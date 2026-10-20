@@ -1,12 +1,15 @@
 #import <Foundation/Foundation.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 // 🔴 BBBulletin 最小接口（只声明我们用到的属性；真机用 Flex3 核对 iOS 16 实际属性名）
 @interface BBBulletin : NSObject
 @property (nonatomic, copy) NSString *sectionID;   // 通常是 App 的 bundleId
 @property (nonatomic, copy) NSString *title;
 @property (nonatomic, copy) NSString *message;
 @property (nonatomic, copy) NSString *subtitle;
-@property (nonatomic, retain) id sound;             // 换提示音用（见 applyToBulletin）
+@property (nonatomic, strong, nullable) NSDate *date;   // 通知时间
+@property (nonatomic, retain, nullable) id sound;       // 换提示音用（见 applyToBulletin）
 @end
 
 @interface NotifyFilter : NSObject
@@ -18,3 +21,5 @@
 + (void)applyToBulletin:(BBBulletin *)bulletin;
 
 @end
+
+NS_ASSUME_NONNULL_END

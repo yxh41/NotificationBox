@@ -17,16 +17,19 @@ NotifyBox_FRAMEWORKS = Foundation CoreFoundation
 # 🔴 不链 BulletinBoard 私有框架：`%hook BBServer` 是运行期 objc_getClass 查找，
 #    BBBulletin 由我们自己声明接口 ⇒ 无需链接，留着反而在精简 SDK 里找不到而报错。
 NotifyBox_CFLAGS = -fobjc-arc -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations
+NotifyBox_LIBRARIES = sqlite3
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
 # ---------- 独立盒子 App（读库展示） ----------
 # Info.plist 走 Theos 约定：项目根 Resources/Info.plist（自动成为 app bundle 的 Info.plist）
 APP_NAME = NotifyBoxApp
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m
+# 🔴 盒子 App 也要编进 NotifyStore.m（ViewController 调它），否则链接时全是 undefined symbols
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m NotifyStore.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
 NotifyBoxApp_FRAMEWORKS = UIKit Foundation MobileCoreServices
 NotifyBoxApp_CFLAGS = -fobjc-arc -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations
+NotifyBoxApp_LIBRARIES = sqlite3
 NotifyBoxApp_INSTALL_PATH = /Applications
 
 include $(THEOS_MAKE_PATH)/application.mk

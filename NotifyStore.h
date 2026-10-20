@@ -1,13 +1,15 @@
 #import <Foundation/Foundation.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 @interface NotifyStore : NSObject
 
-// 录制（tweak 调用）
+// 录制（tweak 调用）。date 传 nil 时自动用当前时间。
 + (void)recordWithBundle:(NSString *)bundle
-                   title:(NSString *)title
-                 message:(NSString *)message
-               subtitle:(NSString *)subtitle
-                    date:(NSDate *)date;
+                   title:(nullable NSString *)title
+                 message:(nullable NSString *)message
+               subtitle:(nullable NSString *)subtitle
+                    date:(nullable NSDate *)date;
 
 // 查询（盒子 App 调用）
 + (NSArray<NSDictionary *> *)queryWithBundle:(nullable NSString *)bundle
@@ -21,3 +23,5 @@
 + (void)clearAll;
 
 @end
+
+NS_ASSUME_NONNULL_END

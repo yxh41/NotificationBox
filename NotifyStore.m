@@ -50,7 +50,8 @@
         sqlite3_bind_text(stmt, 2, [title ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 3, [message ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 4, [subtitle ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
-        sqlite3_bind_double(stmt, 5, [date timeIntervalSince1970]);
+        double ts = date ? [date timeIntervalSince1970] : [[NSDate date] timeIntervalSince1970];
+        sqlite3_bind_double(stmt, 5, ts);
         NSString *h = [NSString stringWithFormat:@"%@|%@|%@", bundle, title ?: @"", message ?: @""];
         NSData *hd = [h dataUsingEncoding:NSUTF8StringEncoding];
         sqlite3_bind_text(stmt, 6, [[hd description] UTF8String], -1, SQLITE_TRANSIENT);
