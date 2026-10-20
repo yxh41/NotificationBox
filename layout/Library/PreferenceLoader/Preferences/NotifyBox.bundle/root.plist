@@ -19,7 +19,11 @@
             <key>label</key>       <string>记录上限(条)</string>
             <key>key</key>         <string>maxRecords</string>
             <key>default</key>     <string>500</string>
-            <key>keyboardType</key> <string>numberPad</string>
+            <!-- 🔴 keyboardType 必须是 **整数**（UIKeyboardType 枚举，4 = UIKeyboardTypeNumberPad）。
+                 写成字符串 "numberPad" 时，[@"numberPad" integerValue] 会得到 0，
+                 键盘静默变成默认键盘；某些第三方设置容器（OneSettings 之类）类型检查更严，会直接抛。
+                 这是本 bundle 唯一一处「类型不合规范」的地方，已改。 -->
+            <key>keyboardType</key> <integer>4</integer>
             <key>placeholder</key> <string>500</string>
         </dict>
 

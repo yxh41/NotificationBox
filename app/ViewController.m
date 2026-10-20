@@ -25,6 +25,7 @@
 
 - (void)onDiag:(id)sender;
 - (void)showText:(NSString *)text title:(NSString *)title;
+- (NSString *)keyLinesFrom:(NSString *)text;
 @end
 
 @implementation ViewController
@@ -51,10 +52,16 @@
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"诊断"
                                                                   message:@"选择要查看的内容"
                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"tweak 日志（尾部 8KB）"
+    // 结论行优先：日志动辄 9KB，全量截图很难抓重点
+    [sheet addAction:[UIAlertAction actionWithTitle:@"只看结论行（推荐）"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
-        [self showText:[NotifyStore logText:8000] title:@"tweak 日志"];
+        [self showText:[self keyLinesFrom:[NotifyStore logText:20000]] title:@"结论行"];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"tweak 日志（尾部 20KB）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self showText:[NotifyStore logText:20000] title:@"tweak 日志"];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"数据库自检"
                                               style:UIAlertActionStyleDefault
@@ -65,6 +72,30 @@
     // iPad 上 actionSheet 必须给 popover 锚点
     sheet.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+// 从全量日志里挑出「能下结论」的行：装载/挂了哪组/命中/探针/丢弃/写库失败
+- (NSString *)keyLinesFrom:(NSString *)text {
+    if (!text.length) return @"(空)";
+    NSArray *all = [text componentsSeparatedByString:@"\n"];
+    NSMutableArray *keep = [NSMutableArray array];
+    // 这些是判据行；不含它们的（比如 sel 清单）不在这里显示
+    NSArray *keys = @[@"===", @"-->", @"hit#", @"P#", @"drop ",
+                      @"APP-ALIVE", @"G3 首次", @"失败", @"!!!", @"探针"];
+    for (NSString *line in all) {
+        if (!line.length) continue;
+        for (NSString *k in keys) {
+            if ([line containsString:k]) { [keep addObject:line]; break; }
+        }
+    }
+    NSString *head = [NSString stringWithFormat:@"命中 %lu 行 / 全文 %lu 行",
+                      (unsigned long)keep.count, (unsigned long)all.count];
+    if (!keep.count) {
+        return [head stringByAppendingFormat:
+                @"\n\n没有任何结论行 —— 连装载日志都没有 ⇒ tweak 没注入到任何进程。\n\n全文前 1200 字：\n%@",
+                text.length > 1200 ? [text substringToIndex:1200] : text];
+    }
+    return [head stringByAppendingFormat:@"\n\n%@", [keep componentsJoinedByString:@"\n"]];
 }
 
 // 长文本用可滚动 VC 展示：UIAlertController 的 message 太长会被截断，且不能复制
