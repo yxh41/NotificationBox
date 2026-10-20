@@ -1,0 +1,9 @@
+# Theos 构建产物
+.theos/
+packages/
+obj/
+*.deb
+
+# macOS / 编辑器
+.DS_Store
+*.swp

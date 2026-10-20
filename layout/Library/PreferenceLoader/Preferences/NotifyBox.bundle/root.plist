@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>title</key>    <string>NotifyBox</string>
+    <!-- 🔴 defaults 必须 = tweak 的 bundleId，才能写到 /var/mobile/Library/Preferences/com.yxh41.notifybox.plist
+         与 NOTIFYBOX_PREFS_PATH 对齐 -->
+    <key>defaults</key> <string>com.yxh41.notifybox</string>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>cell</key>  <string>PSGroupCell</string>
+            <key>label</key> <string>记录设置</string>
+            <key>footerText</key>
+            <string>上限到量后自动删除最旧记录。填 0 或不填 = 默认 500 条。</string>
+        </dict>
+        <dict>
+            <key>cell</key>        <string>PSTextFieldCell</string>
+            <key>label</key>       <string>记录上限(条)</string>
+            <key>key</key>         <string>maxRecords</string>
+            <key>default</key>     <string>500</string>
+            <key>keyboardType</key> <string>numberPad</string>
+            <key>placeholder</key> <string>500</string>
+        </dict>
+
+        <dict>
+            <key>cell</key>  <string>PSGroupCell</string>
+            <key>label</key> <string>App 名单</string>
+            <key>footerText</key>
+            <string>多个用英文逗号分隔。黑名单里的 App 通知不呈现（但仍会记录）。
+若填了白名单，则只有名单内的 App 通知才呈现。</string>
+        </dict>
+        <dict>
+            <key>cell</key>   <string>PSTextFieldCell</string>
+            <key>label</key>  <string>白名单</string>
+            <key>key</key>    <string>whitelist</string>
+            <key>default</key><string></string>
+            <key>placeholder</key> <string>com.tencent.xin,com.apple.MobileSMS</string>
+        </dict>
+        <dict>
+            <key>cell</key>   <string>PSTextFieldCell</string>
+            <key>label</key>  <string>黑名单</string>
+            <key>key</key>    <string>blacklist</string>
+            <key>default</key><string></string>
+            <key>placeholder</key> <string>com.tencent.mttlite</string>
+        </dict>
+
+        <dict>
+            <key>cell</key>  <string>PSGroupCell</string>
+            <key>label</key> <string>关键词过滤</string>
+            <key>footerText</key>
+            <string>命中关键词的通知不呈现（但仍会记录）。多个用英文逗号分隔。</string>
+        </dict>
+        <dict>
+            <key>cell</key>   <string>PSTextFieldCell</string>
+            <key>label</key>  <string>过滤关键词</string>
+            <key>key</key>    <string>blockKeywords</string>
+            <key>default</key><string></string>
+            <key>placeholder</key> <string>红包,领取,限时</string>
+        </dict>
+
+        <!-- 🔴 进阶（阶段2/3）：内容替换规则、按 App 换提示音 这里先做占位，
+             正式版建议做多值编辑 UI；当前可手动改 com.yxh41.notifybox.plist 的
+             replaceRules / appSounds 字段。 -->
+        <dict>
+            <key>cell</key>  <string>PSGroupCell</string>
+            <key>label</key> <string>进阶（手动配置）</string>
+            <key>footerText</key>
+            <string>内容替换 replaceRules=[{from,to}...]、按 App 换提示音 appSounds={bundle:名字}
+暂未在 UI 暴露，需手动编辑 /var/mobile/Library/Preferences/com.yxh41.notifybox.plist。</string>
+        </dict>
+    </array>
+</dict>
+</plist>
