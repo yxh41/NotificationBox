@@ -23,7 +23,9 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 
 # ---------- 独立盒子 App（读库展示） ----------
 # Info.plist 走 Theos 约定：项目根 Resources/Info.plist（自动成为 app bundle 的 Info.plist）
-APP_NAME = NotifyBoxApp
+# 🔴🔴 应用目标的变量是 APPLICATION_NAME（不是 APP_NAME —— 那是 Xcode 的概念）。
+#      写错时 application.mk 拿不到实例 ⇒ **静默跳过、不报错**，deb 里就没有 App。
+APPLICATION_NAME = NotifyBoxApp
 # 🔴 盒子 App 也要编进 NotifyStore.m（ViewController 调它），否则链接时全是 undefined symbols
 NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m NotifyStore.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
