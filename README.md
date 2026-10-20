@@ -141,7 +141,48 @@ Tweak 自己在 `/var/mobile/Library/NotifyBox/tweak.log` 写诊断日志，**�
 | 按 App 换提示音 | `NotifyFilter.applyToBulletin:`（appSounds，待确认 API） | 阶段3 ⚠️ |
 | 朗读（TTS） | `AVSpeechSynthesizer`（待加，黑白名单/关键词） | 阶段3（可选） |
 
-## 已知坑 / 待办
+## 🔴🔴 v0.0.3 进安全模式：病因与铁律（v0.0.4 已修）
+
+真机崩溃报告：
+
+```
+SpringBoard (com.apple.springboard)
+EXC_BAD_ACCESS (SIGSEGV)  KERN_INVALID_ADDRESS at 0x0000000000000001
+"The app read or wrote through a null pointer (address 0x1)
+ – an object was released or was never created."
+```
+
+**唯一变量对照（硬证据，不是猜）：**
+
+| 版本 | 实际 init 的 hook 数量 | 结果 |
+|---|---|---|
+| v0.0.2 | **0 个**（G1/G2 方法都不存在，init 指令没执行） | 不崩 |
+| v0.0.3 | **1 个**（探针 G4 `_sendAddBulletin:toFeeds:`） | **崩进安全模式** |
+
+**病因**：G4 的探针我声明成了 `- (void)`，但**原方法的返回类型我并不确定**。
+一旦原方法返回对象，ARC 会在这个「声明为 void 的 hook」里把返回值丢掉并 release，
+调用方稍后再用该对象 ⇒ 已释放 ⇒ 访问 `0x1`。
+
+> 🔴🔴 **铁律：不知道原方法的完整签名，就不要 hook。**
+> 正确顺序是先用 `method_getTypeEncoding` 把签名**量出来**（纯只读、零风险），
+> 再照着编码逐字写 hook 的返回类型与参数类型。**不许用 `void` 当默认值蒙。**
+
+### v0.0.4 的做法
+
+零 hook 诊断版，只做三件只读的事：
+
+1. 确认 `BBServer` 在哪个进程里存在；
+2. `class_copyMethodList` + **`method_getTypeEncoding`**，把每个候选方法的**精确类型编码**写进日志
+   —— 例 `v32@0:8@16Q24` 即「返回 void；参数 = self, _cmd, 对象, unsigned long long」；
+3. 结论文本放日志最后，保证一定落在 App 的 tail 窗口内。
+
+App「诊断」新增 **「方法清单（SEL+ENC）」**，一眼看全所有签名，截图即可。
+
+另外为排除「设置 App 崩溃」这个变量，本轮**暂时把 PreferenceLoader 载荷移出打包**
+（`layout/` 改名为 `_layout_disabled/`，Theos 只打包 `layout/`）。
+确认设置正常后，下一版再搬回来——或者改为把设置直接做进盒子 App，彻底不依赖 PreferenceLoader。
+
+### 已知坑 / 待办
 
 - **延迟推送**风险最高：再注入的 bulletin 不走 App 自身逻辑，属「再展示一次」，体验需评估。
 - **App 图标**：已用 `LSApplicationProxy applicationProxyForIdentifier:` + `iconDataForVariant:` 取真图标

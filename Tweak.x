@@ -1,37 +1,41 @@
-// Tweak.x —— v0.0.4 纯只读诊断版（零 hook，绝不可能崩）
+// Tweak.x —— v0.0.5 挂上三个真实发布入口（签名全部照 method_getTypeEncoding 逐字抄）
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 🔴 v0.0.3 为什么进安全模式（必须记住的教训）
+// 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
 //
-//   崩溃报告：EXC_BAD_ACCESS (SIGSEGV) / KERN_INVALID_ADDRESS at 0x0000000000000001
-//            "The app read or wrote through a null pointer (address 0x1)
-//             – an object was released or was never created."
-//   ⇒ 这是「过度释放 / 野指针」，不是逻辑错。
+//   SEL publishBulletin:destinations:
+//       ENC v32@0:8@16Q24   ⇒ - (void)xxx:(id) destinations:(unsigned long long)
+//   SEL publishBulletinRequest:destinations:
+//       ENC v32@0:8@16Q24   ⇒ - (void)xxx:(id) destinations:(unsigned long long)
+//   SEL _publishBulletinRequest:forSectionID:forDestinations:
+//       ENC v40@0:8@16@24Q32 ⇒ - (void)xxx:(id) forSectionID:(id) forDestinations:(unsigned long long)
 //
-//   唯一变量对照（这是硬证据，不是猜）：
-//     v0.0.2 实际 init 的 hook = 0 个（G1/G2 都不存在，init 指令没执行） → 不崩
-//     v0.0.3 实际 init 的 hook = 1 个（探针 G4 _sendAddBulletin:toFeeds:） → 崩
+// 🔴 v0.0.3 为什么三个候选全 "NO"：我把名字抄成了
+//    `publishBulletinRequest:forSectionID:forDestinations:`（**漏了前导下划线**），
+//    真名是 `_publishBulletinRequest:...`。缩略图读串丢了细节。
+//    ⇒ 定签名只认 ENC 输出，不认截图。
 //
-//   病因：hook 声明 `- (void)`，但**原方法的返回类型我并不确定**。
-//   一旦原方法返回对象，ARC 会在我这个「void 方法」里把返回值丢掉并 release，
-//   调用方稍后再用该对象 ⇒ 已释放 ⇒ 0x1。
+// 🔴 v0.0.3 为什么进安全模式：挂了一个签名不明的探针并声明成 void。
+//    现在三个目标全部确认返回 void，签名逐字照抄，才敢挂。
 //
-//   ⇒ 铁律：**不知道原方法签名，就不要 hook**。
-//     先用 method_getTypeEncoding 把签名量出来（纯只读，零风险），再照抄写 hook。
+// 🔴 三个入口可能都被调用（一个通知走完整链路），所以必须**去重**，
+//    否则同一条通知会被记 3 次。去重键 = bundle|title|message，窗口 2 秒。
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//
-// 本版做三件事，全是只读：
-//   1. 确认 BBServer 在哪个进程里存在
-//   2. 用 class_copyMethodList + method_getTypeEncoding 打印每个候选方法的**完整类型编码**
-//      （编码里能直接读出返回类型和每个参数类型，下一版照抄即可）
-//   3. 结论文本放在日志最后，保证一定在 App 的 tail 窗口里
 //
 // 🔴 Logos 坑：注释里绝不出现以百分号开头的 Logos 关键字（nb_precheck.py 把关）。
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import "NotifyStore.h"
 
 static NSString *const kNBLogPath = @"/var/mobile/Library/NotifyBox/tweak.log";
+
+static int gHit1 = 0;   // publishBulletin:destinations:
+static int gHit2 = 0;   // publishBulletinRequest:destinations:
+static int gHit3 = 0;   // _publishBulletinRequest:forSectionID:forDestinations:
+
+// 去重表：key -> 最后一次记录的时间戳
+static NSMutableDictionary *gRecent = nil;
 
 static NSString *NBProc(void) {
     NSString *p = [NSProcessInfo processInfo].processName;
@@ -57,45 +61,193 @@ static void NBLog(NSString *fmt, ...) {
     }
 }
 
-// 把类型编码翻成人话，方便直接抄成 hook 签名
-static NSString *NBDecodeEncoding(const char *enc) {
-    if (!enc) return @"(无)";
-    return [NSString stringWithUTF8String:enc] ?: @"?";
+// ---------- 防御式取值：SpringBoard 里抛异常就等于崩，全部包 @try ----------
+
+static id NBSafeValue(id obj, NSString *key) {
+    if (!obj) return nil;
+    if (![obj respondsToSelector:@selector(valueForKey:)]) return nil;
+    @try {
+        return [obj valueForKey:key];
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
 }
 
+static NSString *NBSafeStr(id obj, NSString *key) {
+    id v = NBSafeValue(obj, key);
+    if (!v) return nil;
+    if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
+    @try {
+        return [v description];
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static NSDate *NBSafeDate(id obj, NSString *key) {
+    id v = NBSafeValue(obj, key);
+    return [v isKindOfClass:[NSDate class]] ? (NSDate *)v : nil;
+}
+
+static NSString *NBClassName(id obj) {
+    if (!obj) return @"nil";
+    @try {
+        return NSStringFromClass([obj class]);
+    } @catch (__unused NSException *e) {
+        return @"?";
+    }
+}
+
+// ---------- 去重 ----------
+// 三个发布入口可能依次都被调用，同一条通知不能记三遍。
+// 窗口取 2 秒：足够覆盖同一次发布的多个入口，又不至于吃掉用户连发的两条相同通知。
+static BOOL NBClaimKey(NSString *key) {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    @synchronized (gRecent) {
+        if (!gRecent) return YES;
+        NSNumber *t = gRecent[key];
+        if (t && (now - t.doubleValue) < 2.0) return NO;
+        gRecent[key] = @(now);
+        if (gRecent.count > 300) {
+            NSMutableArray *dead = [NSMutableArray array];
+            for (NSString *k in gRecent) {
+                if (now - [gRecent[k] doubleValue] > 15.0) [dead addObject:k];
+            }
+            // 🔴 NSMutableDictionary 的方法是 removeObjectsForKeys:（复数 Keys）
+            if (dead.count) [gRecent removeObjectsForKeys:dead];
+        }
+        return YES;
+    }
+}
+
+// ---------- 录制 ----------
+// sectionHint：能从参数直接拿到 sectionID 时优先用（最可靠）
+static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *counter) {
+    if (!obj) return;
+
+    NSString *bid   = sectionHint.length ? sectionHint : NBSafeStr(obj, @"sectionID");
+    NSString *title = NBSafeStr(obj, @"title");
+    NSString *msg   = NBSafeStr(obj, @"message");
+    NSString *sub   = NBSafeStr(obj, @"subtitle");
+    NSDate   *date  = NBSafeDate(obj, @"date");
+
+    // 有的版本 packing 了一层，真正内容在 .bulletin 里
+    if (!bid.length || (title.length == 0 && msg.length == 0)) {
+        id inner = NBSafeValue(obj, @"bulletin");
+        if (inner && inner != obj) {
+            if (!bid.length)   bid   = NBSafeStr(inner, @"sectionID");
+            if (!title.length) title = NBSafeStr(inner, @"title");
+            if (!msg.length)   msg   = NBSafeStr(inner, @"message");
+            if (!sub.length)   sub   = NBSafeStr(inner, @"subtitle");
+            if (!date)         date  = NBSafeDate(inner, @"date");
+        }
+    }
+    // 有些 wrapper 用 bulletinID / requestID 之类的键放 section；读不到就只报诊断
+    if (!bid.length) {
+        if (*counter < 6) {
+            (*counter)++;
+            NBLog(@"%@#%d 没有 bundle，cls=%@ title=%@", tag, *counter, NBClassName(obj),
+                  title.length ? title : @"(nil)");
+        }
+        return;
+    }
+
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%@", bid, title ?: @"", msg ?: @""];
+    if (!NBClaimKey(key)) return;      // 已被另一个入口记过
+
+    if (*counter < 10) {
+        (*counter)++;
+        NBLog(@"%@#%d bundle=%@ title=%@ msg=%@",
+              tag, *counter, bid,
+              title.length ? title : @"(nil)",
+              msg.length ? (msg.length > 40 ? [[msg substringToIndex:40] stringByAppendingString:@"..."] : msg) : @"(nil)");
+    }
+    [NotifyStore recordWithBundle:bid title:title message:msg subtitle:sub date:date];
+}
+
+// ---------- 入口 1：- publishBulletin:destinations: ----------
+%group GPB
+%hook BBServer
+- (void)publishBulletin:(id)bulletin destinations:(unsigned long long)destinations {
+    NBRecordItem(bulletin, nil, @"PB", &gHit1);
+    %orig(bulletin, destinations);
+}
+%end
+%end
+
+// ---------- 入口 2：- publishBulletinRequest:destinations: ----------
+%group GPBR
+%hook BBServer
+- (void)publishBulletinRequest:(id)request destinations:(unsigned long long)destinations {
+    NBRecordItem(request, nil, @"PBR", &gHit2);
+    %orig(request, destinations);
+}
+%end
+%end
+
+// ---------- 入口 3：- _publishBulletinRequest:forSectionID:forDestinations: ----------
+// 🔴 注意前导下划线，v0.0.3 就是漏了它才判 NO
+%group GPBRS
+%hook BBServer
+- (void)_publishBulletinRequest:(id)request
+                   forSectionID:(id)sectionID
+                forDestinations:(unsigned long long)destinations {
+    // 第二个参数按 ENC 是 @（对象），本身就是 sectionID，直接当 bundle 用最可靠
+    NSString *sid = [sectionID isKindOfClass:[NSString class]] ? (NSString *)sectionID : nil;
+    NBRecordItem(request, sid, @"PBRS", &gHit3);
+    %orig(request, sectionID, destinations);
+}
+%end
+%end
+
 %ctor {
+    gRecent = [NSMutableDictionary dictionary];   // 单线程时机初始化，之后只读引用
+
     Class c = objc_getClass("BBServer");
     if (!c) {
         NBLog(@"!!! [%@] BBServer 类不存在（该进程里没有公告板服务）", NBProc());
         return;
     }
 
+    // 🔴 用 class_copyMethodList 建名字集合来判断存在性。
+    //    v0.0.3 用 class_getInstanceMethod 在 constructor 阶段对本机 BBServer 会返回 NULL
+    //    （同一时刻 class_copyMethodList 却能列出该方法），所以这条路径更可靠。
+    NSMutableSet *names = [NSMutableSet set];
     unsigned int cnt = 0;
     Method *ms = class_copyMethodList(c, &cnt);
-    NBLog(@"=== [%@] NotifyBox v0.0.4 只读诊断（零 hook）· BBServer 共 %u 个方法 ===", NBProc(), cnt);
-
-    NSMutableArray *names = [NSMutableArray array];   // 只存名字，用于最后统计
     if (ms) {
         for (unsigned i = 0; i < cnt; i++) {
-            NSString *sel = NSStringFromSelector(method_getName(ms[i]));
-            NSString *low = [sel lowercaseString];
-            // 关注：发布入口 / 加公告 / 通知投递
-            if (!([low containsString:@"publish"] ||
-                  [low containsString:@"addbulletin"] ||
-                  [low containsString:@"postnotification"] ||
-                  [low containsString:@"noticesbulletin"] ||
-                  [low containsString:@"sendbulletin"])) {
-                continue;
-            }
-            [names addObject:sel];
-            // 🔴 这一行就是本轮的全部价值：名字 + 精确类型编码
-            //    例：v32@0:8@16Q24 ⇒ 返回 void，参数 = self, _cmd, 对象, unsigned long long
-            NBLog(@"SEL %@  ENC %@", sel, NBDecodeEncoding(method_getTypeEncoding(ms[i])));
+            [names addObject:NSStringFromSelector(method_getName(ms[i]))];
         }
         free(ms);
     }
 
-    NBLog(@"=== [%@] 候选 %lu 条（上面每行 SEL+ENC 就是完整签名） ===",
-          NBProc(), (unsigned long)names.count);
-    NBLog(@"=== [%@] v0.0.4 未挂任何 hook，本版不会崩 === ", NBProc());
+    BOOL h1 = [names containsObject:@"publishBulletin:destinations:"];
+    BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
+    BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
+
+    NBLog(@"=== [%@] NotifyBox v0.0.5 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+          NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
+
+    if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
+    if (h2) { NBLog(@"--> 挂 GPBR (publishBulletinRequest:destinations:)"); %init(GPBR); }
+    if (h3) { NBLog(@"--> 挂 GPBRS (_publishBulletinRequest:forSectionID:forDestinations:)"); %init(GPBRS); }
+
+    if (!h1 && !h2 && !h3) {
+        // 全不存在时把相关名字打出来（只打名字，省日志）
+        NSMutableArray *hits = [NSMutableArray array];
+        for (NSString *n in names) {
+            NSString *low = [n lowercaseString];
+            if ([low containsString:@"publish"] || [low containsString:@"addbulletin"]) {
+                [hits addObject:n];
+            }
+        }
+        NBLog(@"!!! 三个入口都不存在；BBServer 上含 publish/addBulletin 的共 %lu 条：%@",
+              (unsigned long)hits.count,
+              [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
+    }
+
+    NBLog(@"=== [%@] v0.0.5 %@ ===", NBProc(),
+          (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
+                           : @"没挂上任何入口");
 }

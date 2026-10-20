@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 🔴 这个文件之前一直缺，是「设置 App 崩溃」的一个合理嫌疑：
+         PreferenceLoader 会把 NotifyBox.bundle 当 NSBundle 加载，
+         没有 Info.plist 时某些实现（尤其第三方设置容器）拿到的 bundlePath/bundleIdentifier 可能为 nil，
+         后续对 nil 做字符串操作就抛。所有正式的 prefs bundle 都应该有它。 -->
+    <key>CFBundleIdentifier</key>   <string>com.yxh41.notifybox.prefs</string>
+    <key>CFBundleName</key>         <string>NotifyBox</string>
+    <key>CFBundleDisplayName</key>  <string>消息盒子</string>
+    <key>CFBundlePackageType</key>  <string>BNDL</string>
+    <key>CFBundleVersion</key>      <string>1.0</string>
+    <key>CFBundleShortVersionString</key> <string>1.0</string>
+</dict>
+</plist>
