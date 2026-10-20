@@ -2,6 +2,21 @@
 #import "NotifyCommon.h"
 #import <sqlite3.h>
 
+// 写库失败要留痕：区分「hook 没触发」与「触发了但写不进」
+static void NBStoreLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:[NOTIFYBOX_LOG_PATH stringByDeletingLastPathComponent]
+  withIntermediateDirectories:YES attributes:nil error:nil];
+    NSData *d = [[NSString stringWithFormat:@"[STORE %@] %@\n",
+                  [NSDate date], msg] dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:NOTIFYBOX_LOG_PATH];
+    if (fh) { @try { [fh seekToEndOfFile]; [fh writeData:d]; } @finally { [fh closeFile]; } }
+    else { [d writeToFile:NOTIFYBOX_LOG_PATH atomically:YES]; }
+}
+
 @implementation NotifyStore
 
 + (void)ensureDir {
@@ -40,7 +55,10 @@
                     date:(NSDate *)date {
     if (!bundle.length) return;
     sqlite3 *db = [self openDB];
-    if (!db) return;
+    if (!db) {
+        NBStoreLog(@"openDB 失败 path=%@ err=%s", NOTIFYBOX_DB_PATH, sqlite3_errmsg(db));
+        return;
+    }
 
     const char *ins = "INSERT INTO notifications (bundle,title,message,subtitle,ts,hash) "
                       "VALUES (?,?,?,?,?,?)";
@@ -55,8 +73,13 @@
         NSString *h = [NSString stringWithFormat:@"%@|%@|%@", bundle, title ?: @"", message ?: @""];
         NSData *hd = [h dataUsingEncoding:NSUTF8StringEncoding];
         sqlite3_bind_text(stmt, 6, [[hd description] UTF8String], -1, SQLITE_TRANSIENT);
-        sqlite3_step(stmt);
+        int rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE) {
+            NBStoreLog(@"INSERT 失败 rc=%d err=%s bundle=%@", rc, sqlite3_errmsg(db), bundle);
+        }
         sqlite3_finalize(stmt);
+    } else {
+        NBStoreLog(@"prepare 失败 err=%s", sqlite3_errmsg(db));
     }
 
     // 上限裁剪：保留最新的 maxRecords 条
@@ -152,6 +175,38 @@
     }
     sqlite3_close(db);
     return n;
+}
+
++ (void)markAppAlive {
+    NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+    NBStoreLog(@"[APP-ALIVE] 盒子App 启动 v%@ · 说明此路径本 App 可写", ver);
+}
+
++ (NSString *)logText:(NSUInteger)maxBytes {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:NOTIFYBOX_LOG_PATH]) {
+        return [NSString stringWithFormat:@"日志文件不存在：\n%@\n\n（说明 tweak 从未在本机跑过，或注入过滤器未命中）",
+                NOTIFYBOX_LOG_PATH];
+    }
+    NSDictionary *attrs = [fm attributesOfItemAtPath:NOTIFYBOX_LOG_PATH error:nil];
+    unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
+    if (size == 0) return @"日志文件存在但为空（0 字节）";
+
+    if (maxBytes == 0) maxBytes = 8000;
+    unsigned long long start = (size > maxBytes) ? (size - maxBytes) : 0;
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:NOTIFYBOX_LOG_PATH];
+    if (!fh) return @"日志文件打不开（权限问题）";
+    NSData *d = nil;
+    @try {
+        [fh seekToFileOffset:start];
+        d = [fh readDataToEndOfFile];
+    } @finally {
+        [fh closeFile];
+    }
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (!s) s = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
+    NSString *head = [NSString stringWithFormat:@"日志 %llu B，显示尾部 %lu B：\n\n", size, (unsigned long)d.length];
+    return [head stringByAppendingString:s ?: @"(解码失败)"];
 }
 
 + (NSString *)debugSummary {

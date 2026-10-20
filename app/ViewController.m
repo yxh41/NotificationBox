@@ -22,6 +22,9 @@
 @property (nonatomic, copy)   NSString *filterBundle;   // nil = 全部
 @property (nonatomic, copy)   NSString *searchText;
 @property (nonatomic, strong) NSMutableDictionary *iconCache;  // bundle -> UIImage（含 NSNull miss）
+
+- (void)onDiag:(id)sender;
+- (void)showText:(NSString *)text title:(NSString *)title;
 @end
 
 @implementation ViewController
@@ -30,8 +33,60 @@
     [super viewDidLoad];
     self.title = @"消息盒子";
     self.view.backgroundColor = [UIColor systemBackgroundColor];
+    // 在同一日志里打一条「App 活着」，用来和 tweak 的日志对照（见 NotifyStore.h 注释）
+    [NotifyStore markAppAlive];
+    // 诊断入口：把 tweak.log 尾部搬进 App，免去用 Filza 翻文件
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"诊断"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onDiag:)];
     [self buildUI];
     [self loadData];
+}
+
+#pragma mark - 诊断
+
+- (void)onDiag:(id)sender {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"诊断"
+                                                                  message:@"选择要查看的内容"
+                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"tweak 日志（尾部 8KB）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self showText:[NotifyStore logText:8000] title:@"tweak 日志"];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"数据库自检"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self showText:[NotifyStore debugSummary] title:@"数据库自检"];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    // iPad 上 actionSheet 必须给 popover 锚点
+    sheet.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+// 长文本用可滚动 VC 展示：UIAlertController 的 message 太长会被截断，且不能复制
+- (void)showText:(NSString *)text title:(NSString *)title {
+    UIViewController *vc = [[UIViewController alloc] init];
+    vc.title = title;
+    vc.view.backgroundColor = [UIColor systemBackgroundColor];
+
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectZero];
+    tv.editable = NO;
+    tv.selectable = YES;                 // 可全选复制，方便发回给我
+    tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    tv.text = text ?: @"(空)";
+    tv.translatesAutoresizingMaskIntoConstraints = NO;
+    [vc.view addSubview:tv];
+    [NSLayoutConstraint activateConstraints:@[
+        [tv.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor],
+        [tv.leadingAnchor constraintEqualToAnchor:vc.view.leadingAnchor],
+        [tv.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor],
+        [tv.bottomAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.bottomAnchor],
+    ]];
+    [self.navigationController pushViewController:vc animated:YES];
 }
 
 - (void)buildUI {
