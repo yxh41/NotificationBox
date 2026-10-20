@@ -141,4 +141,32 @@
     sqlite3_close(db);
 }
 
++ (NSInteger)count {
+    sqlite3 *db = [self openDB];
+    if (!db) return -1;
+    NSInteger n = -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM notifications", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return n;
+}
+
++ (NSString *)debugSummary {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL exists = [fm fileExistsAtPath:NOTIFYBOX_DB_PATH];
+    NSDictionary *attrs = [fm attributesOfItemAtPath:NOTIFYBOX_DB_PATH error:nil];
+    unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
+    NSInteger n = [self count];
+    return [NSString stringWithFormat:
+            @"DB 路径：%@\n存在：%@    大小：%llu B\n可读：%@    可写：%@\n记录数：%ld    上限：%ld",
+            NOTIFYBOX_DB_PATH,
+            exists ? @"是" : @"否", size,
+            [fm isReadableFileAtPath:NOTIFYBOX_DB_PATH] ? @"是" : @"否",
+            [fm isWritableFileAtPath:NOTIFYBOX_DB_PATH] ? @"是" : @"否",
+            (long)n, (long)[self maxRecords]];
+}
+
 @end

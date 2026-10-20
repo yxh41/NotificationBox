@@ -22,6 +22,10 @@ NS_ASSUME_NONNULL_BEGIN
 + (void)markRead:(NSInteger)rowId;
 + (void)clearAll;
 
+// 自检（盒子 App 空列表时直接显示，用来判断沙盒可达性）
++ (NSInteger)count;
++ (NSString *)debugSummary;
+
 @end
 
 NS_ASSUME_NONNULL_END

@@ -35,33 +35,50 @@
 }
 
 - (void)buildUI {
-    CGFloat w = self.view.bounds.size.width;
-
     // 时间分段
     self.timeSeg = [[UISegmentedControl alloc] initWithItems:@[@"今天", @"近7天", @"全部"]];
     self.timeSeg.selectedSegmentIndex = 0;
     [self.timeSeg addTarget:self action:@selector(onTime:) forControlEvents:UIControlEventValueChanged];
-    self.timeSeg.frame = CGRectMake(12, 8, w - 24, 30);
     [self.view addSubview:self.timeSeg];
 
     // 搜索
-    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 44, w, 40)];
+    self.searchBar = [[UISearchBar alloc] init];
     self.searchBar.delegate = self;
     self.searchBar.placeholder = @"搜索标题或正文";
     [self.view addSubview:self.searchBar];
 
     // 顶部 App 图标栏（横向滚动）
-    self.iconBar = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 88, w, 56)];
+    self.iconBar = [[UIScrollView alloc] init];
     self.iconBar.showsHorizontalScrollIndicator = NO;
     [self.view addSubview:self.iconBar];
 
     // 列表
-    self.table = [[UITableView alloc] initWithFrame:CGRectMake(0, 148, w, self.view.bounds.size.height - 148)
-                                             style:UITableViewStylePlain];
+    self.table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     self.table.delegate = self;
     self.table.dataSource = self;
     [self.table registerClass:[UITableViewCell class] forCellReuseIdentifier:@"c"];
     [self.view addSubview:self.table];
+}
+
+// 统一在 safeArea 里排版，避免和导航栏/搜索框互相压字
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGFloat top = self.view.safeAreaInsets.top;
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    CGFloat safeBottom = self.view.safeAreaInsets.bottom;
+    CGFloat y = top + 6;
+
+    self.timeSeg.frame = CGRectMake(12, y, w - 24, 30);
+    y += 30 + 6;
+
+    self.searchBar.frame = CGRectMake(0, y, w, 44);
+    y += 44;
+
+    self.iconBar.frame = CGRectMake(0, y, w, 56);
+    y += 56;
+
+    self.table.frame = CGRectMake(0, y, w, h - y - safeBottom);
 }
 
 - (void)reloadIconBar {
@@ -161,6 +178,22 @@
                                         since:[self sinceFromSeg]
                                        search:self.searchText];
     [self.table reloadData];
+    [self updateEmptyView];
+}
+
+// 空列表时直接把自检信息打在屏幕上（判断 tweak 有没有写库、App 能不能读到）
+- (void)updateEmptyView {
+    if (self.items.count) {
+        self.table.backgroundView = nil;
+        return;
+    }
+    UILabel *l = [[UILabel alloc] init];
+    l.numberOfLines = 0;
+    l.textAlignment = NSTextAlignmentCenter;
+    l.font = [UIFont systemFontOfSize:13];
+    l.textColor = [UIColor secondaryLabelColor];
+    l.text = [@"暂无记录\n\n" stringByAppendingString:[NotifyStore debugSummary]];
+    self.table.backgroundView = l;
 }
 
 #pragma mark - UISearchBarDelegate
