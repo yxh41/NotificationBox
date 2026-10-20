@@ -26,6 +26,7 @@
 - (void)onDiag:(id)sender;
 - (void)showText:(NSString *)text title:(NSString *)title;
 - (NSString *)keyLinesFrom:(NSString *)text;
+- (NSString *)selLinesFrom:(NSString *)text;
 @end
 
 @implementation ViewController
@@ -58,6 +59,11 @@
                                             handler:^(UIAlertAction *a) {
         [self showText:[self keyLinesFrom:[NotifyStore logText:20000]] title:@"结论行"];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"方法清单（SEL+ENC）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self showText:[self selLinesFrom:[NotifyStore logText:60000]] title:@"方法清单"];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"tweak 日志（尾部 20KB）"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -72,6 +78,30 @@
     // iPad 上 actionSheet 必须给 popover 锚点
     sheet.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+// 只挑 SEL/ENC 行：这就是 v0.0.4 要量回来的「精确方法签名」
+- (NSString *)selLinesFrom:(NSString *)text {
+    if (!text.length) return @"(空)";
+    NSArray *all = [text componentsSeparatedByString:@"\n"];
+    NSMutableArray *keep = [NSMutableArray array];
+    for (NSString *line in all) {
+        if ([line containsString:@"SEL "] || [line containsString:@"候选"] ||
+            [line containsString:@"BBServer 共"]) {
+            // 去掉时间戳前缀，截图更省宽度
+            NSRange r = [line rangeOfString:@"]"];
+            if (r.location != NSNotFound && r.location + 1 < line.length) {
+                [keep addObject:[line substringFromIndex:r.location + 1]];
+            } else {
+                [keep addObject:line];
+            }
+        }
+    }
+    if (!keep.count) {
+        return @"没有 SEL 行 —— 要么日志被截断，要么 BBServer 不在这个进程。\n先看「只看结论行」。";
+    }
+    return [NSString stringWithFormat:@"共 %lu 条（ENC 里 v=void 返回，@=对象，Q=unsigned long long，B=BOOL）\n\n%@",
+            (unsigned long)keep.count, [keep componentsJoinedByString:@"\n"]];
 }
 
 // 从全量日志里挑出「能下结论」的行：装载/挂了哪组/命中/探针/丢弃/写库失败
