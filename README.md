@@ -135,11 +135,11 @@ Tweak 自己在 `/var/mobile/Library/NotifyBox/tweak.log` 写诊断日志，**�
 | 白/黑名单 | `NotifyFilter.shouldDrop:`（读 prefs） | MVP ✅ |
 | 按 App 筛选（图标栏） | `ViewController` 顶部 `iconBar` + `queryWithBundle:` | MVP ✅ |
 | 时间筛选 / 搜索 | `sinceFromSeg` / `queryWithBundle:search:` | MVP ✅ |
-| 关键词过滤 | `NotifyFilter.shouldDrop:`（blockKeywords） | 阶段2 |
-| 内容替换（规则） | `NotifyFilter.applyToBulletin:`（replaceRules） | 阶段2 |
-| 延迟推送 | `Tweak.x` TODO：return + `dispatch_after` 再 `%orig` | 阶段3 ⚠️ |
-| 按 App 换提示音 | `NotifyFilter.applyToBulletin:`（appSounds，待确认 API） | 阶段3 ⚠️ |
-| 朗读（TTS） | `AVSpeechSynthesizer`（待加，黑白名单/关键词） | 阶段3（可选） |
+| 关键词过滤 | `NotifyFilter.shouldDropBundle:...`（blockKeywords） | 阶段2 ✅ |
+| 内容替换（规则） | `NotifyFilter.applyReplaceRulesTo:` + `ReplaceRulesViewController` | 阶段2 ✅ v0.0.14 页面重做 |
+| 延迟推送 | `NotifyFilter.shouldDelayBundle:seconds:` + 三个入口 `dispatch_after` 再 orig | 阶段3 ✅ v0.0.14 |
+| 按 App 换提示音 | `NotifyFilter.applyReplaceRulesTo:`（appSounds，待确认 API） | 阶段3 ⚠️ 等 PROBE 数据 |
+| 朗读（TTS） | `NotifySpeaker`（AVSpeechSynthesizer） | 阶段3 ✅ v0.0.12/13 |
 
 ## 🔴🔴 v0.0.3 进安全模式：病因与铁律（v0.0.4 已修）
 
@@ -737,3 +737,137 @@ UIImageView 同理：template 图也会被 `tintColor` 涂成单色。
 > 前两条都是**工具查不到的**：格式串自检当时是 PASS 的，因为它只看调用点写了几个参数，
 > 不看被调函数是不是可变参数。现在已经给工具补了「签名必须是可变参数」这一条，
 > 并用还原现场做了负向对照（改回单参数后工具精确报出那行）。
+
+## v0.0.14 · 内容替换页重做 + 延迟推送
+
+用户原话：「内容替换规则这个优化下，设置后都不清楚替换掉的是哪些，等设置的多的时候，那记得住那么多」。
+
+### 🔴🔴 先修的那个 bug：替换目标从来没显示过
+
+`ReplaceRulesViewController` 里写的是：
+
+```objc
+[self.table registerClass:[UITableViewCell class] forCellReuseIdentifier:@"r"];   // ← 病根
+...
+c.textLabel.text = from;
+c.detailTextLabel.text = to.length ? [NSString stringWithFormat:@"→ %@", to] : @"→ （删除）";
+```
+
+`registerClass:[UITableViewCell class]` 建出来的是 **Default 样式**，
+而 Default 样式的 `detailTextLabel` **根本不在视图层级里**（是 nil）。
+样式在 `dequeue` 那一刻就定死了，运行期改不回来。
+
+⇒ 那行 `→ 替换成什么` **从 v0.0.9 起就没显示过**。用户只能看到原文、看不到替换目标，
+这正是他说的"不清楚替换掉的是哪些"。
+
+同一个坑在 v0.0.10（列表只有标题没有正文）和 v0.0.13（App 选择器）已经各踩过一次。
+现在这一页干脆不用系统样式，自己摆三个 label：
+
+```
+#1  限时
+→ 删除（替换成空）
+改过 12 条，另有 3 条被前面吃掉
+```
+
+用自绘而不是 `UITableViewCellStyleSubtitle` 的原因：Subtitle 的 `detailTextLabel` 是
+**单行且高度固定**的，塞不下"替换成什么"+"统计"两段信息，长的替换内容会把统计挤掉
+（尾部截断）—— 而统计恰恰是这次要解决的痛点。三行各自截断才互不干扰。
+
+### 一、试运行：不用真发一条通知去试
+
+顶部一块输入框，输入任意文字，实时显示：
+
+- 套用后变成什么（结果为空就明说"整段都被删掉了"）
+- 命中了哪几条规则（`命中 #1、#3`）
+
+🔴 **它必须调用引擎里那个同一个函数**，不能在 App 里再写一份顺序套用：
+
+```objc
+// NotifyFilter.h（引擎与 App 共用）
++ (NSString *)applyRulesToString:(nullable NSString *)text
+                           rules:(nullable NSArray *)rules
+                            hits:(nullable NSMutableArray<NSNumber *> *)hits;
+```
+
+`applyReplaceRulesTo:` 也改成逐字段调它 —— 单一来源。
+两份逻辑一旦走岔，用户看到的试运行结果就是**假的**，而假结果比没有结果更坏
+（他会照着一个错的结果去调规则）。
+
+顺带得到一个真实的行为修正：`from == to` 的规则以前会被算作"改过"
+（`rangeOfString` 找到了就算），现在因为比较替换前后字符串，**正确地算作没改**。
+
+### 二、逐条命中统计：包括"被前面的规则吃掉"
+
+对盒子里最近 2000 条通知的**原文**，按顺序模拟套用（与引擎完全一致：
+标题/正文/副标题各套一遍，三个字段互不影响），统计：
+
+| 显示 | 含义 |
+|---|---|
+| 改过 N 条 | 这条规则真的把这些通知改掉了（绿字） |
+| 最近的通知里没命中过 | 原文里根本没有这个词 |
+| ⚠️ 被前面的规则吃掉 N 条 | 原文里本来有，但已经被上面的规则先改没了，轮到它时匹配不到（橙字） |
+| ⚠️ 和原文一样，等于没配 | `from == to` |
+
+"被前面吃掉"这一列是这次最值钱的东西：**顺序套用最容易踩的坑是静默的** ——
+用户只会觉得"这条规则没生效"，然后删掉重加、越配越乱。
+
+统计在**下一轮 runloop** 才算（不在 `viewDidLoad` 同步做）：读库 + 2000×3×N 次字符串套用，
+同步做会占住主线程 ⇒ 首帧画不出来 ⇒ 用户看到一个空白页以为页面坏了
+（v0.0.13 的 App 选择器已经踩过同类坑）。
+
+刷新统计时只 `reloadSections:`，不整表 `reloadData` —— 后者会把正在输入的试运行输入框的键盘收掉。
+
+### 三、点一条规则可以改它的替换内容
+
+之前只能删了重加（而且因为看不到替换目标，等于只能瞎删）。
+现在点进去预填当前的 `to`，原位替换（**顺序不变** = 用户看到的位置不变）。
+
+### 四、延迟推送（阶段 3）
+
+语义：命中的通知**不立即弹出**，延后 N 秒再交给 BBServer 的发布方法。
+
+设置页：`延迟推送（秒，0 = 关闭）` + `延迟生效的 App`（可搜索多选，空 = 全部）。
+
+实现要点：
+
+- **默认关闭**（0）。它是唯一会改变"通知到达时间"的功能，风险最高。
+- 秒数夹在 1~600；设置页严格校验（只认纯数字）。填 `abc` 会被 `integerValue` 读成 0
+  = 关闭，保存显示成功、用户等半天等不到通知却说不出所以然；填 86400 等于让通知永不出现。
+- 流水线返回值从 `BOOL` 换成结构体，因为"放行"和"晚 N 秒"是两个维度：
+
+```objc
+typedef struct {
+    BOOL allow;            // NO ⇒ 不执行原方法（被过滤）
+    NSTimeInterval delay;  // >0 ⇒ 延后这么多秒再执行原方法
+} NBDecision;
+```
+
+  ⚠️ ARC 禁止结构体持有 ObjC 对象指针，所以 bundle 不进结构体（需要它的日志在流水线内部打掉）。
+
+- 延迟判定放在**过滤之后**（被拦掉的不该进队列）、**朗读之前**（日志顺序=执行顺序）。
+- 三个挂点各自 `dispatch_after` + 块内 orig：
+  block 会**强引用住** bulletin，这是延迟能成立的前提；orig 在块里是合法的
+  （Logos 把它展开成对静态函数指针的普通 C 调用，`self`/`_cmd` 都会被正常捕获）；
+  到期落在**主队列**（SpringBoard 里唯一一定存在的队列，BBServer 发布本身是线程安全的）。
+  `_publishBulletinRequest:forSectionID:...` 的 `sectionID` 也必须一起被捕获住。
+- 日志配对：`DELAY#n bundle=... 5.0s` / `DELAY-FIRE#n tag=...`。
+  只有 DELAY 没有 DELAY-FIRE ⇒ 定时器没走到；两者齐全但通知没出现 ⇒ 系统那边已放弃这条。
+  这两种结论对应的下一步完全相反，所以必须能分开。
+- 朗读**不跟着延迟**：延迟改的是"弹窗什么时候出现"，朗读是即时播报。两者同时开时先听到、
+  N 秒后才看到，设置页里写明了。不做成"一起延后"是刻意的 —— 朗读是刚在真机上验证过的功能，
+  不想为了组合场景去动它的调用路径。
+
+### 五、新增一道离线闸门 `nb_syntax_guard.py`
+
+本地没有 theos/macOS，一次 CI 往返要几分钟，而两类错在多文件改动时最容易漏：
+
+1. 花括号 / 圆括号失衡（**含字符串里的括号不能被误当代码**）
+2. `@interface` 扩展里声明了、`@implementation` 里却没实现
+   （clang `-Wincomplete-implementation` 默认开，CI 报 error）
+
+以及 `NBLog(@"...100%")` 这种裸 `%`（`%c` 被当转换符）。
+
+> 🔴 这个工具**第一版自己就是坏的**：根目录按脚本自身路径反推 ⇒ 不管 cwd 在哪都只查真实项目
+> ⇒ 负向对照（故意塞错的假项目）5 条全部漏报，工具还报 PASS。
+> 修成可由 argv 指定根目录后 6/6 通过（正常/缺右花括号/少一个实现/字符串里带括号/裸 %/多一个右圆括号）。
+> 又一例「判据域必须等于变异域」。
