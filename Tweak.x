@@ -1,4 +1,4 @@
-// Tweak.x —— v0.0.18（当前）：延迟推送走「改时间字段」；本版修的是**判据行看不见**的问题
+// Tweak.x —— v0.0.19（当前）：**延迟推送功能整体删除**（两种实现各撞死一次）
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
@@ -39,11 +39,6 @@ static int gHit2 = 0;   // publishBulletinRequest:destinations:
 static int gHit3 = 0;   // _publishBulletinRequest:forSectionID:forDestinations:
 static int gDropped = 0;    // 被过滤掉（没有交给原方法）的条数
 static int gReplaced = 0;   // 内容替换真正改过字段的次数
-static int gDelayed = 0;    // 被延后发布的条数（v0.0.14）
-static int gDelayFired = 0; // 真的到点执行了原方法的条数（v0.0.14）
-static int gDelayMissed = 0; // v0.0.16：判定要延迟但没找到可写时间字段的条数
-static int gDelaySkipped = 0; // v0.0.16：多入口幂等跳过的条数（同一条通知命中 2~3 个入口）
-
 // 去重表：key -> 最后一次记录的时间戳
 static NSMutableDictionary *gRecent = nil;
 
@@ -58,100 +53,61 @@ static NSString *NBProc(void) {
 //    够不着它。复制一份日志函数是最差解 —— 两份轮转逻辑迟早走岔。
 #define NBLog NBSharedLog
 
-// v0.0.16：延迟的留痕拆成两条，**必须能分开**——它们对应的下一步完全相反。
-//   DELAY#      = 延迟真的生效了（时间字段已改写，系统会晚点弹）
-//                 后面带字段名：这正是"我改的是不是系统读的那个字段"的直接证据
-//   DELAY-MISS# = 判定要延迟，但**一个时间字段都没改成** ⇒ 本条会按时发布。
-//                 这是安全失败（不崩、不吞），但功能没生效，必须能看见。
-//                 下一版要看的就是这条后面 PROBEDATE# 打出来的真实字段名。
-static void NBLogDelayApplied(NSString *tag, NSTimeInterval sec, NSString *fields) {
-    gDelayFired++;
-    NBLog(@"DELAY#%d tag=%@ %.1fs 字段=%@", gDelayFired, tag, (double)sec, fields ?: @"?");
-}
-static void NBLogDelayMissed(NSString *tag, NSTimeInterval sec, id bulletin) {
-    gDelayMissed++;
-    NBLog(@"DELAY-MISS#%d tag=%@ 想要 %.1fs，但找不到可写的时间字段 ⇒ 本条按时发布",
-          gDelayMissed, tag, (double)sec);
-
-    // 🔴 失败时才 dump 字段名，而且只 dump 前 2 次 —— 日志窗口 ≈ 50 条且全局滚动，
-    //    刷多了会把紧接着要看的 DROP#/REPL# 挤出去。
-    //    成功时不用 dump：DELAY# 那行已经带着"我改的是哪个字段"了。
-    if (gDelayMissed > 2) return;
+// ---------- 延迟推送的残留清理（v0.0.19） ----------
+//
+// 🔴🔴 为什么这一版把"自愈"整个换掉 —— v0.0.16~v0.0.18 的自愈会**骗人**：
+//
+//   真机现场（用户 v0.0.18 截图）：
+//       17:59:52  延迟自愈已触发 / 已自动删除 delaySeconds ⇒ 延迟推送回到关闭状态
+//       18:00:18  DELAY#2516 tag=PBRS 5.0s 字段=date          ← 26 秒后还在推
+//       18:00:18  DELAY#2517 tag=PB   5.0s 字段=date+...
+//   ⇒ 它说"删了"，实际上延迟还在按 5 秒跑。用户看到的是"功能明明关掉了，通知还是不弹"。
+//
+//   病因查清了，而且是我自己埋的：
+//     `NBWriteDelayGuard(@"start")` 只在 **v0.0.15** 那个 commit 里被调用过；
+//     v0.0.16 把"写 start"删了、却把"读 start"留着。而 v0.0.15 的延迟是全程关闭的，
+//     所以它写下 start 之后**永远等不到 done** ⇒ 这个文件永久停在 start
+//     ⇒ 从 v0.0.16 起每次启动都误判成"上次崩在延迟里"。
+//     （git log -S 'NBWriteDelayGuard(@"start")' 只有 d47ac61 / 6dc778c 两个 commit。）
+//
+//   ⇒ 教训：**一个只写不读的状态是死状态，一个只读不写的状态是永远为真的谎言。**
+//     自愈判据必须"写和读在同一处、成对出现"，且**回读验证**。
+//
+// 现在的做法只有一件事：把残留的键**真的**清掉，然后把**回读结果**打出来。
+//   不判断、不自愈、不猜测 —— 因为功能已经整个删除了，没有"开着"这个状态。
+static void NBPurgeDelayLeftovers(void) {
     @try {
-        NSString *desc = [NotifyFilter probeTimeFieldsOfBulletin:bulletin];
-        if (!desc.length) return;
-        // 🔴 单条日志 200 字上限。属性清单很容易超，先截断再打 ——
-        //    超长会被日志层截掉，而"截断"和"本来就没有"在事后是分不开的。
-        if (desc.length > 150) {
-            desc = [[desc substringToIndex:150] stringByAppendingString:@"…(截断)"];
+        // 两处都要清：NBLoadSettings() 是「新文件优先，旧 Preferences 域兜底」，
+        // 只清一个的话，另一个会把键"复活"回来。这就是"删了还在跑"的第二个可能来源。
+        NSArray *paths = @[NOTIFYBOX_SETTINGS_PATH, NOTIFYBOX_PREFS_PATH];
+        BOOL purged = NO;
+
+        for (NSString *path in paths) {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
+            if (![d isKindOfClass:[NSDictionary class]] || !d.count) continue;
+            if (!d[NB_KEY_DELAY_SECONDS] && !d[NB_KEY_DELAY_APPS]) continue;
+
+            NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:d];
+            [m removeObjectForKey:NB_KEY_DELAY_SECONDS];
+            [m removeObjectForKey:NB_KEY_DELAY_APPS];
+            if ([m writeToFile:path atomically:YES]) purged = YES;
+            else NBLog(@"!!! 清理延迟残留失败（写不进去）：%@", path);
         }
-        NBLog(@"PROBEDATE#%d cls=%@ :: %@", gDelayMissed,
-              bulletin ? NSStringFromClass([bulletin class]) : @"nil", desc);
-    } @catch (__unused NSException *e) { }
-}
 
-// v0.0.16：同一条通知命中多个入口时，第 2、3 个入口会拿到"已经推过了"的空串。
-// 这条日志的价值：**证明幂等真的生效了**。
-// 反过来说，如果填 5 秒实际晚了 10 秒，这里一定缺 SKIP 行 —— 一眼就能分开
-// 「幂等没生效」和「系统自己又拖了」。
-static void NBLogDelaySkipped(NSString *tag) {
-    gDelaySkipped++;
-    NBLog(@"DELAY-SKIP#%d tag=%@ 这一条已经推过了（多入口幂等）", gDelaySkipped, tag);
-}
+        // 🔴 回读验证：把"我以为的结果"换成"实际读到的结果"。
+        //    上面那句 v0.0.18 的假话就是这么来的 —— 只有写、没有回读。
+        NSDictionary *back = NBLoadSettings();
+        BOOL gone = (back[NB_KEY_DELAY_SECONDS] == nil && back[NB_KEY_DELAY_APPS] == nil);
+        if (!gone) {
+            NBLog(@"!!! 延迟残留还在：回读 settings 仍有 delaySeconds=%@ delayApps=%@",
+                  back[NB_KEY_DELAY_SECONDS] ?: @"(无)", back[NB_KEY_DELAY_APPS] ?: @"(无)");
+        } else if (purged) {
+            NBLog(@"已清除延迟推送的历史残留（回读确认已无 delaySeconds / delayApps）");
+        }
 
-// ---------- 延迟推送的崩溃自愈（v0.0.15） ----------
-// 与朗读那套「自毁保护」同一个思路：崩溃前必须留下可判读的痕迹，
-// 因为崩的是 SpringBoard —— 用户连设置页都进不去，只能靠下一次启动自己恢复。
-
-static void NBWriteDelayGuard(NSString *state) {
-    if (![state isKindOfClass:[NSString class]]) return;
-    @try {
-        NSString *dir = [NOTIFYBOX_DELAY_GUARD_PATH stringByDeletingLastPathComponent];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:nil];
-        [[state dataUsingEncoding:NSUTF8StringEncoding] writeToFile:NOTIFYBOX_DELAY_GUARD_PATH
-                                                        atomically:YES];
-    } @catch (__unused NSException *e) { }
-}
-
-// 返回 YES 表示"上次就是崩在延迟发布里"，已经自动把 delaySeconds 清掉了。
-static BOOL NBRecoverFromDelayCrash(void) {
-    @try {
-        NSString *s = [NSString stringWithContentsOfFile:NOTIFYBOX_DELAY_GUARD_PATH
-                                                encoding:NSUTF8StringEncoding
-                                                   error:nil];
-        s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (![s isEqualToString:@"start"]) return NO;
-
-        NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:NBLoadSettings()];
-        [d removeObjectForKey:NB_KEY_DELAY_SECONDS];
-        [NotifyStore saveSettings:d];
-        NBWriteDelayGuard(@"crash-closed");
-        NBLog(@"!!! 延迟自毁保护触发：上次崩在延迟发布里（guard=start 没有 done）");
-        NBLog(@"!!! 已自动删除 delaySeconds ⇒ 延迟推送回到关闭状态，不用你手动改");
-        return YES;
-    } @catch (__unused NSException *e) {
-        return NO;
-    }
-}
-
-// 🔴 v0.0.15 引入、v0.0.16 起**不再调用**。
-//    v0.0.15 停用延迟时，"主动清掉历史 delaySeconds"是对的：那版的值只有坏处。
-//    v0.0.16 延迟重新启用了，还无条件删就等于**每次都把用户的设置抹掉** ——
-//    他会觉得"我明明设了 5 秒，一升级就没了"，这比崩溃更难解释。
-//    所以改成：只在"确实崩过"（guard=start）时才清，见 NBRecoverFromDelayCrash。
-//    函数本体先留着（现场排障时可能还要手工清），但不许在构造函数里调用。
-static void NBClearStaleDelaySetting(void) __attribute__((unused));
-static void NBClearStaleDelaySetting(void) {
-    @try {
-        NSDictionary *cur = NBLoadSettings();
-        if (!cur[NB_KEY_DELAY_SECONDS]) return;         // 没有就什么都不做（绝大多数情况）
-        NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:cur];
-        [d removeObjectForKey:NB_KEY_DELAY_SECONDS];
-        [NotifyStore saveSettings:d];
-        NBLog(@"已清除历史 delaySeconds（仅在确实崩过时才会走到这里）");
+        // 老版本留下的 guard 文件同样是垃圾（它停在 start 上，会让旧版误判）。
+        // 顺手删掉：万一用户回退到旧版，也不会再被这个死状态骗到。
+        [[NSFileManager defaultManager] removeItemAtPath:NOTIFYBOX_DELAY_GUARD_PATH error:nil];
     } @catch (__unused NSException *e) { }
 }
 
@@ -278,13 +234,16 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
 //    一件事变两个维度 ⇒ 换成结构体。
 //    ⚠️ ARC 禁止结构体持有 ObjC 对象指针，所以 bundle **不进结构体**；
 //    需要 bundle 的日志一律在 NBPipeline 内部就打掉。
+// 🔴 v0.0.19：删掉了 delay 字段。理由见 NotifyFilter.h 顶部那条长注释 ——
+//    延迟这件事两次撞死（跨队列 SIGTRAP / 改时间字段导致通知全不弹），
+//    功能已整体删除。**结构体里留一个永远为 0 的字段是最坏的做法**：
+//    它会让后来的人以为"这条链路是通的，只是没启用"。
 typedef struct {
     BOOL allow;              // NO ⇒ 调用点不要执行原方法（被过滤掉）
-    NSTimeInterval delay;    // >0 ⇒ 延后这么多秒再执行原方法
 } NBDecision;
 
-static NBDecision NBAllowNow(void) { NBDecision d; d.allow = YES; d.delay = 0; return d; }
-static NBDecision NBDeny(void)     { NBDecision d; d.allow = NO;  d.delay = 0; return d; }
+static NBDecision NBAllowNow(void) { NBDecision d; d.allow = YES; return d; }
+static NBDecision NBDeny(void)     { NBDecision d; d.allow = NO;  return d; }
 
 // ---------- 记录 + 过滤流水线（三入口共用） ----------
 // 返回 allow=NO ⇒ 调用点**不要执行原方法**，等于把这条通知拦下来（盒子里仍然查得到）。
@@ -345,23 +304,6 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             }
         }
 
-        // ④ 延迟推送（v0.0.14）
-        //
-        // 🔴 放在过滤**之后**：被拦掉的通知根本不该被排进任何队列。
-        // 🔴 放在朗读**之前**：日志顺序就是执行顺序（DELAY → SPEAK），看日志不会错位。
-        // 🔴 替换必须在延迟之前做完：对象是**原地改写**的，N 秒后才发布 ⇒
-        //    如果先排延迟再改字段，改的仍是同一个对象，结果一样；但日志会看不懂。
-        NSTimeInterval ds = 0;
-        if ([NotifyFilter shouldDelayBundle:bid seconds:&ds]) {
-            gDelayed++;
-            out.delay = ds;
-            // ⚠️ 这里数的是**调用次数**，不是通知条数：同一条通知可能命中 2~3 个入口，
-            //    所以 DELAY 行会比"实际延后的通知"多。看 DELAY-FIRE 的配对更有意义。
-            if (gDelayed <= 8 || (gDelayed % 20) == 0) {
-                NBLog(@"DELAY#%d bundle=%@ tag=%@ %.1fs", gDelayed, bid, tag, ds);
-            }
-        }
-
         // ⑤ 朗读（v0.0.13）
         //
         // 🔴 只在 firstTime 做：三个入口会依次触发，不判首次就会把同一句话读三遍。
@@ -398,32 +340,6 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 - (void)publishBulletin:(id)bulletin destinations:(unsigned long long)destinations {
     NBDecision d = NBPipeline(bulletin, nil, @"PB", &gHit1);
     if (!d.allow) return;
-    if (d.delay > 0) {
-        // 🔴🔴 v0.0.16：延迟的执行方式**整体换掉**了 —— 不再延迟调用原方法。
-        //
-        // 旧实现（v0.0.14，已判死刑）：
-        //     dispatch_after(..., main_queue, ^{ orig(bulletin, destinations); });
-        // 真机崩溃栈：
-        //     _dispatch_assert_queue_fail ← dispatch_assert_queue
-        //     ← -[BBServer dataProviderForSectionID:] +44 ← tweak ← GCD 定时器 ← 主队列
-        // ⇒ BBServer 的方法内部要求"必须在 BB 自己的私有串行队列上"，那个队列句柄
-        //   只活在 BBServer 内部、外面拿不到 ⇒ 换哪个队列都不对，必然 SIGTRAP。
-        //
-        // 新实现：只把 bulletin 上的**时间字段**往后平移 d.delay 秒，
-        // 然后**立刻、在同一个线程上调 orig**，让系统自己按新时间排期。
-        // ⇒ 没有跨队列、没有跨时间的对象持有、没有重复发布。这三件事一个都不做了。
-        //
-        // 🔴 关键：下面的 orig 是**无条件、立即**执行的（不 return、不等待）。
-        //    改字段失败也只是"没延迟"，绝不能因此吞掉通知。
-        NSString *moved = [NotifyFilter applyDelayToBulletin:bulletin seconds:d.delay];
-        if (moved.length) {
-            NBLogDelayApplied(@"PB", d.delay, moved);
-        } else if (moved) {
-            NBLogDelaySkipped(@"PB");        // 空串 = 多入口幂等跳过（不是失败）
-        } else {
-            NBLogDelayMissed(@"PB", d.delay, bulletin);
-        }
-    }
     %orig(bulletin, destinations);
 }
 %end
@@ -435,17 +351,6 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 - (void)publishBulletinRequest:(id)request destinations:(unsigned long long)destinations {
     NBDecision d = NBPipeline(request, nil, @"PBR", &gHit2);
     if (!d.allow) return;
-    if (d.delay > 0) {
-        // 见入口 1 的说明：改时间字段 + 立即调原方法，绝不 dispatch_after
-        NSString *moved = [NotifyFilter applyDelayToBulletin:request seconds:d.delay];
-        if (moved.length) {
-            NBLogDelayApplied(@"PBR", d.delay, moved);
-        } else if (moved) {
-            NBLogDelaySkipped(@"PBR");        // 空串 = 多入口幂等跳过（不是失败）
-        } else {
-            NBLogDelayMissed(@"PBR", d.delay, request);
-        }
-    }
     %orig(request, destinations);
 }
 %end
@@ -462,17 +367,6 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     NSString *sid = [sectionID isKindOfClass:[NSString class]] ? (NSString *)sectionID : nil;
     NBDecision d = NBPipeline(request, sid, @"PBRS", &gHit3);
     if (!d.allow) return;
-    if (d.delay > 0) {
-        // 见入口 1 的说明：改时间字段 + 立即调原方法，绝不 dispatch_after
-        NSString *moved = [NotifyFilter applyDelayToBulletin:request seconds:d.delay];
-        if (moved.length) {
-            NBLogDelayApplied(@"PBRS", d.delay, moved);
-        } else if (moved) {
-            NBLogDelaySkipped(@"PBRS");        // 空串 = 多入口幂等跳过（不是失败）
-        } else {
-            NBLogDelayMissed(@"PBRS", d.delay, request);
-        }
-    }
     %orig(request, sectionID, destinations);
 }
 %end
@@ -496,7 +390,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.18", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.19", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -509,31 +403,22 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户陷入「开机→崩→安全模式→开机」的循环，连盒子 App 都进不去改设置。
     BOOL recovered = [NotifySpeaker recoverFromCrashIfNeeded];
 
-    // 🔴🔴 v0.0.15：延迟推送自毁保护，同样排在任何 hook 之前。
-    //    延迟推送已整体停用（NotifyFilter 的 kDelayEnabled = NO），这里是第二道保险：
-    //    万一哪天有人把那个常量打开、又崩了，下次开机会自动把 delaySeconds 清掉。
-    //
     // 🔴🔴 这两件事**只让 SpringBoard 做**（本 tweak 同时注入 backboardd，见 NotifyBox.plist）：
     //    ① 两个进程同时改 settings.plist 会互相覆盖（后写的赢，可能把用户的改动冲掉）；
     //    ② backboardd 以 **root** 运行 —— 它写出来的文件/目录会变成 root 所有，
     //       之后盒子 App（mobile）就写不动了，表现是「设置保存失败 / 存不住」，
     //       而且现场看起来完全不像是权限问题。这种坑不能留。
-    BOOL delayRecovered = NO;
     if ([NBProc() isEqualToString:@"SpringBoard"]) {
-        delayRecovered = NBRecoverFromDelayCrash();
-        // 🔴 v0.0.16：**不再**调用 NBClearStaleDelaySetting()。
-        //    v0.0.15 停用期间无条件删除是对的，现在延迟重新启用了，
-        //    再无条件删就等于每次都抹掉用户的设置。改成只在 guard=start 时清。
+        // 🔴 v0.0.19：延迟功能已整体删除 ⇒ 这里不再有"自愈"，只有**残留清理**。
+        //    只在 SpringBoard 里做，理由同上一段（backboardd 是 root）。
+        NBPurgeDelayLeftovers();
     }
 
-    // 🔴 v0.0.16：延迟推送**重新启用**，执行方式换成"改时间字段"。
-    //    这行必须如实写出来 —— 上一版这里写的是「已停用」，用户是靠这行判断
-    //    功能到底能不能用。功能状态变了而日志没变，等于给用户一个假现场。
-    NBLog(@"=== [%@] NotifyBox v0.0.18 · %@ · 朗读自愈%@ · 延迟自愈%@ · 延迟推送%@ ===",
+    // 🔴 v0.0.19：banner 里**不许再出现"延迟"的"已启用/已触发"字样**。
+    //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
+    NBLog(@"=== [%@] NotifyBox v0.0.19 · %@ · 朗读自愈%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
-          recovered ? @"已触发" : @"无异常",
-          delayRecovered ? @"已触发" : @"无异常",
-          @"已启用（改时间字段，不跨队列）");
+          recovered ? @"已触发" : @"无异常");
 
     // 只读探针：dump 一次 BBBulletin / BBSound 的类结构（内部自己保证只做一次）
     [NotifyProbe dumpClassesOnce];
@@ -561,7 +446,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.18 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.19 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -582,7 +467,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.18 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.19 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

@@ -46,38 +46,26 @@ NS_ASSUME_NONNULL_BEGIN
 //          引擎与 App 都用这一份口径 ⇒ 不会出现「界面认为有 5 条、引擎只认 4 条」。
 + (NSArray<NSDictionary *> *)normalizedRules:(nullable id)raw;
 
-// v0.0.14：延迟推送判定。
-// 返回 YES ⇒ 这条通知要延后 *seconds 秒再发布。
-// 关闭条件（任一）：没配 delaySeconds / 配了 0 或非数字 / delayApps 里有值但这条的 bundle 不在里面。
-// seconds 会夹在 1~600：用户填 86400 就等于让通知永远不出现，那不该被当成"设置成功"。
-+ (BOOL)shouldDelayBundle:(nullable NSString *)bundle seconds:(NSTimeInterval *)seconds;
-
-// 🔴🔴 v0.0.16：延迟推送的**新实现** —— 不延迟调用，只把通知的发布时间往后写。
+// 🔴🔴 延迟推送：v0.0.19 **功能整体删除**（连接口一起撤掉，不是停用）。
 //
-// 为什么推倒重来：旧实现是「把原方法攒进 dispatch_after，N 秒后再调」，
-// 真机崩溃栈已经证明这条路整体走不通 ——
-//   _dispatch_assert_queue_fail ← dispatch_assert_queue
-//   ← -[BBServer dataProviderForSectionID:] +44 ← tweak ← GCD 定时器 ← 主队列
-// BBServer 的方法内部要求「必须在 BB 自己的私有串行队列上」，而那个队列句柄
-// 只活在 BBServer 内部、外面拿不到 ⇒ 换哪个队列都不对，必然撞断言 ⇒ SIGTRAP。
+// 两版实现各撞死一次，且死法不同 —— 结论是「延迟」这件事在当前注入位置做不到：
+//   ① v0.0.14「攒进 dispatch_after 再调原方法」⇒ SIGTRAP。
+//      栈：_dispatch_assert_queue_fail ← dispatch_assert_queue
+//          ← -[BBServer dataProviderForSectionID:] +44 ← tweak ← GCD 定时器 ← 主队列
+//      ⇒ BBServer 的方法内部要求「必须在 BB 自己的私有串行队列上」，那个队列句柄
+//        只活在 BBServer 内部、外面拿不到 ⇒ 换哪个队列都不对。**跨队列这条路无解。**
+//   ② v0.0.16「只把时间字段往后写，让系统自己改期」⇒ 通知全不弹。
+//      真机日志：PBRS 只改到 date、PBR 被幂等跳过、PB 却改到 date+publicationDate+
+//      expirationDate —— 同一秒内同一条通知。⇒ 三个入口拿到的是**不同包装对象**
+//      （request / bulletin），对象级关联标记跨不过去。
+//      更致命的是：**改排期字段不是"延后发布一次"，是"要求系统改期"**。系统每次重排
+//      都会重新走发布入口、拿到新包装对象 ⇒ 对象级幂等永远失效 ⇒ 每重排一次再 +5 秒
+//      ⇒ 这条通知永远到不了。用户的真实现场就是"一条都不弹"。
 //
-// 新做法：**在同一线程、同一次调用里**照常执行原方法，只把 bulletin 上的时间字段
-// 往后平移 seconds，让**系统自己**在 N 秒后把通知弹出来。
-// 纯数据修改：不跨队列、不持有对象、不重复发布 ⇒ 从根上没有上面那个断言问题。
-//
-// 返回：非空 = 真正改成功的字段名（可能多个，用 + 连接）；
-//       空串 = 这一条**已经推过了**，本次跳过（同一条通知会命中 2~3 个入口，
-//              不做幂等的话 5 秒会变成 10~15 秒，见实现里的 NBDelayMarkKey 注释）；
-//       nil  = 一个字段都没改成。**空串和 nil 都是安全失败**（通知按时发布），不是错误。
-// 🔴 调用方必须区分空串与 nil：把空串当成失败去打 DELAY-MISS，会把"幂等生效"
-//    误报成"没找到字段"，那下一版就会照着错结论去改字段名。
-+ (nullable NSString *)applyDelayToBulletin:(nullable id)bulletin
-                                    seconds:(NSTimeInterval)seconds;
-
-// v0.0.16 只读探针：dump 这个 bulletin 上所有"像时间"的属性名 + 类型编码 + 当前值。
-// 🔴 一个 setter 都不调。返回一行描述，由调用方决定打不打日志。
-// 用途：确认 applyDelayToBulletin: 该改哪个字段 —— 字段名是猜的，必须量出来。
-+ (nullable NSString *)probeTimeFieldsOfBulletin:(nullable id)bulletin;
+// ⇒ 接口在这里全部撤掉（不是加一个常量门）。留着带 `dateByAddingTimeInterval` 的死代码
+//   等于把一把已经伤过两次的刀留在抽屉里 —— 谁改一个字就能再打开，而它一旦打开
+//   用户是"通知全没"这种最难归因的症状。要恢复必须先推翻上面两条真机证据。
+//   校验脚本 nb_delay_gate.py 会把「二进制里不许出现改时间字段」当成硬判据。
 
 @end
 

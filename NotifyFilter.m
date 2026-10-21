@@ -115,196 +115,24 @@
     return cur;
 }
 
-+ (BOOL)shouldDelayBundle:(NSString *)bundle seconds:(NSTimeInterval *)seconds {
-    if (seconds) *seconds = 0;
-
-    // 🔴🔴🔴 v0.0.15：延迟推送**暂停接线**。这里直接返回 NO —— 这是本轮唯一的出口，
-    //   三个 hook 的延迟分支都靠它把关 ⇒ 就算 settings.plist 里还留着 delaySeconds，
-    //   也不会有任何一条通知被攒进 block。
-    //
-    //   停用原因（真机实测，2026-10-21 15:51:27）：SpringBoard 崩在
-    //     EXC_BREAKPOINT (SIGTRAP)，系统报 "The Swift runtime trapped:
-    //     fatalError / failed precondition / force-unwrapped nil /
-    //     array index out of range" ⇒ 进安全模式。
-    //
-    //   🔴🔴🔴 2026-10-21 16:10 拿到 .ips 后的定论 ——
-    //     不是"上面某一条候选因成立"，而是「**延迟调用原方法**」这一类做法**整体走不通**。
-    //
-    //   故障线程栈（真实 .ips，主线程 com.apple.main-thread）：
-    //      0  libdispatch   _dispatch_assert_queue_fail         + 120
-    //      1  libdispatch   dispatch_assert_queue                + 196
-    //      2  BulletinBoard -[BBServer dataProviderForSectionID:] + 44  ← 方法开头就断言
-    //      3  <dylib>       0x7858
-    //      4  <dylib>       0xc0f0
-    //      5  <dylib>       0x49f8   ← GCD 定时器 fire 出来的 block
-    //      6  libdispatch   _dispatch_client_callout
-    //      8  libdispatch   _dispatch_source_invoke
-    //      9  libdispatch   _dispatch_main_queue_drain          ← 主队列
-    //
-    //   ⇒ 病因 = **队列前置条件**。BBServer 的方法在动手前会
-    //     dispatch_assert_queue(<BB 私有串行队列>)，而那个队列句柄只活在 BBServer 内部，
-    //     外面拿不到。把原方法搬到 dispatch_get_main_queue() 上执行 ⇒ 断言落空 ⇒ SIGTRAP。
-    //   ⇒ 最贵的推论：**换队列也没救**。主队列不对，自己开串行队列更不对，
-    //     唯一正确的那个队列我们拿不到 ⇒ 不要再试图"把原方法塞进某个 dispatch_after"。
-    //   ⇒ 正确方向：**不延迟调用，只把通知的发布时间往后写** ——
-    //     照常在**同一线程、同一次调用**里执行原方法，只把 bulletin 上的时间字段
-    //     （date / publicationDate 之类，具体名字待 PROBE 探针确认）改成 now+N，
-    //     让**系统自己**在 N 秒后弹。纯数据修改：不跨队列、不持有对象、不重复发布。
-    //   ⇒ 顺带记一笔：这份 .ips 的故障栈里 **NotifyBox.dylib 一帧都没有**
-    //     （168 个镜像、全部线程全扫），发起方是另一个插件 NotificationFilter.dylib。
-    //     但"这份日志不是我" ≠ "我的代码没问题" —— 上面那条队列断言说明我的延迟分支
-    //     一旦真跑起来会死在同一处。停用的决定与"谁发的"无关。
-    //
-    //   🔴 v0.0.16：**重新启用**，但执行方式整个换掉了（见 applyDelayToBulletin:seconds:）。
-    //     本函数现在只回答"要不要延迟"，不再回答"怎么延迟" —— 判定逻辑从来没崩过，
-    //     崩的一直是执行方式（跨队列调原方法）。
-    //     保留这个常量作为**紧急停用开关**：真出问题改一个字就能整条关掉。
-    static const BOOL kDelayEnabled = YES;
-    if (!kDelayEnabled) return NO;
-
-    @try {
-        NSDictionary *p = [self prefs];
-        if (!p.count) return NO;                       // 没有任何设置 ⇒ 绝不改变任何行为
-
-        // 秒数：NSNumber 或 "5" 两种都认（手改 plist 的人常写成字符串）
-        double sec = 0;
-        id v = p[NB_KEY_DELAY_SECONDS];
-        if ([v isKindOfClass:[NSNumber class]])        sec = [(NSNumber *)v doubleValue];
-        else if ([v isKindOfClass:[NSString class]])   sec = [(NSString *)v doubleValue];
-        if (!(sec >= 1.0)) return NO;                  // 0 / 负数 / 非数字 ⇒ 关闭
-        // 🔴 夹上限：填 86400 等于让通知永远不出现。用户不会知道自己填错了，
-        //    只会觉得"开了延迟之后通知全没了"。
-        if (sec > 600.0) sec = 600.0;
-
-        NSArray<NSString *> *apps = [self arrayFromPref:p[NB_KEY_DELAY_APPS]];
-        if (apps.count && ![apps containsObject:(bundle.length ? bundle : @"")]) return NO;
-
-        if (seconds) *seconds = sec;
-        return YES;
-    } @catch (__unused NSException *e) {
-        return NO;      // 判错就不延迟：宁可准时到，也不要莫名其妙迟到
-    }
-}
-
-// ---------- v0.0.16：延迟的新执行方式（改时间字段，不延迟调用） ----------
-
-// 哪些字段"像发布时间"。顺序 = 猜测的可信度降序。
-// 🔴 故意**不含** expirationDate 之外任何语义不明的字段：改错字段的代价是
-//    "通知永远不出现"，比"没延迟"坏得多。
-static NSArray<NSString *> *NBTimeKeys(void) {
-    return @[@"date", @"publicationDate", @"publishDate", @"timestamp", @"expirationDate"];
-}
-
-// "date" → "setDate:"。⚠️ 首字母必须大写，否则 respondsToSelector 一律 NO。
-static NSString *NBSetterNameFor(NSString *key) {
-    if (!key.length) return nil;
-    return [NSString stringWithFormat:@"set%@%@:",
-            [[key substringToIndex:1] uppercaseString],
-            [key substringFromIndex:1]];
-}
-
-// 🔴🔴 v0.0.16 幂等标记：同一条通知会命中 2~3 个入口（PB / PBR / PBRS）。
-//    这是本项目的常识（日志里同一条通知往往有 PB + PBR 两行），但它在这里的后果是
-//    **延迟时间被乘了几倍**：每个入口都平移一次时间 ⇒ 填 5 秒实际会晚 10~15 秒，
-//    而用户完全看不出为什么（他会以为"延迟不准"，而不是"被推了三次"）。
-//    v0.0.14 的旧实现也有同一个问题（3 个定时器），当时列在候选因②里 —— 现在确认成立。
+// 🔴🔴 v0.0.19：延迟推送的整段实现（shouldDelayBundle: / applyDelayToBulletin: /
+//    probeTimeFieldsOfBulletin:）已从本文件删除，接口也从头文件撤掉。
 //
-//    解：用**关联对象**打标记。选它的理由：
-//      ① 跟着对象生命周期走 —— 对象没了标记自动没，不会泄漏；
-//      ② 不需要额外的锁或全局表（这张表还要考虑线程安全，而 BB 的方法不一定在主线程）；
-//      ③ 不需要 weak 引用容器（NSHashTable 那种要自己管清理）。
-static const void *NBDelayMarkKey = &NBDelayMarkKey;
+// 为什么是"删除"而不是"留一个常量门"：
+//   v0.0.15 的做法是 `static const BOOL kDelayEnabled = NO;` —— 那是**编译期常量**，
+//   整段会被 DCE 掉，看起来"删掉了"。但它的实际效果是**把刀留在抽屉里**：
+//   谁改一个字（NO→YES）就能重新打开，而打开之后的症状是"通知全不弹/闪退"，
+//   属于最难归因的那一类。两次真机事故（SIGTRAP 进安全模式、通知全不弹）都是这么来的。
+//   ⇒ 要恢复这个功能，必须先推翻 README「v0.0.19」那一章里的两条真机证据，
+//     而不是改一个字符。
+//
+// 判据（.workbuddy/tmp/nb_delay_gate.py，负向对照必红）：
+//   ① 本文件里不许出现 dateByAddingTimeInterval / NB_KEY_DELAY_SECONDS；
+//   ② 头文件里不许声明 shouldDelayBundle: / applyDelayToBulletin:；
+//   ③ Tweak.x 里不许出现 dispatch_after / d.delay 分支；
+//   ④ 反方向的哨兵：shouldDropBundle: / applyReplaceRulesTo: 必须还在
+//      —— 否则"删干净了"可能是"整个文件被删了"。
 
-// 返回：非空 = 真正改了哪些字段（幂等：同一对象只生效一次）
-//       空串  = 这一条**已经推过了**，本次跳过（不是失败，调用方照常执行原方法）
-//       nil   = 一个时间字段都没找到（也是安全失败）
-+ (NSString *)applyDelayToBulletin:(id)bulletin seconds:(NSTimeInterval)seconds {
-    if (!bulletin || !(seconds > 0)) return nil;
-
-    // 🔴 幂等闸门必须排在**所有写入之前**。
-    if (objc_getAssociatedObject(bulletin, NBDelayMarkKey)) return @"";
-
-    NSMutableArray<NSString *> *done = [NSMutableArray array];
-
-    // 🔴 每个键**单独 @try**。理由同 NotifyProbe：KVC 碰到不存在的键会抛
-    //    NSUndefinedKeyException，共用一个 @try 的话第一个抛错会带走后面所有键
-    //    ⇒ 明明 date 能改，却因为前面的键名猜错而整个放弃。这类误判已经烧过一整轮。
-    for (NSString *key in NBTimeKeys()) {
-        @try {
-            NSString *setterName = NBSetterNameFor(key);
-            if (!setterName) continue;
-            // ① 没有 setter ⇒ 这个字段是 readonly，跳过（硬写就是抛异常 = 崩）
-            if (![bulletin respondsToSelector:NSSelectorFromString(setterName)]) continue;
-            // ② 没有 getter 就无法确认类型 ⇒ 跳过（不冒险写一个不知道类型的键）
-            if (![bulletin respondsToSelector:NSSelectorFromString(key)]) continue;
-
-            id cur = [bulletin valueForKey:key];
-            // ③ 当前值不是 NSDate ⇒ 这个字段不是时间（可能是数字时间戳或别的），跳过。
-            //    这一条把"改错字段"挡在门外：类型对不上就绝不动手。
-            if (![cur isKindOfClass:[NSDate class]]) continue;
-
-            NSDate *moved = [(NSDate *)cur dateByAddingTimeInterval:seconds];
-            [bulletin setValue:moved forKey:key];
-            [done addObject:key];
-        } @catch (__unused NSException *e) {
-            // 单个键失败不影响其它键，也不影响调用方（它会照常立即执行原方法）
-        }
-    }
-
-    // 🔴 只有真的改成功才打标记；一个字段都没改成 ⇒ 不打标记（让后面的入口再试一次，
-    //    它们传进来的对象可能已经不是同一个包装类了）。
-    if (done.count) {
-        objc_setAssociatedObject(bulletin, NBDelayMarkKey, @(seconds),
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return [done componentsJoinedByString:@"+"];
-    }
-    return nil;
-}
-
-+ (NSString *)probeTimeFieldsOfBulletin:(id)bulletin {
-    if (!bulletin) return nil;
-    @try {
-        Class c = [bulletin class];
-        unsigned int cnt = 0;
-        objc_property_t *ps = class_copyPropertyList(c, &cnt);
-        if (!ps) return [NSString stringWithFormat:@"%@ 没有 property 列表", NSStringFromClass(c)];
-
-        NSMutableArray<NSString *> *hits = [NSMutableArray array];
-        for (unsigned i = 0; i < cnt; i++) {
-            const char *n = property_getName(ps[i]);
-            const char *a = property_getAttributes(ps[i]);
-            if (!n) continue;
-            NSString *name = [NSString stringWithUTF8String:n];
-            NSString *attr = a ? [NSString stringWithUTF8String:a] : @"";
-            NSString *low = [name lowercaseString];
-            if (!([low containsString:@"date"] || [low containsString:@"time"])) continue;
-
-            // 类型编码放在名字后面：T@"NSDate" 才能写，Td/Tq 是标量（写不了对象）
-            NSString *cell = [NSString stringWithFormat:@"%@{%@}", name, attr];
-            @try {
-                id v = [bulletin valueForKey:name];
-                if ([v isKindOfClass:[NSDate class]]) {
-                    cell = [cell stringByAppendingFormat:@"=NSDate(%.0f)", [(NSDate *)v timeIntervalSince1970]];
-                } else if (!v) {
-                    cell = [cell stringByAppendingString:@"=nil"];
-                } else {
-                    cell = [cell stringByAppendingFormat:@"=<%@>", NSStringFromClass([v class])];
-                }
-            } @catch (__unused NSException *e) {
-                cell = [cell stringByAppendingString:@"=THROW"];
-            }
-            [hits addObject:cell];
-        }
-        free(ps);
-
-        if (!hits.count) {
-            return [NSString stringWithFormat:@"%@ 里没有名字含 date/time 的属性", NSStringFromClass(c)];
-        }
-        return [hits componentsJoinedByString:@" "];
-    } @catch (__unused NSException *e) {
-        return @"探针自己抛异常了（已忽略）";
-    }
-}
 
 + (BOOL)applyReplaceRulesTo:(id)bulletin {
     if (!bulletin) return NO;

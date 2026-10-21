@@ -71,7 +71,6 @@ static BOOL NBIsDigits(NSString *s) {
 - (void)onWhite:(id)sender;
 - (void)onBlack:(id)sender;
 - (void)onSpeakApps:(id)sender;
-- (void)onDelayApps:(id)sender;
 - (void)onVoice:(id)sender;
 - (void)onAppDiag:(id)sender;
 - (void)fail:(NSString *)msg;
@@ -114,27 +113,12 @@ static BOOL NBIsDigits(NSString *s) {
     [self addActionRow:@"朗读声音" key:@"voice" action:@selector(onVoice:)];
     [self addActionRow:@"朗读限定 App" key:@"speakapps" action:@selector(onSpeakApps:)];
 
-    // ---------- 延迟推送（v0.0.14 加 → v0.0.15 停用 → v0.0.16 换实现重开） ----------
-    // 🔴🔴 历程必须留住，否则下一版又会有人走回头路：
-    //    v0.0.14 的实现是「把发布动作攒进 dispatch_after，N 秒后再调原方法」。
-    //    真机崩溃栈（2026-10-21 15:51:27，EXC_BREAKPOINT）：
-    //        _dispatch_assert_queue_fail ← dispatch_assert_queue
-    //        ← -[BBServer dataProviderForSectionID:] +44 ← tweak ← GCD 定时器 ← 主队列
-    //    ⇒ BBServer 的方法内部要求「必须在 BB 自己的私有队列上」，那个队列外部拿不到，
-    //      换哪个队列都必然撞断言 ⇒ 所以 v0.0.15 整条停掉。
-    //    v0.0.16 换成**不改调用时机、只改数据**：把 bulletin 的时间字段往后平移，
-    //      然后在同一线程立刻执行原方法，让系统自己排期。这条路不跨队列、不持有对象。
-    // ⚠️ 所以现在标题里**不能**再写「已停用」——功能真的开了。
-    //    文案必须与引擎里的 kDelayEnabled 状态一致，否则就是给用户一个假现场。
-    id ds = cur[NB_KEY_DELAY_SECONDS];
-    NSString *dsStr = [ds isKindOfClass:[NSNumber class]] ? [(NSNumber *)ds stringValue]
-                    : ([ds isKindOfClass:[NSString class]] ? (NSString *)ds : @"");
-    [self addGroup:@"延迟推送（秒，0 = 关闭）"
-                 ph:@"例如 5；填 0 或留空 = 不延迟"
-              value:dsStr
-           keyboard:UIKeyboardTypeNumberPad
-                key:NB_KEY_DELAY_SECONDS];
-    [self addActionRow:@"延迟生效的 App" key:@"delayapps" action:@selector(onDelayApps:)];
+    // ---------- 延迟推送：v0.0.19 已整体移除 ----------
+    // 🔴 这里**故意连这个开关都不放**。历史上它两次把用户手机搞坏：
+    //    v0.0.14 跨队列调原方法 ⇒ 桌面 SIGTRAP 进安全模式；
+    //    v0.0.16 改 bulletin 的时间字段 ⇒ 通知全不弹（每次重排又 +5 秒，永远到不了）。
+    //    ⇒ 留一个"填秒数"的输入框，等于留一个能把通知弄没的开关。
+    //    完整证据链在仓库 notifybox/README.md 的「v0.0.19」那一章。
 
     // ---------- 记录 ----------
     id mx = cur[@"maxRecords"];
@@ -177,11 +161,9 @@ static BOOL NBIsDigits(NSString *s) {
         @"• 朗读只念「替换后」的文字（跟通知上看到的一致）；被过滤规则拦下的通知不念。\n"
         @"• 如果朗读导致桌面崩溃重启，插件会在下次开机时**自动把朗读关掉**，\n"
         @"  并往日志写一行「朗读自毁保护触发」，不需要你做任何事。\n"
-        @"• 延迟推送（v0.0.16 换实现重开）：填 5 = 通知晚 5 秒才弹。\n"
-        @"  上一版是在「晚点再发布」上做文章，结果撞了系统的队列断言，桌面直接崩。\n"
-        @"  这一版不改发布时机，只把通知自带的时间往后挪，让系统自己去排 —— 不会崩。\n"
-        @"  ⚠️ 如果日志里出现 DELAY-MISS，说明没找到能改的时间字段（这条会按时弹出，不崩）；\n"
-        @"  把日志发我，我按 PROBEDATE 那行输出的真实字段名改。\n"
+        @"• 延迟推送已在 v0.0.19 移除（不是关闭）。它两次把手机搞坏：\n"
+        @"  一次让桌面崩进安全模式，一次让通知一条都不弹，所以整个拿掉了。\n"
+        @"  如果你手里那版还填着秒数，装上这版会自动把它清掉，不用你手动改。\n"
         @"• 顺带修好一个会丢数据的问题：数据库锁。以前盒子 App 和桌面同时写库时，\n"
         @"  SQLite 直接返回 busy（日志里 INSERT 失败 rc=5），那条通知就静默丢了；\n"
         @"  现在会最多等 2 秒再放弃。\n"
@@ -342,13 +324,6 @@ static BOOL NBIsDigits(NSString *s) {
                             : @"全部 App ›")
                   forKey:@"speakapps"];
 
-    // v0.0.16：延迟重新启用，这里的写法跟着回到「全部 App」口径 ——
-    // 空 = 全部，这个语义和朗读限定完全一致，用户不用再学一套。
-    NSUInteger dl = [NBStringArray(d[NB_KEY_DELAY_APPS]) count];
-    [self setActionValue:(dl ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)dl]
-                             : @"全部 App ›")
-                  forKey:@"delayapps"];
-
     NSString *voiceName = [VoicePickerViewController currentVoiceDisplayName];
     id rid = d[NB_KEY_SPEAK_RATE];
     NSString *rateName = @"默认速度";
@@ -499,29 +474,19 @@ static BOOL NBIsDigits(NSString *s) {
                     return;
                 }
             }
-        } else if ([key isEqualToString:NB_KEY_DELAY_SECONDS]) {
-            // 🔴 延迟秒数必须严格校验。
-            //    这里糊弄的代价特别大：填 "abc" 会被 integerValue 读成 0（= 关闭），
-            //    保存显示"成功"，用户等半天等不到通知也说不出所以然；
-            //    填 86400 则等于让通知永远不出现 —— 他会以为插件把通知吞了。
-            if (v.length == 0) {
-                [d removeObjectForKey:key];
-            } else if (!NBIsDigits(v)) {
-                [self fail:@"延迟秒数只能填数字（0 = 关闭，原值未改）"];
-                return;
-            } else {
-                NSInteger n = [v integerValue];
-                if (n < 1 || n > 600) {
-                    [self fail:@"延迟秒数必须是 1~600 秒；要关闭就填空或 0（原值未改）"];
-                    return;
-                }
-                d[key] = @(n);
-            }
         } else {
             if (v.length) d[key] = v;
             else [d removeObjectForKey:key];
         }
     }
+
+    // 🔴🔴 v0.0.19 总闸门：写盘之前把已移除功能的键删干净。
+    //    病因：这个方法的写法是「启动时读到的整份 dict → 改一项 → 整份写回」。
+    //    只要那份里还有 delaySeconds，用户改任何别的设置都会把它**原样写回去**，
+    //    于是 tweak 清一次、App 复活一次 —— 表现就是"明明删了，还在跑"。
+    //    ⇒ 让这一个出口负责"已移除的键绝不落盘"，比在每个入口判断都可靠。
+    [d removeObjectForKey:NB_KEY_DELAY_SECONDS];
+    [d removeObjectForKey:NB_KEY_DELAY_APPS];
 
     errno = 0;
     BOOL ok = [NotifyStore saveSettings:d];
@@ -575,11 +540,6 @@ static BOOL NBIsDigits(NSString *s) {
 - (void)onSpeakApps:(id)sender {
     [self.view endEditing:YES];
     [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeSpeak]];
-}
-
-- (void)onDelayApps:(id)sender {
-    [self.view endEditing:YES];
-    [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeDelay]];
 }
 
 - (void)onVoice:(id)sender {
