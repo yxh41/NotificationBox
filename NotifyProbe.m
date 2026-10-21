@@ -167,6 +167,47 @@ static void NBDumpClassMethods(Class c, NSString *label) {
     }
 }
 
++ (void)dumpServerQueueOnce {
+    static BOOL done = NO;
+    if (done) return;
+    // 同 dumpClassesOnce 的教训：%ctor 阶段 BulletinBoard 可能还没加载，
+    // 拿不到类就**不置位**，留给第一次 hook 命中时重试。
+    Class c = objc_getClass("BBServer");
+    if (!c) return;
+    done = YES;
+
+    @try {
+        unsigned int cnt = 0;
+        objc_property_t *ps = class_copyPropertyList(c, &cnt);
+        NSMutableArray *hits = [NSMutableArray array];
+        if (ps) {
+            for (unsigned i = 0; i < cnt; i++) {
+                const char *n = property_getName(ps[i]);
+                if (!n) continue;
+                NSString *name = [NSString stringWithUTF8String:n];
+                NSString *low = [name lowercaseString];
+                if ([low containsString:@"queue"] || [low containsString:@"serial"]
+                    || [low containsString:@"dispatch"] || [low containsString:@"thread"]) {
+                    [hits addObject:name];
+                }
+            }
+            free(ps);
+        }
+        NBSharedLog(@"PROBE BBServer property 共 %u 个，队列相关 %lu 个: %@", cnt,
+                    (unsigned long)hits.count,
+                    hits.count ? [hits componentsJoinedByString:@","] : @"无");
+    } @catch (__unused NSException *e) {
+        NBSharedLog(@"!!! PROBE BBServer property dump 抛异常（已忽略）");
+    }
+
+    // 我们自己此刻在哪个队列上 —— 这决定了"延迟后还能不能回到这个队列"。
+    // dispatch_queue_get_label 是线程安全的只读 API，不会阻塞。
+    @try {
+        const char *label = dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL);
+        NBSharedLog(@"PROBE 当前队列标签 = %s", label ? label : "?");
+    } @catch (__unused NSException *e) { }
+}
+
 + (int)probedCount {
     return gProbed;
 }

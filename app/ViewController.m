@@ -146,8 +146,19 @@
     NSMutableArray *keep = [NSMutableArray array];
     // 这些是判据行；不含它们的（比如 sel 清单）不在这里显示
     // 🔴 DROP# / REPL# 是「过滤真的拦了」「替换真的改了」的唯一证据，必须进结论行
+    //
+    // 🔴🔴 v0.0.16 修一个很隐蔽的漏判：`DELAY` / `PROBEDATE` 必须显式加进来。
+    //    之前只有 `P#` 这个关键词，于是：
+    //      `DELAY-SKIP#1`  刚好含 "SKIP#" 里的 "P#"  ⇒ 侥幸显示
+    //      `DELAY#1`       D,E,L,A,Y,#             ⇒ 一个关键词都不含 ⇒ **被筛掉**
+    //      `DELAY-MISS#1`  同上                    ⇒ 也被筛掉
+    //    结果就是用户截图上只看到 SKIP、看不到 DELAY# —— 而 DELAY# 恰恰带着
+    //    「我改的是哪个字段」这个最关键的信息。查这个问题时我一度以为延迟根本没生效。
+    //    ⇒ 教训：**新增一种日志行，必须同时检查它能不能通过"结论行"筛选**。
+    //      判据写出来了但看不见，等于没写。
     NSArray *keys = @[@"===", @"-->", @"hit#", @"P#", @"drop ",
                       @"DROP#", @"REPL#",
+                      @"DELAY", @"PROBEDATE",
                       @"APP-ALIVE", @"G3 首次", @"失败", @"!!!", @"探针"];
     for (NSString *line in all) {
         if (!line.length) continue;

@@ -28,6 +28,13 @@ NS_ASSUME_NONNULL_BEGIN
 // 探针不能把真正有用的 DROP#/REPL#/SPEAK 行挤掉。
 + (void)probeBulletin:(nullable id)obj tag:(nullable NSString *)tag;
 
+// v0.0.16：万一「改时间字段」不能让系统推迟显示，下一步就得知道
+// **BBServer 的串行队列在哪儿** —— 崩溃栈已经证明只有那个队列能安全调它的方法。
+// 输出两行：① BBServer 里所有名字含 queue/serial/dispatch/thread 的 property；
+//          ② 我们被调用时所在的队列标签（dispatch_queue_get_label）。
+// 🔴 全部只读，一个 setter 都不调。内部自己保证只跑一次（拿不到类就不置位，留给下次）。
++ (void)dumpServerQueueOnce;
+
 // 计数器（判断探针到底跑没跑过；盒子 App 的日志页能读到）
 + (int)probedCount;
 
