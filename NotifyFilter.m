@@ -1,6 +1,7 @@
 #import "NotifyFilter.h"
 #import "NotifyCommon.h"
-#import <objc/runtime.h>       // v0.0.16：probeTimeFieldsOfBulletin 要用 class_copyPropertyList
+#import <objc/runtime.h>       // v0.0.16 起为探针引入；v0.0.19 删掉延迟后本文件已不用 objc_* 函数，
+                              // 但保留这个 import 无害，且省得下次要加探针时又忘
 
 @implementation NotifyFilter
 
