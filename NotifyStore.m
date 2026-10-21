@@ -200,14 +200,20 @@ static void NBStoreLog(NSString *fmt, ...) {
             e ? [NSString stringWithFormat:@"%ld/%@", (long)e.code, e.localizedDescription] : @"-"];
     }
 
-    // 实测写入：报 errno + strerror，比 isWritableFileAtPath 可靠
+    // 实测写入：失败时才报 errno
+    // 🔴 成功路径上 errno 也可能残留非 0（writeToFile:atomically: 内部会先写临时文件）。
+    //    之前把「写入测试=成功」和「errno=2」并排显示，读者会以为失败 —— 判据措辞本身要准。
     NSString *probe = [dir stringByAppendingPathComponent:@".probe"];
     NSData *pd = [@"probe" dataUsingEncoding:NSUTF8StringEncoding];
     errno = 0;
     BOOL wok = [pd writeToFile:probe atomically:YES];
     int e1 = errno;
-    [s appendFormat:@"  写入测试=%@  errno=%d(%s)\n", wok ? @"成功" : @"失败", e1, strerror(e1)];
-    if (wok) [fm removeItemAtPath:probe error:nil];
+    if (wok) {
+        [s appendString:@"  写入测试=成功\n"];
+        [fm removeItemAtPath:probe error:nil];
+    } else {
+        [s appendFormat:@"  写入测试=失败  errno=%d(%s)\n", e1, strerror(e1)];
+    }
 
     [s appendFormat:@"\n── DB ──\n%@\n", NOTIFYBOX_DB_PATH];
     NSDictionary *da = [fm attributesOfItemAtPath:NOTIFYBOX_DB_PATH error:nil];
@@ -237,26 +243,34 @@ static void NBStoreLog(NSString *fmt, ...) {
         [s appendString:@"  ⇒ tweak 从未注入任何进程（或装了没 respring、或过滤器未命中）\n"];
     }
 
-    // dylib 装在哪儿？不同越狱方案前缀不同，逐个探一遍（探不到也没关系）
+    // dylib 装在哪：优先用 tweak 自己用 dladdr 报出来的路径（roothide 会重定向前缀，
+    // App 侧猜路径基本猜不中），猜不到才退回逐个探测。
     [s appendString:@"\n── dylib 安装位置 ──\n"];
-    NSArray *cands = @[
-        @"/var/jb/Library/MobileSubstrate/DynamicLibraries/NotifyBox.dylib",
-        @"/Library/MobileSubstrate/DynamicLibraries/NotifyBox.dylib",
-        @"/var/jb/usr/lib/TweakInject/NotifyBox.dylib",
-        @"/usr/lib/TweakInject/NotifyBox.dylib",
-        @"/var/jb/usr/lib/ellekit/NotifyBox.dylib",
-    ];
-    BOOL anyDylib = NO;
-    for (NSString *p in cands) {
-        if ([fm fileExistsAtPath:p]) {
-            NSDictionary *a = [fm attributesOfItemAtPath:p error:nil];
-            [s appendFormat:@"  ✅ %@  %llu B\n", p, [a[NSFileSize] unsignedLongLongValue]];
-            anyDylib = YES;
+    NSRange dr = mtxt ? [mtxt rangeOfString:@"dylib="] : NSMakeRange(NSNotFound, 0);
+    if (dr.location != NSNotFound) {
+        NSString *p = [[mtxt substringFromIndex:dr.location + dr.length]
+                       stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSDictionary *a = [fm attributesOfItemAtPath:p error:nil];
+        [s appendFormat:@"  ✅ %@\n     %llu B（由 tweak 自己上报，最可靠）\n", p,
+            [a[NSFileSize] unsignedLongLongValue]];
+    } else {
+        NSArray *cands = @[
+            @"/var/jb/Library/MobileSubstrate/DynamicLibraries/NotifyBox.dylib",
+            @"/Library/MobileSubstrate/DynamicLibraries/NotifyBox.dylib",
+            @"/var/jb/usr/lib/TweakInject/NotifyBox.dylib",
+            @"/usr/lib/TweakInject/NotifyBox.dylib",
+        ];
+        BOOL anyDylib = NO;
+        for (NSString *p in cands) {
+            if ([fm fileExistsAtPath:p]) {
+                NSDictionary *a = [fm attributesOfItemAtPath:p error:nil];
+                [s appendFormat:@"  ✅ %@  %llu B\n", p, [a[NSFileSize] unsignedLongLongValue]];
+                anyDylib = YES;
+            }
         }
-    }
-    if (!anyDylib) {
-        [s appendString:@"  ❓ 以上路径都没找到（roothide 前缀可能被重定向，属正常）\n"];
-        [s appendString:@"     ⇒ 去包管理器里确认版本号是不是 0.0.6\n"];
+        if (!anyDylib) {
+            [s appendString:@"  ❓ tweak 未上报路径，候选路径也都没命中（roothide 前缀被重定向，属正常）\n"];
+        }
     }
 
     [s appendString:@"\n── 注入过滤器 ──\n"];

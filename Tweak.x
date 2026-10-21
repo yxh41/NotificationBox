@@ -26,6 +26,7 @@
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
 #import "NotifyStore.h"
 
 static NSString *const kNBLogPath = @"/var/mobile/Library/NotifyBox/tweak.log";
@@ -42,6 +43,20 @@ static NSString *NBProc(void) {
     return p.length ? p : @"?";
 }
 
+// 日志超过 512 KB 就切成 .1（覆盖上一份），避免长期运行把分区写满。
+// 用计数器节流：不是每次写都 stat，每 200 次看一眼。
+static void NBRotateIfNeeded(void) {
+    static int tick = 0;
+    tick++;
+    if (tick % 200 != 1) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *a = [fm attributesOfItemAtPath:kNBLogPath error:nil];
+    if ([a[NSFileSize] unsignedLongLongValue] < 512 * 1024) return;
+    NSString *old = [kNBLogPath stringByAppendingString:@".1"];
+    [fm removeItemAtPath:old error:nil];
+    [fm moveItemAtPath:kNBLogPath toPath:old error:nil];
+}
+
 static void NBLog(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -51,6 +66,7 @@ static void NBLog(NSString *fmt, ...) {
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:[kNBLogPath stringByDeletingLastPathComponent]
   withIntermediateDirectories:YES attributes:nil error:nil];
+    NBRotateIfNeeded();
     NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kNBLogPath];
     if (fh) {
@@ -210,8 +226,15 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
     //      两个都不存在                      ⇒ 真的没注入
     {
         NSString *mark = @"/var/mobile/Library/NotifyBox/.tweak_ctor";
-        NSString *body = [NSString stringWithFormat:@"%@ %@ %@",
-                          [NSDate date], NBProc(), @"v0.0.6"];
+        // 🔴 用 dladdr 拿到 dylib 自己的真实路径：roothide 会把前缀重定向，
+        //    App 侧探测那几个写死的候选路径通常都落空，只有 tweak 自己知道它被装在哪。
+        NSString *selfPath = @"?";
+        Dl_info dli;
+        if (dladdr((const void *)&NBProc, &dli) && dli.dli_fname) {
+            selfPath = [NSString stringWithUTF8String:dli.dli_fname];
+        }
+        NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
+                          [NSDate date], NBProc(), @"v0.0.7", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -242,7 +265,7 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.6 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.7 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -263,7 +286,7 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.6 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.7 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

@@ -182,7 +182,73 @@ App「诊断」新增 **「方法清单（SEL+ENC）」**，一眼看全所有�
 （`layout/` 改名为 `_layout_disabled/`，Theos 只打包 `layout/`）。
 确认设置正常后，下一版再搬回来——或者改为把设置直接做进盒子 App，彻底不依赖 PreferenceLoader。
 
-### 已知坑 / 待办
+### 🔴🔴 v0.0.5 App 崩溃：NSInvocation 的 ARC 过度释放（v0.0.6 已修）
+
+真机崩溃报告：
+
+```
+NotifyBoxApp (com.yxh41.notifybox.app)  0.0.5
+EXC_BAD_ACCESS (SIGSEGV)  KERN_INVALID_ADDRESS at 0x00000000d9c90e120
+"The app touched memory it does not own, at address 0xd9c90e120
+ – usually an object that was already freed."
+```
+
+病因在 `iconForBundle:` 取 App 图标那几行：
+
+```objc
+NSData *data = nil;
+[inv getReturnValue:&data];     // ❌ getReturnValue 写裸指针、从不 retain
+if (data.length) img = [UIImage imageWithData:data];
+// 方法结束时 ARC 仍会 objc_release(data) ⇒ 过度释放 ⇒ 野指针
+```
+
+**正确写法**（先 `__unsafe_unretained` 承接，判类型后再赋强引用，赋值时才 retain）：
+
+```objc
+__unsafe_unretained id ret = nil;
+[inv getReturnValue:&ret];
+if ([ret isKindOfClass:[NSData class]]) img = [UIImage imageWithData:(NSData *)ret];
+```
+
+> 🔴 这个 bug **只在「有记录、需要画图标」时才触发**——列表空的时候永远不崩。
+> 所以 v0.0.2~v0.0.4 都安然无恙，v0.0.5 一有记录就崩。
+> 反过来看，**「App 崩在画图标」本身就是「库里已经有记录」的旁证**。
+
+## 🩺 v0.0.6 新增：环境自检（不依赖日志文件）
+
+上一轮出现一个自相矛盾的现象：App 侧疑似有记录（会崩在图标），但 `tweak.log` 却**不存在**。
+这两件事不可能同时成立（`%ctor` 一跑就会写日志），所以必须拿到不依赖日志的现场。
+
+App「诊断 → **环境自检（不依赖日志）**」现在会报：
+
+| 项 | 说明 |
+|---|---|
+| 目录存在 / 可写 | `/var/mobile/Library/NotifyBox` |
+| **写入测试 + errno** | 真写一个 `.probe` 再删，比 `isWritableFileAtPath` 可靠 |
+| DB 存在 / 大小 / **记录数** | 记录数是「tweak 到底有没有工作」最直接的证据 |
+| 日志文件是否存在 / 大小 | |
+| **`.tweak_ctor` 装载标记** | tweak 在 `%ctor` 第一件事就写它，**与日志文件相互独立** |
+| dylib 安装位置 | 逐个探 `/var/jb/...`、`/Library/...`、`TweakInject/...`，报命中的那个和大小 |
+| 注入过滤器内容 | 直接把 `Filter/Bundles` 读出来 |
+
+判据：
+
+| `.tweak_ctor` | tweak.log | 结论 |
+|---|---|---|
+| 有 | 有 | 正常，看日志内容 |
+| 有 | 无 | **注入成功、但写日志失败**（路径/权限问题） |
+| 无 | 无 | **真的没注入**（没 respring / 过滤器未命中 / 版本没装上） |
+
+另外导航栏标题改成 **`消息盒子 (N)`**，N 是 DB 总记录数——这个数不经过列表渲染，
+即使列表因为别的原因崩了，也能一眼看出库里有没有东西。
+
+## ⚙️ 设置 App 崩溃：已确认与 PreferenceLoader 载荷相关
+
+移除载荷 + 补 `Info.plist` + 修 `keyboardType` 类型之后，用户确认 **设置 App 能正常进入**。
+⇒ 之前「设置崩溃」的病根在那个 prefs bundle（最可能是缺 `Info.plist`）。
+载荷暂时仍留在 `_layout_disabled/`，等录制链路验收后再加回并复验一次。
+
+## 已知坑 / 待办
 
 - **延迟推送**风险最高：再注入的 bulletin 不走 App 自身逻辑，属「再展示一次」，体验需评估。
 - **App 图标**：已用 `LSApplicationProxy applicationProxyForIdentifier:` + `iconDataForVariant:` 取真图标
