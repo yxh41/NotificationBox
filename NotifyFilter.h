@@ -52,6 +52,29 @@ NS_ASSUME_NONNULL_BEGIN
 // seconds 会夹在 1~600：用户填 86400 就等于让通知永远不出现，那不该被当成"设置成功"。
 + (BOOL)shouldDelayBundle:(nullable NSString *)bundle seconds:(NSTimeInterval *)seconds;
 
+// 🔴🔴 v0.0.16：延迟推送的**新实现** —— 不延迟调用，只把通知的发布时间往后写。
+//
+// 为什么推倒重来：旧实现是「把原方法攒进 dispatch_after，N 秒后再调」，
+// 真机崩溃栈已经证明这条路整体走不通 ——
+//   _dispatch_assert_queue_fail ← dispatch_assert_queue
+//   ← -[BBServer dataProviderForSectionID:] +44 ← tweak ← GCD 定时器 ← 主队列
+// BBServer 的方法内部要求「必须在 BB 自己的私有串行队列上」，而那个队列句柄
+// 只活在 BBServer 内部、外面拿不到 ⇒ 换哪个队列都不对，必然撞断言 ⇒ SIGTRAP。
+//
+// 新做法：**在同一线程、同一次调用里**照常执行原方法，只把 bulletin 上的时间字段
+// 往后平移 seconds，让**系统自己**在 N 秒后把通知弹出来。
+// 纯数据修改：不跨队列、不持有对象、不重复发布 ⇒ 从根上没有上面那个断言问题。
+//
+// 返回：真正改成功的字段名（可能多个，用 + 连接），nil = 一个都没改成。
+//       nil 是**安全失败**（这条通知会按时发布，行为等同没开延迟），不是错误。
++ (nullable NSString *)applyDelayToBulletin:(nullable id)bulletin
+                                    seconds:(NSTimeInterval)seconds;
+
+// v0.0.16 只读探针：dump 这个 bulletin 上所有"像时间"的属性名 + 类型编码 + 当前值。
+// 🔴 一个 setter 都不调。返回一行描述，由调用方决定打不打日志。
+// 用途：确认 applyDelayToBulletin: 该改哪个字段 —— 字段名是猜的，必须量出来。
++ (nullable NSString *)probeTimeFieldsOfBulletin:(nullable id)bulletin;
+
 @end
 
 NS_ASSUME_NONNULL_END

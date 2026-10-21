@@ -1,5 +1,6 @@
 #import "NotifyFilter.h"
 #import "NotifyCommon.h"
+#import <objc/runtime.h>       // v0.0.16：probeTimeFieldsOfBulletin 要用 class_copyPropertyList
 
 @implementation NotifyFilter
 
@@ -153,7 +154,12 @@
     //     （168 个镜像、全部线程全扫），发起方是另一个插件 NotificationFilter.dylib。
     //     但"这份日志不是我" ≠ "我的代码没问题" —— 上面那条队列断言说明我的延迟分支
     //     一旦真跑起来会死在同一处。停用的决定与"谁发的"无关。
-    static const BOOL kDelayEnabled = NO;
+    //
+    //   🔴 v0.0.16：**重新启用**，但执行方式整个换掉了（见 applyDelayToBulletin:seconds:）。
+    //     本函数现在只回答"要不要延迟"，不再回答"怎么延迟" —— 判定逻辑从来没崩过，
+    //     崩的一直是执行方式（跨队列调原方法）。
+    //     保留这个常量作为**紧急停用开关**：真出问题改一个字就能整条关掉。
+    static const BOOL kDelayEnabled = YES;
     if (!kDelayEnabled) return NO;
 
     @try {
@@ -177,6 +183,101 @@
         return YES;
     } @catch (__unused NSException *e) {
         return NO;      // 判错就不延迟：宁可准时到，也不要莫名其妙迟到
+    }
+}
+
+// ---------- v0.0.16：延迟的新执行方式（改时间字段，不延迟调用） ----------
+
+// 哪些字段"像发布时间"。顺序 = 猜测的可信度降序。
+// 🔴 故意**不含** expirationDate 之外任何语义不明的字段：改错字段的代价是
+//    "通知永远不出现"，比"没延迟"坏得多。
+static NSArray<NSString *> *NBTimeKeys(void) {
+    return @[@"date", @"publicationDate", @"publishDate", @"timestamp", @"expirationDate"];
+}
+
+// "date" → "setDate:"。⚠️ 首字母必须大写，否则 respondsToSelector 一律 NO。
+static NSString *NBSetterNameFor(NSString *key) {
+    if (!key.length) return nil;
+    return [NSString stringWithFormat:@"set%@%@:",
+            [[key substringToIndex:1] uppercaseString],
+            [key substringFromIndex:1]];
+}
+
++ (NSString *)applyDelayToBulletin:(id)bulletin seconds:(NSTimeInterval)seconds {
+    if (!bulletin || !(seconds > 0)) return nil;
+
+    NSMutableArray<NSString *> *done = [NSMutableArray array];
+
+    // 🔴 每个键**单独 @try**。理由同 NotifyProbe：KVC 碰到不存在的键会抛
+    //    NSUndefinedKeyException，共用一个 @try 的话第一个抛错会带走后面所有键
+    //    ⇒ 明明 date 能改，却因为前面的键名猜错而整个放弃。这类误判已经烧过一整轮。
+    for (NSString *key in NBTimeKeys()) {
+        @try {
+            NSString *setterName = NBSetterNameFor(key);
+            if (!setterName) continue;
+            // ① 没有 setter ⇒ 这个字段是 readonly，跳过（硬写就是抛异常 = 崩）
+            if (![bulletin respondsToSelector:NSSelectorFromString(setterName)]) continue;
+            // ② 没有 getter 就无法确认类型 ⇒ 跳过（不冒险写一个不知道类型的键）
+            if (![bulletin respondsToSelector:NSSelectorFromString(key)]) continue;
+
+            id cur = [bulletin valueForKey:key];
+            // ③ 当前值不是 NSDate ⇒ 这个字段不是时间（可能是数字时间戳或别的），跳过。
+            //    这一条把"改错字段"挡在门外：类型对不上就绝不动手。
+            if (![cur isKindOfClass:[NSDate class]]) continue;
+
+            NSDate *moved = [(NSDate *)cur dateByAddingTimeInterval:seconds];
+            [bulletin setValue:moved forKey:key];
+            [done addObject:key];
+        } @catch (__unused NSException *e) {
+            // 单个键失败不影响其它键，也不影响调用方（它会照常立即执行原方法）
+        }
+    }
+
+    return done.count ? [done componentsJoinedByString:@"+"] : nil;
+}
+
++ (NSString *)probeTimeFieldsOfBulletin:(id)bulletin {
+    if (!bulletin) return nil;
+    @try {
+        Class c = [bulletin class];
+        unsigned int cnt = 0;
+        objc_property_t *ps = class_copyPropertyList(c, &cnt);
+        if (!ps) return [NSString stringWithFormat:@"%@ 没有 property 列表", NSStringFromClass(c)];
+
+        NSMutableArray<NSString *> *hits = [NSMutableArray array];
+        for (unsigned i = 0; i < cnt; i++) {
+            const char *n = property_getName(ps[i]);
+            const char *a = property_getAttributes(ps[i]);
+            if (!n) continue;
+            NSString *name = [NSString stringWithUTF8String:n];
+            NSString *attr = a ? [NSString stringWithUTF8String:a] : @"";
+            NSString *low = [name lowercaseString];
+            if (!([low containsString:@"date"] || [low containsString:@"time"])) continue;
+
+            // 类型编码放在名字后面：T@"NSDate" 才能写，Td/Tq 是标量（写不了对象）
+            NSString *cell = [NSString stringWithFormat:@"%@{%@}", name, attr];
+            @try {
+                id v = [bulletin valueForKey:name];
+                if ([v isKindOfClass:[NSDate class]]) {
+                    cell = [cell stringByAppendingFormat:@"=NSDate(%.0f)", [(NSDate *)v timeIntervalSince1970]];
+                } else if (!v) {
+                    cell = [cell stringByAppendingString:@"=nil"];
+                } else {
+                    cell = [cell stringByAppendingFormat:@"=<%@>", NSStringFromClass([v class])];
+                }
+            } @catch (__unused NSException *e) {
+                cell = [cell stringByAppendingString:@"=THROW"];
+            }
+            [hits addObject:cell];
+        }
+        free(ps);
+
+        if (!hits.count) {
+            return [NSString stringWithFormat:@"%@ 里没有名字含 date/time 的属性", NSStringFromClass(c)];
+        }
+        return [hits componentsJoinedByString:@" "];
+    } @catch (__unused NSException *e) {
+        return @"探针自己抛异常了（已忽略）";
     }
 }
 

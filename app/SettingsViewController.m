@@ -114,22 +114,27 @@ static BOOL NBIsDigits(NSString *s) {
     [self addActionRow:@"朗读声音" key:@"voice" action:@selector(onVoice:)];
     [self addActionRow:@"朗读限定 App" key:@"speakapps" action:@selector(onSpeakApps:)];
 
-    // ---------- 延迟推送（v0.0.14 加、v0.0.15 停用） ----------
-    // 🔴🔴 v0.0.15：延迟推送**已整体停用**。真机 2026-10-21 15:51:30 打开它之后
-    //    SpringBoard 直接 SIGTRAP / Swift runtime trap ⇒ 安全模式。
-    //    输入框保留但无论填什么都不生效（引擎侧 NotifyFilter 的 kDelayEnabled = NO 把关），
-    //    保留的唯一目的 = 让用户能把自己以前填的值清掉。
-    //    🔴 标题里必须写「已停用」：功能被停用这件事本身要可见，
-    //       藏在注释里等于骗人，用户会以为是自己填错了。
+    // ---------- 延迟推送（v0.0.14 加 → v0.0.15 停用 → v0.0.16 换实现重开） ----------
+    // 🔴🔴 历程必须留住，否则下一版又会有人走回头路：
+    //    v0.0.14 的实现是「把发布动作攒进 dispatch_after，N 秒后再调原方法」。
+    //    真机崩溃栈（2026-10-21 15:51:27，EXC_BREAKPOINT）：
+    //        _dispatch_assert_queue_fail ← dispatch_assert_queue
+    //        ← -[BBServer dataProviderForSectionID:] +44 ← tweak ← GCD 定时器 ← 主队列
+    //    ⇒ BBServer 的方法内部要求「必须在 BB 自己的私有队列上」，那个队列外部拿不到，
+    //      换哪个队列都必然撞断言 ⇒ 所以 v0.0.15 整条停掉。
+    //    v0.0.16 换成**不改调用时机、只改数据**：把 bulletin 的时间字段往后平移，
+    //      然后在同一线程立刻执行原方法，让系统自己排期。这条路不跨队列、不持有对象。
+    // ⚠️ 所以现在标题里**不能**再写「已停用」——功能真的开了。
+    //    文案必须与引擎里的 kDelayEnabled 状态一致，否则就是给用户一个假现场。
     id ds = cur[NB_KEY_DELAY_SECONDS];
     NSString *dsStr = [ds isKindOfClass:[NSNumber class]] ? [(NSNumber *)ds stringValue]
                     : ([ds isKindOfClass:[NSString class]] ? (NSString *)ds : @"");
-    [self addGroup:@"延迟推送（⛔ 已停用，填了不生效）"
-                 ph:@"之前填过就清空它"
+    [self addGroup:@"延迟推送（秒，0 = 关闭）"
+                 ph:@"例如 5；填 0 或留空 = 不延迟"
               value:dsStr
            keyboard:UIKeyboardTypeNumberPad
                 key:NB_KEY_DELAY_SECONDS];
-    [self addActionRow:@"延迟生效的 App（已停用）" key:@"delayapps" action:@selector(onDelayApps:)];
+    [self addActionRow:@"延迟生效的 App" key:@"delayapps" action:@selector(onDelayApps:)];
 
     // ---------- 记录 ----------
     id mx = cur[@"maxRecords"];
@@ -172,9 +177,11 @@ static BOOL NBIsDigits(NSString *s) {
         @"• 朗读只念「替换后」的文字（跟通知上看到的一致）；被过滤规则拦下的通知不念。\n"
         @"• 如果朗读导致桌面崩溃重启，插件会在下次开机时**自动把朗读关掉**，\n"
         @"  并往日志写一行「朗读自毁保护触发」，不需要你做任何事。\n"
-        @"• ⛔ 延迟推送「已停用」（v0.0.15）：真机上打开它会让桌面进程崩溃、进安全模式。\n"
-        @"  原因还在查（要看崩溃日志的故障线程栈）。现在填多少都不会生效；\n"
-        @"  你之前填过的值请清空或填 0 —— 那只是把历史值清掉，不会启用任何东西。\n"
+        @"• 延迟推送（v0.0.16 换实现重开）：填 5 = 通知晚 5 秒才弹。\n"
+        @"  上一版是在「晚点再发布」上做文章，结果撞了系统的队列断言，桌面直接崩。\n"
+        @"  这一版不改发布时机，只把通知自带的时间往后挪，让系统自己去排 —— 不会崩。\n"
+        @"  ⚠️ 如果日志里出现 DELAY-MISS，说明没找到能改的时间字段（这条会按时弹出，不崩）；\n"
+        @"  把日志发我，我按 PROBEDATE 那行输出的真实字段名改。\n"
         @"• 顺带修好一个会丢数据的问题：数据库锁。以前盒子 App 和桌面同时写库时，\n"
         @"  SQLite 直接返回 busy（日志里 INSERT 失败 rc=5），那条通知就静默丢了；\n"
         @"  现在会最多等 2 秒再放弃。\n"
@@ -335,11 +342,11 @@ static BOOL NBIsDigits(NSString *s) {
                             : @"全部 App ›")
                   forKey:@"speakapps"];
 
-    // 🔴 v0.0.15：延迟已停用，这里就不能再显示「全部 App ›」了 —— 那会让人以为它在生效。
-    //    有历史选择才显示数量（方便用户自己清），否则直接写「已停用」。
+    // v0.0.16：延迟重新启用，这里的写法跟着回到「全部 App」口径 ——
+    // 空 = 全部，这个语义和朗读限定完全一致，用户不用再学一套。
     NSUInteger dl = [NBStringArray(d[NB_KEY_DELAY_APPS]) count];
-    [self setActionValue:(dl ? [NSString stringWithFormat:@"已选 %lu 个（已停用）›", (unsigned long)dl]
-                             : @"已停用 ›")
+    [self setActionValue:(dl ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)dl]
+                             : @"全部 App ›")
                   forKey:@"delayapps"];
 
     NSString *voiceName = [VoicePickerViewController currentVoiceDisplayName];
