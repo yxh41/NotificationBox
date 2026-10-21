@@ -33,7 +33,14 @@ static id NBCallId(id target, NSString *selName) {
     }
 }
 
-static void NBAddDiag(NSString *line) {
+// 🔴 必须是可变参数。写的时候很容易先写成单参数（"反正就是往数组里塞一行"），
+//    然后调用处全是 NBAddDiag(@"...%lu...", n) —— 编译器报的是
+//    "too many arguments to function call"，一堆报错全指在这个定义上，看着像别处的问题。
+static void NBAddDiag(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *line = fmt ? [[NSString alloc] initWithFormat:fmt arguments:ap] : @"?";
+    va_end(ap);
     if (!gDiag) gDiag = [NSMutableArray array];
     [gDiag addObject:line ?: @"?"];
 }

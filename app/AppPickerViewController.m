@@ -36,6 +36,12 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
 @property (nonatomic, copy)   NSString *query;
 @property (nonatomic, assign) BOOL loading;
 
+// 🔴 内部类方法也要显式声明：CI 是 -Werror，而 [[self class] someClassMethod]
+//    这种写法 clang 不知道 [self class] 具体是哪个类 ⇒ 报
+//    "no known class method for selector"。所以调用点一律写类名，声明也要补齐。
++ (NSString *)keyForMode:(NBAppPickMode)mode;
++ (NSString *)titleForMode:(NBAppPickMode)mode;
+
 - (void)rebuild;
 - (void)persist;
 - (void)toggle:(InstalledApp *)app;
@@ -66,21 +72,21 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
 
 + (NSUInteger)selectedCountForMode:(NBAppPickMode)mode {
     NSDictionary *d = [NotifyStore settings];
-    return [NBStringArray(d[[self keyForMode:mode]]) count];
+    return [NBStringArray(d[[AppPickerViewController keyForMode:mode]]) count];
 }
 
 - (instancetype)initWithMode:(NBAppPickMode)mode {
     self = [super init];
     if (self) {
         _mode = mode;
-        _settingsKey = [[self class] keyForMode:mode];
+        _settingsKey = [AppPickerViewController keyForMode:mode];
     }
     return self;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = [[self class] titleForMode:self.mode];
+    self.title = [AppPickerViewController titleForMode:self.mode];
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
 
     // 🔴 这个页面**点一下就是生效**，没有「保存」按钮。
@@ -165,7 +171,7 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
     // 标题里带数量：这是用户唯一能在"退出本页后"知道配了几个的地方之一，
     // 但真正长期可见的是设置页那一行的副标题（见 SettingsViewController）。
     self.navigationItem.title = [NSString stringWithFormat:@"%@（已选 %lu）",
-                                 [[self class] titleForMode:self.mode],
+                                 [AppPickerViewController titleForMode:self.mode],
                                  (unsigned long)self.selected.count];
 }
 
@@ -312,7 +318,7 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
                                              message:[NSString stringWithFormat:
                                                       @"会清掉 %@ 里全部 %lu 个 App。\n"
                                                       @"（其它设置不受影响）",
-                                                      [[self class] titleForMode:self.mode],
+                                                      [AppPickerViewController titleForMode:self.mode],
                                                       (unsigned long)self.selected.count]
                                       preferredStyle:UIAlertControllerStyleActionSheet];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
