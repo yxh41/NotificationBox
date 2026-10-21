@@ -31,13 +31,13 @@ static const NSInteger kSubSwitch = 103;
 static const NSInteger kSubValue = 104;
 static const NSInteger kSubHit = 105;
 
-// 纯数字判定：`[@"abc" integerValue]` 是 0，跟"用户填了 0"分不开。
-// 延迟秒数那个字段必须能分开 —— 否则填错会被静默当成"关闭"。
-static BOOL NBIsDigits(NSString *s) {
-    if (!s.length) return NO;
-    NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
-    return [s rangeOfCharacterFromSet:nonDigits].location == NSNotFound;
-}
+// 🔴 v0.0.19：这里原来有个 `NBIsDigits()`，只被"延迟秒数"那个字段用。
+//    延迟功能删掉之后它变成死代码，`-Werror -Wunused-function` 直接把编译打断
+//    （CI 报：unused function 'NBIsDigits'）。
+//    ⇒ 删功能时必须连带清掉**只有它用的辅助函数**，否则编译期就拦你；
+//      这类连带影响不会在"读代码"时被发现，只有真编一次才知道。
+//    它当初要解决的问题留着当教训：`[@"abc" integerValue]` 是 0，跟"用户填了 0"
+//    分不开 ⇒ 任何"数字输入"字段都不能只用 integerValue 判对错。
 
 @interface SettingsViewController () <UITextFieldDelegate>
 @property (nonatomic, strong) UIScrollView *scroll;
