@@ -272,7 +272,18 @@
                 NSString *ch = last.length ? [[last substringToIndex:1] uppercaseString] : @"?";
                 [b setTitle:ch forState:UIControlStateNormal];
                 b.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+                // 系统按钮的标题默认走 tintColor（蓝），退化态用灰色更克制
+                [b setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
             }
+        }
+
+        // 🔴 当前筛选的 App 必须看得出来：以前点完毫无视觉反馈，
+        //    用户没法判断"现在到底筛的是哪个"。
+        BOOL selected = [bid isEqualToString:@"全部"] ? (self.filterBundle.length == 0)
+                                                     : [bid isEqualToString:self.filterBundle];
+        if (selected) {
+            b.layer.borderWidth = 2.0;
+            b.layer.borderColor = [UIColor systemBlueColor].CGColor;
         }
         b.imageView.contentMode = UIViewContentModeScaleAspectFit;
         [self.iconBar addSubview:b];

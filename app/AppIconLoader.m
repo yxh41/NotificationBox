@@ -64,6 +64,15 @@ static NSMutableArray<NSString *> *gTrace = nil;   // 每个 bundle 的尝试记
         }
     }
 
+    // 🔴🔴 必须标成 AlwaysOriginal 再交出去。
+    //    `UIButton buttonWithType:UIButtonTypeSystem` 默认把 setImage: 进来的图当
+    //    **template** 渲染：只用它的 alpha 当形状，然后用按钮的 tintColor 上色。
+    //    App 图标是不透明方形图，alpha 全覆盖 ⇒ 整块被涂成主题蓝 ⇒
+    //    「顶上的图标都是蓝色的」（v0.0.10 就是这样）。
+    //    给 UIImageView 用时同理：template 图也会被 tint 成单色。
+    //    所以在这里统一转成原图模式，所有调用方都安全。
+    if (img) img = [img imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+
     gCache[bundleId] = img ?: [NSNull null];
     [self trace:[NSString stringWithFormat:@"%@ ⇒ %@  [%@]",
                  bundleId, img ? @"✅ 取到" : @"❌ 全失败", diag]];

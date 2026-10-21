@@ -532,3 +532,35 @@ int variant = 0;
 - `message>0B` 但界面空 ⇒ 渲染侧问题
 
 **不把这个数打出来，这两种病因长得一模一样。**
+
+## v0.0.11（图标变蓝 + 筛选无反馈）
+
+### 🔴🔴 为什么 App 图标全变成蓝色剪影
+
+`UIButton buttonWithType:UIButtonTypeSystem` 默认把 `setImage:` 进来的图当**模板图（template）**渲染：
+**只用它的 alpha 当形状，然后用按钮的 `tintColor` 上色**。
+App 图标是不透明方形图，alpha 全覆盖 ⇒ 整块被涂成主题蓝。
+
+```objc
+// 错：交给系统按钮前没改成原图模式
+[b setImage:icon forState:UIControlStateNormal];      // → 一块蓝
+
+// 对：先转成 AlwaysOriginal
+img = [img imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+```
+
+修在 `AppIconLoader` 返回前统一转换 —— **一处修，所有调用方（按钮、cell 的 UIImageView）都安全**。
+UIImageView 同理：template 图也会被 `tintColor` 涂成单色。
+
+⚠️ 注意：`全部` 那个 SF Symbol 本来就是**故意**用 template + `secondaryLabelColor`，
+所以它保持 template；只有真图标需要 AlwaysOriginal。**"全部改成原图"是错的**。
+
+### 顺带修的两处
+
+| 问题 | 修法 |
+|---|---|
+| 退化态首字母也是蓝的 | 系统按钮标题默认走 tintColor ⇒ 显式 `setTitleColor:secondaryLabelColor` |
+| 点完 App 筛选看不出选的是哪个 | 选中的那一格加 `borderWidth=2` + `systemBlueColor` 边框 |
+
+> 筛选无反馈这类问题的共性是：**功能其实生效了，但"当前状态"不可见**。
+> 和之前「存储成功却看不出效果」是同一类毛病 —— 凡是改变状态的交互，都要让状态可见。
