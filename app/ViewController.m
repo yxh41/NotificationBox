@@ -263,9 +263,12 @@
     @try {
         Class LSApplicationProxy = NSClassFromString(@"LSApplicationProxy");
         if (LSApplicationProxy) {
-            SEL mk = @selector(applicationProxyForIdentifier:);
-            if ([LSApplicationProxy respondsToSelector:mk]) {
-                id proxy = [LSApplicationProxy performSelector:mk withObject:bid];
+            // 🔴 这里必须用**字面量 @selector**，不能用变量：
+            //    传变量时编译器不知道签名，会报
+            //    `-Werror,-Warc-performSelector-leaks`（本项目开了 -Werror）。
+            if ([LSApplicationProxy respondsToSelector:@selector(applicationProxyForIdentifier:)]) {
+                id proxy = [LSApplicationProxy performSelector:@selector(applicationProxyForIdentifier:)
+                                                    withObject:bid];
                 if (proxy) {
                     SEL sel = @selector(iconDataForVariant:);
                     NSMethodSignature *sig = [proxy methodSignatureForSelector:sel];
