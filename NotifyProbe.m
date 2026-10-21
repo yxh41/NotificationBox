@@ -103,7 +103,12 @@ static void NBDumpClassMethods(Class c, NSString *label) {
     //    下一条通知来的时候明明能拿到，却再也不试了。白跑一整轮。
     //    ⇒ 找不到就**不置位**，留给第一条通知来的时候重试。
     if (!objc_getClass("BBBulletin")) {
-        NBSharedLog(@"PROBE 现在拿不到 BBBulletin（大概率是 %ctor 阶段框架还没加载），等第一条通知再试");
+        // 🔴 日志文案里出现 "%ctor" 必须写成 "%%ctor"：
+        //    NBSharedLog 带 NS_FORMAT_FUNCTION 标注，编译器会把 %c 当成 char 转换符，
+        //    然后报 "more '%' conversions than data arguments" —— -Werror 直接挂。
+        //    （ObjC 字符串字面量里 % 本身不需要转义，只有**格式串语义**要求写成 %%）
+        //    任何裸 % 在格式串里都是雷，写 % 一律双写。
+        NBSharedLog(@"PROBE 现在拿不到 BBBulletin（大概率是 %%ctor 阶段框架还没加载），等第一条通知再试");
         return;
     }
     gDumped = YES;
