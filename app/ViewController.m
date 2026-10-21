@@ -139,6 +139,23 @@
             (unsigned long)keep.count, [keep componentsJoinedByString:@"\n"]];
 }
 
+// 🔴🔴 v0.0.17：关键词表压成**一条带哨兵前缀的字面量**，不再用数组字面量。
+//
+// 为什么非改不可：校验脚本只能"在 App 二进制里找子串"，它要判的是
+// 「DELAY 在不在筛选表里」，但实际能判的只有「App 里有没有出现过 DELAY 这个词」。
+// 而设置页的帮助文案里早就写着「如果日志里出现 DELAY-MISS…我按 PROBEDATE 那行…」
+// ⇒ **在完全没有筛选词的 v0.0.16 上，这条判据也是绿的（假通过）**。
+// 假通过比没判据更坏：它会让我以为已经修好了。
+// 加成哨兵前缀后，脚本能精确定位"表里有哪些词"，判据才等于变异域。
+//
+// 额外好处：全部关键词集中一处，以后加新留痕只改这一行，不会漏。
+static NSString * const kNBKeyLineTable =
+    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|DELAY|PROBEDATE|APP-ALIVE|G3 首次|失败|!!!|探针";
+
+static NSArray<NSString *> *NBKeyLineKeywords(void) {
+    return [kNBKeyLineTable componentsSeparatedByString:@"|"];
+}
+
 // 从全量日志里挑出「能下结论」的行：装载/挂了哪组/命中/探针/丢弃/写库失败
 - (NSString *)keyLinesFrom:(NSString *)text {
     if (!text.length) return @"(空)";
@@ -147,7 +164,7 @@
     // 这些是判据行；不含它们的（比如 sel 清单）不在这里显示
     // 🔴 DROP# / REPL# 是「过滤真的拦了」「替换真的改了」的唯一证据，必须进结论行
     //
-    // 🔴🔴 v0.0.16 修一个很隐蔽的漏判：`DELAY` / `PROBEDATE` 必须显式加进来。
+    // 🔴🔴 v0.0.17 修一个很隐蔽的漏判：`DELAY` / `PROBEDATE` 必须显式加进表里。
     //    之前只有 `P#` 这个关键词，于是：
     //      `DELAY-SKIP#1`  刚好含 "SKIP#" 里的 "P#"  ⇒ 侥幸显示
     //      `DELAY#1`       D,E,L,A,Y,#             ⇒ 一个关键词都不含 ⇒ **被筛掉**
@@ -156,10 +173,7 @@
     //    「我改的是哪个字段」这个最关键的信息。查这个问题时我一度以为延迟根本没生效。
     //    ⇒ 教训：**新增一种日志行，必须同时检查它能不能通过"结论行"筛选**。
     //      判据写出来了但看不见，等于没写。
-    NSArray *keys = @[@"===", @"-->", @"hit#", @"P#", @"drop ",
-                      @"DROP#", @"REPL#",
-                      @"DELAY", @"PROBEDATE",
-                      @"APP-ALIVE", @"G3 首次", @"失败", @"!!!", @"探针"];
+    NSArray *keys = NBKeyLineKeywords();
     for (NSString *line in all) {
         if (!line.length) continue;
         for (NSString *k in keys) {

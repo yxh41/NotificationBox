@@ -1,4 +1,4 @@
-// Tweak.x —— v0.0.17（当前）：延迟推送走「改时间字段」；本版修的是**判据行看不见**的问题
+// Tweak.x —— v0.0.18（当前）：延迟推送走「改时间字段」；本版修的是**判据行看不见**的问题
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
@@ -496,7 +496,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.17", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.18", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -529,7 +529,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     // 🔴 v0.0.16：延迟推送**重新启用**，执行方式换成"改时间字段"。
     //    这行必须如实写出来 —— 上一版这里写的是「已停用」，用户是靠这行判断
     //    功能到底能不能用。功能状态变了而日志没变，等于给用户一个假现场。
-    NBLog(@"=== [%@] NotifyBox v0.0.17 · %@ · 朗读自愈%@ · 延迟自愈%@ · 延迟推送%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.18 · %@ · 朗读自愈%@ · 延迟自愈%@ · 延迟推送%@ ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           delayRecovered ? @"已触发" : @"无异常",
@@ -561,7 +561,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.17 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.18 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -582,7 +582,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.17 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.18 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
