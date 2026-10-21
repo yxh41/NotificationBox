@@ -465,8 +465,17 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     // 🔴🔴 v0.0.15：延迟推送自毁保护，同样排在任何 hook 之前。
     //    延迟推送已整体停用（NotifyFilter 的 kDelayEnabled = NO），这里是第二道保险：
     //    万一哪天有人把那个常量打开、又崩了，下次开机会自动把 delaySeconds 清掉。
-    BOOL delayRecovered = NBRecoverFromDelayCrash();
-    NBClearStaleDelaySetting();
+    //
+    // 🔴🔴 这两件事**只让 SpringBoard 做**（本 tweak 同时注入 backboardd，见 NotifyBox.plist）：
+    //    ① 两个进程同时改 settings.plist 会互相覆盖（后写的赢，可能把用户的改动冲掉）；
+    //    ② backboardd 以 **root** 运行 —— 它写出来的文件/目录会变成 root 所有，
+    //       之后盒子 App（mobile）就写不动了，表现是「设置保存失败 / 存不住」，
+    //       而且现场看起来完全不像是权限问题。这种坑不能留。
+    BOOL delayRecovered = NO;
+    if ([NBProc() isEqualToString:@"SpringBoard"]) {
+        delayRecovered = NBRecoverFromDelayCrash();
+        NBClearStaleDelaySetting();
+    }
 
     // 🔴 这行必须把「延迟推送已停用」打出来。
     //    否则用户看着设置页里那栏还在、填了也不生效，只会以为插件坏了 ——
