@@ -1,4 +1,4 @@
-// Tweak.x —— v0.0.9（当前）：过滤/替换已接线（0.0.8 起）+ 设置存 NotifyBox/settings.plist
+// Tweak.x —— v0.0.10（当前）：过滤/替换已接线（0.0.8 起）+ 设置存 NotifyBox/settings.plist
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
@@ -288,7 +288,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.9", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.10", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -319,7 +319,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.9 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.10 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -340,7 +340,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.9 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.10 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

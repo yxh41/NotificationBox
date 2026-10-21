@@ -2,6 +2,8 @@
 #import "NotifyStore.h"
 #import "NotifyCommon.h"
 #import "SettingsViewController.h"
+#import "NotifyCell.h"
+#import "AppIconLoader.h"
 
 // 🔴 盒子 App：读 NotifyStore 的 SQLite，展示通知列表
 //    - 顶部横向 App 图标栏（抖音聊天页那种）：点击筛选对应 bundle
@@ -22,7 +24,6 @@
 @property (nonatomic, strong) NSArray<NSString *> *bundles;
 @property (nonatomic, copy)   NSString *filterBundle;   // nil = 全部
 @property (nonatomic, copy)   NSString *searchText;
-@property (nonatomic, strong) NSMutableDictionary *iconCache;  // bundle -> UIImage（含 NSNull miss）
 
 - (void)onDiag:(id)sender;
 - (void)onSettings:(id)sender;
@@ -93,6 +94,20 @@
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
         [self showText:[NotifyStore debugSummary] title:@"数据库自检"];
+    }]];
+    // 🔴 取图标在越狱环境里没有保证成功的路，失败又是静默的（退化成首字母）。
+    //    这一项直接告诉你：A/B/C 哪条路走通了、哪条为什么没通。
+    [sheet addAction:[UIAlertAction actionWithTitle:@"图标诊断（A/B/C 哪条通）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self showText:[AppIconLoader diagReport] title:@"图标诊断"];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"清空图标缓存并重取"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [AppIconLoader clearCache];
+        [self loadData];
+        [self showText:@"缓存已清空，列表已重取。\n再看一次「图标诊断」。" title:@"图标缓存"];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     // iPad 上 actionSheet 必须给 popover 锚点
@@ -197,7 +212,10 @@
     self.table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     self.table.delegate = self;
     self.table.dataSource = self;
-    [self.table registerClass:[UITableViewCell class] forCellReuseIdentifier:@"c"];
+    // 🔴 自定义 cell：Default 样式的 UITableViewCell **不显示 detailTextLabel**，
+    //    以前正文全写在那上面 ⇒ 只有标题、没有正文。见 NotifyCell.h 注释。
+    [self.table registerClass:[NotifyCell class] forCellReuseIdentifier:@"c"];
+    self.table.rowHeight = [NotifyCell height];
     [self.view addSubview:self.table];
 }
 
@@ -244,9 +262,17 @@
                        forState:UIControlStateNormal];
             b.tintColor = [UIColor secondaryLabelColor];
         } else {
-            UIImage *ic = [self iconForBundle:bid];
-            if (ic) [b setImage:ic forState:UIControlStateNormal];
-            else    [b setTitle:[self shortName:bid] forState:UIControlStateNormal];
+            UIImage *ic = [AppIconLoader iconForBundle:bid];
+            if (ic) {
+                [b setImage:ic forState:UIControlStateNormal];
+            } else {
+                // 退化态：只放**首字母**。之前放的是 bundle 末段全名（如 "bijia"），
+                // 44pt 的方块里根本显示不下，看起来像坏掉。
+                NSString *last = [self shortName:bid];
+                NSString *ch = last.length ? [[last substringToIndex:1] uppercaseString] : @"?";
+                [b setTitle:ch forState:UIControlStateNormal];
+                b.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+            }
         }
         b.imageView.contentMode = UIViewContentModeScaleAspectFit;
         [self.iconBar addSubview:b];
@@ -261,57 +287,9 @@
     return [parts lastObject];
 }
 
-// 🔴 取 App 真图标（LSApplicationProxy）。App 不是 SpringBoard，不能用 SBApplication，
-//    只能走 LSApplicationProxy。用 NSClassFromString + NSInvocation 避免依赖私有头文件。
-//
-// 🔴🔴 v0.0.5 崩溃真因（EXC_BAD_ACCESS / "already freed"，地址 0xd9c90e120）就在下一段：
-//     `NSData *data = nil; [inv getReturnValue:&data];`
-//     getReturnValue: 把**裸指针**写进来、**从不 retain**，而 ARC 认为 data 是 __strong，
-//     方法结束时照样 objc_release ⇒ **过度释放** ⇒ 该内存被复用后任何一次访问就崩。
-//     正确写法：先用 __unsafe_unretained id 承接，再判类型赋给强引用（赋值时才 retain）。
-//     这个 bug 只在「有记录、需要画图标」时才被触发 —— 列表空的时候永远不崩。
-- (UIImage *)iconForBundle:(NSString *)bid {
-    if (!bid.length) return nil;
-    if (self.iconCache == nil) self.iconCache = [NSMutableDictionary dictionary];
-    id cached = self.iconCache[bid];
-    if (cached) return (cached == [NSNull null]) ? nil : cached;
-
-    UIImage *img = nil;
-    @try {
-        Class LSApplicationProxy = NSClassFromString(@"LSApplicationProxy");
-        if (LSApplicationProxy) {
-            // 🔴 这里必须用**字面量 @selector**，不能用变量：
-            //    传变量时编译器不知道签名，会报
-            //    `-Werror,-Warc-performSelector-leaks`（本项目开了 -Werror）。
-            if ([LSApplicationProxy respondsToSelector:@selector(applicationProxyForIdentifier:)]) {
-                id proxy = [LSApplicationProxy performSelector:@selector(applicationProxyForIdentifier:)
-                                                    withObject:bid];
-                if (proxy) {
-                    SEL sel = @selector(iconDataForVariant:);
-                    NSMethodSignature *sig = [proxy methodSignatureForSelector:sel];
-                    if (sig && sig.numberOfArguments >= 3) {
-                        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                        [inv setSelector:sel];
-                        [inv setTarget:proxy];
-                        int variant = 0;
-                        [inv setArgument:&variant atIndex:2];
-                        [inv invoke];
-                        // 🔴 关键修正：裸指针 → __unsafe_unretained 承接 → 判类型后再赋强引用
-                        __unsafe_unretained id ret = nil;
-                        [inv getReturnValue:&ret];
-                        if ([ret isKindOfClass:[NSData class]] && [(NSData *)ret length]) {
-                            img = [UIImage imageWithData:(NSData *)ret];
-                        }
-                    }
-                }
-            }
-        }
-    } @catch (__unused NSException *e) {
-        img = nil;      // 取图标失败一律降级成首字母，绝不让它带走 App
-    }
-    self.iconCache[bid] = img ?: [NSNull null];
-    return img;
-}
+// 图标统一由 AppIconLoader 负责（多策略 + 诊断 + 缓存），这里不再自己实现。
+// 🔴 历史：v0.0.5 的崩溃（NSInvocation getReturnValue: 的 ARC 过度释放）就发生在这段，
+//    已经搬进 AppIconLoader 并保留了 __unsafe_unretained 的正确写法。
 
 - (void)onIcon:(UIButton *)sender {
     NSArray *list = [@[@"全部"] arrayByAddingObjectsFromArray:self.bundles];
@@ -372,24 +350,25 @@
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *c = [tableView dequeueReusableCellWithIdentifier:@"c" forIndexPath:indexPath];
+    NotifyCell *c = [tableView dequeueReusableCellWithIdentifier:@"c" forIndexPath:indexPath];
     NSDictionary *d = self.items[indexPath.row];
-    NSString *title = d[@"title"] ?: @"(无标题)";
-    NSString *msg = d[@"message"] ?: @"";
+    NSString *bid = d[@"bundle"];
+    NSString *title = d[@"title"];
+    NSString *msg = d[@"message"];
+    NSString *sub = d[@"subtitle"];
     NSDate *date = [NSDate dateWithTimeIntervalSince1970:[d[@"ts"] doubleValue]];
-    NSDateFormatter *f = [[NSDateFormatter alloc] init];
-    f.dateFormat = @"MM-dd HH:mm";
-    c.textLabel.text = title;
-    c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@\n%@",
-                             d[@"bundle"], [f stringFromDate:date], msg];
-    c.detailTextLabel.numberOfLines = 2;
-    c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-    UIImage *ic = [self iconForBundle:d[@"bundle"]];
-    if (ic) {
-        c.imageView.image = ic;
-        c.imageView.layer.cornerRadius = 6;
-        c.imageView.clipsToBounds = YES;
-    }
+
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"MM-dd HH:mm";
+    });
+
+    UIImage *ic = [AppIconLoader iconForBundle:bid];
+    [c setIcon:ic letter:[self shortName:bid]];
+    [c setTitleText:title message:msg subtitle:sub];
+    [c setTimeText:[fmt stringFromDate:date]];
     return c;
 }
 

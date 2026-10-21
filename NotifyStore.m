@@ -404,13 +404,45 @@ static void NBStoreLog(NSString *fmt, ...) {
     NSDictionary *attrs = [fm attributesOfItemAtPath:NOTIFYBOX_DB_PATH error:nil];
     unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
     NSInteger n = [self count];
-    return [NSString stringWithFormat:
+    NSMutableString *s = [NSMutableString stringWithFormat:
             @"DB 路径：%@\n存在：%@    大小：%llu B\n可读：%@    可写：%@\n记录数：%ld    上限：%ld",
             NOTIFYBOX_DB_PATH,
             exists ? @"是" : @"否", size,
             [fm isReadableFileAtPath:NOTIFYBOX_DB_PATH] ? @"是" : @"否",
             [fm isWritableFileAtPath:NOTIFYBOX_DB_PATH] ? @"是" : @"否",
             (long)n, (long)[self maxRecords]];
+
+    // 🔴 v0.0.10：把最近 3 条的**字段长度**打出来。
+    //    这个量专治一种混淆：「列表里看不到正文」到底是
+    //    ① 库里就没存到正文（message 长度=0） 还是 ② 存了但没画出来。
+    //    不看这个数，两种病因长得一模一样，只能猜。
+    sqlite3 *db = [self openDB];
+    if (db) {
+        sqlite3_stmt *st = NULL;
+        const char *sql = "SELECT bundle, title, message, subtitle FROM notifications "
+                          "ORDER BY id DESC LIMIT 3;";
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+            [s appendString:@"\n\n最近 3 条（字段字数）:"];
+            int row = 0;
+            while (sqlite3_step(st) == SQLITE_ROW && row < 3) {
+                row++;
+                const unsigned char *b = sqlite3_column_text(st, 0);
+                const unsigned char *t = sqlite3_column_text(st, 1);
+                const unsigned char *m = sqlite3_column_text(st, 2);
+                const unsigned char *u = sqlite3_column_text(st, 3);
+                NSUInteger lt = t ? strlen((const char *)t) : 0;   // 字节数，够判断"有没有"
+                NSUInteger lm = m ? strlen((const char *)m) : 0;
+                NSUInteger lu = u ? strlen((const char *)u) : 0;
+                [s appendFormat:@"\n  %d) %@  title=%luB message=%luB subtitle=%luB",
+                 row, b ? [NSString stringWithUTF8String:(const char *)b] : @"?",
+                 (unsigned long)lt, (unsigned long)lm, (unsigned long)lu];
+            }
+            if (row == 0) [s appendString:@"\n  (空)"];
+            sqlite3_finalize(st);
+        }
+        sqlite3_close(db);
+    }
+    return s;
 }
 
 @end

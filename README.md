@@ -468,3 +468,67 @@ v0.0.8 真机自检通过（记录数 800 顶在上限、设置读到 `blockKeyw
 | `NotifyStore.clearAll` | 0.0.9 前**没有任何 UI 入口**（0.0.9 接上） |
 
 > 结论：**「代码在包里」不等于「代码在链路上」**。每接一条新链路，都要把那段当新代码重读一遍。
+
+## v0.0.10（列表能看到正文了 + 真 App 图标 + 图标诊断）
+
+v0.0.9 真机日志已经证明引擎全通：
+`DROP#1~4` 有拦截、`REPL#1~5 cls=BBBulletinRequest` 有替换（不再是死代码）。
+但用户反馈两件事：**列表只有标题没有正文**、**图标栏只有首字母**。
+
+### 🔴🔴 为什么「只有标题、没有正文」——一个很隐蔽的 UIKit 陷阱
+
+```objc
+[table registerClass:[UITableViewCell class] forCellReuseIdentifier:@"c"];
+...
+c.textLabel.text = title;
+c.detailTextLabel.text = @"bundle · 时间\n正文";   // ← 写了，但永远不会显示
+```
+
+`registerClass:` 建出来的是 **`UITableViewCellStyleDefault`**，
+而 **Default 样式的 cell 里 `detailTextLabel` 根本不存在/不显示**。
+`dequeueReusableCellWithIdentifier:forIndexPath:` 只会给你 Default 样式，
+**样式是注册时定的，运行期改不了**。所以正文一直被写进一个看不见的 label。
+
+> 这类 bug 的特点：**代码没有错、编译没有警告、运行时也不报错**，只是画不出来。
+> 判据只能是"看界面" —— 而它恰恰最容易被"我以为写了就会显示"骗过去。
+
+修法：自定义 `NotifyCell`（图标 + 标题 + 正文两行 + 时间），`rowHeight = 82`。
+**并且正文为空时明确显示 `(无正文)`**：留空的话，「库里没存到正文」和
+「存了但没画出来」看起来一模一样 —— 上一版就是把这两种病因混在一起了。
+
+### 🔴 为什么图标一直只有首字母：NSInvocation 参数宽度
+
+旧代码：
+```objc
+int variant = 0;
+[inv setArgument:&variant atIndex:2];   // 只准备了 4 字节
+```
+如果签名里该参数是 `Q`（8 字节），NSInvocation 会按 **8 字节**去读那块只有 4 字节的内存
+⇒ 高 4 字节是垃圾 ⇒ 取到的 variant 是个乱数 ⇒ `iconDataForVariant:` 返回 nil ⇒ 退化成首字母。
+
+修法：**参数宽度按签名来填，不能一律 `int`**。统一用 8 字节的 `unsigned long long`：
+签名 4 字节时 NSInvocation 只拷低 4 字节，8 字节时正好拷满，两种都对。
+
+另外把取图标独立成 `AppIconLoader`，按序试三条路并**记录每条路的成败**：
+
+| 路 | 做法 |
+|---|---|
+| A | `LSApplicationProxy` + `iconDataForVariant:`（variant 依次试 0/1/2/3/8/14） |
+| B | `UIImage` 私有方法 `_applicationIconImageForBundleIdentifier:format:scale:`（format 多档） |
+| C | 直接读包内 `Info.plist` + png（新 App 的图在 `Assets.car` 里，必然失败） |
+
+诊断 →「图标诊断（A/B/C 哪条通）」直接看结果；「清空图标缓存并重取」可重试。
+**取图标没有任何一条保证成功的路，所以"哪条通"必须是可观测的，不能靠猜。**
+
+### 另一个判据：正文到底存没存进库
+
+「数据库自检」新增最近 3 条的**字段字节数**：
+
+```
+最近 3 条（字段字数）:
+  1) com.tencent.mqq  title=48B message=0B subtitle=0B
+```
+- `message=0B` ⇒ 库里就没有正文（记录侧问题）
+- `message>0B` 但界面空 ⇒ 渲染侧问题
+
+**不把这个数打出来，这两种病因长得一模一样。**
