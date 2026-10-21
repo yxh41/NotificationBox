@@ -39,6 +39,19 @@
 #define NB_KEY_DELAY_SECONDS  @"delaySeconds"    // NSNumber 或 "5"，0/缺失 = 关闭
 #define NB_KEY_DELAY_APPS     @"delayApps"       // 数组或 "a,b"，空/缺失 = 全部 App
 
+// 🔴🔴 延迟推送的崩溃自愈标记（v0.0.15）。
+//    延迟实现是"把 bulletin/request 攒在 block 里，N 秒后再调原发布方法"。
+//    这条路上有两个我们控制不了的前提：
+//      ① 那个对象在 N 秒后还能不能被安全使用（调用方可能已经把它作废/消费掉了）
+//      ② 从别的队列/线程再去调一次发布，是否违反 SpringBoard 内部的前置条件
+//    2026-10-21 15:51:30 实测：开了延迟之后 SpringBoard 直接
+//        EXC_BREAKPOINT (SIGTRAP) + "Swift runtime trapped"（force-unwrapped nil /
+//        array index out of range / failed precondition）⇒ 安全模式。
+//    所以在延迟路径上复用「朗读自毁保护」那套：调度前写 start，原方法返回后写 done。
+//    下次进程启动看到 start 而没有 done ⇒ 上次就是崩在延迟里 ⇒ 自动把 delaySeconds 清掉。
+//    这样**以后每次实验最多崩一次**，不会陷入崩溃循环。
+#define NOTIFYBOX_DELAY_GUARD_PATH @"/var/mobile/Library/NotifyBox/.delay_guard"
+
 // 🔴 「一组 bundle id」的读法只在这里写一份。
 //    历史数据是**逗号分隔字符串**（v0.0.12 及以前是输入框），
 //    新数据是**数组**（v0.0.13 的选择器写）。

@@ -116,6 +116,33 @@
 
 + (BOOL)shouldDelayBundle:(NSString *)bundle seconds:(NSTimeInterval *)seconds {
     if (seconds) *seconds = 0;
+
+    // 🔴🔴🔴 v0.0.15：延迟推送**暂停接线**。这里直接返回 NO —— 这是本轮唯一的出口，
+    //   三个 hook 的延迟分支都靠它把关 ⇒ 就算 settings.plist 里还留着 delaySeconds，
+    //   也不会有任何一条通知被攒进 block。
+    //
+    //   停用原因（真机实测，2026-10-21 15:51:30）：
+    //     SpringBoard 崩在 EXC_BREAKPOINT (SIGTRAP)，系统报
+    //     "The Swift runtime trapped: fatalError / failed precondition /
+    //      force-unwrapped nil / array index out of range" ⇒ 进安全模式。
+    //   发生条件 = 打开延迟推送之后。
+    //
+    //   为什么"攒起来 N 秒后再调原方法"这条路本身不牢（两条都还没排除）：
+    //     ① 对象生命周期：调用方在同步返回后可能已经把 BBBulletinRequest 作废/消费掉了
+    //        （日志里 REPL 行显示这类对象确实是 cls=BBBulletinRequest）。
+    //        N 秒后再拿它去发布 ⇒ 内部 force unwrap 到 nil 就是 SIGTRAP。
+    //     ② 同一条通知会命中 2~3 个入口（PB/PBR/PBRS）：同步时它们挤在同一毫秒、
+    //        由 BBServer 自己合并；延迟后变成 3 个独立定时任务去发布**同一个对象** ⇒
+    //        第一个发布之后就可能是"用已经消费过的对象再发一次"。
+    //     ③ 线程/队列：这三个方法大概率跑在 BulletinBoard 自己的串行队列上，
+    //        我们从主队列回调进去，可能踩到内部 queue/actor 前置条件
+    //        （"failed precondition" 正好是这个形状）。
+    //   ⇒ 恢复前必须先拿到崩溃 .ips 的故障线程栈，确认上面哪一条成立；
+    //     并把 kDelayEnabled 打开、只对**单个入口**、单个 App 做最小实验
+    //     （自毁保护已经在 Tweak.x 里就位，实验最多崩一次）。
+    static const BOOL kDelayEnabled = NO;
+    if (!kDelayEnabled) return NO;
+
     @try {
         NSDictionary *p = [self prefs];
         if (!p.count) return NO;                       // 没有任何设置 ⇒ 绝不改变任何行为

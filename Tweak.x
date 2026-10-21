@@ -1,4 +1,4 @@
-// Tweak.x —— v0.0.14（当前）：过滤/替换/朗读已接线；本版新增**延迟推送**
+// Tweak.x —— v0.0.15（当前）：过滤/替换/朗读已接线；延迟推送**已停用**（曾致 SpringBoard 崩）
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
@@ -63,6 +63,59 @@ static NSString *NBProc(void) {
 static void NBLogDelayFired(NSString *tag) {
     gDelayFired++;
     NBLog(@"DELAY-FIRE#%d tag=%@", gDelayFired, tag);
+}
+
+// ---------- 延迟推送的崩溃自愈（v0.0.15） ----------
+// 与朗读那套「自毁保护」同一个思路：崩溃前必须留下可判读的痕迹，
+// 因为崩的是 SpringBoard —— 用户连设置页都进不去，只能靠下一次启动自己恢复。
+
+static void NBWriteDelayGuard(NSString *state) {
+    if (![state isKindOfClass:[NSString class]]) return;
+    @try {
+        NSString *dir = [NOTIFYBOX_DELAY_GUARD_PATH stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
+        [[state dataUsingEncoding:NSUTF8StringEncoding] writeToFile:NOTIFYBOX_DELAY_GUARD_PATH
+                                                        atomically:YES];
+    } @catch (__unused NSException *e) { }
+}
+
+// 返回 YES 表示"上次就是崩在延迟发布里"，已经自动把 delaySeconds 清掉了。
+static BOOL NBRecoverFromDelayCrash(void) {
+    @try {
+        NSString *s = [NSString stringWithContentsOfFile:NOTIFYBOX_DELAY_GUARD_PATH
+                                                encoding:NSUTF8StringEncoding
+                                                   error:nil];
+        s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (![s isEqualToString:@"start"]) return NO;
+
+        NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:NBLoadSettings()];
+        [d removeObjectForKey:NB_KEY_DELAY_SECONDS];
+        [NotifyStore saveSettings:d];
+        NBWriteDelayGuard(@"crash-closed");
+        NBLog(@"!!! 延迟自毁保护触发：上次崩在延迟发布里（guard=start 没有 done）");
+        NBLog(@"!!! 已自动删除 delaySeconds ⇒ 延迟推送回到关闭状态，不用你手动改");
+        return YES;
+    } @catch (__unused NSException *e) {
+        return NO;
+    }
+}
+
+// 🔴 v0.0.15：延迟既然停用了，就**主动把历史值清掉**。
+//    理由：用户 plist 里残留的 delaySeconds=5 现在不生效，但等到哪天重新启用这功能，
+//    他一升级就立刻落在崩溃路径上 —— 那才是最难查的现场。
+//    「留着一个永远不生效的值」等于给未来埋雷，现在就拆掉。
+static void NBClearStaleDelaySetting(void) {
+    @try {
+        NSDictionary *cur = NBLoadSettings();
+        if (!cur[NB_KEY_DELAY_SECONDS]) return;         // 没有就什么都不做（绝大多数情况）
+        NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:cur];
+        [d removeObjectForKey:NB_KEY_DELAY_SECONDS];
+        [NotifyStore saveSettings:d];
+        NBLog(@"已清除历史 delaySeconds（延迟推送停用中；留着它只会在以后重新启用时变成雷）");
+    } @catch (__unused NSException *e) { }
 }
 
 // ---------- 防御式取值：SpringBoard 里抛异常就等于崩，全部包 @try ----------
@@ -310,10 +363,17 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         //     `_logos_orig$...(self, _cmd, 参数...)`，self 与 _cmd 都会被 block 正常捕获。
         //  ③ 落在**主队列**：延迟到期时必须落在某个队列上，SpringBoard 里唯一一定存在的
         //     就是主队列；BBServer 的发布本身是线程安全的。
+        //
+        // 🔴🔴 v0.0.15：这条分支现在**走不到**（NotifyFilter 的 kDelayEnabled = NO）。
+        //    它导致过真机安全模式（SpringBoard SIGTRAP / Swift runtime trap），
+        //    恢复前先读 NotifyFilter.m 里那段停用原因，别想当然地把它打开。
+        //    自毁保护已经就位：start → 崩 ⇒ 下次开机自动清掉 delaySeconds，最多崩一次。
+        NBWriteDelayGuard(@"start");        // 🔴 必须在 dispatch_after **之前**落盘
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.delay * (double)NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             NBLogDelayFired(@"PB");
             %orig(bulletin, destinations);
+            NBWriteDelayGuard(@"done");     // 只有原方法正常返回才写 done
         });
         return;
     }
@@ -329,10 +389,12 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     NBDecision d = NBPipeline(request, nil, @"PBR", &gHit2);
     if (!d.allow) return;
     if (d.delay > 0) {
+        NBWriteDelayGuard(@"start");        // 见入口 1 的说明；这条分支当前走不到
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.delay * (double)NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             NBLogDelayFired(@"PBR");
             %orig(request, destinations);
+            NBWriteDelayGuard(@"done");
         });
         return;
     }
@@ -355,10 +417,12 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     if (d.delay > 0) {
         // 🔴 sectionID 也要一起被 block 捕获住：延迟到点时要把它当参数传回原方法，
         //    它可能是个 autorelease 的 NSString，不捕获就可能已经死了。
+        NBWriteDelayGuard(@"start");        // 见入口 1 的说明；这条分支当前走不到
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.delay * (double)NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             NBLogDelayFired(@"PBRS");
             %orig(request, sectionID, destinations);
+            NBWriteDelayGuard(@"done");
         });
         return;
     }
@@ -385,7 +449,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.14", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.15", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -398,9 +462,20 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户陷入「开机→崩→安全模式→开机」的循环，连盒子 App 都进不去改设置。
     BOOL recovered = [NotifySpeaker recoverFromCrashIfNeeded];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.14 · %@ · 朗读自愈%@ ===",
+    // 🔴🔴 v0.0.15：延迟推送自毁保护，同样排在任何 hook 之前。
+    //    延迟推送已整体停用（NotifyFilter 的 kDelayEnabled = NO），这里是第二道保险：
+    //    万一哪天有人把那个常量打开、又崩了，下次开机会自动把 delaySeconds 清掉。
+    BOOL delayRecovered = NBRecoverFromDelayCrash();
+    NBClearStaleDelaySetting();
+
+    // 🔴 这行必须把「延迟推送已停用」打出来。
+    //    否则用户看着设置页里那栏还在、填了也不生效，只会以为插件坏了 ——
+    //    **功能被停用这件事本身必须是可见的**，藏在注释里等于骗人。
+    NBLog(@"=== [%@] NotifyBox v0.0.15 · %@ · 朗读自愈%@ · 延迟自愈%@ · 延迟推送%@ ===",
           NBProc(), [NotifySpeaker diagnosticLine],
-          recovered ? @"已触发" : @"无异常");
+          recovered ? @"已触发" : @"无异常",
+          delayRecovered ? @"已触发" : @"无异常",
+          @"已停用（曾致桌面崩溃）");
 
     // 只读探针：dump 一次 BBBulletin / BBSound 的类结构（内部自己保证只做一次）
     [NotifyProbe dumpClassesOnce];
@@ -428,7 +503,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.14 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.15 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -449,7 +524,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.14 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.15 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

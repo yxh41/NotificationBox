@@ -899,3 +899,77 @@ must be equal to the number of rows contained in that section before the update 
 > 教训：**任何"局部改行数"的 API（`deleteRows` / `insertRows` / `reloadRows`）都必须把这
 > 一次改动的所有受影响节一起算进去。**只要行数来源是"某个数组的 count"，
 > 数组一变就可能同时影响多节 —— 这种崩溃在本地看不出来，只会在用户删到第 0 条时炸。
+
+## v0.0.15 · 止血：延迟推送停用 + 数据库锁修复
+
+### 🔴🔴 事故：延迟推送导致 SpringBoard 崩溃（安全模式）
+
+真机现象（iPhone13,3 / iOS 16.4.1，2026-10-21 15:51:30）：
+
+```
+SpringBoard  com.apple.springboard  1.0 (50)
+The Swift runtime trapped: a fatalError, a failed precondition,
+a force-unwrapped nil or an array index out of range.
+EXC_BREAKPOINT (SIGTRAP)
+```
+
+打开「延迟推送」之后出现，15:51:30 崩、15:51:36 重新拉起。
+
+**为什么这条实现不牢**（三个候选，都还没排除，需要 `.ips` 的故障线程栈才能定位）：
+
+1. **对象生命周期** —— 日志里 `REPL#n tag=PBR cls=BBBulletinRequest` 说明传进来的确实是
+   `BBBulletinRequest`。调用方在同步返回后可能已经把它消费/作废了；N 秒后再拿它去发布，
+   内部 force unwrap 到 nil 就是 SIGTRAP。**这一条最像。**
+2. **同一条通知命中 2~3 个入口** —— 同步时 PB/PBR/PBRS 挤在同一毫秒，由 BBServer 自己合并；
+   延迟后变成 3 个独立定时任务去发布**同一个对象**，第一个发布之后剩下的就是
+   "拿已经用过的对象再发一次"。
+3. **线程/队列** —— 这三个方法大概率跑在 BulletinBoard 自己的串行队列上；我们从主队列
+   回调进去，可能踩到内部的 queue/actor 前置条件（"failed precondition" 正好是这个形状）。
+
+> 教训：**「能拦下来」不等于「能攒起来晚点再交出去」。**
+> 前四个版本做的所有事（过滤、替换、朗读）都是在**同一次同步调用里**完成的，
+> 所以从来没碰过对象生命周期。延迟是第一个跨时间的动作 —— 它把"调用栈内的局部对象"
+> 变成了"要活过 N 秒的东西"，而这从来不是我们说了算的。
+
+### 本版做了什么
+
+1. **延迟推送整条停用**：`NotifyFilter.m` 里 `kDelayEnabled = NO`，
+   `shouldDelayBundle:` 第一句就 `return NO` ⇒ 三个 hook 的延迟分支全部走不到。
+   代码保留（注释里写清停用原因），为了拿到栈以后能继续。
+2. **自毁保护（第二道保险）**：延迟路径上调度前写 `.delay_guard = start`，
+   原方法返回后才写 `done`。下次启动若看到 `start` 没有 `done` ⇒ 上次崩在延迟里
+   ⇒ 自动删掉 `delaySeconds`。**以后每次实验最多崩一次**，不会陷入崩溃循环。
+3. **主动清除历史值**：停用了就 `%ctor` 里把用户 plist 里的 `delaySeconds` 删掉。
+   留着一个永远不生效的值，只在给未来埋雷 —— 哪天重新启用，他一升级就落在崩溃路径上。
+4. **设置页把「已停用」写在标题里**：功能被停用这件事本身必须可见；
+   藏在代码注释里等于骗人，用户只会以为自己填错了。
+
+### 顺带修：数据库锁导致通知被静默丢弃
+
+真机日志里反复出现：
+
+```
+INSERT 失败 rc=5 err=database is locked bundle=com.jd.jingmai
+INSERT 失败 rc=5 err=database is locked bundle=com.lemon.lv
+```
+
+`rc=5` = `SQLITE_BUSY`。**两个进程都在写这个库**（SpringBoard 里的 tweak 记通知、
+盒子 App 清空/标已读），而 SQLite 默认行为是"拿不到写锁立刻返回 BUSY" ⇒
+**那条通知直接丢了**，而且没有回头路（库里根本没有它）。
+
+`openDB` 里补 `sqlite3_busy_timeout(db, 2000)`：正常写只要几毫秒，2 秒足够等对方放开。
+
+> 判据用**符号表**而不是字符串：`sqlite3_busy_timeout` 是 C 函数名，不会以字面量出现。
+> 只有 `LC_SYMTAB` 的未定义符号能证明"这个函数被调用了"
+> （依赖表只能证明链了哪个库，不能证明调了哪个函数）。
+
+### 新增闸门 `nb_delay_gate.py`
+
+「停用了」这件事必须能被机器验证，不能靠"我记得改过"。四条判据：
+
+1. `kDelayEnabled = NO` 存在；
+2. **门排在业务逻辑之前** —— 常量改了、门却写在函数末尾，等于没关；
+3. 门前没有别的 `return`（有的话可能从别的出口漏出去）；
+4. 三个延迟分支都写了自毁标记 `start`，且 `%ctor` 调了自愈 + 清理。
+
+脚本**自带负向对照**（`--selftest`）：把 `NO` 改成 `YES` 必须报红，已验证会拦住。

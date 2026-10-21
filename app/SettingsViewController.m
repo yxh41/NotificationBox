@@ -114,19 +114,22 @@ static BOOL NBIsDigits(NSString *s) {
     [self addActionRow:@"朗读声音" key:@"voice" action:@selector(onVoice:)];
     [self addActionRow:@"朗读限定 App" key:@"speakapps" action:@selector(onSpeakApps:)];
 
-    // ---------- 延迟推送（v0.0.14） ----------
-    // 🔴 它排在白名单/黑名单**之前**：延迟是"什么时候弹"，拦截是"弹不弹"。
-    //    用户的直觉顺序是先决定弹不弹、再决定什么时候弹；但延迟判定在流水线里
-    //    紧跟过滤之后，所以设置页把"订阅/时机"这组放一起更好找。
+    // ---------- 延迟推送（v0.0.14 加、v0.0.15 停用） ----------
+    // 🔴🔴 v0.0.15：延迟推送**已整体停用**。真机 2026-10-21 15:51:30 打开它之后
+    //    SpringBoard 直接 SIGTRAP / Swift runtime trap ⇒ 安全模式。
+    //    输入框保留但无论填什么都不生效（引擎侧 NotifyFilter 的 kDelayEnabled = NO 把关），
+    //    保留的唯一目的 = 让用户能把自己以前填的值清掉。
+    //    🔴 标题里必须写「已停用」：功能被停用这件事本身要可见，
+    //       藏在注释里等于骗人，用户会以为是自己填错了。
     id ds = cur[NB_KEY_DELAY_SECONDS];
     NSString *dsStr = [ds isKindOfClass:[NSNumber class]] ? [(NSNumber *)ds stringValue]
                     : ([ds isKindOfClass:[NSString class]] ? (NSString *)ds : @"");
-    [self addGroup:@"延迟推送（秒，0 = 关闭）"
-                 ph:@"0"
+    [self addGroup:@"延迟推送（⛔ 已停用，填了不生效）"
+                 ph:@"之前填过就清空它"
               value:dsStr
            keyboard:UIKeyboardTypeNumberPad
                 key:NB_KEY_DELAY_SECONDS];
-    [self addActionRow:@"延迟生效的 App" key:@"delayapps" action:@selector(onDelayApps:)];
+    [self addActionRow:@"延迟生效的 App（已停用）" key:@"delayapps" action:@selector(onDelayApps:)];
 
     // ---------- 记录 ----------
     id mx = cur[@"maxRecords"];
@@ -169,11 +172,12 @@ static BOOL NBIsDigits(NSString *s) {
         @"• 朗读只念「替换后」的文字（跟通知上看到的一致）；被过滤规则拦下的通知不念。\n"
         @"• 如果朗读导致桌面崩溃重启，插件会在下次开机时**自动把朗读关掉**，\n"
         @"  并往日志写一行「朗读自毁保护触发」，不需要你做任何事。\n"
-        @"• 延迟推送默认关闭（0）。开了之后：命中的通知会晚 N 秒才交给系统发布，\n"
-        @"  日志里会有 DELAY / DELAY-FIRE 两行配对（配对不齐 = 没到点，没出现是系统那边的事）。\n"
-        @"• ⚠️ 延迟不是「提醒我」那种功能：延迟期间如果 App 又推一条，两条会一起到；\n"
-        @"  某些 App 的通知延迟后「可能完全不出现」（系统已放弃这条）。不确定就先填 5 秒试。\n"
-        @"  秒数上限 600；填 0 或留空 = 关闭。\n"
+        @"• ⛔ 延迟推送「已停用」（v0.0.15）：真机上打开它会让桌面进程崩溃、进安全模式。\n"
+        @"  原因还在查（要看崩溃日志的故障线程栈）。现在填多少都不会生效；\n"
+        @"  你之前填过的值请清空或填 0 —— 那只是把历史值清掉，不会启用任何东西。\n"
+        @"• 顺带修好一个会丢数据的问题：数据库锁。以前盒子 App 和桌面同时写库时，\n"
+        @"  SQLite 直接返回 busy（日志里 INSERT 失败 rc=5），那条通知就静默丢了；\n"
+        @"  现在会最多等 2 秒再放弃。\n"
         @"• 存储位置：\n  /var/mobile/Library/NotifyBox/settings.plist";
     [self.scroll addSubview:self.hintLabel];
 
@@ -331,9 +335,11 @@ static BOOL NBIsDigits(NSString *s) {
                             : @"全部 App ›")
                   forKey:@"speakapps"];
 
+    // 🔴 v0.0.15：延迟已停用，这里就不能再显示「全部 App ›」了 —— 那会让人以为它在生效。
+    //    有历史选择才显示数量（方便用户自己清），否则直接写「已停用」。
     NSUInteger dl = [NBStringArray(d[NB_KEY_DELAY_APPS]) count];
-    [self setActionValue:(dl ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)dl]
-                             : @"全部 App ›")
+    [self setActionValue:(dl ? [NSString stringWithFormat:@"已选 %lu 个（已停用）›", (unsigned long)dl]
+                             : @"已停用 ›")
                   forKey:@"delayapps"];
 
     NSString *voiceName = [VoicePickerViewController currentVoiceDisplayName];

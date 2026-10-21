@@ -71,6 +71,15 @@ void NBSharedLog(NSString *fmt, ...) {
     [self ensureDir];
     sqlite3 *db = NULL;
     if (sqlite3_open([NOTIFYBOX_DB_PATH UTF8String], &db) != SQLITE_OK) return NULL;
+    // 🔴🔴 v0.0.15：必须设 busy_timeout。
+    //    真机日志里反复出现：
+    //        INSERT 失败 rc=5 err=database is locked bundle=com.jd.jingmai / com.lemon.lv
+    //    rc=5 就是 SQLITE_BUSY。**两个进程都在写这个库**（SpringBoard 里的 tweak 记通知、
+    //    盒子 App 清空/标已读），SQLite 的默认行为是"拿不到写锁立刻返回 BUSY"⇒
+    //    **那条通知就被静默丢掉了**，而且丢了以后没有任何回头路（库里根本没有它）。
+    //    设 2 秒超时：正常情况写一下就几毫秒，2 秒足够等对方放开；
+    //    真超过 2 秒说明对方卡的更久，那时再失败也不冤。
+    sqlite3_busy_timeout(db, 2000);
     const char *sql = "CREATE TABLE IF NOT EXISTS notifications ("
                       "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                       "bundle TEXT, title TEXT, message TEXT, subtitle TEXT, "
