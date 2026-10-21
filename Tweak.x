@@ -203,6 +203,22 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
 %ctor {
     gRecent = [NSMutableDictionary dictionary];   // 单线程时机初始化，之后只读引用
 
+    // 🔴 与 tweak.log 独立的「我跑过」证据：
+    //    上一轮出现「日志文件不存在」，但 App 侧又疑似有记录 ⇒ 无法区分
+    //    「tweak 没注入」与「日志写不进去」。这个标记文件把两者分开：
+    //      .tweak_ctor 存在 + tweak.log 不存在 ⇒ 注入成功、但写日志失败
+    //      两个都不存在                      ⇒ 真的没注入
+    {
+        NSString *mark = @"/var/mobile/Library/NotifyBox/.tweak_ctor";
+        NSString *body = [NSString stringWithFormat:@"%@ %@ %@",
+                          [NSDate date], NBProc(), @"v0.0.6"];
+        NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
+        [[NSFileManager defaultManager] createDirectoryAtPath:
+            [mark stringByDeletingLastPathComponent]
+                                 withIntermediateDirectories:YES attributes:nil error:nil];
+        [md writeToFile:mark atomically:YES];
+    }
+
     Class c = objc_getClass("BBServer");
     if (!c) {
         NBLog(@"!!! [%@] BBServer 类不存在（该进程里没有公告板服务）", NBProc());
@@ -226,7 +242,7 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.5 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.6 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -247,7 +263,7 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.5 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.6 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

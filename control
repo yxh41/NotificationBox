@@ -1,6 +1,6 @@
 Package: com.yxh41.notifybox
 Name: NotifyBox
-Version: 0.0.5
+Version: 0.0.6
 Architecture: iphoneos-arm64e
 Description: 通知记录与消息盒子（iOS 16 roothide）
 Maintainer: yxh41

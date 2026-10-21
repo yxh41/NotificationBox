@@ -32,6 +32,10 @@ NS_ASSUME_NONNULL_BEGIN
 //    ⇒ 说明路径可写、但 tweak 没注入（而不是写不进）。
 + (void)markAppAlive;
 
+// 🔴 环境自检：**完全不依赖日志文件**，直接实测路径可写性 + DB 记录数 + dylib 安装位置。
+//    日志文件不存在时（连 App 都没写成功），这份数据是唯一能定位的现场。
++ (NSString *)envCheck;
+
 @end
 
 NS_ASSUME_NONNULL_END

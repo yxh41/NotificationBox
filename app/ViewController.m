@@ -54,6 +54,11 @@
                                                                   message:@"选择要查看的内容"
                                                            preferredStyle:UIAlertControllerStyleActionSheet];
     // 结论行优先：日志动辄 9KB，全量截图很难抓重点
+    [sheet addAction:[UIAlertAction actionWithTitle:@"环境自检（不依赖日志）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self showText:[NotifyStore envCheck] title:@"环境自检"];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"只看结论行（推荐）"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -121,9 +126,12 @@
     NSString *head = [NSString stringWithFormat:@"命中 %lu 行 / 全文 %lu 行",
                       (unsigned long)keep.count, (unsigned long)all.count];
     if (!keep.count) {
+        // 日志都没有时，附上「不依赖日志」的环境自检，否则这一屏毫无信息量
         return [head stringByAppendingFormat:
-                @"\n\n没有任何结论行 —— 连装载日志都没有 ⇒ tweak 没注入到任何进程。\n\n全文前 1200 字：\n%@",
-                text.length > 1200 ? [text substringToIndex:1200] : text];
+                @"\n\n没有任何结论行 —— 日志文件里没有装载记录。\n\n"
+                @"【环境自检】\n%@\n\n【日志原文前 800 字】\n%@",
+                [NotifyStore envCheck],
+                text.length > 800 ? [text substringToIndex:800] : text];
     }
     return [head stringByAppendingFormat:@"\n\n%@", [keep componentsJoinedByString:@"\n"]];
 }
@@ -238,7 +246,13 @@
 
 // 🔴 取 App 真图标（LSApplicationProxy）。App 不是 SpringBoard，不能用 SBApplication，
 //    只能走 LSApplicationProxy。用 NSClassFromString + NSInvocation 避免依赖私有头文件。
-// ⚠️ TODO（真机）：iconDataForVariant: 的 variant 取值（0 通常=默认图标），若拿到空图再调。
+//
+// 🔴🔴 v0.0.5 崩溃真因（EXC_BAD_ACCESS / "already freed"，地址 0xd9c90e120）就在下一段：
+//     `NSData *data = nil; [inv getReturnValue:&data];`
+//     getReturnValue: 把**裸指针**写进来、**从不 retain**，而 ARC 认为 data 是 __strong，
+//     方法结束时照样 objc_release ⇒ **过度释放** ⇒ 该内存被复用后任何一次访问就崩。
+//     正确写法：先用 __unsafe_unretained id 承接，再判类型赋给强引用（赋值时才 retain）。
+//     这个 bug 只在「有记录、需要画图标」时才被触发 —— 列表空的时候永远不崩。
 - (UIImage *)iconForBundle:(NSString *)bid {
     if (!bid.length) return nil;
     if (self.iconCache == nil) self.iconCache = [NSMutableDictionary dictionary];
@@ -246,25 +260,34 @@
     if (cached) return (cached == [NSNull null]) ? nil : cached;
 
     UIImage *img = nil;
-    Class LSApplicationProxy = NSClassFromString(@"LSApplicationProxy");
-    if (LSApplicationProxy) {
-        id proxy = [LSApplicationProxy performSelector:@selector(applicationProxyForIdentifier:)
-                                          withObject:bid];
-        if (proxy) {
-            SEL sel = @selector(iconDataForVariant:);
-            NSMethodSignature *sig = [proxy methodSignatureForSelector:sel];
-            if (sig) {
-                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                [inv setSelector:sel];
-                [inv setTarget:proxy];
-                int variant = 0;
-                [inv setArgument:&variant atIndex:2];
-                [inv invoke];
-                NSData *data = nil;
-                [inv getReturnValue:&data];
-                if (data.length) img = [UIImage imageWithData:data];
+    @try {
+        Class LSApplicationProxy = NSClassFromString(@"LSApplicationProxy");
+        if (LSApplicationProxy) {
+            SEL mk = @selector(applicationProxyForIdentifier:);
+            if ([LSApplicationProxy respondsToSelector:mk]) {
+                id proxy = [LSApplicationProxy performSelector:mk withObject:bid];
+                if (proxy) {
+                    SEL sel = @selector(iconDataForVariant:);
+                    NSMethodSignature *sig = [proxy methodSignatureForSelector:sel];
+                    if (sig && sig.numberOfArguments >= 3) {
+                        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                        [inv setSelector:sel];
+                        [inv setTarget:proxy];
+                        int variant = 0;
+                        [inv setArgument:&variant atIndex:2];
+                        [inv invoke];
+                        // 🔴 关键修正：裸指针 → __unsafe_unretained 承接 → 判类型后再赋强引用
+                        __unsafe_unretained id ret = nil;
+                        [inv getReturnValue:&ret];
+                        if ([ret isKindOfClass:[NSData class]] && [(NSData *)ret length]) {
+                            img = [UIImage imageWithData:(NSData *)ret];
+                        }
+                    }
+                }
             }
         }
+    } @catch (__unused NSException *e) {
+        img = nil;      // 取图标失败一律降级成首字母，绝不让它带走 App
     }
     self.iconCache[bid] = img ?: [NSNull null];
     return img;
@@ -295,6 +318,11 @@
                                        search:self.searchText];
     [self.table reloadData];
     [self updateEmptyView];
+
+    // 🔴 标题里直接报 DB 总记录数：这个数不依赖列表渲染，
+    //    即使列表因为取图标崩了，用户也能从标题看出「库里到底有没有东西」。
+    NSInteger total = [NotifyStore count];
+    self.title = [NSString stringWithFormat:@"消息盒子 (%ld)", (long)total];
 }
 
 // 空列表时直接把自检信息打在屏幕上（判断 tweak 有没有写库、App 能不能读到）
