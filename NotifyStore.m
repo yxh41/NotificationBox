@@ -44,7 +44,8 @@ static void NBStoreLog(NSString *fmt, ...) {
 }
 
 + (NSInteger)maxRecords {
-    NSDictionary *p = [NSDictionary dictionaryWithContentsOfFile:NOTIFYBOX_PREFS_PATH];
+    // v0.0.8：走统一入口（新 settings.plist 优先，旧 Preferences 域兜底、只读）
+    NSDictionary *p = NBLoadSettings();
     id v = p[@"maxRecords"];
     NSInteger n = v ? [v integerValue] : 500;
     return (n > 0 && n < 100000) ? n : 500;
@@ -287,6 +288,27 @@ static void NBStoreLog(NSString *fmt, ...) {
         }
     }
     if (!anyPl) [s appendString:@"  ❓ 未读到过滤器 plist\n"];
+
+    // 🔴 v0.0.8：设置到底有没有被读到 —— 这一段是「设置改了不生效」类问题的第一判据
+    [s appendString:@"\n── 设置（settings.plist） ──\n"];
+    NSFileManager *sfm = [NSFileManager defaultManager];
+    BOOL sExists = [sfm fileExistsAtPath:NOTIFYBOX_SETTINGS_PATH];
+    [s appendFormat:@"  文件：%@  %@\n", NOTIFYBOX_SETTINGS_PATH, sExists ? @"存在" : @"不存在"];
+    NSDictionary *cfg = NBLoadSettings();
+    [s appendFormat:@"  生效配置项数：%lu\n", (unsigned long)cfg.count];
+    if (cfg.count) {
+        NSArray *keys = [[cfg allKeys] sortedArrayUsingSelector:@selector(compare:)];
+        for (NSString *k in keys) {
+            NSString *v = [cfg[k] description] ?: @"";
+            if (v.length > 60) v = [[v substringToIndex:60] stringByAppendingString:@"..."];
+            [s appendFormat:@"    %@ = %@\n", k, v];
+        }
+    } else {
+        [s appendString:@"    （无设置 ⇒ 不过滤、不替换，行为与不装插件一致）\n"];
+    }
+    if (sExists && cfg.count == 0) {
+        [s appendString:@"  ⚠️ 文件存在但为空：等于「全部清空」，这是合法状态\n"];
+    }
 
     return s;
 }

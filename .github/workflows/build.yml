@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
@@ -50,3 +53,34 @@ jobs:
           name: notifybox-deb
           path: packages/*.deb
           if-no-files-found: error
+
+      # 关键：把 deb 推到公开分支 ci-deb，这样任何人（包括没有 PAT 的自动化）都能匿名下载。
+      # 只允许 main 的 push 触发，避免 PR 也能写分支。
+      - name: Publish deb to ci-deb branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          DEB=$(ls packages/*.deb | head -1)
+          NAME=$(basename "$DEB")
+          SHORT=$(git rev-parse --short HEAD)
+          echo "发布：$NAME  (commit $SHORT)"
+
+          rm -rf /tmp/pub && mkdir -p /tmp/pub
+          cd /tmp/pub
+          git init -q -b ci-deb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp "$DEB" .
+          {
+            echo "本分支由 CI 自动发布，请勿手改。"
+            echo "commit: $SHORT"
+            echo "deb   : $NAME"
+            echo "下载  : https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/ci-deb/${NAME}"
+          } > 说明.txt
+          git add -A
+          git commit -q -m "ci-deb: $SHORT $NAME"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-deb
+
+          echo "已发布：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/ci-deb/${NAME}"

@@ -248,6 +248,75 @@ App「诊断 → **环境自检（不依赖日志）**」现在会报：
 ⇒ 之前「设置崩溃」的病根在那个 prefs bundle（最可能是缺 `Info.plist`）。
 载荷暂时仍留在 `_layout_disabled/`，等录制链路验收后再加回并复验一次。
 
+## ✅ v0.0.6 真机验收通过（录制链路通了）
+
+真机环境自检结果：
+
+```
+目录 /var/mobile/Library/NotifyBox     存在=是  可写=是  写入测试=成功
+DB   notifybox.sqlite                  存在=是  大小=217088 B  记录数=500
+日志  tweak.log                         存在=是  大小=22130 B
+标记  .tweak_ctor                       ✅ SpringBoard v0.0.6（tweak 确实注入过）
+App 标题                                消息盒子 (500)
+```
+
+- **记录数 500 = maxRecords 上限**，说明通知一直在进、上限裁剪也在正常工作；
+- **App 标题能显示 `(500)` 且不再崩溃** ⇒ NSInvocation 那个过度释放确实是崩溃根因；
+- `dylib 安装位置` / `注入过滤器 plist` 两项报“没找到”属正常 —— roothide 把前缀重定向了，
+  App 侧猜路径必然落空。v0.0.7 起改为**由 tweak 用 `dladdr` 自报真实路径**。
+
+## v0.0.7（设置界面回到包里）
+
+| 改动 | 原因 |
+|---|---|
+| **PreferenceLoader 载荷加回** | 之前为二分“设置崩溃”临时移除；已补 `Info.plist`（BNDL）+ `keyboardType` 整数化，用户复测设置能进 |
+| tweak 用 **`dladdr`** 上报 dylib 真实路径 | roothide 前缀重定向，App 猜路径必落空；写进 `.tweak_ctor` 的 `dylib=` 字段 |
+| 日志 **512 KB 自动轮转** 到 `tweak.log.1` | 22 KB 且持续增长，长期跑会把分区写满；用计数器节流，每 200 次写才 stat 一次 |
+| 修 `errno` 误导显示 | 之前「写入测试=成功」旁边并列 `errno=2`，读者会以为失败；成功路径上 errno 本就可能残留（`writeToFile:atomically:` 内部先写临时文件） |
+
+> 🔴 **如果这版设置 App 又进不去**，立刻回退载荷（把 `layout/` 改名）并把崩溃日志发我，
+> 那就说明病根不在 `Info.plist`，我改用「设置直接做进盒子 App」的方案，彻底不依赖 PreferenceLoader。
+
+## v0.0.7 交付校验（机器对拍，非目测）
+
+CI run **#14**（`a455a3c`）success，产物 30123 B；下载后逐项校验：
+
+| 检查项 | 结果 |
+|---|---|
+| ar 成员 | `debian-binary` / `control.tar.gz` / `data.tar.lzma` |
+| `control` Version / Arch | `0.0.7` / `iphoneos-arm64e` ✅ |
+| tweak dylib | `Library/MobileSubstrate/DynamicLibraries/NotifyBox.dylib` 90064 B，**arm64e**（cpusub `0x80000002`）✅ |
+| 盒子 App | `Applications/NotifyBoxApp.app/NotifyBoxApp` 108576 B，**arm64e**（filetype=2）✅ |
+| App Info.plist | `com.yxh41.notifybox.app` / `CFBundleExecutable=NotifyBoxApp` / 名称「消息盒子」/ 版本 `0.0.7` ✅ |
+| 偏好包三件套 | `NotifyBox.bundle/{Info.plist, root.plist}` + `Entry.plist` 齐全 ✅ |
+| 偏好 `Info.plist` | `CFBundlePackageType=BNDL`、`CFBundleIdentifier=com.yxh41.notifybox.prefs` ✅ |
+| `root.plist` 的 `keyboardType` | 类型是 **int**（值 4）✅（之前是字符串 `"numberPad"`，是设置崩溃的可疑病根） |
+| 设置键名 ↔ 代码读取 | `defaults=com.yxh41.notifybox` → `NOTIFYBOX_PREFS_PATH`，`maxRecords`/`whitelist`/`blacklist`/`blockKeywords` 键名逐字一致 ✅ |
+| dylib 内字面量 | `dylib=` / `.tweak_ctor` / `tweak.log` / `.1` / `v0.0.7` / 三个挂点选择器 全命中 ✅ |
+| 反向检查 | **不含** `_sendAddBulletin:toFeeds:`（v0.0.3 安全模式的崩点）✅ |
+| cpusubtype 读法 | 🔴 必须按**无符号**读；按有符号读会把 `0x80000002` 显示成 `-0x7ffffffe`，误判「不是 arm64e」 |
+
+> 🔴 **本轮踩到的期望表错误（全部改期望、不动包）**：App 目录叫 `NotifyBoxApp.app` 不是 `NotifyBox.app`；
+> 版本字面量是 `v0.0.7` 不是 `V007`；轮转后缀是 `".1"` 不是 `tweak.log.1`；
+> App 二进制里**没有** `v0.0.7`（版本在 `Info.plist`，源码里那两处只是注释）；cpusubtype 读成负数。
+> 口诀照旧：**期望必须逐字从源码抄**。
+
+## 🔴 本版明确「没接线」的功能（别当 bug 报）
+
+`NotifyFilter.m` 被编进了 dylib，但 `Tweak.x` 里**一次都没有调用** `NotifyFilter`
+（`shouldDrop:` / `applyToBulletin:` 零引用）。所以在 v0.0.7：
+
+| 功能 | 状态 |
+|---|---|
+| 通知记录 / 上限裁剪 / 三入口去重 | ✅ 真机已验收（v0.0.6 起） |
+| 设置界面（上限、名单、关键词输入框） | ⚠️ 本版目标 = 只验证「设置 App 能不能进」，填了**不会生效** |
+| 白名单 / 黑名单 / 关键词过滤 | ❌ 代码在、没接线 |
+| 内容替换 `replaceRules` / 按 App 换提示音 `appSounds` | ❌ 同上，且声音 API 仍是 🔴 TODO |
+| 延迟推送 / 朗读 | ❌ 未开始 |
+
+下一版（v0.0.8，已完成）：把 `shouldDrop` 接进三个挂点的记录之后、原方法之前。
+🔴 实现时发现「接线」比预想的危险 —— 见下节。
+
 ## 已知坑 / 待办
 
 - **延迟推送**风险最高：再注入的 bulletin 不走 App 自身逻辑，属「再展示一次」，体验需评估。
@@ -256,3 +325,68 @@ App「诊断 → **环境自检（不依赖日志）**」现在会报：
   真机调一下即可。纯 App 侧、不依赖 hook 方法名，已落地。
 - **声音 / 延迟**两项的 iOS 16 具体 API 未在沙箱内验证，标记了 🔴 TODO。
 - **roothide 沙盒**：tweak 与 App 共享 DB 的路径需真机确认可写。
+
+## v0.0.8（设置搬进盒子 App，彻底不碰设置 App）
+
+### 为什么放弃 PreferenceLoader（结论，不再回头）
+
+v0.0.7 把偏好 bundle 加回包里后，设置 App **又进不去**，而且**没有崩溃日志**。
+这个组合本身就是判据：
+
+| 现象 | 说明 |
+|---|---|
+| 没有崩溃日志 | **不是闪崩**。闪崩一定有 `.ips`；没有 ⇒ 挂起 / 被跳过 / 根本没走到崩溃 |
+| 只在包里有 `Preferences/NotifyBox.bundle` 时复现 | 两次对照：移除就好、加回就坏 |
+| 设置 App 是系统 App | 在别人的进程里去盲调一个不归自己控制的加载器，收益低、代价高 |
+
+⇒ 继续在 PreferenceLoader 上二分没有收益（连接下来该调哪个字段都无从观察）。
+直接换通道：设置做进自己的 App，`Preferences` 载荷从包里移除。
+dpkg 升级时会自动删掉旧版本留下、新包里没有的那些文件。
+
+### 改动
+
+| 改动 | 说明 |
+|---|---|
+| **移除 PreferenceLoader 载荷** | `layout/` → `_prefs_disabled/`（源码留档、不再打包）；`control` 去掉 `preferenceloader` 依赖 |
+| **内置设置页** | `app/SettingsViewController.{h,m}`，盒子 App 导航栏左侧「设置」 |
+| **设置存储换位置** | `/var/mobile/Library/NotifyBox/settings.plist`（原在 `Library/Preferences/` 域） |
+| **修掉一个会崩的写法** | `arrayFromPref:` 里的 `valueForKey:@"stringByTrimmingCharactersInSet:"` |
+| **过滤/替换真正接线** | 三入口统一走 `NBPipeline` |
+| 环境自检加「设置」段 | 直接显示设置文件、生效项数和每一项的值 |
+
+### 🔴 为什么设置不能继续放 `Library/Preferences/`
+
+那个目录归 **cfprefsd** 管。App 用 `writeToFile:` 直接写文件，而 cfprefsd 手里有自己的缓存，
+随时可能把文件盖回去 ⇒ 出现「我改了、也提示保存成功、就是不生效」这种最难查的幽灵故障。
+新位置是我自己的文件，**单一写入者（App）**、tweak 只读，不经过 cfprefsd。
+
+### 🔴 顺带排掉一个炸弹（这段代码以前从没被调用过）
+
+```objc
+// v0.0.7（错，会崩）
+return [[v componentsSeparatedByString:@","] valueForKey:@"stringByTrimmingCharactersInSet:"];
+```
+`NSArray` 的 `valueForKey:` 拿到带冒号的键，KVC 取不到 ⇒ 抛 **`NSUndefinedKeyException`**
+⇒ 这段跑在 SpringBoard 里，就是闪退 / 进安全模式。
+它一直没炸，**只因为 `NotifyFilter` 从来没被调用过（死代码）**。
+这一版要接线所以必须先修 —— **「接线」不是免费的：调用一个从未被调用过的函数，
+等于第一次执行它里面的每一行。**
+同族风险还有：对传入对象直接发 `[obj sectionID]`，对象不响应就抛 `NSInvalidArgumentException`。
+所以过滤接口改成了**纯字符串入参**，完全不碰传入对象。
+
+### 接线后的顺序（有讲究）
+
+```
+① 记录原文 → ② 用原文判定是否拦截 → ③ 内容替换 → ④ 原方法
+```
+- **先记录**：被拦掉的通知在盒子里仍能查到「本来要推什么」；
+- **用原文判定**：若先替换再判定，用户配「把"红包"替换成空」又过滤"红包"，过滤会永远不命中；
+- **任何异常都放行**：宁可多推一条，也不要把通知吞掉；
+- 认不出 bundle 的通知**一律不拦**。
+
+### ⚠️ 行为变更（默认安全）
+
+- 没有任何设置时：`shouldDrop` 返回 NO、替换直接返回 NO ⇒ 行为与不装插件**完全一致**；
+- **白名单一旦填了就等于「只保留这些 App」**，其它全不弹 —— 这是它的语义，但杀伤力大，用前想清楚；
+- 想彻底关掉：设置页清空全部字段后保存，或直接删 `settings.plist`。
+

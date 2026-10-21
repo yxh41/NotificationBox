@@ -1,4 +1,4 @@
-// Tweak.x —— v0.0.5 挂上三个真实发布入口（签名全部照 method_getTypeEncoding 逐字抄）
+// Tweak.x —— v0.0.8 过滤/替换接线（三入口共用 NBPipeline）+ 设置文件改到 NotifyBox/settings.plist
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
@@ -28,12 +28,15 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import "NotifyStore.h"
+#import "NotifyCommon.h"
+#import "NotifyFilter.h"
 
 static NSString *const kNBLogPath = @"/var/mobile/Library/NotifyBox/tweak.log";
 
 static int gHit1 = 0;   // publishBulletin:destinations:
 static int gHit2 = 0;   // publishBulletinRequest:destinations:
 static int gHit3 = 0;   // _publishBulletinRequest:forSectionID:forDestinations:
+static int gDropped = 0;   // 被过滤掉（没有交给原方法）的条数
 
 // 去重表：key -> 最后一次记录的时间戳
 static NSMutableDictionary *gRecent = nil;
@@ -138,8 +141,10 @@ static BOOL NBClaimKey(NSString *key) {
 
 // ---------- 录制 ----------
 // sectionHint：能从参数直接拿到 sectionID 时优先用（最可靠）
-static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *counter) {
-    if (!obj) return;
+// 🔴 v0.0.8：返回**真正用来记录的那个 bundle**（可能是从 .bulletin 里兜出来的）。
+//    这样下游过滤判定用的 bundle 和库里存的是同一个值，不会出现「记的 A、判的 B」错位。
+static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *counter) {
+    if (!obj) return nil;
 
     NSString *bid   = sectionHint.length ? sectionHint : NBSafeStr(obj, @"sectionID");
     NSString *title = NBSafeStr(obj, @"title");
@@ -165,11 +170,11 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
             NBLog(@"%@#%d 没有 bundle，cls=%@ title=%@", tag, *counter, NBClassName(obj),
                   title.length ? title : @"(nil)");
         }
-        return;
+        return nil;
     }
 
     NSString *key = [NSString stringWithFormat:@"%@|%@|%@", bid, title ?: @"", msg ?: @""];
-    if (!NBClaimKey(key)) return;      // 已被另一个入口记过
+    if (!NBClaimKey(key)) return bid;      // 已被另一个入口记过；bundle 仍有效
 
     if (*counter < 10) {
         (*counter)++;
@@ -179,14 +184,49 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
               msg.length ? (msg.length > 40 ? [[msg substringToIndex:40] stringByAppendingString:@"..."] : msg) : @"(nil)");
     }
     [NotifyStore recordWithBundle:bid title:title message:msg subtitle:sub date:date];
+    return bid;
+}
+
+// ---------- 记录 + 过滤流水线（三入口共用） ----------
+// 返回 NO ⇒ 调用点**不要执行原方法**，等于把这条通知拦下来（盒子里仍然查得到）。
+// 🔴 整段 @try：这段跑在 SpringBoard 里，抛一个异常就是用户眼里的闪退 / 进安全模式。
+// 🔴 顺序讲究：**先记录原文 → 再判定过滤（用原文判）→ 最后才做内容替换**。
+//    若先替换再判定，用户配了「把"红包"替换成空」又同时过滤"红包"时，过滤会永远不命中。
+static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counter) {
+    // ① 记录（原文；被过滤也留档，方便回头查「本来要推什么」）
+    NSString *bid = NBRecordItem(obj, sectionHint, tag, counter);
+    if (!bid.length) return YES;            // 认不出是哪个 App ⇒ 绝不拦
+
+    @try {
+        NSString *t = NBSafeStr(obj, @"title");
+        NSString *m = NBSafeStr(obj, @"message");
+        NSString *s = NBSafeStr(obj, @"subtitle");
+
+        // ② 拦截判定（用原文）
+        if ([NotifyFilter shouldDropBundle:bid title:t message:m subtitle:s]) {
+            gDropped++;
+            // 前 8 条全记（方便确认到底拦了什么），之后每 50 条记一次（不刷爆日志）
+            if (gDropped <= 8 || (gDropped % 50) == 0) {
+                NBLog(@"DROP#%d bundle=%@ tag=%@ title=%@",
+                      gDropped, bid, tag, t.length ? t : @"(nil)");
+            }
+            return NO;
+        }
+        // ③ 内容替换（只改呈现，库里留着原文）
+        [NotifyFilter applyReplaceRulesTo:obj];
+    } @catch (__unused NSException *e) {
+        // 兜底一律放行：宁可多推一条，也不要把通知吞掉
+    }
+    return YES;
 }
 
 // ---------- 入口 1：- publishBulletin:destinations: ----------
 %group GPB
 %hook BBServer
 - (void)publishBulletin:(id)bulletin destinations:(unsigned long long)destinations {
-    NBRecordItem(bulletin, nil, @"PB", &gHit1);
-    %orig(bulletin, destinations);
+    if (NBPipeline(bulletin, nil, @"PB", &gHit1)) {
+        %orig(bulletin, destinations);
+    }
 }
 %end
 %end
@@ -195,8 +235,9 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
 %group GPBR
 %hook BBServer
 - (void)publishBulletinRequest:(id)request destinations:(unsigned long long)destinations {
-    NBRecordItem(request, nil, @"PBR", &gHit2);
-    %orig(request, destinations);
+    if (NBPipeline(request, nil, @"PBR", &gHit2)) {
+        %orig(request, destinations);
+    }
 }
 %end
 %end
@@ -210,8 +251,9 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
                 forDestinations:(unsigned long long)destinations {
     // 第二个参数按 ENC 是 @（对象），本身就是 sectionID，直接当 bundle 用最可靠
     NSString *sid = [sectionID isKindOfClass:[NSString class]] ? (NSString *)sectionID : nil;
-    NBRecordItem(request, sid, @"PBRS", &gHit3);
-    %orig(request, sectionID, destinations);
+    if (NBPipeline(request, sid, @"PBRS", &gHit3)) {
+        %orig(request, sectionID, destinations);
+    }
 }
 %end
 %end
@@ -234,7 +276,7 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.7", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.8", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -265,7 +307,7 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.7 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.8 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -286,7 +328,7 @@ static void NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *coun
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.7 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.8 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

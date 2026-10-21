@@ -1,6 +1,7 @@
 #import "ViewController.h"
 #import "NotifyStore.h"
 #import "NotifyCommon.h"
+#import "SettingsViewController.h"
 
 // 🔴 盒子 App：读 NotifyStore 的 SQLite，展示通知列表
 //    - 顶部横向 App 图标栏（抖音聊天页那种）：点击筛选对应 bundle
@@ -24,6 +25,7 @@
 @property (nonatomic, strong) NSMutableDictionary *iconCache;  // bundle -> UIImage（含 NSNull miss）
 
 - (void)onDiag:(id)sender;
+- (void)onSettings:(id)sender;
 - (void)showText:(NSString *)text title:(NSString *)title;
 - (NSString *)keyLinesFrom:(NSString *)text;
 - (NSString *)selLinesFrom:(NSString *)text;
@@ -43,8 +45,21 @@
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(onDiag:)];
+    // 🔴 v0.0.8：设置留在自己 App 里，不再往设置 App 装 PreferenceLoader 载荷
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"设置"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onSettings:)];
     [self buildUI];
     [self loadData];
+}
+
+- (void)onSettings:(id)sender {
+    SettingsViewController *vc = [[SettingsViewController alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationFormSheet;
+    [self presentViewController:nav animated:YES completion:nil];
 }
 
 #pragma mark - 诊断
