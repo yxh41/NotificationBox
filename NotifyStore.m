@@ -19,6 +19,44 @@ static void NBStoreLog(NSString *fmt, ...) {
     else { [d writeToFile:NOTIFYBOX_LOG_PATH atomically:YES]; }
 }
 
+// ---------- 统一日志（tweak / App / 新模块共用） ----------
+// 🔴 从 Tweak.x 搬过来的，逻辑逐字保持：超过 512 KB 就切成 .1（覆盖上一份），
+//    避免长期运行把分区写满。用计数器节流：不是每次写都 stat，每 200 次看一眼。
+void NBSharedLog(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+
+    // 轮转检查（节流）
+    {
+        static int tick = 0;
+        tick++;
+        if ((tick % 200) == 1) {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSDictionary *a = [fm attributesOfItemAtPath:NOTIFYBOX_LOG_PATH error:nil];
+            if ([a[NSFileSize] unsignedLongLongValue] >= 512 * 1024) {
+                NSString *old = [NOTIFYBOX_LOG_PATH stringByAppendingString:@".1"];
+                [fm removeItemAtPath:old error:nil];
+                [fm moveItemAtPath:NOTIFYBOX_LOG_PATH toPath:old error:nil];
+            }
+        }
+    }
+
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:[NOTIFYBOX_LOG_PATH stringByDeletingLastPathComponent]
+  withIntermediateDirectories:YES attributes:nil error:nil];
+    NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:NOTIFYBOX_LOG_PATH];
+    if (fh) {
+        @try { [fh seekToEndOfFile]; [fh writeData:d]; }
+        @finally { [fh closeFile]; }
+    } else {
+        [d writeToFile:NOTIFYBOX_LOG_PATH atomically:YES];
+    }
+}
+
 @implementation NotifyStore
 
 + (void)ensureDir {

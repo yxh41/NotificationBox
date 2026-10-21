@@ -1,4 +1,4 @@
-// Tweak.x —— v0.0.11（当前）：过滤/替换已接线（0.0.8 起）+ 设置存 NotifyBox/settings.plist
+// Tweak.x —— v0.0.12（当前）：过滤/替换已接线（0.0.8 起）+ 设置存 NotifyBox/settings.plist
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
@@ -30,8 +30,9 @@
 #import "NotifyStore.h"
 #import "NotifyCommon.h"
 #import "NotifyFilter.h"
+#import "NotifySpeaker.h"
+#import "NotifyProbe.h"
 
-static NSString *const kNBLogPath = @"/var/mobile/Library/NotifyBox/tweak.log";
 
 static int gHit1 = 0;   // publishBulletin:destinations:
 static int gHit2 = 0;   // publishBulletinRequest:destinations:
@@ -47,39 +48,11 @@ static NSString *NBProc(void) {
     return p.length ? p : @"?";
 }
 
-// 日志超过 512 KB 就切成 .1（覆盖上一份），避免长期运行把分区写满。
-// 用计数器节流：不是每次写都 stat，每 200 次看一眼。
-static void NBRotateIfNeeded(void) {
-    static int tick = 0;
-    tick++;
-    if (tick % 200 != 1) return;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSDictionary *a = [fm attributesOfItemAtPath:kNBLogPath error:nil];
-    if ([a[NSFileSize] unsignedLongLongValue] < 512 * 1024) return;
-    NSString *old = [kNBLogPath stringByAppendingString:@".1"];
-    [fm removeItemAtPath:old error:nil];
-    [fm moveItemAtPath:kNBLogPath toPath:old error:nil];
-}
-
-static void NBLog(NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createDirectoryAtPath:[kNBLogPath stringByDeletingLastPathComponent]
-  withIntermediateDirectories:YES attributes:nil error:nil];
-    NBRotateIfNeeded();
-    NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kNBLogPath];
-    if (fh) {
-        @try { [fh seekToEndOfFile]; [fh writeData:d]; }
-        @finally { [fh closeFile]; }
-    } else {
-        [d writeToFile:kNBLogPath atomically:YES];
-    }
-}
+// 🔴 v0.0.12：日志实现搬到 NotifyStore.m 的 NBSharedLog（那个文件 tweak 与 App 都编），
+//    这里只留一个别名，全部调用点不用改。
+//    为什么不各留一份：Tweak.x 原来是 static NBLog，新加的 NotifySpeaker/NotifyProbe
+//    够不着它。复制一份日志函数是最差解 —— 两份轮转逻辑迟早走岔。
+#define NBLog NBSharedLog
 
 // ---------- 防御式取值：SpringBoard 里抛异常就等于崩，全部包 @try ----------
 
@@ -144,7 +117,16 @@ static BOOL NBClaimKey(NSString *key) {
 // sectionHint：能从参数直接拿到 sectionID 时优先用（最可靠）
 // 🔴 v0.0.8：返回**真正用来记录的那个 bundle**（可能是从 .bulletin 里兜出来的）。
 //    这样下游过滤判定用的 bundle 和库里存的是同一个值，不会出现「记的 A、判的 B」错位。
-static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int *counter) {
+//
+// 🔴 v0.0.12 新增 firstTime 出参（可为 NULL）：
+//    三个入口可能对同一条通知依次触发，去重表只会让**第一条**真正落库。
+//    但调用方仍然拿到 bid ⇒ 下游会跟着跑三次。
+//    这对「过滤/替换」无害（幂等：判三次、替换三次结果一样），
+//    对**朗读**是灾难 —— 用户会听见同一句话被读三遍。
+//    所以必须把"是不是首次"这个事实交出去，而不是让每个下游自己再猜一遍。
+static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
+                              int *counter, BOOL *firstTime) {
+    if (firstTime) *firstTime = NO;
     if (!obj) return nil;
 
     NSString *bid   = sectionHint.length ? sectionHint : NBSafeStr(obj, @"sectionID");
@@ -177,6 +159,8 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int 
     NSString *key = [NSString stringWithFormat:@"%@|%@|%@", bid, title ?: @"", msg ?: @""];
     if (!NBClaimKey(key)) return bid;      // 已被另一个入口记过；bundle 仍有效
 
+    if (firstTime) *firstTime = YES;       // 🔴 只有走到这里才算"首次"
+
     if (*counter < 10) {
         (*counter)++;
         NBLog(@"%@#%d bundle=%@ title=%@ msg=%@",
@@ -195,10 +179,17 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag, int 
 //    若先替换再判定，用户配了「把"红包"替换成空」又同时过滤"红包"时，过滤会永远不命中。
 static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counter) {
     // ① 记录（原文；被过滤也留档，方便回头查「本来要推什么」）
-    NSString *bid = NBRecordItem(obj, sectionHint, tag, counter);
+    BOOL firstTime = NO;
+    NSString *bid = NBRecordItem(obj, sectionHint, tag, counter, &firstTime);
     if (!bid.length) return YES;            // 认不出是哪个 App ⇒ 绝不拦
 
     @try {
+        // ①.5 只读探针（v0.0.12）：量 BBBulletin 的 sound/alertType 等量，
+        //     为下一版「按 App 换提示音」取数。内部自己限流（只前 3 条、且只 dump 一次）。
+        //     🔴 放在过滤判定**之前**：我要的是"原始对象长什么样"，
+        //        不能等替换改过字段之后再量。
+        if (firstTime) [NotifyProbe probeBulletin:obj tag:tag];
+
         NSString *t = NBSafeStr(obj, @"title");
         NSString *m = NBSafeStr(obj, @"message");
         NSString *s = NBSafeStr(obj, @"subtitle");
@@ -211,6 +202,9 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
                 NBLog(@"DROP#%d bundle=%@ tag=%@ title=%@",
                       gDropped, bid, tag, t.length ? t : @"(nil)");
             }
+            // 🔴🔴 被拦下的通知**不朗读**。
+            //    「别烦我」是用户配这条规则的全部意图 —— 屏幕上不弹、耳朵里却念出来，
+            //    那是最糟的组合：既没躲开，还更吵。所以朗读只能在 drop 判定之后。
             return NO;
         }
         // ③ 内容替换（只改呈现，库里留着原文）
@@ -219,11 +213,32 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
         //    若日志里从来没有 REPL 行，只有两种可能：①没配规则 ②入口传进来的对象
         //    没有 setTitle:/setMessage:（request 包装类常见）⇒ 是"对象不对"，不是"规则没读到"。
         //    这两种病因必须能分开，否则又是一轮盲猜。
-        if ([NotifyFilter applyReplaceRulesTo:obj]) {
+        BOOL replaced = [NotifyFilter applyReplaceRulesTo:obj];
+        if (replaced) {
             gReplaced++;
             if (gReplaced <= 8 || (gReplaced % 50) == 0) {
                 NBLog(@"REPL#%d bundle=%@ tag=%@ cls=%@",
                       gReplaced, bid, tag, NBClassName(obj));
+            }
+        }
+
+        // ④ 朗读（v0.0.12）
+        //
+        // 🔴 只在 firstTime 做：三个入口会依次触发，不判首次就会把同一句话读三遍。
+        // 🔴 读**替换后**的文字：替换规则的意义就是"让这条通知说人话"，
+        //    屏幕上改干净了、耳朵里还在念原来的骚扰词，等于只做了一半。
+        //    替换失败时退回原文（replaced==NO 就不重读，省两次 KVC）。
+        if (firstTime) {
+            NSString *st = t;
+            NSString *sm = m;
+            if (replaced) {
+                NSString *x = NBSafeStr(obj, @"title");
+                NSString *y = NBSafeStr(obj, @"message");
+                if (x) st = x;
+                if (y) sm = y;
+            }
+            if ([NotifySpeaker shouldSpeakBundle:bid title:st message:sm]) {
+                [NotifySpeaker speakWithBundle:bid title:st message:sm];
             }
         }
     } @catch (__unused NSException *e) {
@@ -288,13 +303,25 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.11", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.12", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
                                  withIntermediateDirectories:YES attributes:nil error:nil];
         [md writeToFile:mark atomically:YES];
     }
+
+    // 🔴🔴 v0.0.12：朗读自毁保护，必须排在任何 hook 之前。
+    //    如果上次是崩在朗读里，先把开关关掉再干别的 —— 否则这一轮开机又会崩一次，
+    //    用户陷入「开机→崩→安全模式→开机」的循环，连盒子 App 都进不去改设置。
+    BOOL recovered = [NotifySpeaker recoverFromCrashIfNeeded];
+
+    NBLog(@"=== [%@] NotifyBox v0.0.12 · %@ · 朗读自愈%@ ===",
+          NBProc(), [NotifySpeaker diagnosticLine],
+          recovered ? @"已触发" : @"无异常");
+
+    // 只读探针：dump 一次 BBBulletin / BBSound 的类结构（内部自己保证只做一次）
+    [NotifyProbe dumpClassesOnce];
 
     Class c = objc_getClass("BBServer");
     if (!c) {
@@ -319,7 +346,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.11 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.12 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -340,7 +367,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.11 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.12 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
