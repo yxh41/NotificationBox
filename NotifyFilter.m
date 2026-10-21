@@ -203,8 +203,26 @@ static NSString *NBSetterNameFor(NSString *key) {
             [key substringFromIndex:1]];
 }
 
+// 🔴🔴 v0.0.16 幂等标记：同一条通知会命中 2~3 个入口（PB / PBR / PBRS）。
+//    这是本项目的常识（日志里同一条通知往往有 PB + PBR 两行），但它在这里的后果是
+//    **延迟时间被乘了几倍**：每个入口都平移一次时间 ⇒ 填 5 秒实际会晚 10~15 秒，
+//    而用户完全看不出为什么（他会以为"延迟不准"，而不是"被推了三次"）。
+//    v0.0.14 的旧实现也有同一个问题（3 个定时器），当时列在候选因②里 —— 现在确认成立。
+//
+//    解：用**关联对象**打标记。选它的理由：
+//      ① 跟着对象生命周期走 —— 对象没了标记自动没，不会泄漏；
+//      ② 不需要额外的锁或全局表（这张表还要考虑线程安全，而 BB 的方法不一定在主线程）；
+//      ③ 不需要 weak 引用容器（NSHashTable 那种要自己管清理）。
+static const void *NBDelayMarkKey = &NBDelayMarkKey;
+
+// 返回：非空 = 真正改了哪些字段（幂等：同一对象只生效一次）
+//       空串  = 这一条**已经推过了**，本次跳过（不是失败，调用方照常执行原方法）
+//       nil   = 一个时间字段都没找到（也是安全失败）
 + (NSString *)applyDelayToBulletin:(id)bulletin seconds:(NSTimeInterval)seconds {
     if (!bulletin || !(seconds > 0)) return nil;
+
+    // 🔴 幂等闸门必须排在**所有写入之前**。
+    if (objc_getAssociatedObject(bulletin, NBDelayMarkKey)) return @"";
 
     NSMutableArray<NSString *> *done = [NSMutableArray array];
 
@@ -233,7 +251,14 @@ static NSString *NBSetterNameFor(NSString *key) {
         }
     }
 
-    return done.count ? [done componentsJoinedByString:@"+"] : nil;
+    // 🔴 只有真的改成功才打标记；一个字段都没改成 ⇒ 不打标记（让后面的入口再试一次，
+    //    它们传进来的对象可能已经不是同一个包装类了）。
+    if (done.count) {
+        objc_setAssociatedObject(bulletin, NBDelayMarkKey, @(seconds),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return [done componentsJoinedByString:@"+"];
+    }
+    return nil;
 }
 
 + (NSString *)probeTimeFieldsOfBulletin:(id)bulletin {

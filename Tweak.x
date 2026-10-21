@@ -42,6 +42,7 @@ static int gReplaced = 0;   // 内容替换真正改过字段的次数
 static int gDelayed = 0;    // 被延后发布的条数（v0.0.14）
 static int gDelayFired = 0; // 真的到点执行了原方法的条数（v0.0.14）
 static int gDelayMissed = 0; // v0.0.16：判定要延迟但没找到可写时间字段的条数
+static int gDelaySkipped = 0; // v0.0.16：多入口幂等跳过的条数（同一条通知命中 2~3 个入口）
 
 // 去重表：key -> 最后一次记录的时间戳
 static NSMutableDictionary *gRecent = nil;
@@ -87,6 +88,15 @@ static void NBLogDelayMissed(NSString *tag, NSTimeInterval sec, id bulletin) {
         NBLog(@"PROBEDATE#%d cls=%@ :: %@", gDelayMissed,
               bulletin ? NSStringFromClass([bulletin class]) : @"nil", desc);
     } @catch (__unused NSException *e) { }
+}
+
+// v0.0.16：同一条通知命中多个入口时，第 2、3 个入口会拿到"已经推过了"的空串。
+// 这条日志的价值：**证明幂等真的生效了**。
+// 反过来说，如果填 5 秒实际晚了 10 秒，这里一定缺 SKIP 行 —— 一眼就能分开
+// 「幂等没生效」和「系统自己又拖了」。
+static void NBLogDelaySkipped(NSString *tag) {
+    gDelaySkipped++;
+    NBLog(@"DELAY-SKIP#%d tag=%@ 这一条已经推过了（多入口幂等）", gDelaySkipped, tag);
 }
 
 // ---------- 延迟推送的崩溃自愈（v0.0.15） ----------
@@ -400,8 +410,10 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         // 🔴 关键：下面的 orig 是**无条件、立即**执行的（不 return、不等待）。
         //    改字段失败也只是"没延迟"，绝不能因此吞掉通知。
         NSString *moved = [NotifyFilter applyDelayToBulletin:bulletin seconds:d.delay];
-        if (moved) {
+        if (moved.length) {
             NBLogDelayApplied(@"PB", d.delay, moved);
+        } else if (moved) {
+            NBLogDelaySkipped(@"PB");        // 空串 = 多入口幂等跳过（不是失败）
         } else {
             NBLogDelayMissed(@"PB", d.delay, bulletin);
         }
@@ -420,8 +432,10 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     if (d.delay > 0) {
         // 见入口 1 的说明：改时间字段 + 立即调原方法，绝不 dispatch_after
         NSString *moved = [NotifyFilter applyDelayToBulletin:request seconds:d.delay];
-        if (moved) {
+        if (moved.length) {
             NBLogDelayApplied(@"PBR", d.delay, moved);
+        } else if (moved) {
+            NBLogDelaySkipped(@"PBR");        // 空串 = 多入口幂等跳过（不是失败）
         } else {
             NBLogDelayMissed(@"PBR", d.delay, request);
         }
@@ -445,8 +459,10 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     if (d.delay > 0) {
         // 见入口 1 的说明：改时间字段 + 立即调原方法，绝不 dispatch_after
         NSString *moved = [NotifyFilter applyDelayToBulletin:request seconds:d.delay];
-        if (moved) {
+        if (moved.length) {
             NBLogDelayApplied(@"PBRS", d.delay, moved);
+        } else if (moved) {
+            NBLogDelaySkipped(@"PBRS");        // 空串 = 多入口幂等跳过（不是失败）
         } else {
             NBLogDelayMissed(@"PBRS", d.delay, request);
         }

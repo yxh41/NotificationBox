@@ -973,3 +973,107 @@ INSERT 失败 rc=5 err=database is locked bundle=com.lemon.lv
 4. 三个延迟分支都写了自毁标记 `start`，且 `%ctor` 调了自愈 + 清理。
 
 脚本**自带负向对照**（`--selftest`）：把 `NO` 改成 `YES` 必须报红，已验证会拦住。
+
+---
+
+## v0.0.16 · 延迟推送换实现重开（拿到 .ips 之后）
+
+### 一、崩溃原因定案：不是"哪条候选因"，是整条路不通
+
+用户提供了 `.ips`（bug_type 309，SpringBoard 主线程）。故障线程栈：
+
+```
+ 0  libdispatch     _dispatch_assert_queue_fail          + 120
+ 1  libdispatch     dispatch_assert_queue                + 196
+ 2  BulletinBoard   -[BBServer dataProviderForSectionID:] + 44   ← 方法开头就断言
+ 3  <dylib>         0x7858
+ 4  <dylib>         0xc0f0
+ 5  <dylib>         0x49f8   ← GCD 定时器 fire 出来的 block
+ 6  libdispatch     _dispatch_client_callout
+ 8  libdispatch     _dispatch_source_invoke
+ 9  libdispatch     _dispatch_main_queue_drain          ← 主队列
+11  CoreFoundation  __CFRUNLOOP_IS_SERVICING_THE_MAIN_DISPATCH_QUEUE__
+```
+
+`-[BBServer dataProviderForSectionID:]` 在偏移 **+44**（几乎第一件事）就调
+`dispatch_assert_queue(<BB 私有串行队列>)`。而调用它的代码是从**主队列的 GCD 定时器**
+里跑出来的 ⇒ 断言当场落空 ⇒ `EXC_BREAKPOINT` / `SIGTRAP`。
+
+> 🔴🔴 最贵的推论：**「延迟调用原方法」这条整体没有可行解**。
+> 换队列也没救 —— 主队列不对、自己开串行队列更不对，
+> **唯一正确的那个队列句柄只活在 BBServer 内部，外面根本拿不到**。
+> 所以「把 `%orig` 塞进某个 `dispatch_after`」不是"还没调好"，是**永远调不好**。
+
+**顺带一个诚实的记录**：这份 .ips 的故障栈里 `NotifyBox.dylib` **零帧**
+（168 个镜像、全部线程全扫），发起方是机器上另一个插件 `NotificationFilter.dylib`。
+但"这份日志不是我" ≠ "我的代码没问题" —— 上面那条队列断言说明我们的延迟分支
+一旦真跑起来会死在同一处。停用的决定与"谁发的"无关。
+
+### 二、新实现：不改调用时机，只改数据
+
+```objc
+// NotifyFilter.m
++ (NSString *)applyDelayToBulletin:(id)bulletin seconds:(NSTimeInterval)seconds;
+```
+
+把 bulletin 上**像发布时间**的字段整体平移 N 秒，然后**立刻、在同一线程**执行原方法，
+让系统自己按新时间排期：
+
+| 字段 | 说明 |
+|---|---|
+| `date` | 头文件里早就有声明，但真机从未验证过 |
+| `publicationDate` / `publishDate` / `timestamp` | 候选 |
+| `expirationDate` | 一起平移 —— 只推 date 不推它，通知可能"已过期"而不显示 |
+
+**三重保护**（每条都对应一种真实失败模式）：
+
+1. `respondsToSelector:@selector(setXxx:)` —— readonly 字段硬写就是抛异常 = 崩；
+2. `respondsToSelector:@selector(xxx)` + 当前值 `isKindOfClass:[NSDate class]`
+   —— 类型对不上说明这个字段不是时间，**不动手**（改错字段的代价是"通知永远不出现"）；
+3. 每个键**单独 `@try`** —— KVC 碰到不存在的键会抛 `NSUndefinedKeyException`，
+   共用一个 `@try` 的话第一个抛错会带走后面所有键（这个坑在 `NotifyProbe` 里已经踩过）。
+
+三个 hook 的形状统一成：
+
+```objc
+if (d.delay > 0) {
+    NSString *moved = [NotifyFilter applyDelayToBulletin:bulletin seconds:d.delay];
+    if (moved) NBLogDelayApplied(@"PB", d.delay, moved);
+    else       NBLogDelayMissed(@"PB", d.delay, bulletin);
+}
+%orig(bulletin, destinations);      // 🔴 无条件、立即
+```
+
+**没有 `dispatch_after`、没有 `return`、没有跨时间的对象持有。**
+改字段失败只是"没延迟"（安全失败），绝不吞掉通知。
+
+### 三、留痕拆成两条（它们对应的下一步完全相反）
+
+| 日志 | 含义 | 下一动作 |
+|---|---|---|
+| `DELAY#n tag=PB 5.0s 字段=date+expirationDate` | 改动成功，系统会晚点弹 | 看通知是否真的晚了 |
+| `DELAY-MISS#n tag=PB ...` | 要延迟但**一个字段都没改成**，本条按时发布 | 看紧跟的 `PROBEDATE#` |
+| `PROBEDATE#n cls=BBBulletin :: date{T@"NSDate"}=NSDate(1761...)` | 该对象上所有含 date/time 的属性名 + 类型编码 + 当前值 | 按真实字段名定案 |
+
+`DELAY-FIRE#` 这个留痕**已经删掉** —— 它的语义是"N 秒之后再去执行原方法"，
+正是被判死刑的那条路。校验脚本把它列为**反向断言**：它出现就说明有人走回去了。
+
+### 四、闸门 `nb_delay_gate.py` 整份重写
+
+判据从"必须停用"反转成"不许跨队列"，六条：
+
+1. `kDelayEnabled = YES`（否则界面写着能用、实际什么都不做）；
+2. 三个 hook 的方法体里**不许出现 `dispatch_after`** —— 死因本身；
+3. 延迟分支里**不许有 `return`** —— 有 return 就说明它不想立刻执行原方法了；
+4. 三个 hook 都必须调 `applyDelayToBulletin:`；
+5. `applyDelayToBulletin:` 三重保护齐全；
+6. 三个 hook 方法体的**最后一句**必须是 `%orig(...)`。
+
+负向对照：往 PB 方法体塞一句 `dispatch_after` 必须报红，已验证。
+
+> 🔴 修闸门时又踩一个坑：它原来 `body = s[i:i+2000]` 取**固定 2000 字符窗口**，
+> 我往 `shouldDelayBundle:` 里补了 13 行注释把门语句挤出了窗口 ⇒ **假红**。
+> 改成按方法边界切（到下一个 `\n+ (` / `\n- (` / `\n@end`）。
+> 老话重提：**判据域必须等于变异域**，"取前 N 字符"本身就是一种判据域。
+> 另外闸门现在会**先剥掉 `//` 注释再查** —— 注释里写着"旧实现是 dispatch_after"
+> 是在留教训，不该被当成现行代码。
