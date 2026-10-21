@@ -121,25 +121,38 @@
     //   三个 hook 的延迟分支都靠它把关 ⇒ 就算 settings.plist 里还留着 delaySeconds，
     //   也不会有任何一条通知被攒进 block。
     //
-    //   停用原因（真机实测，2026-10-21 15:51:30）：
-    //     SpringBoard 崩在 EXC_BREAKPOINT (SIGTRAP)，系统报
-    //     "The Swift runtime trapped: fatalError / failed precondition /
-    //      force-unwrapped nil / array index out of range" ⇒ 进安全模式。
-    //   发生条件 = 打开延迟推送之后。
+    //   停用原因（真机实测，2026-10-21 15:51:27）：SpringBoard 崩在
+    //     EXC_BREAKPOINT (SIGTRAP)，系统报 "The Swift runtime trapped:
+    //     fatalError / failed precondition / force-unwrapped nil /
+    //     array index out of range" ⇒ 进安全模式。
     //
-    //   为什么"攒起来 N 秒后再调原方法"这条路本身不牢（两条都还没排除）：
-    //     ① 对象生命周期：调用方在同步返回后可能已经把 BBBulletinRequest 作废/消费掉了
-    //        （日志里 REPL 行显示这类对象确实是 cls=BBBulletinRequest）。
-    //        N 秒后再拿它去发布 ⇒ 内部 force unwrap 到 nil 就是 SIGTRAP。
-    //     ② 同一条通知会命中 2~3 个入口（PB/PBR/PBRS）：同步时它们挤在同一毫秒、
-    //        由 BBServer 自己合并；延迟后变成 3 个独立定时任务去发布**同一个对象** ⇒
-    //        第一个发布之后就可能是"用已经消费过的对象再发一次"。
-    //     ③ 线程/队列：这三个方法大概率跑在 BulletinBoard 自己的串行队列上，
-    //        我们从主队列回调进去，可能踩到内部 queue/actor 前置条件
-    //        （"failed precondition" 正好是这个形状）。
-    //   ⇒ 恢复前必须先拿到崩溃 .ips 的故障线程栈，确认上面哪一条成立；
-    //     并把 kDelayEnabled 打开、只对**单个入口**、单个 App 做最小实验
-    //     （自毁保护已经在 Tweak.x 里就位，实验最多崩一次）。
+    //   🔴🔴🔴 2026-10-21 16:10 拿到 .ips 后的定论 ——
+    //     不是"上面某一条候选因成立"，而是「**延迟调用原方法**」这一类做法**整体走不通**。
+    //
+    //   故障线程栈（真实 .ips，主线程 com.apple.main-thread）：
+    //      0  libdispatch   _dispatch_assert_queue_fail         + 120
+    //      1  libdispatch   dispatch_assert_queue                + 196
+    //      2  BulletinBoard -[BBServer dataProviderForSectionID:] + 44  ← 方法开头就断言
+    //      3  <dylib>       0x7858
+    //      4  <dylib>       0xc0f0
+    //      5  <dylib>       0x49f8   ← GCD 定时器 fire 出来的 block
+    //      6  libdispatch   _dispatch_client_callout
+    //      8  libdispatch   _dispatch_source_invoke
+    //      9  libdispatch   _dispatch_main_queue_drain          ← 主队列
+    //
+    //   ⇒ 病因 = **队列前置条件**。BBServer 的方法在动手前会
+    //     dispatch_assert_queue(<BB 私有串行队列>)，而那个队列句柄只活在 BBServer 内部，
+    //     外面拿不到。把原方法搬到 dispatch_get_main_queue() 上执行 ⇒ 断言落空 ⇒ SIGTRAP。
+    //   ⇒ 最贵的推论：**换队列也没救**。主队列不对，自己开串行队列更不对，
+    //     唯一正确的那个队列我们拿不到 ⇒ 不要再试图"把原方法塞进某个 dispatch_after"。
+    //   ⇒ 正确方向：**不延迟调用，只把通知的发布时间往后写** ——
+    //     照常在**同一线程、同一次调用**里执行原方法，只把 bulletin 上的时间字段
+    //     （date / publicationDate 之类，具体名字待 PROBE 探针确认）改成 now+N，
+    //     让**系统自己**在 N 秒后弹。纯数据修改：不跨队列、不持有对象、不重复发布。
+    //   ⇒ 顺带记一笔：这份 .ips 的故障栈里 **NotifyBox.dylib 一帧都没有**
+    //     （168 个镜像、全部线程全扫），发起方是另一个插件 NotificationFilter.dylib。
+    //     但"这份日志不是我" ≠ "我的代码没问题" —— 上面那条队列断言说明我的延迟分支
+    //     一旦真跑起来会死在同一处。停用的决定与"谁发的"无关。
     static const BOOL kDelayEnabled = NO;
     if (!kDelayEnabled) return NO;
 
