@@ -167,6 +167,15 @@ static void NBStoreLog(NSString *fmt, ...) {
     sqlite3_close(db);
 }
 
++ (NSDictionary *)settings {
+    return NBLoadSettings();
+}
+
++ (BOOL)saveSettings:(NSDictionary *)settings {
+    [self ensureDir];       // settings.plist 与 DB 同目录，目录建好就能写
+    return [(settings ?: @{}) writeToFile:NOTIFYBOX_SETTINGS_PATH atomically:YES];
+}
+
 + (NSInteger)count {
     sqlite3 *db = [self openDB];
     if (!db) return -1;
@@ -222,6 +231,29 @@ static void NBStoreLog(NSString *fmt, ...) {
         [fm fileExistsAtPath:NOTIFYBOX_DB_PATH] ? @"是" : @"否",
         [da[NSFileSize] unsignedLongLongValue], (long)[self count]];
 
+    // 🔴 记录数被 maxRecords 顶在上限时，「数」是死的（永远等于上限），看不出还在不在收。
+    //    「最新一条的时间」才看得出 —— 这也是判断「是不是早就断了」的唯一硬指标。
+    NSTimeInterval latest = 0;
+    sqlite3 *ldb = [self openDB];
+    if (ldb) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(ldb, "SELECT MAX(ts) FROM notifications;", -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL) {
+                latest = sqlite3_column_double(st, 0);
+            }
+            sqlite3_finalize(st);
+        }
+        sqlite3_close(ldb);
+    }
+    if (latest > 0) {
+        NSDate *d = [NSDate dateWithTimeIntervalSince1970:latest];
+        NSTimeInterval age = [[NSDate date] timeIntervalSinceDate:d];
+        [s appendFormat:@"  最新一条=%@  （%.0f 分钟前）\n",
+            d, age / 60.0];
+    } else {
+        [s appendString:@"  最新一条=(读不到)\n"];
+    }
+
     [s appendFormat:@"\n── 日志 ──\n%@\n", NOTIFYBOX_LOG_PATH];
     NSDictionary *la = [fm attributesOfItemAtPath:NOTIFYBOX_LOG_PATH error:nil];
     BOOL logExists = (la != nil);
@@ -247,10 +279,12 @@ static void NBStoreLog(NSString *fmt, ...) {
     // dylib 装在哪：优先用 tweak 自己用 dladdr 报出来的路径（roothide 会重定向前缀，
     // App 侧猜路径基本猜不中），猜不到才退回逐个探测。
     [s appendString:@"\n── dylib 安装位置 ──\n"];
+    NSString *dylibPath = nil;
     NSRange dr = mtxt ? [mtxt rangeOfString:@"dylib="] : NSMakeRange(NSNotFound, 0);
     if (dr.location != NSNotFound) {
         NSString *p = [[mtxt substringFromIndex:dr.location + dr.length]
                        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        dylibPath = p;
         NSDictionary *a = [fm attributesOfItemAtPath:p error:nil];
         [s appendFormat:@"  ✅ %@\n     %llu B（由 tweak 自己上报，最可靠）\n", p,
             [a[NSFileSize] unsignedLongLongValue]];
@@ -267,6 +301,7 @@ static void NBStoreLog(NSString *fmt, ...) {
                 NSDictionary *a = [fm attributesOfItemAtPath:p error:nil];
                 [s appendFormat:@"  ✅ %@  %llu B\n", p, [a[NSFileSize] unsignedLongLongValue]];
                 anyDylib = YES;
+                if (!dylibPath) dylibPath = p;
             }
         }
         if (!anyDylib) {
@@ -275,19 +310,42 @@ static void NBStoreLog(NSString *fmt, ...) {
     }
 
     [s appendString:@"\n── 注入过滤器 ──\n"];
-    NSArray *plists = @[
+    // 🔴🔴 v0.0.9：判据改成「跟 tweak 上报的 dylib **同目录**的 NotifyBox.plist」。
+    //    上一版把候选路径写死在 /var/jb/... 与 /Library/...，而 roothide 实际把它放在
+    //    .../.jbroot-XXXX/usr/lib/TweakInject/ 里 ⇒ 永远猜不中 ⇒ 界面上一直显示
+    //    「未读到过滤器 plist」。**那是假红灯：判据写死路径造成的，不是安装有问题。**
+    //    教训：凡是「换个环境就换个位置」的东西，判据必须**从已知的真实位置推导**，不能写死。
+    NSMutableArray<NSString *> *plists = [NSMutableArray array];
+    if (dylibPath.length) {
+        [plists addObject:[[dylibPath stringByDeletingLastPathComponent]
+                           stringByAppendingPathComponent:@"NotifyBox.plist"]];
+    }
+    [plists addObjectsFromArray:@[
         @"/var/jb/Library/MobileSubstrate/DynamicLibraries/NotifyBox.plist",
         @"/Library/MobileSubstrate/DynamicLibraries/NotifyBox.plist",
-    ];
+        @"/usr/lib/TweakInject/NotifyBox.plist",
+    ]];
     BOOL anyPl = NO;
     for (NSString *p in plists) {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
         if (d) {
-            [s appendFormat:@"  ✅ %@ ⇒ %@\n", p, d[@"Filter"] ?: @"(无 Filter 键)"];
+            id filt = d[@"Filter"];
+            NSString *ftxt = @"(无 Filter 键)";
+            if ([filt isKindOfClass:[NSDictionary class]]) {
+                id bundles = ((NSDictionary *)filt)[@"Bundles"];
+                if ([bundles isKindOfClass:[NSArray class]]) {
+                    ftxt = [(NSArray *)bundles componentsJoinedByString:@","];
+                }
+            }
+            [s appendFormat:@"  ✅ %@\n     Filter.Bundles = %@\n", p, ftxt];
             anyPl = YES;
+            break;      // 找到一份就够，别把三份都打印出来占屏
         }
     }
-    if (!anyPl) [s appendString:@"  ❓ 未读到过滤器 plist\n"];
+    if (!anyPl) {
+        [s appendFormat:@"  ❓ 同目录也没找到 NotifyBox.plist（dylib 目录=%@）\n",
+            dylibPath.length ? [dylibPath stringByDeletingLastPathComponent] : @"未知"];
+    }
 
     // 🔴 v0.0.8：设置到底有没有被读到 —— 这一段是「设置改了不生效」类问题的第一判据
     [s appendString:@"\n── 设置（settings.plist） ──\n"];

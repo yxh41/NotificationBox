@@ -22,6 +22,12 @@ NS_ASSUME_NONNULL_BEGIN
 + (void)markRead:(NSInteger)rowId;
 + (void)clearAll;
 
+// 设置（App 侧的**唯一**读写入口；tweak 侧读走 NotifyCommon.h 的 NBLoadSettings）
+// 🔴 统一在这里写，别让每个 VC 各写一遍 writeToFile: —— 写入点一多，
+//    "某个页面写了、另一个页面没写" 这类 bug 就必然出现。
++ (NSDictionary *)settings;
++ (BOOL)saveSettings:(NSDictionary *)settings;
+
 // 自检（盒子 App 空列表时直接显示，用来判断沙盒可达性）
 + (NSInteger)count;
 + (NSString *)debugSummary;

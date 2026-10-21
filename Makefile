@@ -27,7 +27,7 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 #      写错时 application.mk 拿不到实例 ⇒ **静默跳过、不报错**，deb 里就没有 App。
 APPLICATION_NAME = NotifyBoxApp
 # 🔴 盒子 App 也要编进 NotifyStore.m（ViewController 调它），否则链接时全是 undefined symbols
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m NotifyStore.m
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m NotifyStore.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
 NotifyBoxApp_FRAMEWORKS = UIKit Foundation MobileCoreServices
 NotifyBoxApp_CFLAGS = -fobjc-arc -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations

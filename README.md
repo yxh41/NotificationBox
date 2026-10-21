@@ -390,3 +390,81 @@ return [[v componentsSeparatedByString:@","] valueForKey:@"stringByTrimmingChara
 - **白名单一旦填了就等于「只保留这些 App」**，其它全不弹 —— 这是它的语义，但杀伤力大，用前想清楚；
 - 想彻底关掉：设置页清空全部字段后保存，或直接删 `settings.plist`。
 
+## 取包方式（v0.0.8 起，不需要 PAT）
+
+CI 现在多一步 `Publish deb to ci-deb branch`：用 CI 内置的 `GITHUB_TOKEN` 把 deb 推到公开分支 `ci-deb`。
+
+```
+https://raw.githubusercontent.com/yxh41/NotificationBox/ci-deb/com.yxh41.notifybox_0.0.8_iphoneos-arm64e.deb
+```
+
+- 浏览器直接看分支：`https://github.com/yxh41/NotificationBox/tree/ci-deb`
+- ⚠️ `raw.githubusercontent.com` 在国内常常连不上（实测本机 `curl` 直接被 reset）。
+  连不上就走网页版分支页下载，或继续用 Actions 页面的 artifact。
+- artifact 的 API `/zip` 端点**必须鉴权**（匿名 401）；`nightly.link` 可匿名取，
+  **对 failed run 里已上传的 artifact 也有效** —— 但必须用包内版本号自证不是拿了旧包。
+
+### 这一步踩过的坑
+
+```bash
+DEB=$(ls packages/*.deb | head -1)   # 相对路径
+cd /tmp/pub
+cp "$DEB" .                          # ← 先 cd 后 cp，相对路径失效
+```
+报 `cp: packages/....deb: No such file or directory`，而文件明明存在。
+修法：`DEB=$(ls "$GITHUB_WORKSPACE"/packages/*.deb | head -1)`，且 `cp` 放在 `cd` 之前。
+🔴 通用规律：**shell 里「先 cd 再引用旧相对路径」都是雷**；出现"文件不存在"但文件确实在，先查 cwd。
+
+🔴 另一个教训：`conclusion=failure` 是整条 workflow 的与门，**必须看是哪个 step 红了**。
+那次 `Build package` 和 `Upload deb` 都是 success，失败的只是我新加的便利步骤
+⇒ **包本身是好的**。加"便利步骤"的代价就是会把原本全绿的流水线弄红，要有心理准备。
+
+## v0.0.9（内容替换规则可编辑 + 诊断修正）
+
+v0.0.8 真机自检通过（记录数 800 顶在上限、设置读到 `blockKeywords=限时`、tweak 注入 ✅），
+但截图里暴露出一个**假红灯**和一个判据缺口，这版一起修，同时补上第一个真正可用的「进阶功能」。
+
+### 🔴 假红灯：「未读到过滤器 plist」
+
+自检里 dylib 位置显示 ✅（tweak 用 `dladdr` 自报 `.../.jbroot-D50FC3217E2182E5/usr/lib/TweakInject/NotifyBox.dylib`），
+但下一段「注入过滤器」却报 ❓ —— 因为候选路径写死成 `/var/jb/...` 和 `/Library/...`。
+
+> **tweak 早就把真实路径上报了，我却在下一个检查项里又回去猜路径。**
+> 同一个「猜路径」的错，在同一个函数里犯了两次。
+
+修法：用上报路径的 `stringByDeletingLastPathComponent + "NotifyBox.plist"`，猜不到才退回候选。
+**通用规律：凡是「换个环境就换个位置」的东西，判据必须从已知的真实位置推导，不能写死。**
+
+### 判据缺口：记录数顶在上限时，「数」是死的
+
+`记录数=800` 而 `maxRecords=800` ⇒ 这个数永远等于上限，**看不出还在不在收**。
+新增「**最新一条=…（N 分钟前）**」（`SELECT MAX(ts)`）—— 这才是「是不是早就断了」的硬指标。
+
+### 新功能
+
+| 功能 | 说明 |
+|---|---|
+| **内容替换规则编辑** | 设置 →「内容替换规则」：列表 + 添加/左滑删除，`from → to`；引擎（0.0.8 已接线）直接消费 |
+| **清空全部记录** | `NotifyStore.clearAll` 一直有实现却**没有任何入口**（又一例死代码），这版接上，带二次确认 |
+| `REPL#` 日志 | 替换生效的唯一证据；进「结论行」 |
+| `DROP#` 进「结论行」 | 过滤真拦过的唯一证据 |
+| 统一设置写入点 | `NotifyStore +settings / +saveSettings:`，避免每个 VC 各写一遍 `writeToFile:` |
+
+### 🔴 为什么替换必须留 `REPL#` 日志
+
+替换是**静默**的：配了规则没生效，界面上完全看不出来。日志里从来没有 `REPL#` 只有两种可能：
+
+1. 没配规则 → 看「设置」段的生效项里有没有 `replaceRules`；
+2. 入口传进来的对象**没有 `setTitle:`/`setMessage:`**（request 包装类常见）⇒ 是「对象不对」，不是「规则没读到」。
+
+这两种病因必须能分开，否则又是一轮盲猜。
+
+### 死代码清单（同一个坑反复出现，记在这里）
+
+| 符号 | 状态 |
+|---|---|
+| `NotifyFilter` 全套 | 0.0.7 及以前**从未被调用**（0.0.8 接线） |
+| `arrayFromPref:` 的 KVC 写法 | 会抛 `NSUndefinedKeyException`，因是死代码才没炸（0.0.8 修） |
+| `NotifyStore.clearAll` | 0.0.9 前**没有任何 UI 入口**（0.0.9 接上） |
+
+> 结论：**「代码在包里」不等于「代码在链路上」**。每接一条新链路，都要把那段当新代码重读一遍。

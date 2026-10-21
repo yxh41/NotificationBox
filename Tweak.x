@@ -1,4 +1,4 @@
-// Tweak.x —— v0.0.8 过滤/替换接线（三入口共用 NBPipeline）+ 设置文件改到 NotifyBox/settings.plist
+// Tweak.x —— v0.0.9（当前）：过滤/替换已接线（0.0.8 起）+ 设置存 NotifyBox/settings.plist
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
@@ -36,7 +36,8 @@ static NSString *const kNBLogPath = @"/var/mobile/Library/NotifyBox/tweak.log";
 static int gHit1 = 0;   // publishBulletin:destinations:
 static int gHit2 = 0;   // publishBulletinRequest:destinations:
 static int gHit3 = 0;   // _publishBulletinRequest:forSectionID:forDestinations:
-static int gDropped = 0;   // 被过滤掉（没有交给原方法）的条数
+static int gDropped = 0;    // 被过滤掉（没有交给原方法）的条数
+static int gReplaced = 0;   // 内容替换真正改过字段的次数
 
 // 去重表：key -> 最后一次记录的时间戳
 static NSMutableDictionary *gRecent = nil;
@@ -213,7 +214,18 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
             return NO;
         }
         // ③ 内容替换（只改呈现，库里留着原文）
-        [NotifyFilter applyReplaceRulesTo:obj];
+        //
+        // 🔴 这里必须留痕：替换是"静默"的 —— 配了规则没生效，界面上完全看不出来。
+        //    若日志里从来没有 REPL 行，只有两种可能：①没配规则 ②入口传进来的对象
+        //    没有 setTitle:/setMessage:（request 包装类常见）⇒ 是"对象不对"，不是"规则没读到"。
+        //    这两种病因必须能分开，否则又是一轮盲猜。
+        if ([NotifyFilter applyReplaceRulesTo:obj]) {
+            gReplaced++;
+            if (gReplaced <= 8 || (gReplaced % 50) == 0) {
+                NBLog(@"REPL#%d bundle=%@ tag=%@ cls=%@",
+                      gReplaced, bid, tag, NBClassName(obj));
+            }
+        }
     } @catch (__unused NSException *e) {
         // 兜底一律放行：宁可多推一条，也不要把通知吞掉
     }
@@ -276,7 +288,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.8", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.9", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -307,7 +319,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.8 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.9 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -328,7 +340,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.8 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.9 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

@@ -130,7 +130,9 @@
     NSArray *all = [text componentsSeparatedByString:@"\n"];
     NSMutableArray *keep = [NSMutableArray array];
     // 这些是判据行；不含它们的（比如 sel 清单）不在这里显示
+    // 🔴 DROP# / REPL# 是「过滤真的拦了」「替换真的改了」的唯一证据，必须进结论行
     NSArray *keys = @[@"===", @"-->", @"hit#", @"P#", @"drop ",
+                      @"DROP#", @"REPL#",
                       @"APP-ALIVE", @"G3 首次", @"失败", @"!!!", @"探针"];
     for (NSString *line in all) {
         if (!line.length) continue;
