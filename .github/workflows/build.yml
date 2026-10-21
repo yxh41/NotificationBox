@@ -62,17 +62,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          DEB=$(ls packages/*.deb | head -1)
+          # 🔴 必须用**绝对路径**：下面会 cd 到 /tmp/pub，相对路径就失效了。
+          #    上一版就是栽在这 —— 先 cd 再 cp，报 "No such file or directory"。
+          DEB=$(ls "$GITHUB_WORKSPACE"/packages/*.deb | head -1)
           NAME=$(basename "$DEB")
           SHORT=$(git rev-parse --short HEAD)
           echo "发布：$NAME  (commit $SHORT)"
 
           rm -rf /tmp/pub && mkdir -p /tmp/pub
+          cp "$DEB" /tmp/pub/
           cd /tmp/pub
           git init -q -b ci-deb
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          cp "$DEB" .
           {
             echo "本分支由 CI 自动发布，请勿手改。"
             echo "commit: $SHORT"
