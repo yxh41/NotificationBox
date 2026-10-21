@@ -178,21 +178,12 @@ static NSMutableArray<NSNumber *> *NBZeroArray(NSUInteger n) {
 }
 
 - (void)updateEmptyHint {
-    if (self.rules.count) {
-        self.table.backgroundView = nil;
-        return;
-    }
-    UILabel *l = [[UILabel alloc] init];
-    l.numberOfLines = 0;
-    l.textAlignment = NSTextAlignmentCenter;
-    l.font = [UIFont systemFontOfSize:13];
-    l.textColor = [UIColor secondaryLabelColor];
-    l.text = @"还没有规则\n\n点右上角 + 添加。\n"
-             @"例：把「限时」替换成空 ⇒ 通知里这个词就消失了\n"
-             @"（盒子里仍然保留原文，方便回溯）\n\n"
-             @"规则一多，顺序就有影响 —— 加完看每条的统计，\n"
-             @"上面那块「试运行」可以直接输入文字看效果。";
-    self.table.backgroundView = l;
+    // 🔴 这里**不能**再用 table.backgroundView 显示空状态提示。
+    //    v0.0.9~v0.0.13 是那样写的，因为那时整页只有规则列表，空表 = 整页空白。
+    //    v0.0.14 起页面顶部永远有「试运行」两行 ⇒ backgroundView 是**衬在 cell 后面**的，
+    //    提示文字只会从分组之间的缝隙里露出来一角，看着像渲染坏了。
+    //    空状态的说明改放到规则那一节的 footer 里（见 titleForFooterInSection:）。
+    self.table.backgroundView = nil;
 }
 
 #pragma mark - 保存
@@ -512,7 +503,13 @@ static NSMutableArray<NSNumber *> *NBZeroArray(NSUInteger n) {
         return @"输入一段文字，看下面这些规则会把它改成什么。"
                @"真实通知里会对「标题」「正文」「副标题」三个字段各套一遍，三个字段互不影响。";
     }
-    if (section == kSecRules && self.rules.count) {
+    if (section == kSecRules) {
+        if (!self.rules.count) {
+            // 空状态就写在这里：页面顶部永远有「试运行」，所以不能用 backgroundView
+            return @"还没有规则 —— 点右上角 + 添加。\n"
+                    "例：把「限时」替换成空，通知里这个词就消失了（盒子里仍保留原文）。\n"
+                    "规则一多，顺序就有影响：加完看每条的统计，也可以在下面输入文字试运行。";
+        }
         NSMutableString *s = [NSMutableString string];
         if (!self.statsReady) {
             [s appendString:@"正在统计历史命中情况…"];
@@ -685,7 +682,15 @@ static NSMutableArray<NSNumber *> *NBZeroArray(NSUInteger n) {
     if ((NSUInteger)indexPath.row >= self.rules.count) return;      // 防御：行号越界直接不动
     [self.rules removeObjectAtIndex:(NSUInteger)indexPath.row];
     [self persist];
-    [self reload];
+    // 🔴 这里**不能**用 deleteRowsAtIndexPaths: 做局部删除。
+    //    删掉最后一条规则时，kSecAction 那一节的行数也会从 1 变成 0
+    //    （numberOfRowsInSection: 是按 rules.count 算的），局部删除就把两节的行数
+    //    交代不平 ⇒ "Invalid update: invalid number of rows" 断言 ⇒ 闪退。
+    // 🔴 也不要同步 reloadData：删除事务还没提交完，有的 iOS 版本会把左滑状态卡住。
+    //    推到下一轮 runloop 整表刷，差一帧，看不出来。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self reload];       // 行号要重排（#1 #2 #3）+ 统计要重算 + 空状态要更新
+    });
 }
 
 #pragma mark - 输入框
