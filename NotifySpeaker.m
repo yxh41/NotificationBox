@@ -162,12 +162,35 @@ static AVSpeechSynthesizer *gSynth = nil;
         NBWriteGuard(@"failed");
         return;
     }
-    u.rate = AVSpeechUtteranceDefaultSpeechRate;
+
+    // ---------- 语音与语速（v0.0.13）----------
+    // 每次朗读都重新读设置：用户在设置页改完立刻生效，不需要 respring。
+    // 这点 IO 相比"改完不生效"的代价可以忽略。
+    NSDictionary *cfg = NBLoadSettings();
+
+    id rid = cfg[NB_KEY_SPEAK_RATE];
+    float rate = [rid isKindOfClass:[NSNumber class]] ? [(NSNumber *)rid floatValue]
+                                                      : AVSpeechUtteranceDefaultSpeechRate;
+    // 🔴 必须夹范围。设置文件是可以手改的，也可能因为别的原因出现 0 或 5：
+    //    • rate=0 ⇒ 几乎不动，用户以为"朗读没声音"
+    //    • rate>1 ⇒ 系统行为未定义，可能极快或直接不出声
+    //    这两种都属于"看起来像功能坏了"的错，而原值其实还在文件里，极难查。
+    if (rate < 0.20f || rate > 1.00f) rate = AVSpeechUtteranceDefaultSpeechRate;
+    u.rate = rate;
+
+    NSString *vid = cfg[NB_KEY_SPEAK_VOICE];
+    if ([vid isKindOfClass:[NSString class]] && [(NSString *)vid length]) {
+        AVSpeechSynthesisVoice *v = [AVSpeechSynthesisVoice voiceWithIdentifier:vid];
+        // 🔴 找不到就**不设** voice（= 跟随系统），既不要报错也不要静音。
+        //    这个语音可能已经被用户在系统设置里删掉了，那时正确的退化就是回默认声音。
+        if (v) u.voice = v;
+    }
+
     u.pitchMultiplier = 1.0f;
     u.volume = 1.0f;
     u.postUtteranceDelay = 0.0;
 
-    // 🔴 语言**不显式指定** ⇒ 跟随系统语言。
+    // 🔴 用户没选语音时**不显式指定** ⇒ 跟随系统语言。
     //    写死 zh-CN 看着像"照顾中文用户"，实际在英文系统上会把英文读成怪腔，
     //    而且中文里混的英文单词（"Wi-Fi 已连接"）也会被读坏。
 
@@ -175,7 +198,9 @@ static AVSpeechSynthesizer *gSynth = nil;
 
     // speakUtterance: 是异步的，返回时声音还没出来 —— 这里只需要确认"调用没炸"
     NBWriteGuard(@"done");
-    NBSharedLog(@"SPEAK 已提交 bundle=%@ len=%lu", bundle, (unsigned long)text.length);
+    NBSharedLog(@"SPEAK 已提交 bundle=%@ len=%lu voice=%@ rate=%.2f",
+                bundle, (unsigned long)text.length,
+                u.voice ? u.voice.name : @"(跟随系统)", u.rate);
 }
 
 #pragma mark - 崩溃自愈
@@ -214,8 +239,20 @@ static AVSpeechSynthesizer *gSynth = nil;
         NSString *guard = NBTrimStr([NSString stringWithContentsOfFile:NOTIFYBOX_SPEAK_GUARD_PATH
                                                               encoding:NSUTF8StringEncoding
                                                                  error:nil]);
-        return [NSString stringWithFormat:@"朗读=%@ AVSpeech=%@ guard=%@",
-                on ? @"开" : @"关",
+        // v0.0.13：把语音/语速也带上 —— "朗读没声音"和"朗读声音不对"是两种问题，
+        // 诊断行必须能直接分开，否则又要来回问一轮。
+        NSString *vid = d[NB_KEY_SPEAK_VOICE];
+        NSString *vname = @"跟随系统";
+        if ([vid isKindOfClass:[NSString class]] && [(NSString *)vid length]) {
+            AVSpeechSynthesisVoice *v = [AVSpeechSynthesisVoice voiceWithIdentifier:vid];
+            vname = v ? v.name : [NSString stringWithFormat:@"已失效(%@)", vid];
+        }
+        id rid = d[NB_KEY_SPEAK_RATE];
+        NSString *rateStr = [rid isKindOfClass:[NSNumber class]]
+                          ? [NSString stringWithFormat:@"%.2f", [(NSNumber *)rid floatValue]]
+                          : @"默认";
+        return [NSString stringWithFormat:@"朗读=%@ 声音=%@ 语速=%@ AVSpeech=%@ guard=%@",
+                on ? @"开" : @"关", vname, rateStr,
                 hasCls ? @"有" : @"无",
                 guard.length ? guard : @"(无)"];
     } @catch (__unused NSException *e) {

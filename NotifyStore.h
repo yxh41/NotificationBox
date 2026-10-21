@@ -16,6 +16,8 @@ NS_ASSUME_NONNULL_BEGIN
                                        since:(NSTimeInterval)since   // 0 = 不限
                                       search:(nullable NSString *)q; // nil = 不限
 + (NSArray<NSString *> *)distinctBundles;          // 顶部 App 图标栏
+// v0.0.13：bundle -> 通知条数。App 选择器用它把「经常来通知的」排前面。
++ (NSDictionary<NSString *, NSNumber *> *)bundleCounts;
 + (NSInteger)maxRecords;                           // 从 prefs 读上限
 
 // 维护

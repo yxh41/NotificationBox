@@ -36,9 +36,12 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 #      写错时 application.mk 拿不到实例 ⇒ **静默跳过、不报错**，deb 里就没有 App。
 APPLICATION_NAME = NotifyBoxApp
 # 🔴 盒子 App 也要编进 NotifyStore.m（ViewController 调它），否则链接时全是 undefined symbols
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/AppIconLoader.m NotifyStore.m
+# 🔴 v0.0.13 新增三个：AppPicker（可搜索多选）、VoicePicker（选声音+试听）、InstalledApps（枚举）
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/InstalledApps.m NotifyStore.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
-NotifyBoxApp_FRAMEWORKS = UIKit Foundation MobileCoreServices
+# 🔴 App 侧也要 AVFoundation/AVFAudio：声音选择页要**试听**，那是在 App 里跑的 TTS。
+#    不链的话编译期就找不到 AVSpeechSynthesizer，而 tweak 侧那份救不了 App。
+NotifyBoxApp_FRAMEWORKS = UIKit Foundation MobileCoreServices AVFoundation AVFAudio
 NotifyBoxApp_CFLAGS = -fobjc-arc -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations
 NotifyBoxApp_LIBRARIES = sqlite3
 NotifyBoxApp_INSTALL_PATH = /Applications

@@ -28,7 +28,32 @@
 // 🔴 设置键名只在这里定义一份：App 写、tweak 读，任何一边拼错就是「开了不生效」，
 //    而这种错在运行时完全是静默的（读到一个不存在的键 = nil = 关）。
 #define NB_KEY_SPEAK_ENABLED  @"speakEnabled"    // NSNumber(BOOL) 或 "1"/"0"
-#define NB_KEY_SPEAK_APPS     @"speakApps"       // NSString "a,b"，空/缺失 = 全部 App
+#define NB_KEY_SPEAK_APPS     @"speakApps"       // 数组或 "a,b"，空/缺失 = 全部 App
+#define NB_KEY_SPEAK_VOICE    @"speakVoice"      // AVSpeechSynthesisVoice.identifier，空 = 跟随系统
+#define NB_KEY_SPEAK_RATE     @"speakRate"       // NSNumber(float)，缺失 = 系统默认语速
+
+// 🔴 「一组 bundle id」的读法只在这里写一份。
+//    历史数据是**逗号分隔字符串**（v0.0.12 及以前是输入框），
+//    新数据是**数组**（v0.0.13 的选择器写）。
+//    两种都必须认 —— 否则老用户升级后就是「我明明配了白名单，怎么全放行了」，
+//    而且这种错完全静默：设置文件在、内容在，就是解析不出来。
+static inline NSArray<NSString *> *NBStringArray(id v) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    if ([v isKindOfClass:[NSArray class]]) {
+        for (id e in (NSArray *)v) {
+            if (![e isKindOfClass:[NSString class]]) continue;
+            NSString *t = [(NSString *)e stringByTrimmingCharactersInSet:ws];
+            if (t.length) [out addObject:t];
+        }
+    } else if ([v isKindOfClass:[NSString class]]) {
+        for (NSString *p in [(NSString *)v componentsSeparatedByString:@","]) {
+            NSString *t = [p stringByTrimmingCharactersInSet:ws];
+            if (t.length) [out addObject:t];
+        }
+    }
+    return out;
+}
 
 // 🔴🔴 朗读自毁保护用的标记文件。
 //    朗读要跑 ARSpeechSynth（AVSpeechSynthesizer），运行在 SpringBoard 里 ——

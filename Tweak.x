@@ -1,4 +1,4 @@
-// Tweak.x —— v0.0.12（当前）：过滤/替换已接线（0.0.8 起）+ 设置存 NotifyBox/settings.plist
+// Tweak.x —— v0.0.13（当前）：过滤/替换已接线（0.0.8 起）+ 设置存 NotifyBox/settings.plist
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
@@ -48,7 +48,7 @@ static NSString *NBProc(void) {
     return p.length ? p : @"?";
 }
 
-// 🔴 v0.0.12：日志实现搬到 NotifyStore.m 的 NBSharedLog（那个文件 tweak 与 App 都编），
+// 🔴 v0.0.13：日志实现搬到 NotifyStore.m 的 NBSharedLog（那个文件 tweak 与 App 都编），
 //    这里只留一个别名，全部调用点不用改。
 //    为什么不各留一份：Tweak.x 原来是 static NBLog，新加的 NotifySpeaker/NotifyProbe
 //    够不着它。复制一份日志函数是最差解 —— 两份轮转逻辑迟早走岔。
@@ -118,7 +118,7 @@ static BOOL NBClaimKey(NSString *key) {
 // 🔴 v0.0.8：返回**真正用来记录的那个 bundle**（可能是从 .bulletin 里兜出来的）。
 //    这样下游过滤判定用的 bundle 和库里存的是同一个值，不会出现「记的 A、判的 B」错位。
 //
-// 🔴 v0.0.12 新增 firstTime 出参（可为 NULL）：
+// 🔴 v0.0.13 新增 firstTime 出参（可为 NULL）：
 //    三个入口可能对同一条通知依次触发，去重表只会让**第一条**真正落库。
 //    但调用方仍然拿到 bid ⇒ 下游会跟着跑三次。
 //    这对「过滤/替换」无害（幂等：判三次、替换三次结果一样），
@@ -184,7 +184,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
     if (!bid.length) return YES;            // 认不出是哪个 App ⇒ 绝不拦
 
     @try {
-        // ①.5 只读探针（v0.0.12）：量 BBBulletin 的 sound/alertType 等量，
+        // ①.5 只读探针（v0.0.13）：量 BBBulletin 的 sound/alertType 等量，
         //     为下一版「按 App 换提示音」取数。内部自己限流（只前 3 条、且只 dump 一次）。
         //     🔴 放在过滤判定**之前**：我要的是"原始对象长什么样"，
         //        不能等替换改过字段之后再量。
@@ -222,7 +222,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
             }
         }
 
-        // ④ 朗读（v0.0.12）
+        // ④ 朗读（v0.0.13）
         //
         // 🔴 只在 firstTime 做：三个入口会依次触发，不判首次就会把同一句话读三遍。
         // 🔴 读**替换后**的文字：替换规则的意义就是"让这条通知说人话"，
@@ -303,7 +303,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.12", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.13", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -311,12 +311,12 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
         [md writeToFile:mark atomically:YES];
     }
 
-    // 🔴🔴 v0.0.12：朗读自毁保护，必须排在任何 hook 之前。
+    // 🔴🔴 v0.0.13：朗读自毁保护，必须排在任何 hook 之前。
     //    如果上次是崩在朗读里，先把开关关掉再干别的 —— 否则这一轮开机又会崩一次，
     //    用户陷入「开机→崩→安全模式→开机」的循环，连盒子 App 都进不去改设置。
     BOOL recovered = [NotifySpeaker recoverFromCrashIfNeeded];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.12 · %@ · 朗读自愈%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.13 · %@ · 朗读自愈%@ ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常");
 
@@ -346,7 +346,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.12 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.13 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -367,7 +367,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.12 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.13 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

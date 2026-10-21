@@ -191,6 +191,29 @@ void NBSharedLog(NSString *fmt, ...) {
     return a;
 }
 
++ (NSDictionary<NSString *, NSNumber *> *)bundleCounts {
+    // v0.0.13：给「可搜索 App 选择器」用 —— 有通知记录的 App 排在前面。
+    // 只回 bundle + 条数，不碰 title/message，比拉全表轻得多。
+    NSMutableDictionary *m = [NSMutableDictionary dictionary];
+    sqlite3 *db = [self openDB];
+    if (!db) return m;
+    sqlite3_stmt *st;
+    const char *sql = "SELECT bundle, COUNT(*) FROM notifications "
+                      "WHERE bundle IS NOT NULL AND bundle <> '' "
+                      "GROUP BY bundle ORDER BY COUNT(*) DESC";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *t = (const char *)sqlite3_column_text(st, 0);
+            if (!t) continue;
+            NSString *bid = [NSString stringWithUTF8String:t];
+            if (bid.length) m[bid] = @(sqlite3_column_int(st, 1));
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return m;
+}
+
 + (void)markRead:(NSInteger)rowId {
     sqlite3 *db = [self openDB];
     if (!db) return;
