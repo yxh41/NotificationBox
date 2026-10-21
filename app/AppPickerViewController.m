@@ -57,7 +57,6 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
         case NBAppPickModeWhitelist: return @"whitelist";
         case NBAppPickModeBlacklist: return @"blacklist";
         case NBAppPickModeSpeak:     return NB_KEY_SPEAK_APPS;
-        case NBAppPickModeDelay:     return NB_KEY_DELAY_APPS;
     }
     return @"whitelist";
 }
@@ -67,7 +66,6 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
         case NBAppPickModeWhitelist: return @"白名单";
         case NBAppPickModeBlacklist: return @"黑名单";
         case NBAppPickModeSpeak:     return @"朗读限定 App";
-        case NBAppPickModeDelay:     return @"延迟生效的 App";
     }
     return @"选择 App";
 }
@@ -261,9 +259,6 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
     NSInteger last = [tv numberOfSections] - 1;
     if (section != last) return nil;
     switch (self.mode) {
-        case NBAppPickModeDelay:
-            return @"这个列表为空 = 全部 App 都延迟。只想让某几个 App 延迟，就把它们选上。\n"
-                    "延迟秒数在设置页那一栏填（0 = 关闭）。";
         case NBAppPickModeSpeak:
             return @"这个列表为空 = 全部 App 都朗读。";
         case NBAppPickModeWhitelist:
