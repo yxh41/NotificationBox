@@ -871,3 +871,31 @@ typedef struct {
 > ⇒ 负向对照（故意塞错的假项目）5 条全部漏报，工具还报 PASS。
 > 修成可由 argv 指定根目录后 6/6 通过（正常/缺右花括号/少一个实现/字符串里带括号/裸 %/多一个右圆括号）。
 > 又一例「判据域必须等于变异域」。
+
+### 六、顺带排掉两个「会翻车」的地方
+
+**① 空状态不能用 `table.backgroundView`**
+
+v0.0.9~v0.0.13 用 `backgroundView` 显示"还没有规则"的提示，因为那时整页只有规则列表，
+空表 = 整页空白。v0.0.14 起页面**顶部永远有「试运行」两行** ⇒ `backgroundView` 是衬在
+cell **后面**的，提示文字只会从分组之间的缝隙里露出来一角，看着像渲染坏了。
+空状态说明改放到规则那一节的 footer 里。
+
+**② 左滑删除不能只删那一行**
+
+`numberOfRowsInSection:kSecAction` 是按 `self.rules.count` 算的（有规则才显示"清空全部规则"）。
+删掉**最后一条**规则时，规则节 1→0 行、操作节 1→0 行，两节同时变。
+只调 `deleteRowsAtIndexPaths:` 删一行 ⇒ 第二节的行数交代不平 ⇒
+
+```
+Invalid update: invalid number of rows in section 2.
+The number of rows contained in an existing section after the update (0)
+must be equal to the number of rows contained in that section before the update (1)
+```
+
+⇒ 断言崩溃。所以改成：数组删掉 + 落盘 + **下一轮 runloop 整表 reloadData**
+（也不要在 `commitEditingStyle:` 里同步 reloadData —— 删除事务没提交完，有的版本会把左滑状态卡住）。
+
+> 教训：**任何"局部改行数"的 API（`deleteRows` / `insertRows` / `reloadRows`）都必须把这
+> 一次改动的所有受影响节一起算进去。**只要行数来源是"某个数组的 count"，
+> 数组一变就可能同时影响多节 —— 这种崩溃在本地看不出来，只会在用户删到第 0 条时炸。
