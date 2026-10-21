@@ -37,7 +37,11 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 APPLICATION_NAME = NotifyBoxApp
 # 🔴 盒子 App 也要编进 NotifyStore.m（ViewController 调它），否则链接时全是 undefined symbols
 # 🔴 v0.0.13 新增三个：AppPicker（可搜索多选）、VoicePicker（选声音+试听）、InstalledApps（枚举）
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/InstalledApps.m NotifyStore.m
+# 🔴🔴 v0.0.14 新增 NotifyFilter.m：内容替换页的「试运行」与「命中统计」必须调用
+#      **引擎里那个同一个函数**（applyRulesToString），不能在 App 里再写一份顺序套用 ——
+#      两份逻辑一旦走岔，用户看到的试运行结果就是假的。
+#      只加 .m 不加 .h 是够的（头文件已 import）；注意它不链 BulletinBoard，只用自己声明的 BBBulletin 接口。
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/InstalledApps.m NotifyStore.m NotifyFilter.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
 # 🔴 App 侧也要 AVFoundation/AVFAudio：声音选择页要**试听**，那是在 App 里跑的 TTS。
 #    不链的话编译期就找不到 AVSpeechSynthesizer，而 tweak 侧那份救不了 App。

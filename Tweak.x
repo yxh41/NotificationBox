@@ -1,4 +1,4 @@
-// Tweak.x —— v0.0.13（当前）：过滤/替换已接线（0.0.8 起）+ 设置存 NotifyBox/settings.plist
+// Tweak.x —— v0.0.14（当前）：过滤/替换/朗读已接线；本版新增**延迟推送**
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
@@ -39,6 +39,8 @@ static int gHit2 = 0;   // publishBulletinRequest:destinations:
 static int gHit3 = 0;   // _publishBulletinRequest:forSectionID:forDestinations:
 static int gDropped = 0;    // 被过滤掉（没有交给原方法）的条数
 static int gReplaced = 0;   // 内容替换真正改过字段的次数
+static int gDelayed = 0;    // 被延后发布的条数（v0.0.14）
+static int gDelayFired = 0; // 真的到点执行了原方法的条数（v0.0.14）
 
 // 去重表：key -> 最后一次记录的时间戳
 static NSMutableDictionary *gRecent = nil;
@@ -53,6 +55,15 @@ static NSString *NBProc(void) {
 //    为什么不各留一份：Tweak.x 原来是 static NBLog，新加的 NotifySpeaker/NotifyProbe
 //    够不着它。复制一份日志函数是最差解 —— 两份轮转逻辑迟早走岔。
 #define NBLog NBSharedLog
+
+// v0.0.14：延迟到期那一刀必须**单独留痕**。
+// 判据价值：日志里只有 DELAY 没有 DELAY-FIRE ⇒ 定时器没走到（或进程被杀了）；
+//            两者配对齐全但通知没出现 ⇒ 不是我们的定时器问题，是系统那边已经放弃了这条。
+//            这两种结论对应的下一步完全相反，所以必须能分开。
+static void NBLogDelayFired(NSString *tag) {
+    gDelayFired++;
+    NBLog(@"DELAY-FIRE#%d tag=%@", gDelayFired, tag);
+}
 
 // ---------- 防御式取值：SpringBoard 里抛异常就等于崩，全部包 @try ----------
 
@@ -172,16 +183,32 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
     return bid;
 }
 
+// ---------- 流水线结论 ----------
+// 🔴 v0.0.14：原来返回 BOOL，只能表达「拦不拦」。延迟推送要表达「放行，但晚 N 秒」，
+//    一件事变两个维度 ⇒ 换成结构体。
+//    ⚠️ ARC 禁止结构体持有 ObjC 对象指针，所以 bundle **不进结构体**；
+//    需要 bundle 的日志一律在 NBPipeline 内部就打掉。
+typedef struct {
+    BOOL allow;              // NO ⇒ 调用点不要执行原方法（被过滤掉）
+    NSTimeInterval delay;    // >0 ⇒ 延后这么多秒再执行原方法
+} NBDecision;
+
+static NBDecision NBAllowNow(void) { NBDecision d; d.allow = YES; d.delay = 0; return d; }
+static NBDecision NBDeny(void)     { NBDecision d; d.allow = NO;  d.delay = 0; return d; }
+
 // ---------- 记录 + 过滤流水线（三入口共用） ----------
-// 返回 NO ⇒ 调用点**不要执行原方法**，等于把这条通知拦下来（盒子里仍然查得到）。
+// 返回 allow=NO ⇒ 调用点**不要执行原方法**，等于把这条通知拦下来（盒子里仍然查得到）。
+// 返回 delay>0 ⇒ 调用点延后这么久再执行原方法。
 // 🔴 整段 @try：这段跑在 SpringBoard 里，抛一个异常就是用户眼里的闪退 / 进安全模式。
 // 🔴 顺序讲究：**先记录原文 → 再判定过滤（用原文判）→ 最后才做内容替换**。
 //    若先替换再判定，用户配了「把"红包"替换成空」又同时过滤"红包"时，过滤会永远不命中。
-static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counter) {
+static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counter) {
     // ① 记录（原文；被过滤也留档，方便回头查「本来要推什么」）
     BOOL firstTime = NO;
     NSString *bid = NBRecordItem(obj, sectionHint, tag, counter, &firstTime);
-    if (!bid.length) return YES;            // 认不出是哪个 App ⇒ 绝不拦
+    if (!bid.length) return NBAllowNow();   // 认不出是哪个 App ⇒ 绝不拦
+
+    NBDecision out = NBAllowNow();          // 🔴 初值就是"立即放行"：异常兜底 = 不改变行为
 
     @try {
         // ①.5 只读探针（v0.0.13）：量 BBBulletin 的 sound/alertType 等量，
@@ -205,7 +232,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
             // 🔴🔴 被拦下的通知**不朗读**。
             //    「别烦我」是用户配这条规则的全部意图 —— 屏幕上不弹、耳朵里却念出来，
             //    那是最糟的组合：既没躲开，还更吵。所以朗读只能在 drop 判定之后。
-            return NO;
+            return NBDeny();
         }
         // ③ 内容替换（只改呈现，库里留着原文）
         //
@@ -222,12 +249,33 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
             }
         }
 
-        // ④ 朗读（v0.0.13）
+        // ④ 延迟推送（v0.0.14）
+        //
+        // 🔴 放在过滤**之后**：被拦掉的通知根本不该被排进任何队列。
+        // 🔴 放在朗读**之前**：日志顺序就是执行顺序（DELAY → SPEAK），看日志不会错位。
+        // 🔴 替换必须在延迟之前做完：对象是**原地改写**的，N 秒后才发布 ⇒
+        //    如果先排延迟再改字段，改的仍是同一个对象，结果一样；但日志会看不懂。
+        NSTimeInterval ds = 0;
+        if ([NotifyFilter shouldDelayBundle:bid seconds:&ds]) {
+            gDelayed++;
+            out.delay = ds;
+            // ⚠️ 这里数的是**调用次数**，不是通知条数：同一条通知可能命中 2~3 个入口，
+            //    所以 DELAY 行会比"实际延后的通知"多。看 DELAY-FIRE 的配对更有意义。
+            if (gDelayed <= 8 || (gDelayed % 20) == 0) {
+                NBLog(@"DELAY#%d bundle=%@ tag=%@ %.1fs", gDelayed, bid, tag, ds);
+            }
+        }
+
+        // ⑤ 朗读（v0.0.13）
         //
         // 🔴 只在 firstTime 做：三个入口会依次触发，不判首次就会把同一句话读三遍。
         // 🔴 读**替换后**的文字：替换规则的意义就是"让这条通知说人话"，
         //    屏幕上改干净了、耳朵里还在念原来的骚扰词，等于只做了一半。
         //    替换失败时退回原文（replaced==NO 就不重读，省两次 KVC）。
+        // 🔴 朗读**不跟着延迟**：延迟改的是"弹窗什么时候出现"，朗读是即时播报。
+        //    两者同时开着时，用户会先听到、N 秒后才看到。设置页里写明了这一点。
+        //    不做成"一起延后"是刻意的：朗读是刚在真机上验证过的功能，
+        //    不想为了组合场景去动它的调用路径。
         if (firstTime) {
             NSString *st = t;
             NSString *sm = m;
@@ -243,17 +291,33 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
         }
     } @catch (__unused NSException *e) {
         // 兜底一律放行：宁可多推一条，也不要把通知吞掉
+        return NBAllowNow();
     }
-    return YES;
+    return out;
 }
 
 // ---------- 入口 1：- publishBulletin:destinations: ----------
 %group GPB
 %hook BBServer
 - (void)publishBulletin:(id)bulletin destinations:(unsigned long long)destinations {
-    if (NBPipeline(bulletin, nil, @"PB", &gHit1)) {
-        %orig(bulletin, destinations);
+    NBDecision d = NBPipeline(bulletin, nil, @"PB", &gHit1);
+    if (!d.allow) return;
+    if (d.delay > 0) {
+        // 🔴 延迟分支。三条都踩过点，别随手改：
+        //  ① block 会**强引用住** bulletin（ARC 捕获），所以对象在 N 秒后仍然活着 ——
+        //     这是延迟能成立的前提。若哪天改成 __weak 捕获，到点就是给 nil 发消息。
+        //  ② 「orig」这个宏在 block 里是合法用法：Logos 把它展开成对静态函数指针的普通 C 调用
+        //     `_logos_orig$...(self, _cmd, 参数...)`，self 与 _cmd 都会被 block 正常捕获。
+        //  ③ 落在**主队列**：延迟到期时必须落在某个队列上，SpringBoard 里唯一一定存在的
+        //     就是主队列；BBServer 的发布本身是线程安全的。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.delay * (double)NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NBLogDelayFired(@"PB");
+            %orig(bulletin, destinations);
+        });
+        return;
     }
+    %orig(bulletin, destinations);
 }
 %end
 %end
@@ -262,9 +326,17 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
 %group GPBR
 %hook BBServer
 - (void)publishBulletinRequest:(id)request destinations:(unsigned long long)destinations {
-    if (NBPipeline(request, nil, @"PBR", &gHit2)) {
-        %orig(request, destinations);
+    NBDecision d = NBPipeline(request, nil, @"PBR", &gHit2);
+    if (!d.allow) return;
+    if (d.delay > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.delay * (double)NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NBLogDelayFired(@"PBR");
+            %orig(request, destinations);
+        });
+        return;
     }
+    %orig(request, destinations);
 }
 %end
 %end
@@ -278,9 +350,19 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
                 forDestinations:(unsigned long long)destinations {
     // 第二个参数按 ENC 是 @（对象），本身就是 sectionID，直接当 bundle 用最可靠
     NSString *sid = [sectionID isKindOfClass:[NSString class]] ? (NSString *)sectionID : nil;
-    if (NBPipeline(request, sid, @"PBRS", &gHit3)) {
-        %orig(request, sectionID, destinations);
+    NBDecision d = NBPipeline(request, sid, @"PBRS", &gHit3);
+    if (!d.allow) return;
+    if (d.delay > 0) {
+        // 🔴 sectionID 也要一起被 block 捕获住：延迟到点时要把它当参数传回原方法，
+        //    它可能是个 autorelease 的 NSString，不捕获就可能已经死了。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.delay * (double)NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NBLogDelayFired(@"PBRS");
+            %orig(request, sectionID, destinations);
+        });
+        return;
     }
+    %orig(request, sectionID, destinations);
 }
 %end
 %end
@@ -303,7 +385,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.13", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.14", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -316,7 +398,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
     //    用户陷入「开机→崩→安全模式→开机」的循环，连盒子 App 都进不去改设置。
     BOOL recovered = [NotifySpeaker recoverFromCrashIfNeeded];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.13 · %@ · 朗读自愈%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.14 · %@ · 朗读自愈%@ ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常");
 
@@ -346,7 +428,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.13 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.14 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -367,7 +449,7 @@ static BOOL NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counte
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.13 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.14 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

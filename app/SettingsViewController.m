@@ -31,6 +31,14 @@ static const NSInteger kSubSwitch = 103;
 static const NSInteger kSubValue = 104;
 static const NSInteger kSubHit = 105;
 
+// 纯数字判定：`[@"abc" integerValue]` 是 0，跟"用户填了 0"分不开。
+// 延迟秒数那个字段必须能分开 —— 否则填错会被静默当成"关闭"。
+static BOOL NBIsDigits(NSString *s) {
+    if (!s.length) return NO;
+    NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+    return [s rangeOfCharacterFromSet:nonDigits].location == NSNotFound;
+}
+
 @interface SettingsViewController () <UITextFieldDelegate>
 @property (nonatomic, strong) UIScrollView *scroll;
 @property (nonatomic, strong) NSMutableArray<UIView *> *rows;        // 统一的行，按加入顺序
@@ -63,6 +71,7 @@ static const NSInteger kSubHit = 105;
 - (void)onWhite:(id)sender;
 - (void)onBlack:(id)sender;
 - (void)onSpeakApps:(id)sender;
+- (void)onDelayApps:(id)sender;
 - (void)onVoice:(id)sender;
 - (void)onAppDiag:(id)sender;
 - (void)fail:(NSString *)msg;
@@ -105,6 +114,20 @@ static const NSInteger kSubHit = 105;
     [self addActionRow:@"朗读声音" key:@"voice" action:@selector(onVoice:)];
     [self addActionRow:@"朗读限定 App" key:@"speakapps" action:@selector(onSpeakApps:)];
 
+    // ---------- 延迟推送（v0.0.14） ----------
+    // 🔴 它排在白名单/黑名单**之前**：延迟是"什么时候弹"，拦截是"弹不弹"。
+    //    用户的直觉顺序是先决定弹不弹、再决定什么时候弹；但延迟判定在流水线里
+    //    紧跟过滤之后，所以设置页把"订阅/时机"这组放一起更好找。
+    id ds = cur[NB_KEY_DELAY_SECONDS];
+    NSString *dsStr = [ds isKindOfClass:[NSNumber class]] ? [(NSNumber *)ds stringValue]
+                    : ([ds isKindOfClass:[NSString class]] ? (NSString *)ds : @"");
+    [self addGroup:@"延迟推送（秒，0 = 关闭）"
+                 ph:@"0"
+              value:dsStr
+           keyboard:UIKeyboardTypeNumberPad
+                key:NB_KEY_DELAY_SECONDS];
+    [self addActionRow:@"延迟生效的 App" key:@"delayapps" action:@selector(onDelayApps:)];
+
     // ---------- 记录 ----------
     id mx = cur[@"maxRecords"];
     NSString *mxStr = [mx respondsToSelector:@selector(stringValue)] ? [mx stringValue]
@@ -146,6 +169,11 @@ static const NSInteger kSubHit = 105;
         @"• 朗读只念「替换后」的文字（跟通知上看到的一致）；被过滤规则拦下的通知不念。\n"
         @"• 如果朗读导致桌面崩溃重启，插件会在下次开机时**自动把朗读关掉**，\n"
         @"  并往日志写一行「朗读自毁保护触发」，不需要你做任何事。\n"
+        @"• 延迟推送默认关闭（0）。开了之后：命中的通知会晚 N 秒才交给系统发布，\n"
+        @"  日志里会有 DELAY / DELAY-FIRE 两行配对（配对不齐 = 没到点，没出现是系统那边的事）。\n"
+        @"• ⚠️ 延迟不是「提醒我」那种功能：延迟期间如果 App 又推一条，两条会一起到；\n"
+        @"  某些 App 的通知延迟后「可能完全不出现」（系统已放弃这条）。不确定就先填 5 秒试。\n"
+        @"  秒数上限 600；填 0 或留空 = 关闭。\n"
         @"• 存储位置：\n  /var/mobile/Library/NotifyBox/settings.plist";
     [self.scroll addSubview:self.hintLabel];
 
@@ -303,6 +331,11 @@ static const NSInteger kSubHit = 105;
                             : @"全部 App ›")
                   forKey:@"speakapps"];
 
+    NSUInteger dl = [NBStringArray(d[NB_KEY_DELAY_APPS]) count];
+    [self setActionValue:(dl ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)dl]
+                             : @"全部 App ›")
+                  forKey:@"delayapps"];
+
     NSString *voiceName = [VoicePickerViewController currentVoiceDisplayName];
     id rid = d[NB_KEY_SPEAK_RATE];
     NSString *rateName = @"默认速度";
@@ -453,6 +486,24 @@ static const NSInteger kSubHit = 105;
                     return;
                 }
             }
+        } else if ([key isEqualToString:NB_KEY_DELAY_SECONDS]) {
+            // 🔴 延迟秒数必须严格校验。
+            //    这里糊弄的代价特别大：填 "abc" 会被 integerValue 读成 0（= 关闭），
+            //    保存显示"成功"，用户等半天等不到通知也说不出所以然；
+            //    填 86400 则等于让通知永远不出现 —— 他会以为插件把通知吞了。
+            if (v.length == 0) {
+                [d removeObjectForKey:key];
+            } else if (!NBIsDigits(v)) {
+                [self fail:@"延迟秒数只能填数字（0 = 关闭，原值未改）"];
+                return;
+            } else {
+                NSInteger n = [v integerValue];
+                if (n < 1 || n > 600) {
+                    [self fail:@"延迟秒数必须是 1~600 秒；要关闭就填空或 0（原值未改）"];
+                    return;
+                }
+                d[key] = @(n);
+            }
         } else {
             if (v.length) d[key] = v;
             else [d removeObjectForKey:key];
@@ -511,6 +562,11 @@ static const NSInteger kSubHit = 105;
 - (void)onSpeakApps:(id)sender {
     [self.view endEditing:YES];
     [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeSpeak]];
+}
+
+- (void)onDelayApps:(id)sender {
+    [self.view endEditing:YES];
+    [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeDelay]];
 }
 
 - (void)onVoice:(id)sender {

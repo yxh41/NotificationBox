@@ -32,6 +32,13 @@
 #define NB_KEY_SPEAK_VOICE    @"speakVoice"      // AVSpeechSynthesisVoice.identifier，空 = 跟随系统
 #define NB_KEY_SPEAK_RATE     @"speakRate"       // NSNumber(float)，缺失 = 系统默认语速
 
+// ---------- 延迟推送（v0.0.14） ----------
+// 语义：命中的通知**不立即弹出**，延后 N 秒再交给 BBServer 的发布方法。
+// 🔴 0 / 缺失 = 关闭（默认关闭，因为它是唯一会**改变通知到达时间**的功能，风险最高）。
+// 🔴 秒数上限在主判定函数里夹到 600 秒：用户手填个 86400 就等于让通知永远不出现。
+#define NB_KEY_DELAY_SECONDS  @"delaySeconds"    // NSNumber 或 "5"，0/缺失 = 关闭
+#define NB_KEY_DELAY_APPS     @"delayApps"       // 数组或 "a,b"，空/缺失 = 全部 App
+
 // 🔴 「一组 bundle id」的读法只在这里写一份。
 //    历史数据是**逗号分隔字符串**（v0.0.12 及以前是输入框），
 //    新数据是**数组**（v0.0.13 的选择器写）。

@@ -57,6 +57,7 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
         case NBAppPickModeWhitelist: return @"whitelist";
         case NBAppPickModeBlacklist: return @"blacklist";
         case NBAppPickModeSpeak:     return NB_KEY_SPEAK_APPS;
+        case NBAppPickModeDelay:     return NB_KEY_DELAY_APPS;
     }
     return @"whitelist";
 }
@@ -66,6 +67,7 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
         case NBAppPickModeWhitelist: return @"白名单";
         case NBAppPickModeBlacklist: return @"黑名单";
         case NBAppPickModeSpeak:     return @"朗读限定 App";
+        case NBAppPickModeDelay:     return @"延迟生效的 App";
     }
     return @"选择 App";
 }
@@ -251,6 +253,25 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
     return self.otherRows.count
         ? [NSString stringWithFormat:@"点一下加入（共 %lu 个）", (unsigned long)self.otherRows.count]
         : nil;
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)section {
+    // 只在最后一节显示：这页的使用口径每个模式都不一样，
+    // 尤其是「空列表 = 全部 App」这条 —— 不说清楚，用户会以为"没选就是没配、等于关闭"。
+    NSInteger last = [tv numberOfSections] - 1;
+    if (section != last) return nil;
+    switch (self.mode) {
+        case NBAppPickModeDelay:
+            return @"这个列表为空 = 全部 App 都延迟。只想让某几个 App 延迟，就把它们选上。\n"
+                    "延迟秒数在设置页那一栏填（0 = 关闭）。";
+        case NBAppPickModeSpeak:
+            return @"这个列表为空 = 全部 App 都朗读。";
+        case NBAppPickModeWhitelist:
+            return @"这个列表为空 = 全部放行。一旦选了，就等于「只保留这些 App」，其它全部不弹（有杀伤力，慎重）。";
+        case NBAppPickModeBlacklist:
+            return @"选上的 App 通知不会被弹出，但仍然会记进盒子里。";
+    }
+    return nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {

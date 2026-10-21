@@ -2,11 +2,12 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-// 选择器服务于哪个设置键。三个键语义不同、存储格式相同（bundle id 数组）。
+// 选择器服务于哪个设置键。四个键语义不同、存储格式相同（bundle id 数组）。
 typedef NS_ENUM(NSInteger, NBAppPickMode) {
     NBAppPickModeWhitelist = 0,   // whitelist：只推送这些
     NBAppPickModeBlacklist = 1,   // blacklist：不推送这些
     NBAppPickModeSpeak     = 2,   // speakApps：只朗读这些
+    NBAppPickModeDelay     = 3,   // delayApps：只对这些延迟推送（v0.0.14）
 };
 
 // 可搜索、可多选的 App 选择器（v0.0.13）
