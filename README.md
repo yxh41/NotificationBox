@@ -2481,15 +2481,44 @@ UTF-16LE（`__ustring`），纯 ASCII 才是 UTF-8（`__cstring`）**。
 
 | 项 | 值 |
 |---|---|
-| deb | `com.yxh41.notifybox_0.0.28_iphoneos-arm64e.deb` · **98336 B** |
-| CI | **#53** · `run_id 39932917143` · success |
-| 产物 zip | **98521 B**（与 API `size_in_bytes` 对拍一致） |
+| deb | `com.yxh41.notifybox_0.0.28_iphoneos-arm64e.deb` · **98050 B** |
+| CI | 代码构建 **#53**（`run_id 39932917143`）· 文档构建 **#54**（`run_id 39933533873`）· 两次都 success |
+| 产物 zip | `#53` 98521 B / `#54` 98229 B（各自与 API `size_in_bytes` 对拍一致） |
 
 ⚠️ 这次推送不是 `git push`：本机 `github.com:443` 直连超时、代理 CONNECT 502
 （`api.github.com` 直连 200）。所以改走 **GitHub REST API**（blobs → tree → commit → PATCH ref）。
 代价是**远端 commit sha 与本地不同**（API 建的 commit 由服务端填 committer），
 所以验收口径改成**逐文件 blob 对拍**：远端 tree 里 51 个文件的 blob sha 与本地 `HEAD:<path>`
 逐一相等 —— 这比"sha 相同"更硬，它直接证明每个文件的字节都一致。
+
+> 顺带记一条：API 推送下"远端 sha ≠ 本地父提交"是**常态**，所以判断能不能推
+> 不能看 sha，要看 **tree**：`远端 head 的 tree == 本地 HEAD^ 的 tree` ⇒ 内容等价、可按快进处理。
+> 按 sha 判会导致第二次推送就误报"分叉"。
+
+### 九·补、🔴 不要拿 deb 字节跨构建对拍
+
+#53 和 #54 的 deb 差了 286 B（98336 vs 98050），但 **#54 只改了 README**。
+拆开比对过，两个二进制的差异是**固定的 68 个字节、三处**：
+
+| 偏移 | 字节 | 落在哪 |
+|---|---|---|
+| 2728..2743（app 是 2968..2983） | 16 | `__TEXT` 段但**不在任何 section 里** ⇒ **LC_UUID** load command |
+| `__LINKEDIT` 尾部 | 20 | 代码签名派生数据 |
+| `__LINKEDIT` 尾部 | 32 | 代码签名派生数据 |
+
+`__text` section 的实际偏移是 16384（不是 0），所以这三处**没有一处在代码里**；
+`__cstring` / `__ustring`（所有文案）也一个字节没变。
+两版的 `LC_UUID` 也直接读出来对过：`b7577589…` vs `51709bd3…`（dylib）。
+
+⇒ 结论：**同一个 commit 两次构建，deb 字节必然不同**（LC_UUID + 代码签名 + tar 里的 mtime）。
+所以"跨构建字节对拍"不成立；能对拍的是**同一次构建内**的 `zip 字节 == API size_in_bytes`。
+想证明"代码没变"要靠 **tree / blob sha**，不能靠 deb 大小。
+
+> 这一条也提醒了另一个坑：自己写的 Mach-O 解析器**字段偏移很容易写错**
+> （`section_64` 的 `size` 是 8 字节、`offset` 在 +48，不是 +40/+44）。
+> 写错时前半段的结论是反的 —— 会把"Load Commands 区"报成"`__text` section 内"，
+> 于是看起来"代码变了"。判据错和实现错长得一模一样，所以解析器本身也要能自证。
+
 
 ### 十、真机验收清单
 
