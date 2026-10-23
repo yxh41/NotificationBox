@@ -52,6 +52,40 @@
 //    这样**以后每次实验最多崩一次**，不会陷入崩溃循环。
 #define NOTIFYBOX_DELAY_GUARD_PATH @"/var/mobile/Library/NotifyBox/.delay_guard"
 
+// ---------- 免打扰时段（v0.0.21）----------
+// 语义：命中的通知**不弹**（同黑名单），但照常记进盒子。
+// 这是 v0.0.19 删掉「延迟推送」之后给用户的**安全替代品** ——
+// 延迟想解决的其实是"别在这个时间点吵我"，而"延迟"必须改系统的发布时间才能实现
+// （两次撞死：跨队列 SIGTRAP / 通知永远到不了）；"这个时段直接不弹"则是**我们自己的判断**，
+// 不碰 BB 内部、不改任何系统字段 ⇒ 从根上没有那两类风险。
+// 🔴 时间一律存**分钟数**（0~1439），不存 "23:00" 字符串：
+//    字符串要靠 App 和 tweak 各自解析一遍，两边只要差一点就是"填了不生效"，
+//    而这种错完全静默（读到 nil = 关闭）。
+#define NB_KEY_DND_ENABLED  @"dndEnabled"    // NSNumber(BOOL) 或 "1"/"0"
+#define NB_KEY_DND_START    @"dndStart"      // NSNumber 分钟，例如 23*60=1380
+#define NB_KEY_DND_END      @"dndEnd"        // NSNumber 分钟，可以小于 start（跨零点）
+#define NB_KEY_DND_APPS     @"dndApps"       // 数组或 "a,b"，空/缺失 = 全部 App
+
+// ---------- 按 App 换提示音（v0.0.21，实验）----------
+// 🔴 实验性质，默认关闭，而且**必须显式选 App 才生效**。
+//    原因（真机 PROBE 数据，2026-10-23）：
+//      · `PROBE#1/2/3` 全是 `sound=nil` ⇒ 默认提示音根本不带 BBSound 对象；
+//      · `BBSound 类方法共 1 个，其中相关 0 个` ⇒ **没有工厂方法**，只能自己 alloc/init 再填字段；
+//      · `alertType` 是只读（R），可写的只有 `soundType` / `systemSoundID` / `vibrationIdentifier`。
+//    ⇒ 也就是说这个功能在**造一个系统对象**，造坏了的结果是"这条通知不出声"（不是崩溃）。
+//    所以：默认关、必须点名 App、每次尝试都留 SOUND# 留痕、失败自动回退到默认声音。
+#define NB_KEY_SOUND_ENABLED @"soundEnabled"  // NSNumber(BOOL)
+#define NB_KEY_SOUND_ID      @"soundID"       // NSNumber(int)，1000~1035 是系统提示音区段
+#define NB_KEY_SOUND_APPS    @"soundApps"     // 数组或 "a,b"；**空 = 不生效**（与其它名单语义相反）
+
+// 换提示音的崩溃自愈标记。
+// 🔴 v0.0.21 这一版**写法和 v0.0.15 的延迟 guard 不同**，因为那个写法骗过人：
+//    v0.0.15 只写 start、从不写 done（那版延迟是关的），于是文件永久停在 start，
+//    从 v0.0.16 起每次启动都误报"上次崩在延迟里"，还谎称"已自动删掉设置"。
+//    ⇒ 这一次 write(start) / write(done) **配对出现在同一个函数里**（NotifyFilter），
+//      读取侧必须**回读确认**自己真的把开关关掉了，再打日志。
+#define NOTIFYBOX_SOUND_GUARD_PATH @"/var/mobile/Library/NotifyBox/.sound_guard"
+
 // 🔴 「一组 bundle id」的读法只在这里写一份。
 //    历史数据是**逗号分隔字符串**（v0.0.12 及以前是输入框），
 //    新数据是**数组**（v0.0.13 的选择器写）。

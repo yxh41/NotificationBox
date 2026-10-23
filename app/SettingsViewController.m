@@ -1,4 +1,5 @@
 #import "SettingsViewController.h"
+#import <AudioToolbox/AudioToolbox.h>   // v0.0.21：试听系统提示音（AudioServicesPlaySystemSound）
 #import "NotifyStore.h"
 #import "NotifyCommon.h"
 #import "ReplaceRulesViewController.h"
@@ -47,12 +48,16 @@ static const NSInteger kSubHit = 105;
 //    写死下标的话，只要在中间插一个新字段，后面所有键就整体错位一格：
 //    用户改"记录上限"，实际写进了"过滤关键词"。保存成功、回读一致、就是不生效。
 @property (nonatomic, strong) NSMutableArray<NSString *> *fieldKeys;
-@property (nonatomic, strong) UISwitch *speakSwitch;
+// 🔴 v0.0.21：开关从"一个属性"改成"按 key 存"。
+//    这是兑现 addSwitchRow 里早就写下的警告 ——
+//    原来三个开关会全挂到同一个属性上，最后建的那个覆盖前面的，
+//    症状是"我明明开了免打扰，一保存自己变回关"，而且**完全不报错**。
+@property (nonatomic, strong) NSMutableDictionary<NSString *, UISwitch *> *switches;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *actionRows;
 @property (nonatomic, strong) UILabel *hintLabel;
 @property (nonatomic, strong) UILabel *statusLabel;
 
-- (void)addSwitchRow:(NSString *)title on:(BOOL)on;
+- (void)addSwitchRow:(NSString *)title on:(BOOL)on key:(NSString *)key;
 - (void)addGroup:(NSString *)title
               ph:(NSString *)ph
            value:(NSString *)value
@@ -71,6 +76,10 @@ static const NSInteger kSubHit = 105;
 - (void)onWhite:(id)sender;
 - (void)onBlack:(id)sender;
 - (void)onSpeakApps:(id)sender;
+- (void)onDndApps:(id)sender;
+- (void)onSoundApps:(id)sender;
+- (void)onSoundPreview:(id)sender;
+- (NSString *)timeText:(id)v;
 - (void)onVoice:(id)sender;
 - (void)onAppDiag:(id)sender;
 - (void)fail:(NSString *)msg;
@@ -104,14 +113,51 @@ static const NSInteger kSubHit = 105;
     self.fields = [NSMutableArray array];
     self.fieldKeys = [NSMutableArray array];
     self.actionRows = [NSMutableDictionary dictionary];
+    self.switches = [NSMutableDictionary dictionary];
 
     NSDictionary *cur = NBLoadSettings();
 
     // ---------- 朗读 ----------
     [self addSwitchRow:@"朗读通知（用系统语音念出来）"
-                    on:[self boolOf:cur[NB_KEY_SPEAK_ENABLED]]];
+                    on:[self boolOf:cur[NB_KEY_SPEAK_ENABLED]]
+                   key:NB_KEY_SPEAK_ENABLED];
     [self addActionRow:@"朗读声音" key:@"voice" action:@selector(onVoice:)];
     [self addActionRow:@"朗读限定 App" key:@"speakapps" action:@selector(onSpeakApps:)];
+
+    // ---------- 免打扰时段（v0.0.21）----------
+    // 这是 v0.0.19 删掉「延迟推送」之后的安全替代：
+    // 延迟想解决的其实是"别在某个时间点吵我"，而它必须**改系统的发布时间**才能做到
+    // （两次撞死）；这里只是**我们自己不弹**，不碰 BB 内部 ⇒ 零系统风险。
+    [self addSwitchRow:@"免打扰时段（这段时间不弹，只记录）"
+                    on:[self boolOf:cur[NB_KEY_DND_ENABLED]]
+                   key:NB_KEY_DND_ENABLED];
+    [self addGroup:@"开始时间（HH:mm，例如 23:00）"
+                 ph:@"23:00"
+              value:[self timeText:cur[NB_KEY_DND_START]]
+           keyboard:UIKeyboardTypeNumbersAndPunctuation
+                key:NB_KEY_DND_START];
+    [self addGroup:@"结束时间（HH:mm，可跨零点，例如 07:00）"
+                 ph:@"07:00"
+              value:[self timeText:cur[NB_KEY_DND_END]]
+           keyboard:UIKeyboardTypeNumbersAndPunctuation
+                key:NB_KEY_DND_END];
+    [self addActionRow:@"免打扰生效的 App" key:@"dndapps" action:@selector(onDndApps:)];
+
+    // ---------- 按 App 换提示音（v0.0.21，实验）----------
+    // 🔴 真机 PROBE 数据说明这是"造系统对象"：默认提示音**不带 BBSound**（sound=nil），
+    //    而 BBSound 没有工厂方法、alertType 只读 ⇒ 只能 alloc + 填 soundType/systemSoundID。
+    //    失败的表现是"这条通知不出声"。所以：默认关、必须点名 App、可试听、每次留痕、有自愈。
+    [self addSwitchRow:@"按 App 换提示音（实验，先只选一个 App 试）"
+                    on:[self boolOf:cur[NB_KEY_SOUND_ENABLED]]
+                   key:NB_KEY_SOUND_ENABLED];
+    [self addGroup:@"提示音 ID（1000~1035，填完点下面的试听）"
+                 ph:@"1007"
+              value:[self strOf:cur[NB_KEY_SOUND_ID]]
+           keyboard:UIKeyboardTypeNumberPad
+                key:NB_KEY_SOUND_ID];
+    [self addActionRow:@"换提示音的 App（空 = 不生效）"
+                    key:@"soundapps" action:@selector(onSoundApps:)];
+    [self addActionRow:@"试听这个提示音" key:@"soundpreview" action:@selector(onSoundPreview:)];
 
     // ---------- 延迟推送：v0.0.19 已整体移除 ----------
     // 🔴 这里**故意连这个开关都不放**。历史上它两次把用户手机搞坏：
@@ -193,7 +239,7 @@ static const NSInteger kSubHit = 105;
 
 #pragma mark - 行的创建
 
-- (void)addSwitchRow:(NSString *)title on:(BOOL)on {
+- (void)addSwitchRow:(NSString *)title on:(BOOL)on key:(NSString *)key {
     UIView *box = [[UIView alloc] init];
     box.tag = kRowSwitch;
     box.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
@@ -213,9 +259,8 @@ static const NSInteger kSubHit = 105;
     sw.on = on;
     sw.tag = kSubSwitch;
     [box addSubview:sw];
-    // ⚠️ 目前只有这一个开关，所以直接挂到属性上。
-    //    以后再加开关必须改成分开存（比如进字典），否则最后一个会覆盖前面的。
-    self.speakSwitch = sw;
+    // 🔴 按 key 存（v0.0.21 兑现了这里原本的警告）。
+    if (key.length && self.switches) self.switches[key] = sw;
 
     [self.rows addObject:box];
 }
@@ -323,6 +368,21 @@ static const NSInteger kSubHit = 105;
     [self setActionValue:(s ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)s]
                             : @"全部 App ›")
                   forKey:@"speakapps"];
+
+    NSUInteger dn = [NBStringArray(d[NB_KEY_DND_APPS]) count];
+    [self setActionValue:(dn ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)dn]
+                             : @"全部 App ›")
+                  forKey:@"dndapps"];
+
+    // 🔴 换提示音的名单语义与上面**相反**：空 = 不生效（实验功能绝不默认全量）。
+    //    界面上也必须说清楚，否则用户会以为"没选就是全部"，然后发现没效果。
+    NSUInteger sn = [NBStringArray(d[NB_KEY_SOUND_APPS]) count];
+    [self setActionValue:(sn ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)sn]
+                             : @"未选（不生效）›")
+                  forKey:@"soundapps"];
+    id sidNow = d[NB_KEY_SOUND_ID];
+    [self setActionValue:(sidNow ? [NSString stringWithFormat:@"%@", sidNow] : @"未设置")
+                  forKey:@"soundpreview"];
 
     NSString *voiceName = [VoicePickerViewController currentVoiceDisplayName];
     id rid = d[NB_KEY_SPEAK_RATE];
@@ -454,7 +514,11 @@ static const NSInteger kSubHit = 105;
     // 不这样兜底就会被本页的保存动作整体冲掉。
     NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[NotifyStore settings]];
 
-    d[NB_KEY_SPEAK_ENABLED] = @(self.speakSwitch ? self.speakSwitch.isOn : NO);
+    // 🔴 v0.0.21：开关从字典里按 key 取（三个开关，不可能再共用一个属性）
+    for (NSString *k in @[NB_KEY_SPEAK_ENABLED, NB_KEY_DND_ENABLED, NB_KEY_SOUND_ENABLED]) {
+        UISwitch *sw = self.switches[k];
+        d[k] = @(sw ? sw.isOn : NO);
+    }
 
     // 🔴 遍历字段用 fieldKeys 配对，不写死下标
     for (NSUInteger i = 0; i < self.fields.count; i++) {
@@ -462,7 +526,45 @@ static const NSInteger kSubHit = 105;
         if (!key.length) continue;
         NSString *v = [self trim:self.fields[i].text];
 
-        if ([key isEqualToString:@"maxRecords"]) {
+        // 🔴 时间字段：只接受 HH:mm（或纯分钟数），并且落盘成**分钟数**。
+        //    存字符串会让 App 和 tweak 各解析一遍，两边差一点就是"填了不生效"，
+        //    而这种错完全静默（读到 nil = 关闭）。
+        if ([key isEqualToString:NB_KEY_DND_START] || [key isEqualToString:NB_KEY_DND_END]) {
+            if (v.length == 0) {
+                [d removeObjectForKey:key];
+            } else {
+                NSInteger mins = -1;
+                NSArray *parts = [v componentsSeparatedByString:@":"];
+                if (parts.count == 1) {
+                    NSInteger n = [v integerValue];
+                    if (n >= 0 && n < 24 * 60) mins = n;
+                } else if (parts.count == 2) {
+                    NSInteger h = [[parts[0] stringByTrimmingCharactersInSet:
+                                    [NSCharacterSet whitespaceCharacterSet]] integerValue];
+                    NSInteger mi = [[parts[1] stringByTrimmingCharactersInSet:
+                                     [NSCharacterSet whitespaceCharacterSet]] integerValue];
+                    if (h >= 0 && h <= 23 && mi >= 0 && mi <= 59) mins = h * 60 + mi;
+                }
+                if (mins < 0) {
+                    [self fail:@"时间要写成 HH:mm（例如 23:00），或直接填 0~1439 的分钟数（原值未改）"];
+                    return;
+                }
+                d[key] = @(mins);
+            }
+        } else if ([key isEqualToString:NB_KEY_SOUND_ID]) {
+            // 🔴 只收 1000~1035：这是系统提示音区段。
+            //    填别的一律拒绝 —— 造一个 id=0 的 BBSound 只会让通知变哑，比不生效更坏。
+            if (v.length == 0) {
+                [d removeObjectForKey:key];
+            } else {
+                NSInteger n = [v integerValue];
+                if (n < 1000 || n > 1035) {
+                    [self fail:@"提示音 ID 必须是 1000~1035 之间的数字（原值未改）"];
+                    return;
+                }
+                d[key] = @(n);
+            }
+        } else if ([key isEqualToString:@"maxRecords"]) {
             if (v.length == 0) {
                 [d removeObjectForKey:key];
             } else {
@@ -498,7 +600,7 @@ static const NSInteger kSubHit = 105;
         self.statusLabel.text = [NSString stringWithFormat:@"已保存 %lu 项（回读%@）· 朗读%@\n%@",
                                  (unsigned long)d.count,
                                  rt ? @"一致" : @"不一致",
-                                 (self.speakSwitch && self.speakSwitch.isOn) ? @"开" : @"关",
+                                 (self.switches[NB_KEY_SPEAK_ENABLED].isOn) ? @"开" : @"关",
                                  NOTIFYBOX_SETTINGS_PATH];
     } else {
         self.statusLabel.textColor = [UIColor systemRedColor];
@@ -540,6 +642,47 @@ static const NSInteger kSubHit = 105;
 - (void)onSpeakApps:(id)sender {
     [self.view endEditing:YES];
     [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeSpeak]];
+}
+
+- (void)onDndApps:(id)sender {
+    [self.view endEditing:YES];
+    [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeDnd]];
+}
+
+- (void)onSoundApps:(id)sender {
+    [self.view endEditing:YES];
+    [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeSound]];
+}
+
+// 试听：直接在 App 里放系统提示音，用户不用去猜 1007 是什么声音。
+// 🔴 播完要恢复音频会话，否则会影响正在播放的音乐（朗读那边踩过同一类问题）。
+- (void)onSoundPreview:(id)sender {
+    [self.view endEditing:YES];
+    NSInteger sid = 0;
+    for (NSUInteger i = 0; i < self.fields.count; i++) {
+        if (i < self.fieldKeys.count && [self.fieldKeys[i] isEqualToString:NB_KEY_SOUND_ID]) {
+            sid = [self trim:self.fields[i].text].integerValue;
+            break;
+        }
+    }
+    if (sid < 1000 || sid > 1035) {
+        [self fail:@"先填一个 1000~1035 之间的提示音 ID，再点试听"];
+        return;
+    }
+    AudioServicesPlaySystemSound((SystemSoundID)sid);
+    self.statusLabel.textColor = [UIColor secondaryLabelColor];
+    self.statusLabel.text = [NSString stringWithFormat:
+                             @"已试听 ID=%ld。听到声音就说明这个 ID 有效，可以保存了。",
+                             (long)sid];
+}
+
+// 分钟数 → "HH:mm"，只用于**显示**（落盘永远是分钟数）。
+- (NSString *)timeText:(id)v {
+    NSInteger n = -1;
+    if ([v isKindOfClass:[NSNumber class]]) n = [(NSNumber *)v integerValue];
+    else if ([v isKindOfClass:[NSString class]]) n = [(NSString *)v integerValue];
+    if (n < 0 || n >= 24 * 60) return @"";
+    return [NSString stringWithFormat:@"%02ld:%02ld", (long)(n / 60), (long)(n % 60)];
 }
 
 - (void)onVoice:(id)sender {

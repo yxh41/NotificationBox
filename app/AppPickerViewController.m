@@ -57,6 +57,8 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
         case NBAppPickModeWhitelist: return @"whitelist";
         case NBAppPickModeBlacklist: return @"blacklist";
         case NBAppPickModeSpeak:     return NB_KEY_SPEAK_APPS;
+        case NBAppPickModeDnd:       return NB_KEY_DND_APPS;
+        case NBAppPickModeSound:     return NB_KEY_SOUND_APPS;
     }
     return @"whitelist";
 }
@@ -66,6 +68,8 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
         case NBAppPickModeWhitelist: return @"白名单";
         case NBAppPickModeBlacklist: return @"黑名单";
         case NBAppPickModeSpeak:     return @"朗读限定 App";
+        case NBAppPickModeDnd:       return @"免打扰生效的 App";
+        case NBAppPickModeSound:     return @"换提示音的 App";
     }
     return @"选择 App";
 }
@@ -259,6 +263,14 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
     NSInteger last = [tv numberOfSections] - 1;
     if (section != last) return nil;
     switch (self.mode) {
+        case NBAppPickModeDnd:
+            // 🔴 空列表 = 全部 App（和其它名单一致）
+            return @"这个列表为空 = 全部 App 都在免打扰时段内不弹。"
+                    "时段本身在设置页填（开始/结束时间，可跨零点）。";
+        case NBAppPickModeSound:
+            // 🔴 空列表 = **不生效**（与其它名单相反，必须写清楚）
+            return @"⚠️ 这个列表为空 = 换提示音**不生效**（实验功能不会一次性改掉所有 App）。"
+                    "先只选一个 App 试，确认能听到声音后再加别的。";
         case NBAppPickModeSpeak:
             return @"这个列表为空 = 全部 App 都朗读。";
         case NBAppPickModeWhitelist:

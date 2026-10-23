@@ -11,6 +11,8 @@ typedef NS_ENUM(NSInteger, NBAppPickMode) {
     NBAppPickModeWhitelist = 0,   // whitelist：只推送这些
     NBAppPickModeBlacklist = 1,   // blacklist：不推送这些
     NBAppPickModeSpeak     = 2,   // speakApps：只朗读这些
+    NBAppPickModeDnd       = 3,   // dndApps：这些 App 在免打扰时段不弹
+    NBAppPickModeSound     = 4,   // soundApps：这些 App 换提示音（空 = 不生效）
 };
 
 // 可搜索、可多选的 App 选择器（v0.0.13）

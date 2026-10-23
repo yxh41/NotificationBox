@@ -1,6 +1,16 @@
-// Tweak.x —— v0.0.20（当前）：**修「探针数据被结论行筛掉」** —— 换提示音的最后一块数据缺口
+// Tweak.x —— v0.0.21（当前）：**两个新功能一起上** —— 免打扰时段（DND）＋ 按 App 换提示音（SOUND）
 //
-// 上一版（v0.0.19）把延迟推送整体删除了，那一版改的是引擎，本版**只改 App 侧的日志可见性**：
+// 依据真机 PROBE 数据（v0.0.20 采）定下换提示音的实现方式，一条都不凭猜：
+//   sound{T@"BBSound",&,N,V_sound} 可写；BBSound **只有 1 个类方法且与声音无关 ⇒ 没有工厂方法**；
+//   alertType 是 R（只读），可写的是 soundType / systemSoundID / vibrationIdentifier；
+//   PROBE#1/2/3 全是 sound=nil ⇒ 默认提示音**不带 BBSound**，必须自己 alloc/init 造一个再挂。
+//   挂完必须回读验证（造出来的对象被系统丢弃 = 静默无效，不报错）。
+//
+// 免打扰：命中时段就 NBDeny() 丢掉，仍记一条日志（DND#），保证"不弹但可回看"。
+// 换提示音：**空名单不生效** —— 实验性功能，绝不允许一次性改掉整台手机的通知音。
+//
+// 上一版（v0.0.20）修的是「探针数据被结论行筛掉」：
+//
 //   探针（PROBE）的实质数据行里一个筛选关键词都不含 ⇒ 结论行只剩「开始/结束」两行空壳，
 //   看起来像「探针跑了但什么都没量到」，实际数据一直在日志里。
 //
@@ -43,6 +53,8 @@ static int gHit2 = 0;   // publishBulletinRequest:destinations:
 static int gHit3 = 0;   // _publishBulletinRequest:forSectionID:forDestinations:
 static int gDropped = 0;    // 被过滤掉（没有交给原方法）的条数
 static int gReplaced = 0;   // 内容替换真正改过字段的次数
+static int gDndDropped = 0; // v0.0.21：免打扰时段拦下的条数
+static int gSoundApplied = 0; // v0.0.21：尝试过换提示音的条数（成没成看 SOUND# 那行）
 // 去重表：key -> 最后一次记录的时间戳
 static NSMutableDictionary *gRecent = nil;
 
@@ -293,6 +305,25 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             //    那是最糟的组合：既没躲开，还更吵。所以朗读只能在 drop 判定之后。
             return NBDeny();
         }
+        // ②.5 免打扰时段（v0.0.21）
+        //
+        // 这是 v0.0.19 删掉「延迟推送」之后给的安全替代：
+        // 延迟要达成的是"别在这个时间吵我"，而它必须**改系统发布时间**才能实现
+        // （两次撞死：跨队列 SIGTRAP / 通知永远到不了）；这里只是**我们自己不弹**，
+        // 不碰 BB 内部、不改任何系统字段 ⇒ 从根上没有那两类风险。
+        //
+        // 🔴 被免打扰拦下的通知**不朗读、不换音**（和黑名单同一个语义）：
+        //    「别吵我」是用户配这条规则的全部意图，屏幕上不弹、耳朵里却念出来是最糟的组合。
+        NSString *dndWhy = nil;
+        if ([NotifyFilter shouldDropForDND:bid now:nil reason:&dndWhy]) {
+            gDndDropped++;
+            if (gDndDropped <= 8 || (gDndDropped % 50) == 0) {
+                NBLog(@"DND#%d bundle=%@ tag=%@ 时段=%@ ⇒ 不弹（仍记进盒子）",
+                      gDndDropped, bid, tag, dndWhy ?: @"?");
+            }
+            return NBDeny();
+        }
+
         // ③ 内容替换（只改呈现，库里留着原文）
         //
         // 🔴 这里必须留痕：替换是"静默"的 —— 配了规则没生效，界面上完全看不出来。
@@ -305,6 +336,23 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             if (gReplaced <= 8 || (gReplaced % 50) == 0) {
                 NBLog(@"REPL#%d bundle=%@ tag=%@ cls=%@",
                       gReplaced, bid, tag, NBClassName(obj));
+            }
+        }
+
+        // ④.5 按 App 换提示音（v0.0.21，实验）
+        //
+        // 🔴 这是本版**唯一"造系统对象"**的地方（alloc 一个 BBSound 再挂到 bulletin 上），
+        //    没有任何官方保证。失败的表现是"这条通知不出声"，不是崩溃。
+        //    ⇒ 默认关闭、必须点名 App、每次尝试都留 SOUND# 行、外层还有一份崩溃自愈。
+        // 🔴 不看 firstTime：三个入口传进来的对象不同，谁先到谁把 sound 挂上即可，
+        //    挂两次的代价只是多 alloc 一个对象（不影响声音），比"漏挂"好。
+        {
+            NSString *sres = nil;
+            if ([NotifyFilter applySoundForBundle:bid toBulletin:obj forResult:&sres]) {
+                gSoundApplied++;
+                if (gSoundApplied <= 8 || (gSoundApplied % 50) == 0) {
+                    NBLog(@"SOUND#%d bundle=%@ tag=%@ %@", gSoundApplied, bid, tag, sres ?: @"?");
+                }
             }
         }
 
@@ -394,7 +442,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.20", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.21", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -412,17 +460,27 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    ② backboardd 以 **root** 运行 —— 它写出来的文件/目录会变成 root 所有，
     //       之后盒子 App（mobile）就写不动了，表现是「设置保存失败 / 存不住」，
     //       而且现场看起来完全不像是权限问题。这种坑不能留。
+    BOOL soundRecovered = NO;
     if ([NBProc() isEqualToString:@"SpringBoard"]) {
         // 🔴 v0.0.19：延迟功能已整体删除 ⇒ 这里不再有"自愈"，只有**残留清理**。
         //    只在 SpringBoard 里做，理由同上一段（backboardd 是 root）。
         NBPurgeDelayLeftovers();
+        // 🔴 v0.0.21：换提示音是本版唯一的"造系统对象"操作，必须有自愈兜底。
+        //    和 v0.0.15 那个坏掉的 guard 的区别：这里的 start/done 是**配对写**的
+        //    （都在 NotifyFilter 的同一个函数里），而且关开关之后会**回读确认**。
+        soundRecovered = [NotifyFilter recoverFromSoundCrashIfNeeded];
     }
 
     // 🔴 v0.0.19：banner 里**不许再出现"延迟"的"已启用/已触发"字样**。
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
-    NBLog(@"=== [%@] NotifyBox v0.0.20 · %@ · 朗读自愈%@ · 延迟推送已移除 ===",
+    // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
+    //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
+    NBLog(@"=== [%@] NotifyBox v0.0.21 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
-          recovered ? @"已触发" : @"无异常");
+          recovered ? @"已触发" : @"无异常",
+          soundRecovered ? @"已触发" : @"无异常",
+          @"可用",
+          @"实验（默认关）");
 
     // 只读探针：dump 一次 BBBulletin / BBSound 的类结构（内部自己保证只做一次）
     [NotifyProbe dumpClassesOnce];
@@ -450,7 +508,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.20 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.21 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -471,7 +529,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.20 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.21 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

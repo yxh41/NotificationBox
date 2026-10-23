@@ -67,6 +67,32 @@ NS_ASSUME_NONNULL_BEGIN
 //   用户是"通知全没"这种最难归因的症状。要恢复必须先推翻上面两条真机证据。
 //   校验脚本 nb_delay_gate.py 会把「二进制里不许出现改时间字段」当成硬判据。
 
+// ---------- v0.0.21：免打扰时段 ----------
+// 命中的通知**不弹**（同黑名单语义），但照常记进盒子。
+// 返回 YES 表示"当前时间落在免打扰时段内，且这条通知的 App 在范围内"。
+// reason 非空时写入一段人话（形如 "23:00~07:00"），供调用方留痕。
+//
+// 🔴 任何异常、任何"设置没配全"的情况一律返回 NO ——
+//    这个功能的失效方式必须是"照常弹"，绝不能是"莫名其妙全都不弹"。
+//    （开始时间 == 结束时间也按 NO 处理：那本来会等价于"全天不弹"，是个灾难性误配。）
++ (BOOL)shouldDropForDND:(nullable NSString *)bundle
+                     now:(nullable NSDate *)now
+                  reason:(NSString * _Nullable * _Nullable)reason;
+
+// ---------- v0.0.21：按 App 换提示音（实验） ----------
+// 返回 YES 表示**这条命中了规则、已经动手尝试过**（成没成看 result）；
+// 返回 NO 表示不适用（功能关 / 没配 App / 这条 App 不在名单 / 没填数）。
+// result 非空时写入"发生了什么"，形如 "id=1007 cls=BBSound" 或 "throw:NSInvalidArgumentException"。
+// 🔴 调用方必须把 result 原样打进日志：这个功能是"造系统对象"，
+//    沉默的失败等于"用户设了没效果，还查不出原因"。
++ (BOOL)applySoundForBundle:(nullable NSString *)bundle
+                 toBulletin:(nullable id)bulletin
+                  forResult:(NSString * _Nullable * _Nullable)result;
+
+// v0.0.21：换提示音的崩溃自愈（只在 SpringBoard 的构造函数里调一次）。
+// 返回 YES 表示"上次就是崩在换提示音里，已经把这个开关关掉了"，**并且已回读确认**。
++ (BOOL)recoverFromSoundCrashIfNeeded;
+
 @end
 
 NS_ASSUME_NONNULL_END
