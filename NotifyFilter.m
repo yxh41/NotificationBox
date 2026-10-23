@@ -1,5 +1,8 @@
 #import "NotifyFilter.h"
 #import "NotifyCommon.h"
+// 🔴 v0.0.28：按 App 分配提示音的**写盘**走 NotifyStore（与其它页面同一条写路径）。
+//    NotifyStore.m 在 tweak 与 App 两个 FILES 里都有，所以两边都链得到。
+#import "NotifyStore.h"
 #import <AudioToolbox/AudioToolbox.h>   // v0.0.25：AudioServicesPlaySystemSound（换提示音改成「自己播」）
 // 🔴 v0.0.26：播自定义音频文件。mp3/m4a 走不了 AudioServices（它只吃 caf/wav/aiff 这类），
 //    必须用 AVAudioPlayer 兜底。AVFoundation 在 Makefile 里两个目标都已链接
@@ -340,12 +343,140 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
     NBSharedLog(@"%@", msg);
 }
 
+// ================== v0.0.28：按 App 分配提示音 ==================
+
+static inline NSString *NBTrimText(NSString *s) {
+    if (![s isKindOfClass:[NSString class]]) return nil;
+    return [(NSString *)s stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+}
+
+// 从设置里取一份**只含合法条目**的映射（脏数据一律丢掉，绝不让它把功能带崩）。
+//
+// 合法性口径：
+//   · 键 = 非空字符串（bundle id）；
+//   · 值 = 字典，且 file / id 至少有一个"看起来能用"（file 是非空字符串 / id 是数字或数字串）。
+//   · 两样都没有的条目不合法 —— 🔴 这类条目**不能留**：
+//     留着它会让判定以为"这个 App 有分配"，然后拿一个空音去播
+//     ⇒ `playCustomSoundForBundle` 返回 YES 却没出声 ⇒ **把系统原声掐掉 = 哑巴**。
+//     （这是本项目最贵的一类错：宁可不换音，也绝不哑巴。）
+// 🔴 这里**故意不 stat 文件**：那是判定阶段的事，而且必须排在这个 App 到底要不要换音之后。
+static NSDictionary<NSString *, NSDictionary *> *NBSanitizedSoundMap(id raw) {
+    if (![raw isKindOfClass:[NSDictionary class]]) return @{};
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (id k in (NSDictionary *)raw) {
+        if (![k isKindOfClass:[NSString class]] || ![(NSString *)k length]) continue;
+        id v = ((NSDictionary *)raw)[k];
+        if (![v isKindOfClass:[NSDictionary class]]) continue;
+        NSString *f = NBTrimText(((NSDictionary *)v)[NB_KEY_SOUND_ENTRY_FILE]);
+        id iv = ((NSDictionary *)v)[NB_KEY_SOUND_ENTRY_ID];
+        BOOL hasI = [iv isKindOfClass:[NSNumber class]] ||
+                    ([iv isKindOfClass:[NSString class]] && [(NSString *)iv length] > 0);
+        if (!f.length && !hasI) continue;
+        out[k] = v;
+    }
+    return out;
+}
+
+// entry 一行人话（界面显示用）。只用于显示，**不做判定** ——
+// 判定只认 soundVerdictForBundle + playCustomSoundForBundle 那一套。
++ (NSString *)soundEntrySummary:(NSDictionary *)entry {
+    if (![entry isKindOfClass:[NSDictionary class]]) return @"未设置";
+    NSString *f = NBTrimText(entry[NB_KEY_SOUND_ENTRY_FILE]);
+    if (f.length) return f;
+    id iv = entry[NB_KEY_SOUND_ENTRY_ID];
+    NSInteger sid = 0;
+    if ([iv isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)iv integerValue];
+    else if ([iv isKindOfClass:[NSString class]]) sid = [(NSString *)iv integerValue];
+    if (sid >= 1000 && sid <= 1035) return [NSString stringWithFormat:@"系统音 %ld", (long)sid];
+    return @"未设置";
+}
+
+// 🔴 增删改的唯一实现。所有界面都调它，不许在页面里自己拼字典 ——
+//    "哪里少删了一个键"这种错在界面上看不出来（值在，只是对不上）。
++ (BOOL)setSoundEntry:(NSDictionary *)entry forBundle:(NSString *)bundle {
+    @try {
+        NSString *key = NBTrimText(bundle);
+        if (!key.length) return NO;
+        NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:NBLoadSettings() ?: @{}];
+        NSMutableDictionary *map = [NSMutableDictionary dictionaryWithDictionary:
+                                    NBSanitizedSoundMap(d[NB_KEY_SOUND_MAP])];
+        // 🔴 用"净化后还剩不剩"来判断要不要写：entry 写了 file=@"" 这种空壳，
+        //    如果直接 map[key] = entry，就留下一条"有分配但没音"的记录 ⇒ 哑巴风险（见上面注释）。
+        if (entry && [NBSanitizedSoundMap(@{key: entry}) count]) map[key] = entry;
+        else [map removeObjectForKey:key];                 // entry = nil ⇒ 删除分配
+        if (map.count) d[NB_KEY_SOUND_MAP] = map;
+        else [d removeObjectForKey:NB_KEY_SOUND_MAP];      // 空就删键，别留空字典（与别处一致）
+        return [NotifyStore saveSettings:d];
+    } @catch (__unused NSException *e) {
+        return NO;
+    }
+}
+
++ (NSDictionary<NSString *, NSDictionary *> *)soundMap {
+    @try {
+        return NBSanitizedSoundMap([self prefs][NB_KEY_SOUND_MAP]);
+    } @catch (__unused NSException *e) {
+        return @{};
+    }
+}
+
+// 旧格式 → soundMap 的一次性迁移。**只在 App 启动时调**。
+//
+// 三个必须做对的地方（每一个错了都会静默）：
+//   ① **必须删 soundApps**：否则用户在界面里删掉一个 App，旧回退还会命中它
+//      ⇒ "我明明删了，它还在响"（这种鬼最难解释）；
+//   ② 默认音拿不到就**不迁移**：造一堆"未设置"的半成品，等于把旧配置废掉但没有新配置；
+//   ③ 迁移是**幂等**的：已经有 map 就什么都不做（否则用户改过的分配会被旧名单覆盖）。
++ (BOOL)migrateSoundMapIfNeeded {
+    @try {
+        NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:NBLoadSettings() ?: @{}];
+        if (NBSanitizedSoundMap(d[NB_KEY_SOUND_MAP]).count) return NO;      // ③ 已经在新格式上
+        NSArray *legacy = [self arrayFromPref:d[NB_KEY_SOUND_APPS]];
+        if (!legacy.count) return NO;                                      // 没有旧配置
+
+        // ② 物化一条 entry：文件优先，其次 ID；都没有 ⇒ 放弃迁移（旧回退继续可用）
+        NSString *fname = NBTrimText(d[NB_KEY_SOUND_FILE]);
+        NSInteger sid = 0;
+        id iv = d[NB_KEY_SOUND_ID];
+        if ([iv isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)iv integerValue];
+        else if ([iv isKindOfClass:[NSString class]]) sid = [(NSString *)iv integerValue];
+        NSDictionary *entry = nil;
+        if (fname.length) entry = @{NB_KEY_SOUND_ENTRY_FILE: fname};
+        else if (sid >= 1000 && sid <= 1035) entry = @{NB_KEY_SOUND_ENTRY_ID: @(sid)};
+        if (!entry) return NO;
+
+        NSMutableDictionary *map = [NSMutableDictionary dictionary];
+        for (NSString *b in legacy) {
+            NSString *k = NBTrimText(b);
+            if (k.length) map[k] = entry;
+        }
+        if (!map.count) return NO;
+        d[NB_KEY_SOUND_MAP] = map;
+        [d removeObjectForKey:NB_KEY_SOUND_APPS];                           // ① 必须删
+        BOOL ok = [NotifyStore saveSettings:d];
+        NBSharedLog(@"SOUNDMAP 迁移 %lu 个 App（%@）⇒ %@", (unsigned long)map.count,
+                    entry[NB_KEY_SOUND_ENTRY_FILE] ? @"文件" : @"系统音 ID",
+                    ok ? @"已写盘" : @"写盘失败");
+        return ok;
+    } @catch (__unused NSException *e) {
+        return NO;
+    }
+}
+
 // 判定口径的唯一实现。见文件顶部的 NBSoundVerdict。
 //
 // 🔴 v0.0.26 起两个输出（优先级：**文件 > ID**）：
 //    · outFile 非空 ⇒ 播这个文件，**完全不看 outSID**（用户选了文件就该听到文件）；
 //    · outFile 为 nil ⇒ 才去校验 outSID（1000~1035 系统音区段）。
 //    这样"没选文件"的老配置行为一个字节都没变（v0.0.25 已验证通过的那条路）。
+//
+// 🔴🔴 v0.0.28：**先查「App → 音」映射，查不到才回退旧格式**。
+//    "这一次该用哪个音"仍然是**两个来源、一条校验尾巴**：
+//      · 来源① = soundMap[bundle]（新格式，每个 App 各自一个音）
+//      · 来源② = soundApps 名单 + 全局 soundFile/soundID（v0.0.21~27 的老配置）
+//    两个来源都只产出 (fname, sid) 两个值，**后面的净化/冒号/stat/区段校验只有一份**。
+//    这样"新格式有校验、旧格式没校验"这种分叉从结构上就不存在。
 + (NBSoundVerdict)soundVerdictForBundle:(NSString *)bundle
                                 soundID:(NSInteger *)outSID
                               soundFile:(NSString * _Nullable * _Nullable)outFile {
@@ -356,43 +487,64 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
         if (!p.count) return NBSoundVerdictOff;
         if (!NBBoolValue(p[NB_KEY_SOUND_ENABLED])) return NBSoundVerdictOff;
 
-        // ---- ① 先看有没有选文件（v0.0.26）----
+        NSString *key = bundle.length ? bundle : @"";
         NSString *fname = nil;
-        id fv = p[NB_KEY_SOUND_FILE];
-        if ([fv isKindOfClass:[NSString class]]) {
-            fname = [(NSString *)fv stringByTrimmingCharactersInSet:
-                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        }
-        BOOL hasFile = (fname.length > 0);
+        NSInteger sid = 0;
 
-        // ---- ② 没选文件才算 ID（老路径，v0.0.25 已验证）----
-        if (!hasFile) {
-            NSInteger sid = 0;
-            id v = p[NB_KEY_SOUND_ID];
-            if ([v isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)v integerValue];
-            else if ([v isKindOfClass:[NSString class]]) sid = [(NSString *)v integerValue];
+        // ---- ① 新格式：这个 App 有没有单独分配的音 ----
+        NSDictionary *map = NBSanitizedSoundMap(p[NB_KEY_SOUND_MAP]);
+        NSDictionary *entry = map[key];
+        BOOL fromMap = (entry != nil);
+
+        if (fromMap) {
+            id fv = entry[NB_KEY_SOUND_ENTRY_FILE];
+            if ([fv isKindOfClass:[NSString class]]) fname = NBTrimText((NSString *)fv);
+            id iv = entry[NB_KEY_SOUND_ENTRY_ID];
+            if ([iv isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)iv integerValue];
+            else if ([iv isKindOfClass:[NSString class]]) sid = [(NSString *)iv integerValue];
             if (outSID) *outSID = sid;
-            // 只接受系统提示音区段。填错就什么都不做。
-            if (sid < 1000 || sid > 1035) return NBSoundVerdictBadID;
+        } else {
+            // ---- ② 旧格式回退：名单 + 全局音 ----
+            // 🔴 保留它只为**升级不炸**：用户刚装上这版的那一刻，设置文件还是旧格式，
+            //    而 SpringBoard 不会去迁移（通知路径不写盘）⇒ 必须还能读旧格式。
+            //    迁移完成后 soundApps 会被删掉，这条路自然失效（不是被关掉的，是没有输入了）。
+            NSArray *apps = [self arrayFromPref:p[NB_KEY_SOUND_APPS]];
+            if (!apps.count) {
+                // 新格式为空、旧名单也为空 ⇒ 用户确实什么都没配（而不是"这个 App 不在名单里"）
+                return map.count ? NBSoundVerdictNotListed : NBSoundVerdictEmptyApps;
+            }
+            if (![apps containsObject:key]) return NBSoundVerdictNotListed;
+
+            id fv = p[NB_KEY_SOUND_FILE];
+            if ([fv isKindOfClass:[NSString class]]) fname = NBTrimText((NSString *)fv);
+            if (!fname.length) {
+                id iv = p[NB_KEY_SOUND_ID];
+                if ([iv isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)iv integerValue];
+                else if ([iv isKindOfClass:[NSString class]]) sid = [(NSString *)iv integerValue];
+                if (outSID) *outSID = sid;
+                if (sid < 1000 || sid > 1035) return NBSoundVerdictBadID;
+            }
         }
 
-        // ---- ③ 名单语义（与 speakApps/dndApps **相反**：空 = 不生效）----
-        // 🔴 顺序讲究：**先判名单、再判文件是否存在**。
-        //    反过来会给用户一堆"文件不存在"的告警，而那些 App 本来就不在名单里。
-        NSArray *apps = [self arrayFromPref:p[NB_KEY_SOUND_APPS]];
-        if (!apps.count) return NBSoundVerdictEmptyApps;
-        if (![apps containsObject:(bundle.length ? bundle : @"")]) return NBSoundVerdictNotListed;
-
-        // ---- ④ 到这里这个 App 确实要换音 ⇒ 才去认真校验文件 ----
-        if (hasFile) {
-            // 🔴 净化 + 存在性检查都在这里做，而且**都在名单判定之后**。
-            //    文件名不合法（含 / 或 ..）不报错，直接当"配置错"处理 ⇒ 放原声。
+        // ---- ③ 到这里这个 App 确实要换音 ⇒ 才去认真校验文件 ----
+        // 🔴 顺序讲究：**先判"这个 App 要不要换音"、再判文件是否存在**。
+        //    反过来会给用户一堆"文件不存在"的告警，而那些 App 本来就没分配。
+        if (fname.length) {
+            // 文件名不合法（含 / 或 ..）不报错，直接当"配置错"处理 ⇒ 放原声。
             NSString *path = NBSoundFilePath(fname);
             if (!path) return NBSoundVerdictBadFile;
             if (!NBIsSoundFileExt(fname)) return NBSoundVerdictBadFile;
             if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return NBSoundVerdictBadFile;
             if (outFile) *outFile = fname;
+            return NBSoundVerdictOK;
         }
+
+        // ---- ④ 只剩 ID 这条路：新格式的 entry 也得过区段校验 ----
+        // 🔴 v0.0.28 之前这里只有旧格式会走到（旧格式在上面已经校验过），
+        //    新格式的 entry 如果写了 id=0/9999，必须同样拦下来 ——
+        //    否则 `playCustomSoundForBundle` 会拿 sid=0 去播"什么都没有"，
+        //    然后 return YES 把系统原声掐掉 ⇒ **通知变哑**（v0.0.21 那个症状）。
+        if (sid < 1000 || sid > 1035) return NBSoundVerdictBadID;
         return NBSoundVerdictOK;
     } @catch (__unused NSException *e) {
         return NBSoundVerdictOff;

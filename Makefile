@@ -62,7 +62,12 @@ APPLICATION_NAME = NotifyBoxApp
 # 🔴🔴 v0.0.26 新增 app/SoundFilePickerViewController.m：选自定义提示音文件。
 #      ⚠️ 必须同时把 .h 写好并 import，否则 application.mk 编译期报
 #      "cannot find interface declaration"（看着像代码问题，其实是漏了文件）。
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/InstalledApps.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m
+# 🔴🔴 v0.0.28 新增 app/SoundAppsViewController.m：按 App 分配提示音的总览页。
+#      ⚠️ 这一条**必须加**，而且失败得很安静：SettingsViewController 里 import 了它、
+#      也 new 了它，但 application.mk 不会自动去收目录里的新文件 ⇒
+#      编译期过、**链接期**报 `undefined symbol _OBJCCLASS_$_SoundAppsViewController`。
+#      看到这个符号名先查这里，不要去查代码。
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
 # 🔴 App 侧也要 AVFoundation/AVFAudio：声音选择页要**试听**，那是在 App 里跑的 TTS。
 #    不链的话编译期就找不到 AVSpeechSynthesizer，而 tweak 侧那份救不了 App。

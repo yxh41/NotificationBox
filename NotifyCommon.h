@@ -75,7 +75,14 @@
 //    ⇒ 也就是说这个功能在**造一个系统对象**，造坏了的结果是"这条通知不出声"（不是崩溃）。
 //    所以：默认关、必须点名 App、每次尝试都留 SOUND# 留痕、失败自动回退到默认声音。
 #define NB_KEY_SOUND_ENABLED @"soundEnabled"  // NSNumber(BOOL)
-#define NB_KEY_SOUND_ID      @"soundID"       // NSNumber(int)，1000~1035 是系统提示音区段
+#define NB_KEY_SOUND_ID      @"soundID"       // NSNumber(int)，1000~1035 是系统提示音区段（v0.0.28 起 = **默认音**）
+// 🔴🔴 v0.0.28：`soundApps` 降级为**只读的历史格式**。现在的权威存储是下面的 NB_KEY_SOUND_MAP。
+//    这个键只剩三个读点、**零个写点**：
+//      ① App 启动时的迁移（migrateSoundMapIfNeeded，读完会把它删掉）；
+//      ② SpringBoard 侧的旧格式回退（soundVerdictForBundle 的 ② 分支，只在 map 为空时走）；
+//      ③ 设置页副标题（用来显示"旧名单 N 个，尚未迁移"）。
+//    ⛔ 不要再给它加任何写入通道 —— 判定在 map 非空时根本不读它，
+//    写进去的东西没人看，表现就是"界面上选了 App，却一点反应都没有"。
 #define NB_KEY_SOUND_APPS    @"soundApps"     // 数组或 "a,b"；**空 = 不生效**（与其它名单语义相反）
 
 // 换提示音的崩溃自愈标记。
@@ -205,6 +212,23 @@ static inline double NBSoundMaxSecFromValue(id v) {
     if (n > NB_SOUND_MAX_SEC_CEIL) return NB_SOUND_MAX_SEC_CEIL;
     return n;                                            // 0 = 不限
 }
+
+// ---------- v0.0.28：按 App 分配提示音 ----------
+// 语义：`soundMap` = { bundleId : { "file": 文件名 } 或 { "id": 1000~1035 } }
+//   · **有记录 ⇒ 这个 App 换音**，用记录里的那个音（文件优先于 id，与全局同口径）；
+//   · 没有记录 ⇒ 不换音。⇒ **名单就是 map 的键**，`soundApps` 不再需要。
+//
+// 🔴 为什么不再用「一份名单 + 一个全局音」：
+//    那是"要么全换、要么不换"。用户第二个需求一定是"微信用 A、QQ 用 B"，
+//    而现有结构连"两个 App 两个音"都表达不了 —— 这才是真正缺的东西。
+//
+// 🔴 旧格式（`soundApps` 名单 + 全局 `soundFile`/`soundID`）**仍然认**，作为回退：
+//    · App 侧：打开时做一次迁移（把名单里每个 App 物化成一条记录，然后**删掉 `soundApps`**）；
+//    · SpringBoard 侧：**只读、不迁移** —— 通知路径上不写盘（写盘是用户的动作，不是通知的副作用）。
+//    迁移必须删 `soundApps`，否则"我在界面上删了这个 App，它还在响"这种鬼会一直存在。
+#define NB_KEY_SOUND_MAP        @"soundMap"
+#define NB_KEY_SOUND_ENTRY_FILE @"file"
+#define NB_KEY_SOUND_ENTRY_ID   @"id"
 
 // 🔴 「一组 bundle id」的读法只在这里写一份。
 //    历史数据是**逗号分隔字符串**（v0.0.12 及以前是输入框），
