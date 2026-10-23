@@ -280,6 +280,18 @@ static void NBWriteSoundGuard(NSString *state) {
     } @catch (__unused NSException *e) { }
 }
 
+// 🔴 v0.0.21：换提示音有两条「开关开了但配置不完整」的分支（名单空 / ID 越界）。
+//    原来两条都是静默 `return NO;` ⇒ 用户的观感是「我把开关打开了，一切照旧」，
+//    必然当成「功能坏了」报回来。这里各留一条痕迹。
+// 🔴 **每个进程只打一次**：这个函数每条通知都会走到，不去重就是刷屏 ——
+//    而日志窗口只有最后 50 条，刷屏等于没有日志。
+// 🔴 用 static BOOL 而不是集合：跨队列调用时最坏情况是多打一条，不会有竞态崩溃。
+static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
+    if (*flag) return;
+    *flag = YES;
+    NBSharedLog(@"%@", msg);
+}
+
 + (BOOL)applySoundForBundle:(NSString *)bundle
                  toBulletin:(id)bulletin
                   forResult:(NSString **)result {
@@ -296,12 +308,22 @@ static void NBWriteSoundGuard(NSString *state) {
         if ([v isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)v integerValue];
         else if ([v isKindOfClass:[NSString class]]) sid = [(NSString *)v integerValue];
         // 只接受系统提示音区段。填错就什么都不做 —— 造一个 id=0 的 BBSound 只会让它变哑。
-        if (sid < 1000 || sid > 1035) return NO;
+        if (sid < 1000 || sid > 1035) {
+            static BOOL onceBadID = NO;
+            NBWarnSoundMisconfig(&onceBadID, @"!!! 换提示音的 ID 不在 1000~1035"
+                                             @"（当前值取不到或越界）⇒ 不生效，通知按原声播放");
+            return NO;
+        }
 
         // 🔴 与 speakApps/dndApps 语义**相反**：这里空名单 = 不生效。
         //    实验功能默认绝不能"全部 App 都改"，那等于一次性把整台手机的通知声音变掉。
         NSArray *apps = [self arrayFromPref:p[NB_KEY_SOUND_APPS]];
-        if (!apps.count) return NO;
+        if (!apps.count) {
+            static BOOL onceEmpty = NO;
+            NBWarnSoundMisconfig(&onceEmpty, @"!!! 换提示音开着但 App 名单是空的"
+                                             @" ⇒ 不生效（故意的：实验功能不许全量改掉整机通知音）");
+            return NO;
+        }
         if (![apps containsObject:(bundle.length ? bundle : @"")]) return NO;
 
         if (![bulletin respondsToSelector:@selector(setSound:)]) {
