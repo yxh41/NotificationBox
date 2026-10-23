@@ -165,6 +165,15 @@ static const NSInteger kSubHit = 105;
     //    顺序即语义，用户从上往下读："先看有没有文件，没有才用 ID"。
     [self addActionRow:@"提示音文件（优先于上面的 ID）"
                     key:@"soundfile" action:@selector(onSoundFile:)];
+    // v0.0.27：最长播放秒数。**排在文件下面**：它管的是"播多久"，紧跟着"播什么"讲。
+    // 🔴 为什么必须有这一项：v0.0.26 实测出不一致 —— 同一份设置，wav 最多响 30 秒
+    //    （A 通道没有 stop API，系统硬上限），mp3 从头响到尾（B 通道能 stop）。
+    //    用户只会觉得"是不是没生效"。这一项把两条通道的时长拉齐到同一个语义。
+    [self addGroup:@"最长播放秒数（0 = 不限；清空 = 默认 8）"
+                 ph:@"8（默认）"
+              value:[self strOf:cur[NB_KEY_SOUND_MAX_SEC]]
+           keyboard:UIKeyboardTypeDecimalPad
+                key:NB_KEY_SOUND_MAX_SEC];
     [self addActionRow:@"换提示音的 App（空 = 不生效）"
                     key:@"soundapps" action:@selector(onSoundApps:)];
     [self addActionRow:@"试听这个提示音" key:@"soundpreview" action:@selector(onSoundPreview:)];
@@ -439,6 +448,12 @@ static const NSInteger kSubHit = 105;
 - (NSString *)strOf:(id)v {
     if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
     if ([v isKindOfClass:[NSArray class]]) return [(NSArray *)v componentsJoinedByString:@","];
+    // 🔴 v0.0.27 补上 NSNumber：数字型设置落盘时是 @(n)（见 onSave 里的 soundID / maxRecords），
+    //    而这里原来对 NSNumber 一律返回 @"" ⇒ **重新进设置页时输入框是空的**。
+    //    那是一种非常难受的错：值明明在生效，界面却说没设过，用户会重新填一遍
+    //    （填的如果和原来一样就没事，填成别的就等于悄悄改配置）。
+    //    v0.0.21 起 soundID 一直有这个毛病，只是没人去核对过输入框。
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v stringValue];
     return @"";
 }
 
@@ -588,6 +603,24 @@ static const NSInteger kSubHit = 105;
                 NSInteger n = [v integerValue];
                 if (n < 1000 || n > 1035) {
                     [self fail:@"提示音 ID 必须是 1000~1035 之间的数字（原值未改）"];
+                    return;
+                }
+                d[key] = @(n);
+            }
+        } else if ([key isEqualToString:NB_KEY_SOUND_MAX_SEC]) {
+            // v0.0.27：最长播放秒数。**0 = 不限**，清空 = 回默认 8 秒。
+            // 🔴 这里必须严格校验，不能只 `[v doubleValue]` —— 那对 "abc" 返回 0，
+            //    而 0 的语义正是"不限"⇒ 一个手滑就变成"播到底"，而且界面上看起来还"保存成功了"。
+            if (v.length == 0) {
+                [d removeObjectForKey:key];       // 清空 = 用默认值（与别处"清空要能生效"一致）
+            } else {
+                NSScanner *sc = [NSScanner scannerWithString:v];
+                double n = 0;
+                if (![sc scanDouble:&n] || !sc.isAtEnd
+                    || n < 0 || n > NB_SOUND_MAX_SEC_CEIL) {
+                    [self fail:[NSString stringWithFormat:
+                                @"最长播放秒数要填 0~%.0f 之间的数字（0 = 不限，清空 = 默认 8 秒）（原值未改）",
+                                NB_SOUND_MAX_SEC_CEIL]];
                     return;
                 }
                 d[key] = @(n);

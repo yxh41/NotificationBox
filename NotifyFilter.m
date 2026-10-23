@@ -39,7 +39,16 @@ typedef NS_ENUM(NSInteger, NBSoundVerdict) {
 
 // v0.0.26：文件播放的两条通道（只在内部用）
 + (BOOL)nbPlayViaAudioServices:(NSString *)path why:(NSString **)why;
-+ (BOOL)nbPlayViaAVPlayer:(NSString *)path why:(NSString **)why;
+// v0.0.27：maxSec > 0 时到点 stop（0 = 不限）。只有 B 通道能截断，A 通道做不到。
++ (BOOL)nbPlayViaAVPlayer:(NSString *)path
+                   maxSec:(NSTimeInterval)maxSec
+                      why:(NSString **)why;
+
+// v0.0.27：时长上限相关（都只在内部用）
++ (NSTimeInterval)nbDurationOfFile:(NSString *)path;   // -1 = 量不出来
++ (NSTimeInterval)nbSoundMaxSec;                       // 0 = 不限
+// 通道优先级：YES = 先试 A（已验证通道），NO = 先走 B。**选路逻辑只写在这一处。**
++ (BOOL)nbPrefersAudioServicesForDuration:(NSTimeInterval)dur cap:(NSTimeInterval)cap;
 @end
 
 @implementation NotifyFilter
@@ -450,6 +459,84 @@ static NSMutableArray<AVAudioPlayer *> *NBLivePlayers(void) {
     return a;
 }
 
+// ---------- v0.0.27：时长上限 ----------
+//
+// 这一节只回答两个问题：**这个文件有多长**、**这一次该走哪条通道**。
+//
+// 🔴 为什么需要"选通道"而不是"给 A 加个定时器"：
+//    A 通道（AudioServicesPlaySystemSound）**没有 stop API** —— 唯一的
+//    `AudioServicesDisposeSystemSoundID` 会把播放一起掐断并释放资源（等于"停一次废一个 ID"）。
+//    所以 A 能响多久我们**控制不了**（系统硬上限见 NotifyCommon.h 的 NB_A_CHANNEL_MAX_SEC）。
+//    ⇒ 上限只能靠"能不能在时限内播完"来选路：短的走 A，长的走 B。
+
+// 量出来的时长缓存。key 里带文件大小与 mtime ⇒ 用户换掉同名文件后自动失效
+// （不失效的后果：把 3 秒的 wav 换成 3 分钟的 wav，仍然按"A 放得完"选路 ⇒ 实际只响 30 秒，
+//   而排错时看到的日志全是"选了 A"，跟真因隔着两层）。
+static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
+    static NSMutableDictionary *d = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+
+// 文件时长（秒）。**负数 = 量不出来**，调用方据此按"未知"处理（未知就不赌 A）。
++ (NSTimeInterval)nbDurationOfFile:(NSString *)path {
+    if (!path.length) return -1;
+
+    NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+    id sz = attr[NSFileSize];
+    id mt = attr[NSFileModificationDate];
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%.0f", path,
+                     [sz isKindOfClass:[NSNumber class]] ? sz : @(-1),
+                     [mt isKindOfClass:[NSDate class]] ? [(NSDate *)mt timeIntervalSince1970] : -1.0];
+
+    NSMutableDictionary *cache = NBDurCache();
+    @synchronized (cache) {
+        NSNumber *c = cache[key];
+        if (c) return (NSTimeInterval)[c doubleValue];
+    }
+
+    NSTimeInterval dur = -1;
+    @try {
+        // 🔴 用 AVAudioPlayer 量，**不用 AVURLAsset**：
+        //    `AVAsset.duration` 从 iOS 16 起被标记弃用（要求改成异步 load(.duration)），
+        //    而 `AVAudioPlayer.duration` 没有弃用；而且它和 B 通道是**同一个解码器** ⇒
+        //    "它说多长"就是 B 通道实际会播多长，两者不会打架。
+        // 🔴 这里只是建一个 player 读属性：**不 play、不碰 AVAudioSession**
+        //    （改 session 是有全局副作用的动作，只允许在真要播的时候做，见 nbPlayViaAVPlayer）。
+        NSError *e = nil;
+        AVAudioPlayer *pl = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path]
+                                                                  error:&e];
+        if (pl) dur = pl.duration;
+        pl = nil;                                   // 只为量时长，立刻放掉
+    } @catch (__unused NSException *e) { }
+
+    if (dur <= 0 || dur > 3600) dur = -1;           // 量不出来 / 明显不可信 ⇒ 未知
+
+    @synchronized (cache) { cache[key] = @(dur); }
+    return dur;
+}
+
+// 读"最长播放秒数"。**0 = 不限**；键缺失 = 默认 8 秒（解读口径只有 NBSoundMaxSecFromValue 一份）。
++ (NSTimeInterval)nbSoundMaxSec {
+    id v = nil;
+    @try {
+        NSDictionary *p = [self prefs];
+        if ([p isKindOfClass:[NSDictionary class]]) v = p[NB_KEY_SOUND_MAX_SEC];
+    } @catch (__unused NSException *e) { }
+    return NBSoundMaxSecFromValue(v);
+}
+
+// **选路逻辑只写在这一处**（播放和界面提示都调它，否则"界面上说的"和"实际做的"会走岔）。
+// YES = 先试 A（v0.0.25 已验证的那条通道）；NO = 先走 B（只有它能截断）。
++ (BOOL)nbPrefersAudioServicesForDuration:(NSTimeInterval)dur cap:(NSTimeInterval)cap {
+    // ① 比 A 的系统上限还长 ⇒ A 放不全，别选它。
+    if (dur > 0 && dur > NB_A_CHANNEL_MAX_SEC) return NO;
+    // ② 开了上限、但不保证能播完（时长未知 或 超上限）⇒ 只有 B 能截断。
+    if (cap > 0 && (dur < 0 || dur > cap)) return NO;
+    return YES;
+}
+
 + (BOOL)nbPlayViaAudioServices:(NSString *)path why:(NSString **)why {
     NSMutableDictionary *cache = NBSidCache();
     SystemSoundID sid = 0;
@@ -472,7 +559,9 @@ static NSMutableArray<AVAudioPlayer *> *NBLivePlayers(void) {
     return YES;
 }
 
-+ (BOOL)nbPlayViaAVPlayer:(NSString *)path why:(NSString **)why {
++ (BOOL)nbPlayViaAVPlayer:(NSString *)path
+                   maxSec:(NSTimeInterval)maxSec
+                      why:(NSString **)why {
     NSError *err = nil;
     AVAudioPlayer *pl = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path]
                                                               error:&err];
@@ -509,11 +598,21 @@ static NSMutableArray<AVAudioPlayer *> *NBLivePlayers(void) {
         [live addObject:pl];
     }
 
-    // 播完就放掉。duration 不可信时给个短兜底，绝不能出现"永久持有"。
+    // 到点收工。duration 不可信时给个短兜底，绝不能出现"永久持有"。
+    //
+    // 🔴 v0.0.27：只有"文件本来就更长"（或时长量不出来、上限又开着）才 `stop`。
+    //    本来就比上限短的**必须让它自然播完** —— `stop` 会削掉尾音，
+    //    听感上就是"这提示音怎么断在半截"，用户只会怀疑是插件坏了。
     NSTimeInterval dur = pl.duration;
-    if (dur <= 0 || dur > 120) dur = 3.0;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((dur + 1.0) * NSEC_PER_SEC)),
+    BOOL known = (dur > 0 && dur <= 3600);
+    BOOL needStop = (maxSec > 0) && (!known || dur > maxSec);
+    NSTimeInterval after = needStop ? maxSec : (known ? dur + 0.5 : 3.0);
+    if (after < 0.05) after = 0.05;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(after * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        if (needStop) {
+            @try { [pl stop]; } @catch (__unused NSException *e) { }
+        }
         @synchronized (live) { [live removeObject:pl]; }
     });
     return YES;
@@ -542,14 +641,32 @@ static NSMutableArray<AVAudioPlayer *> *NBLivePlayers(void) {
             return NO;
         }
 
+        // ---- v0.0.27：按"能不能在时限内播完"选通道 ----
+        // 上限 0 = 不限 ⇒ 仍然走 A（已验证通道，零 session 副作用）。
+        NSTimeInterval cap = [self nbSoundMaxSec];
+        NSTimeInterval dur = [self nbDurationOfFile:path];          // 负数 = 量不出来
+        BOOL aFirst = [self nbPrefersAudioServicesForDuration:dur cap:cap];
+
         NSString *whyA = nil;
-        if ([self nbPlayViaAudioServices:path why:&whyA]) {
-            if (result) *result = [NSString stringWithFormat:@"自播 file=%@ ch=A", name];
-            return YES;
-        }
         NSString *whyB = nil;
-        if ([self nbPlayViaAVPlayer:path why:&whyB]) {
-            if (result) *result = [NSString stringWithFormat:@"自播 file=%@ ch=B", name];
+        BOOL okA = NO;
+        BOOL okB = NO;
+        // 🔴 两条通道**互为兜底**：先走的那条失败就试另一条。
+        //    代价是 A 不遵守上限（它没有 stop），但那只发生在"B 也播不出来"的双失败路径上 ——
+        //    那时响得久一点，远好过哑巴。这个取舍要写进 README，不能只在代码里。
+        if (aFirst) {
+            okA = [self nbPlayViaAudioServices:path why:&whyA];
+            if (!okA) okB = [self nbPlayViaAVPlayer:path maxSec:cap why:&whyB];
+        } else {
+            okB = [self nbPlayViaAVPlayer:path maxSec:cap why:&whyB];
+            if (!okB) okA = [self nbPlayViaAudioServices:path why:&whyA];
+        }
+        if (okA || okB) {
+            if (result) {
+                // dur=-1.0 表示"时长没量出来"（不是播了 -1 秒）；cap=0.0 表示不限。
+                *result = [NSString stringWithFormat:@"自播 file=%@ ch=%@ dur=%.1f cap=%.1f",
+                           name, okA ? @"A" : @"B", dur, cap];
+            }
             return YES;
         }
         // 两条都失败 ⇒ 一定要把两条的原因都带出去，否则下一轮只能猜。
@@ -559,6 +676,35 @@ static NSMutableArray<AVAudioPlayer *> *NBLivePlayers(void) {
     } @catch (NSException *e) {
         if (result) *result = [NSString stringWithFormat:@"throw:%@", e.name ?: @"?"];
         return NO;
+    }
+}
+
+// v0.0.27：给界面用的"这个文件会怎么播"（时长 + 走哪条通道 + 会不会被截断）。
+// **只用于显示，不做判定** —— 判定仍然只在 soundVerdictForBundle 里。
+// 🔴 放在引擎里而不是界面里：这样"界面写的"和"实际做的"用**同一份选路逻辑**。
+//    两份必走岔，而走岔的症状（界面说会截断、实际没截断）几乎没法自证。
++ (NSString *)playbackPlanForFileNamed:(NSString *)name {
+    @try {
+        NSString *path = NBSoundFilePath(name);
+        if (!path) return @"文件名不合法";
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return @"文件不在";
+
+        NSTimeInterval dur = [self nbDurationOfFile:path];
+        NSTimeInterval cap = [self nbSoundMaxSec];
+        BOOL aFirst = [self nbPrefersAudioServicesForDuration:dur cap:cap];
+        NSString *durText = (dur < 0) ? @"时长未知" : [NSString stringWithFormat:@"%.1f 秒", dur];
+
+        NSString *how = @"走 A";
+        if (!aFirst) {
+            if (cap > 0 && (dur < 0 || dur > cap)) {
+                how = [NSString stringWithFormat:@"走 B，%.0f 秒后停", cap];
+            } else {
+                how = [NSString stringWithFormat:@"走 B（超 %.0f 秒，A 放不全）", NB_A_CHANNEL_MAX_SEC];
+            }
+        }
+        return [NSString stringWithFormat:@"%@ · %@", durText, how];
+    } @catch (NSException *e) {
+        return @"?";
     }
 }
 

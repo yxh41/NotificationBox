@@ -109,7 +109,7 @@
         return [NSString stringWithFormat:
                 @"把音频放进来就能选：\n%@\n"
                 @"支持 %@。放完回到这个页面会自动刷新；没刷新就退出去再进来一次。\n"
-                @"⚠️ 超过 30 秒的音频建议先剪短：AudioServices 那条路只播前 30 秒。",
+                @"长音频不用先剪：超过「最长播放秒数」的会自动截断（在上一页设，默认 8 秒）。",
                 NOTIFYBOX_SOUND_DIR,
                 [NOTIFYBOX_SOUND_EXTS componentsJoinedByString:@"/"]];
     }
@@ -138,7 +138,12 @@
     NSString *name = self.files[(NSUInteger)ip.row];
     c.textLabel.text = name;
 
-    // 副标题给"大小 + 能不能被 A 通道吃下"——这两个直接决定"点了会不会响"
+    // 副标题给"大小 + 这个文件会怎么播"——这两项直接决定"点了会不会响、会响多久"
+    //
+    // 🔴 v0.0.27 改口径：**不再按扩展名猜通道**。现在通道是由「文件时长 / 最长播放秒数」
+    //    决定的（一个 40 秒的 wav 会走 B，一个 3 秒的 mp3 会先试 A），
+    //    按扩展名写"这是 A 通道"会直接写错，而用户是照着这行字做判断的。
+    //    口径统一走引擎的 playbackPlanForFileNamed:（界面与实际共用一份选路逻辑）。
     NSString *path = NBSoundFilePath(name);
     NSNumber *sz = nil;
     NSDictionary *attr = path ? [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL] : nil;
@@ -146,11 +151,9 @@
     NSString *sizeText = sz ? [NSByteCountFormatter stringFromByteCount:sz.longLongValue
                                                              countStyle:NSByteCountFormatterCountStyleFile]
                             : @"?";
-    NSString *ext = [[name pathExtension] lowercaseString];
-    BOOL aOK = [@[@"caf", @"wav", @"aiff", @"aif"] containsObject:ext];
     c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@",
                               sizeText,
-                              aOK ? @"AudioServices（已验证通道）" : @"AVAudioPlayer 兜底"];
+                              [NotifyFilter playbackPlanForFileNamed:name]];
     c.accessoryType = [name isEqualToString:self.selected] ? UITableViewCellAccessoryCheckmark
                                                            : UITableViewCellAccessoryNone;
     return c;

@@ -156,6 +156,56 @@ static inline BOOL NBIsSoundFileExt(NSString *name) {
     return [NOTIFYBOX_SOUND_EXTS containsObject:e];
 }
 
+// ---------- 提示音最长播放秒数（v0.0.27）----------
+// 语义：**0 = 不限**；键缺失 = 默认 8 秒。
+//
+// 🔴 为什么要加这个（实测出来的不一致，不是拍脑袋）：
+//   · A 通道（`AudioServicesPlaySystemSound`）**没有 stop API** —— 只有
+//     `AudioServicesDisposeSystemSoundID` 能停，而那会把资源一起释放掉（下次还得重建），
+//     所以 A 通道的时长**我们控制不了**，硬上限是系统给的 **30 秒**；
+//   · B 通道（`AVAudioPlayer`）能 `stop`，想播多久播多久。
+//   ⇒ 同一份设置、同一个文件，wav 响 30 秒、mp3 响到底 —— 用户只会觉得"是不是没生效"。
+//
+// 解法不是"给 A 加个定时器"（做不到），而是**按能不能播完来选通道**：
+//   文件时长 ≤ 上限 ⇒ 走 A（已验证通道，零 session 副作用）；
+//   文件时长 > 上限 ⇒ 走 B（因为只有它能截断）。
+// 这样"最多响 N 秒"对所有格式都成立，而绝大多数短提示音仍然走那条验证过的路。
+#define NB_KEY_SOUND_MAX_SEC    @"soundMaxSec"   // NSNumber 或 "8"，0 = 不限
+#define NB_DEFAULT_SOUND_MAX_SEC 8.0             // 键缺失时的默认
+#define NB_SOUND_MAX_SEC_CEIL   120.0            // 手填上限，防止有人写 86400
+
+// A 通道（AudioServicesPlaySystemSound）的系统硬上限：超过 30 秒的音频它只播前 30 秒。
+// 🔴 v0.0.27 起这个数**不再是一个要跟用户解释的局限**，而是一条选路依据：
+//    时长 > 30 秒一律不走 A（走 B，B 想播多久播多久）⇒ 界面上不会出现"我设了 60 秒只响 30 秒"。
+//    ⚠️ 30 这个数来自 AudioServices 的文档行为，本机没有单独验证过 ——
+//    真机若发现更短，第一个症状会是"长 wav 只响一小段"，那时把这里调小即可（选路逻辑不用动）。
+#define NB_A_CHANNEL_MAX_SEC    30.0
+
+// 「最长播放秒数」的**唯一**解读口径（App 与 tweak 两边都编进各自的二进制）。
+// 🔴 与 NBBoolValue 同一个道理：两边各写一份解读，就会出现"界面显示 8 秒、tweak 当成不限"
+//    这种任何保存期检查都发现不了的错。
+// 语义：缺失/空/负数/不是数 ⇒ 默认 8 秒；0 ⇒ **不限**；> 120 ⇒ 夹到 120。
+static inline double NBSoundMaxSecFromValue(id v) {
+    if (!v) return NB_DEFAULT_SOUND_MAX_SEC;
+    double n = 0;
+    if ([v isKindOfClass:[NSNumber class]]) {
+        n = [(NSNumber *)v doubleValue];
+    } else if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!s.length) return NB_DEFAULT_SOUND_MAX_SEC;
+        // 🔴 手填的值必须**严格**校验：`[s doubleValue]` 对 "abc" 返回 0，
+        //    而 0 的语义是"不限" ⇒ 一个手滑就会变成"播到底"。宁可用默认值。
+        NSScanner *sc = [NSScanner scannerWithString:s];
+        if (![sc scanDouble:&n] || !sc.isAtEnd) return NB_DEFAULT_SOUND_MAX_SEC;
+    } else {
+        return NB_DEFAULT_SOUND_MAX_SEC;
+    }
+    if (n < 0) return NB_DEFAULT_SOUND_MAX_SEC;           // 负数当没填
+    if (n > NB_SOUND_MAX_SEC_CEIL) return NB_SOUND_MAX_SEC_CEIL;
+    return n;                                            // 0 = 不限
+}
+
 // 🔴 「一组 bundle id」的读法只在这里写一份。
 //    历史数据是**逗号分隔字符串**（v0.0.12 及以前是输入框），
 //    新数据是**数组**（v0.0.13 的选择器写）。

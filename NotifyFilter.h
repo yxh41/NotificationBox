@@ -110,9 +110,17 @@ NS_ASSUME_NONNULL_BEGIN
 //    而通知路径必须先判定。两者共用"播"这一步，判定各走各的入口。
 //
 // 返回契约与 playCustomSoundForBundle 一致：YES = 播放请求已发出；NO = 播不出去，调用方回退。
-// result 非空时写入走了哪条通道（ch=A = AudioServices，ch=B = AVAudioPlayer）或失败原因。
+// result 非空时写入走了哪条通道与量到的时长，形如
+// `自播 file=xx.wav ch=A dur=3.2 cap=8.0`（dur=-1.0 = 时长没量出来，cap=0.0 = 不限）。
 + (BOOL)playSoundFileNamed:(nullable NSString *)name
                  forResult:(NSString * _Nullable * _Nullable)result;
+
+// ---------- v0.0.27：播放计划（只给界面显示用）----------
+// 返回人话，形如 `3.2 秒 · 走 A` / `42.0 秒 · 走 B，8 秒后停`。
+// 🔴 **不做判定**（不管开关、不管名单），也**不改任何设置**。
+//   放在引擎里是为了让"界面写的"和"实际做的"共用同一份选路逻辑：
+//   两份一旦走岔，症状是"界面说会截断、实际没截断"，几乎没法自证。
++ (NSString *)playbackPlanForFileNamed:(nullable NSString *)name;
 
 // v0.0.21：换提示音的崩溃自愈（只在 SpringBoard 的构造函数里调一次）。
 // 返回 YES 表示"上次就是崩在换提示音里，已经把这个开关关掉了"，**并且已回读确认**。
