@@ -230,6 +230,16 @@ static inline double NBSoundMaxSecFromValue(id v) {
 #define NB_KEY_SOUND_ENTRY_FILE @"file"
 #define NB_KEY_SOUND_ENTRY_ID   @"id"
 
+// ---------- v0.0.29：连续通知不叠加 ----------
+// 「这一声归谁」的标识：通知用 bundleId，试听用这个常量。
+//
+// 🔴 为什么试听要单独一个 owner、而不复用 bundleId：
+//    ① 试听**没有** bundleId（设置页试听是全局的）；
+//    ② 试听之间也要互斥 —— 连点两次"试听"，两个长音一起放会很难听；
+//    ③ 试听与通知**不**互斥是故意的：用户在配置时不该因为来了条通知就听不到自己在听的那个音。
+//    前缀用 `@` 是因为 bundleId 不可能以 `@` 开头，撞不上真实 App。
+#define NB_SOUND_OWNER_PREVIEW  @"@preview"
+
 // 🔴 「一组 bundle id」的读法只在这里写一份。
 //    历史数据是**逗号分隔字符串**（v0.0.12 及以前是输入框），
 //    新数据是**数组**（v0.0.13 的选择器写）。
