@@ -30,6 +30,7 @@
 - (void)showText:(NSString *)text title:(NSString *)title;
 - (NSString *)keyLinesFrom:(NSString *)text;
 - (NSString *)selLinesFrom:(NSString *)text;
+- (NSString *)probeLinesFrom:(NSString *)text;
 @end
 
 @implementation ViewController
@@ -79,6 +80,18 @@
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
         [self showText:[self keyLinesFrom:[NotifyStore logText:20000]] title:@"结论行"];
+    }]];
+    // 🔴 v0.0.20：探针数据单独开一个入口。
+    //    为什么不能只靠结论行：
+    //      ① 结论行只看**尾部 20KB**，而探针是**开机那一刻**打的 —— 手机跑几个小时后
+    //         那几行早被挤出窗口了，改了关键词也照样看不到（这是"两个独立的丢数据原因"，
+    //         只修关键词等于只修了一半）；
+    //      ② 探针行很长（几十个属性名 + 类型编码），混在结论行里会把别的判据挤出去。
+    //    窗口取 200KB（日志轮转阈值 512KB，足够覆盖一次开机到现在的全部内容）。
+    [sheet addAction:[UIAlertAction actionWithTitle:@"探针数据（PROBE，换提示音要用）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self showText:[self probeLinesFrom:[NotifyStore logText:200000]] title:@"探针数据"];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"方法清单（SEL+ENC）"
                                               style:UIAlertActionStyleDefault
@@ -149,11 +162,57 @@
 // 加成哨兵前缀后，脚本能精确定位"表里有哪些词"，判据才等于变异域。
 //
 // 额外好处：全部关键词集中一处，以后加新留痕只改这一行，不会漏。
+//
+// 🔴🔴 v0.0.20：把已经死掉的 DELAY / PROBEDATE 换成 PROBE。
+//   这一条又是"留痕被自己筛掉"，和 v0.0.17 的 DELAY# 是**同一个病，第三次了**：
+//   探针所有实质数据都以 PROBE 开头（`PROBE BBBulletin 名字: …` /
+//   `PROBE#1 tag=PB :: sound=<BBSound> …` / `PROBE 当前队列标签 = …`），
+//   而表里一个能匹配它们的词都没有 ⇒ 结论行里只剩
+//   `=== PROBE 开始 dump 类结构 ===` 和 `=== PROBE dump 结束 ===` 两行，
+//   **这两行恰好不含任何数据**。
+//   现场看起来就是"探针跑了、什么都没量到"，实际数据一直在日志里。
+//   ⇒ 「按 App 换提示音」等 PROBE 数据等了好几版，根因在这里。
+//   🔴 教训升级版：**加了新留痕，必须同时问"它能通过筛选吗"**；
+//      而"筛选表里有旧词"不等于"新留痕能被捞出来"。
 static NSString * const kNBKeyLineTable =
-    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|DELAY|PROBEDATE|APP-ALIVE|G3 首次|失败|!!!|探针";
+    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|APP-ALIVE|G3 首次|失败|!!!|探针";
 
 static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [kNBKeyLineTable componentsSeparatedByString:@"|"];
+}
+
+// v0.0.20：只挑探针行。
+// 判据域 = 含 "PROBE" 的行；变异域 = 探针的全部输出（NotifyProbe.m 里每一行都以 PROBE 开头）
+// ⇒ 两者严格对齐。这正是上一版"关键词表漏词"要买的课。
+// 单独开入口、而不是塞进结论行，有两个**互相独立**的原因：
+//   ① 结论行只看尾部 20KB，而探针是**开机那一刻**打的 —— 手机跑几小时后早被挤出窗口，
+//      光把关键词补进表里也照样看不见（只修一半 = 还是看不到）；
+//   ② 探针行很长（几十个属性名 + 类型编码），混进结论行会把 DROP#/REPL# 这些判据挤掉。
+- (NSString *)probeLinesFrom:(NSString *)text {
+    if (!text.length) return @"(空)";
+    NSArray *all = [text componentsSeparatedByString:@"\n"];
+    NSMutableArray *keep = [NSMutableArray array];
+    for (NSString *line in all) {
+        if ([line containsString:@"PROBE"]) [keep addObject:line];
+    }
+    NSUInteger total = keep.count;
+    if (!total) {
+        return @"(没找到 PROBE 行)\n\n"
+                "常见原因（按可能性排）：\n"
+                "① SpringBoard 起来之后还没收到过通知 —— 探针要等第一条通知到达才跑；\n"
+                "② 日志轮转过了（超过 512KB 切到 .1），开机那几条不在当前文件里；\n"
+                "③ tweak 没注入 —— 先去「只看结论行」看有没有 banner 那两行。";
+    }
+    // 只留最后 40 行：单行可能上千字，多了翻不动
+    if (keep.count > 40) {
+        keep = [[keep subarrayWithRange:NSMakeRange(keep.count - 40, 40)] mutableCopy];
+    }
+    NSString *head = [NSString stringWithFormat:@"PROBE 行 %lu 条 / 全文 %lu 行%@",
+                      (unsigned long)total, (unsigned long)all.count,
+                      (total > keep.count
+                       ? [NSString stringWithFormat:@"（只显示最后 %lu 条）", (unsigned long)keep.count]
+                       : @"")];
+    return [head stringByAppendingFormat:@"\n\n%@", [keep componentsJoinedByString:@"\n"]];
 }
 
 // 从全量日志里挑出「能下结论」的行：装载/挂了哪组/命中/探针/丢弃/写库失败

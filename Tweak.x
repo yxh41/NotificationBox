@@ -1,4 +1,8 @@
-// Tweak.x —— v0.0.19（当前）：**延迟推送功能整体删除**（两种实现各撞死一次）
+// Tweak.x —— v0.0.20（当前）：**修「探针数据被结论行筛掉」** —— 换提示音的最后一块数据缺口
+//
+// 上一版（v0.0.19）把延迟推送整体删除了，那一版改的是引擎，本版**只改 App 侧的日志可见性**：
+//   探针（PROBE）的实质数据行里一个筛选关键词都不含 ⇒ 结论行只剩「开始/结束」两行空壳，
+//   看起来像「探针跑了但什么都没量到」，实际数据一直在日志里。
 //
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 📌 真机量回来的签名（v0.0.4 零 hook 诊断，SpringBoard / iOS 16.4.1）：
@@ -390,7 +394,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.19", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.20", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -416,7 +420,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 
     // 🔴 v0.0.19：banner 里**不许再出现"延迟"的"已启用/已触发"字样**。
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
-    NBLog(@"=== [%@] NotifyBox v0.0.19 · %@ · 朗读自愈%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.20 · %@ · 朗读自愈%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常");
 
@@ -446,7 +450,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.19 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.20 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -467,7 +471,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.19 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.20 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
