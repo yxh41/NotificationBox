@@ -3,6 +3,24 @@
 #import <objc/runtime.h>       // v0.0.16 起为探针引入；v0.0.19 删掉延迟后本文件已不用 objc_* 函数，
                               // 但保留这个 import 无害，且省得下次要加探针时又忘
 
+// 🔴 v0.0.22：换提示音「该不该生效」的判定**只写这一处**。
+//    刀（applySoundForBundle）和诊断（isSoundTargetBundle）都调它。
+//    理由见本文件顶部那一版说明：两处各写一份，一旦走岔就是
+//    "诊断说该生效、刀说不该生效"，而刀往往才是对的 —— 那一轮直接白跑。
+typedef NS_ENUM(NSInteger, NBSoundVerdict) {
+    NBSoundVerdictOK = 0,      // 该生效
+    NBSoundVerdictOff,         // 功能没开 / 设置读不到 / 读的时候抛异常
+    NBSoundVerdictBadID,       // ID 不在 1000~1035
+    NBSoundVerdictEmptyApps,   // App 名单为空（语义与其它名单相反：空 = 不生效）
+    NBSoundVerdictNotListed,   // 这个 App 不在名单里
+};
+
+@interface NotifyFilter ()
+// outSID 可为 NULL。任何异常都返回 NBSoundVerdictOff ——
+// 这个功能的失效方式必须是"什么都不做"，绝不能影响通知本身。
++ (NBSoundVerdict)soundVerdictForBundle:(nullable NSString *)bundle soundID:(NSInteger *)outSID;
+@end
+
 @implementation NotifyFilter
 
 + (NSDictionary *)prefs {
@@ -292,6 +310,73 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
     NBSharedLog(@"%@", msg);
 }
 
+// 🔴 v0.0.22：把 BBSound 上几个关键字段的**当前值**写成一小段文本，塞进 SOUND# 行。
+//
+// 为什么非要这个：我们造完对象、填了两个字段，但从外面**看不到值到底进去了没有**。
+// 写进去但被 setter 忽略（比如 setSoundType: 存在但语义不是我想的那个）时，
+// 现象和"完全没写"一模一样 ⇒ 上一轮就是这样卡住的。
+// 把 src / tone / type / sid 四个值直接打在留痕里，一次就能分清
+// 「没填进去」和「填进去了但不生效」——这两条路的修法完全不同。
+//
+// 🔴 每个字段**单独 @try**：一个字段抛异常不能带走其余的，
+//    否则"没读到"会被误判成"没这个字段"。
+// 🔴 键名用短名（src/tone/type/sid）：单条日志有 200 字硬上限，
+//    这一行本身还要带 bundle 和 tag。
+static NSString *NBSoundFieldSummary(id snd) {
+    if (!snd) return @"snd=nil";
+    NSArray *pairs = @[@[@"src", @"soundSource"], @[@"tone", @"toneIdentifier"],
+                       @[@"type", @"soundType"], @[@"sid", @"systemSoundID"]];
+    NSMutableString *m = [NSMutableString string];
+    for (NSArray *pair in pairs) {
+        NSString *shortName = pair[0];
+        NSString *key = pair[1];
+        NSString *val = @"!";
+        @try {
+            id v = [snd valueForKey:key];
+            if (!v) val = @"nil";
+            else if ([v isKindOfClass:[NSNumber class]]) val = [(NSNumber *)v stringValue];
+            else if ([v isKindOfClass:[NSString class]]) val = (NSString *)v;
+            else val = NSStringFromClass([v class]);
+        } @catch (__unused NSException *e) {
+            val = @"!抛";
+        }
+        [m appendFormat:@"%@=%@ ", shortName, val];
+    }
+    return m;
+}
+
+// 判定口径的唯一实现。见文件顶部的 NBSoundVerdict。
++ (NBSoundVerdict)soundVerdictForBundle:(NSString *)bundle soundID:(NSInteger *)outSID {
+    if (outSID) *outSID = 0;
+    @try {
+        NSDictionary *p = [self prefs];
+        if (!p.count) return NBSoundVerdictOff;
+        if (!NBBoolValue(p[NB_KEY_SOUND_ENABLED])) return NBSoundVerdictOff;
+
+        NSInteger sid = 0;
+        id v = p[NB_KEY_SOUND_ID];
+        if ([v isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)v integerValue];
+        else if ([v isKindOfClass:[NSString class]]) sid = [(NSString *)v integerValue];
+        if (outSID) *outSID = sid;
+        // 只接受系统提示音区段。填错就什么都不做 —— 造一个 id=0 的 BBSound 只会让它变哑。
+        if (sid < 1000 || sid > 1035) return NBSoundVerdictBadID;
+
+        // 🔴 与 speakApps/dndApps 语义**相反**：这里空名单 = 不生效。
+        //    实验功能默认绝不能"全部 App 都改"，那等于一次性把整台手机的通知声音变掉。
+        NSArray *apps = [self arrayFromPref:p[NB_KEY_SOUND_APPS]];
+        if (!apps.count) return NBSoundVerdictEmptyApps;
+        if (![apps containsObject:(bundle.length ? bundle : @"")]) return NBSoundVerdictNotListed;
+        return NBSoundVerdictOK;
+    } @catch (__unused NSException *e) {
+        return NBSoundVerdictOff;
+    }
+}
+
+// 给诊断（NotifySoundDiag）用：这个 App 是不是该换音。
++ (BOOL)isSoundTargetBundle:(NSString *)bundle {
+    return [self soundVerdictForBundle:bundle soundID:NULL] == NBSoundVerdictOK;
+}
+
 + (BOOL)applySoundForBundle:(NSString *)bundle
                  toBulletin:(id)bulletin
                   forResult:(NSString **)result {
@@ -299,32 +384,22 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
     if (!bulletin) return NO;
 
     @try {
-        NSDictionary *p = [self prefs];
-        if (!p.count) return NO;
-        if (!NBBoolValue(p[NB_KEY_SOUND_ENABLED])) return NO;
-
+        // 🔴 判定走唯一实现（见 soundVerdictForBundle）。这里只负责"按原因给说法"。
         NSInteger sid = 0;
-        id v = p[NB_KEY_SOUND_ID];
-        if ([v isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)v integerValue];
-        else if ([v isKindOfClass:[NSString class]]) sid = [(NSString *)v integerValue];
-        // 只接受系统提示音区段。填错就什么都不做 —— 造一个 id=0 的 BBSound 只会让它变哑。
-        if (sid < 1000 || sid > 1035) {
+        NBSoundVerdict verdict = [self soundVerdictForBundle:bundle soundID:&sid];
+        if (verdict == NBSoundVerdictOff || verdict == NBSoundVerdictNotListed) return NO;
+        if (verdict == NBSoundVerdictBadID) {
             static BOOL onceBadID = NO;
             NBWarnSoundMisconfig(&onceBadID, @"!!! 换提示音的 ID 不在 1000~1035"
                                              @"（当前值取不到或越界）⇒ 不生效，通知按原声播放");
             return NO;
         }
-
-        // 🔴 与 speakApps/dndApps 语义**相反**：这里空名单 = 不生效。
-        //    实验功能默认绝不能"全部 App 都改"，那等于一次性把整台手机的通知声音变掉。
-        NSArray *apps = [self arrayFromPref:p[NB_KEY_SOUND_APPS]];
-        if (!apps.count) {
+        if (verdict == NBSoundVerdictEmptyApps) {
             static BOOL onceEmpty = NO;
             NBWarnSoundMisconfig(&onceEmpty, @"!!! 换提示音开着但 App 名单是空的"
                                              @" ⇒ 不生效（故意的：实验功能不许全量改掉整机通知音）");
             return NO;
         }
-        if (![apps containsObject:(bundle.length ? bundle : @"")]) return NO;
 
         if (![bulletin respondsToSelector:@selector(setSound:)]) {
             if (result) *result = @"这个对象没有 setSound:（不是 bulletin？）";
@@ -383,8 +458,9 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
 
         NBWriteSoundGuard(kNBGuardDone);
         if (result) {
-            *result = [NSString stringWithFormat:@"id=%ld 已挂上 cls=%@ setType=%d setID=%d",
-                       (long)sid, cls, (int)setType, (int)setID];
+            // 🔴 v0.0.22：附带 snd 的字段实值 —— 见 NBSoundFieldSummary 上面那段说明。
+            *result = [NSString stringWithFormat:@"id=%ld 已挂上 cls=%@ set=%d/%d %@",
+                       (long)sid, cls, (int)setType, (int)setID, NBSoundFieldSummary(snd)];
         }
         return YES;
     } @catch (NSException *e) {

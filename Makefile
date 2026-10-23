@@ -13,7 +13,12 @@ include $(THEOS)/makefiles/common.mk
 # ---------- Tweak（SpringBoard 录制 + 过滤引擎 + 朗读） ----------
 TWEAK_NAME = NotifyBox
 # 🔴 v0.0.12 新增两件：NotifySpeaker（朗读 + 崩溃自愈）、NotifyProbe（BB 侧只读探针）
-NotifyBox_FILES = Tweak.x NotifyStore.m NotifyFilter.m NotifySpeaker.m NotifyProbe.m
+# 🔴 v0.0.22 新增 NotifySoundDiag：换提示音「听不到」的只读诊断。
+#    **只进 tweak，不进 App** —— 它要 objc runtime 反射 BB 的私有类，
+#    在盒子 App 进程里那些类根本不存在，编进去也是死代码。
+#    也**不要**塞进 NotifyFilter.m：重型只读观测和"刀"必须分开，
+#    否则刀被观测代码拖出异常时，两个都成了嫌疑犯，一轮下来解释不清。
+NotifyBox_FILES = Tweak.x NotifyStore.m NotifyFilter.m NotifySpeaker.m NotifyProbe.m NotifySoundDiag.m
 # 🔴 AVFoundation 必须显式链接，否则 AVSpeechSynthesizer 的符号在加载期解析不到
 #    ⇒ 整条 dylib 加载失败 ⇒ 表面上"tweak 没注入"，实际是链接问题。
 #    SpringBoard 本身就用 AVFoundation（系统提示音），所以链接是安全的；

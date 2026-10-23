@@ -1,4 +1,18 @@
-// Tweak.x —— v0.0.21（当前）：**两个新功能一起上** —— 免打扰时段（DND）＋ 按 App 换提示音（SOUND）
+// Tweak.x —— v0.0.22（当前）：**只读诊断** —— 换提示音回读成功、但真机听不到
+//
+// 上一版（v0.0.21）上了两个功能：免打扰时段 ✅、按 App 换提示音 ❌（听不到）。
+// 这一版**不出新刀**，只把现场量清楚。理由是本项目已经付过学费的那条：
+//   同一个类+选择器，一条成功一条失败时，"再换把刀猜"等于把多个反常量赌成一个；
+//   正解是先交只读诊断件 —— 一次拿全，别再猜。
+//
+// 这一版要一次量清三件事（缺任何一件都得再来一轮）：
+//   ① BBSound 到底有哪些属性、哪些**可写**（[R]/[W] 标注 + setter 清单）；
+//   ② 我们填进去的值到底有没有进对象（SOUND# 行里直接带 src/tone/type/sid 实值）；
+//   ③ orig 之后 sound 还在不在（同步 + 0.4 秒后各读一次）——
+//      区分"系统当场就抹掉"和"被后续链路换掉"。
+//
+// 另外挂了一个白捡的宝贝：一旦遇到**系统给的、非 nil 的 sound**就整份 dump。
+// 抄一个真实对象的字段值，比猜枚举值强一万倍。
 //
 // 依据真机 PROBE 数据（v0.0.20 采）定下换提示音的实现方式，一条都不凭猜：
 //   sound{T@"BBSound",&,N,V_sound} 可写；BBSound **只有 1 个类方法且与声音无关 ⇒ 没有工厂方法**；
@@ -46,6 +60,7 @@
 #import "NotifyFilter.h"
 #import "NotifySpeaker.h"
 #import "NotifyProbe.h"
+#import "NotifySoundDiag.h"
 
 
 static int gHit1 = 0;   // publishBulletin:destinations:
@@ -339,6 +354,12 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             }
         }
 
+        // ④.4 v0.0.22 只读诊断：如果这个对象身上已经带了一个**系统给的** sound，
+        //     立刻整份 dump（全进程只一次）。
+        //     🔴 必须在 ④.5 **之前**：挂完之后再看，就分不清是"系统给的"还是"我们挂的"，
+        //        而这两者的字段值正是这一轮唯一能抄到正确答案的来源。
+        [NBSoundDiag noteForeignSoundIfAny:obj stage:tag];
+
         // ④.5 按 App 换提示音（v0.0.21，实验）
         //
         // 🔴 这是本版**唯一"造系统对象"**的地方（alloc 一个 BBSound 再挂到 bulletin 上），
@@ -393,6 +414,9 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     NBDecision d = NBPipeline(bulletin, nil, @"PB", &gHit1);
     if (!d.allow) return;
     %orig(bulletin, destinations);
+    // 🔴 v0.0.22：必须在 orig **之后**读 —— 要看的正是"系统处理完之后 sound 还在不在"。
+    //    只在目标 App 输出（内部判），不会刷屏。
+    [NBSoundDiag probeAfterPublish:bulletin stage:@"PB"];
 }
 %end
 %end
@@ -404,6 +428,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     NBDecision d = NBPipeline(request, nil, @"PBR", &gHit2);
     if (!d.allow) return;
     %orig(request, destinations);
+    [NBSoundDiag probeAfterPublish:request stage:@"PBR"];
 }
 %end
 %end
@@ -420,6 +445,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     NBDecision d = NBPipeline(request, sid, @"PBRS", &gHit3);
     if (!d.allow) return;
     %orig(request, sectionID, destinations);
+    [NBSoundDiag probeAfterPublish:request stage:@"PBRS"];
 }
 %end
 %end
@@ -442,7 +468,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.21", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.22", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -475,15 +501,20 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.21 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.22 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
           @"可用",
-          @"实验（默认关）");
+          @@"实验（默认关，v0.0.22 诊断中）");
 
     // 只读探针：dump 一次 BBBulletin / BBSound 的类结构（内部自己保证只做一次）
     [NotifyProbe dumpClassesOnce];
+    // 🔴 v0.0.22：换提示音听不到 ⇒ 必须知道 BBSound 到底有哪些属性、哪些**可写**。
+    //    和上面那份的分工：NotifyProbe 打的是"名字 + 类型"，
+    //    这份额外标注 [R]/[W]，并且把 BBSound 的声音相关 setter 全列出来 ——
+    //    "能不能填进去"看的就是 setter 在不在。
+    [NBSoundDiag dumpClassOnce];
 
     Class c = objc_getClass("BBServer");
     if (!c) {
@@ -508,7 +539,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.21 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.22 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -529,7 +560,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.21 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.22 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

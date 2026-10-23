@@ -89,6 +89,11 @@ NS_ASSUME_NONNULL_BEGIN
                  toBulletin:(nullable id)bulletin
                   forResult:(NSString * _Nullable * _Nullable)result;
 
+// v0.0.22：这个 App 是不是「该换提示音」（开关开 + 名单里有它 + ID 合法）。
+// 🔴 给诊断用。判定口径与 applySoundForBundle **同源**（都走 soundVerdictForBundle），
+//    不允许在诊断里另写一份 —— 两边走岔的后果见 notifybox/README.md v0.0.22 章。
++ (BOOL)isSoundTargetBundle:(nullable NSString *)bundle;
+
 // v0.0.21：换提示音的崩溃自愈（只在 SpringBoard 的构造函数里调一次）。
 // 返回 YES 表示"上次就是崩在换提示音里，已经把这个开关关掉了"，**并且已回读确认**。
 + (BOOL)recoverFromSoundCrashIfNeeded;

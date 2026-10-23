@@ -175,7 +175,7 @@
 //   🔴 教训升级版：**加了新留痕，必须同时问"它能通过筛选吗"**；
 //      而"筛选表里有旧词"不等于"新留痕能被捞出来"。
 static NSString * const kNBKeyLineTable =
-    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|APP-ALIVE|G3 首次|失败|!!!|探针";
+    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针";
 
 static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [kNBKeyLineTable componentsSeparatedByString:@"|"];
