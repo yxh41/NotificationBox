@@ -122,6 +122,29 @@ NS_ASSUME_NONNULL_BEGIN
 //   两份一旦走岔，症状是"界面说会截断、实际没截断"，几乎没法自证。
 + (NSString *)playbackPlanForFileNamed:(nullable NSString *)name;
 
+// ---------- v0.0.28：按 App 分配提示音 ----------
+//
+// 存储口径（唯一权威）见 NotifyCommon.h 的 NB_KEY_SOUND_MAP。
+// 🔴 增删改**全部走下面这三个方法**，不要在界面里直接改字典：
+//    界面各处各写一份"改 map + 落盘"的逻辑，迟早出现「页面 A 写对了、页面 B 少删了一个键」，
+//    而那种错在界面上看不出来（值在、只是对不上）。
+//
+// entry 的形态：@{NB_KEY_SOUND_ENTRY_FILE: 文件名} 或 @{NB_KEY_SOUND_ENTRY_ID: @(1007)}，
+// 两者都给时**文件优先**（与判定口径一致）。entry = nil ⇒ 删除这个 App 的分配。
++ (NSDictionary<NSString *, NSDictionary *> *)soundMap;
+
+// 返回 YES 表示**已经落盘成功**。写盘失败也返回 NO（界面据此提示，不许假装成功）。
++ (BOOL)setSoundEntry:(nullable NSDictionary *)entry forBundle:(nullable NSString *)bundle;
+
+// 一行给人看的音名（文件名 / "系统音 1007" / "未设置"）。只用于显示。
++ (NSString *)soundEntrySummary:(nullable NSDictionary *)entry;
+
+// 旧格式 → soundMap 的一次性迁移（**只在 App 启动时调**，SpringBoard 不写盘）。
+// 返回 YES 表示这次真的迁移并写盘了。
+// 🔴 默认音（全局 soundFile/soundID）拿不到时**不迁移**：与其造一堆"未设置"的半成品，
+//    不如让旧回退继续工作 —— 回退是代码里写着的，不需要用户配合。
++ (BOOL)migrateSoundMapIfNeeded;
+
 // v0.0.21：换提示音的崩溃自愈（只在 SpringBoard 的构造函数里调一次）。
 // 返回 YES 表示"上次就是崩在换提示音里，已经把这个开关关掉了"，**并且已回读确认**。
 + (BOOL)recoverFromSoundCrashIfNeeded;

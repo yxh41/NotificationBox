@@ -10,6 +10,8 @@
 #import "AppPickerViewController.h"
 #import "VoicePickerViewController.h"
 #import "SoundFilePickerViewController.h"
+// v0.0.28：按 App 分配提示音的总览页（列表 + 进子页改音）
+#import "SoundAppsViewController.h"
 #import "InstalledApps.h"
 #import <errno.h>
 #import <string.h>
@@ -153,17 +155,22 @@ static const NSInteger kSubHit = 105;
     // 🔴 真机 PROBE 数据说明这是"造系统对象"：默认提示音**不带 BBSound**（sound=nil），
     //    而 BBSound 没有工厂方法、alertType 只读 ⇒ 只能 alloc + 填 soundType/systemSoundID。
     //    失败的表现是"这条通知不出声"。所以：默认关、必须点名 App、可试听、每次留痕、有自愈。
-    [self addSwitchRow:@"按 App 换提示音（实验，先只选一个 App 试）"
+    [self addSwitchRow:@"按 App 换提示音（实验）"
                     on:[self boolOf:cur[NB_KEY_SOUND_ENABLED]]
                    key:NB_KEY_SOUND_ENABLED];
-    [self addGroup:@"提示音 ID（1000~1035，填完点下面的试听）"
+    // 🔴 v0.0.28：文案从「提示音 ID / 提示音文件」改成「默认提示音 …」。
+    //    这一版起这两个值不再直接决定"所有目标 App 用什么音"，而是**新 App 的起始音**
+    //    （每个 App 的音存在 soundMap 里，可以在下面的「按 App 分配提示音」里逐个改）。
+    //    不改文案的后果很具体：用户在按 App 页给微信选了 a.mp3，回来看到这里还写着
+    //    "提示音文件 b.wav"，会以为配置互相打架 —— 其实一个管默认、一个管个体。
+    [self addGroup:@"默认提示音 ID（1000~1035，填完点下面的试听）"
                  ph:@"1007"
               value:[self strOf:cur[NB_KEY_SOUND_ID]]
            keyboard:UIKeyboardTypeNumberPad
                 key:NB_KEY_SOUND_ID];
     // 🔴🔴 v0.0.26：自定义音频文件。**排在 ID 下面**，因为它的优先级比 ID 高 ——
     //    顺序即语义，用户从上往下读："先看有没有文件，没有才用 ID"。
-    [self addActionRow:@"提示音文件（优先于上面的 ID）"
+    [self addActionRow:@"默认提示音文件（优先于上面的 ID）"
                     key:@"soundfile" action:@selector(onSoundFile:)];
     // v0.0.27：最长播放秒数。**排在文件下面**：它管的是"播多久"，紧跟着"播什么"讲。
     // 🔴 为什么必须有这一项：v0.0.26 实测出不一致 —— 同一份设置，wav 最多响 30 秒
@@ -174,7 +181,9 @@ static const NSInteger kSubHit = 105;
               value:[self strOf:cur[NB_KEY_SOUND_MAX_SEC]]
            keyboard:UIKeyboardTypeDecimalPad
                 key:NB_KEY_SOUND_MAX_SEC];
-    [self addActionRow:@"换提示音的 App（空 = 不生效）"
+    // v0.0.28：这一行的 key 仍然复用 `soundapps`（只在代码里作为"这一行"的标识，
+    // 不再写盘）—— 真正的数据是 soundMap。副标题见 refreshValues 里那段。
+    [self addActionRow:@"按 App 分配提示音"
                     key:@"soundapps" action:@selector(onSoundApps:)];
     [self addActionRow:@"试听这个提示音" key:@"soundpreview" action:@selector(onSoundPreview:)];
 
@@ -393,12 +402,25 @@ static const NSInteger kSubHit = 105;
                              : @"全部 App ›")
                   forKey:@"dndapps"];
 
-    // 🔴 换提示音的名单语义与上面**相反**：空 = 不生效（实验功能绝不默认全量）。
-    //    界面上也必须说清楚，否则用户会以为"没选就是全部"，然后发现没效果。
-    NSUInteger sn = [NBStringArray(d[NB_KEY_SOUND_APPS]) count];
-    [self setActionValue:(sn ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)sn]
-                             : @"未选（不生效）›")
-                  forKey:@"soundapps"];
+    // 🔴🔴 v0.0.28：这一行的数据源从 `soundApps`（数组）换成了 `soundMap`（映射）。
+    //    三态必须分开显示，因为后果完全不同：
+    //      · 有分配                ⇒ 说个数；
+    //      · 没分配但旧名单非空    ⇒ **旧格式还没迁移**（迁移在拿不到默认音时会放弃）。
+    //        这种情况只显示"未分配"就是在骗人 —— 用户明明配过；
+    //      · 两样都空              ⇒ 确实什么都没配。
+    //    ⚠️ 顺带一条：`NBStringArray(d[NB_KEY_SOUND_MAP])` 会返回 0（形状是字典，不是数组），
+    //    所以必须走 AppPicker 那个带特判的计数函数，不能在这里直接读键。
+    NSUInteger sn = [AppPickerViewController selectedCountForMode:NBAppPickModeSoundMap];
+    NSUInteger legacyN = [NBStringArray(d[NB_KEY_SOUND_APPS]) count];
+    NSString *snShow = nil;
+    if (sn) {
+        snShow = [NSString stringWithFormat:@"已分配 %lu 个 ›", (unsigned long)sn];
+    } else if (legacyN) {
+        snShow = [NSString stringWithFormat:@"旧名单 %lu 个（尚未迁移）›", (unsigned long)legacyN];
+    } else {
+        snShow = @"未分配（系统原声）›";
+    }
+    [self setActionValue:snShow forKey:@"soundapps"];
     id sidNow = d[NB_KEY_SOUND_ID];
     [self setActionValue:(sidNow ? [NSString stringWithFormat:@"%@", sidNow] : @"未设置")
                   forKey:@"soundpreview"];
@@ -712,7 +734,9 @@ static const NSInteger kSubHit = 105;
 
 - (void)onSoundApps:(id)sender {
     [self.view endEditing:YES];
-    [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeSound]];
+    // v0.0.28：不再是"分 App 列表 + 一个全局音"，而是"每个 App 各自的音"。
+    // ⇒ 入口换成总览页（列出已分配 + 进子页逐个改），选择器只作为它的子页出现。
+    [self push:[[SoundAppsViewController alloc] init]];
 }
 
 - (void)onSoundFile:(id)sender {

@@ -12,7 +12,14 @@ typedef NS_ENUM(NSInteger, NBAppPickMode) {
     NBAppPickModeBlacklist = 1,   // blacklist：不推送这些
     NBAppPickModeSpeak     = 2,   // speakApps：只朗读这些
     NBAppPickModeDnd       = 3,   // dndApps：这些 App 在免打扰时段不弹
-    NBAppPickModeSound     = 4,   // soundApps：这些 App 换提示音（空 = 不生效）
+
+    // 🔴 v0.0.28：`NBAppPickModeSound = 4`（soundApps：一份名单共用全局音）已删除，
+    //    同一个槽位换成本模式。删它的理由和上面 NBAppPickModeDelay 一样，而且更值得记：
+    //    旧模式写的是 `soundApps` 数组，而 v0.0.28 起判定**先看 soundMap、map 非空时
+    //    根本不读 soundApps**（迁移还会把它删掉）。所以留着这个模式 =
+    //    界面上有一个「勾了 App 却不出声」的按钮 —— 它写进去的东西没人读。
+    //    ⇒ 旧写法只保留"被读"的部分（迁移 + 回退），**不再保留任何写入通道**。
+    NBAppPickModeSoundMap  = 4,   // soundMap：点一下 = 给这个 App 建/删一条独立分配
 };
 
 // 可搜索、可多选的 App 选择器（v0.0.13）

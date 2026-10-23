@@ -7,3 +7,6 @@ obj/
 # macOS / 编辑器
 .DS_Store
 *.swp
+
+# 交付物（deb / 测试音）不进仓库
+dist/
