@@ -79,15 +79,23 @@ NS_ASSUME_NONNULL_BEGIN
                      now:(nullable NSDate *)now
                   reason:(NSString * _Nullable * _Nullable)reason;
 
-// ---------- v0.0.21：按 App 换提示音（实验） ----------
-// 返回 YES 表示**这条命中了规则、已经动手尝试过**（成没成看 result）；
-// 返回 NO 表示不适用（功能关 / 没配 App / 这条 App 不在名单 / 没填数）。
-// result 非空时写入"发生了什么"，形如 "id=1007 cls=BBSound" 或 "throw:NSInvalidArgumentException"。
-// 🔴 调用方必须把 result 原样打进日志：这个功能是"造系统对象"，
-//    沉默的失败等于"用户设了没效果，还查不出原因"。
-+ (BOOL)applySoundForBundle:(nullable NSString *)bundle
-                 toBulletin:(nullable id)bulletin
-                  forResult:(NSString * _Nullable * _Nullable)result;
+// ---------- v0.0.25：按 App 换提示音（实验）—— **换挂点重写** ----------
+//
+// 🔴🔴 为什么整段换掉 v0.0.21~v0.0.24 的做法：
+//   那四版走的是「alloc 一个 BBSound、填字段、`setValue:forKey:@"sound"` 挂到 bulletin 上」。
+//   代价已经实测到了：**造错就整条通知变哑**（v0.0.21），而且 BBSound 上**连 bundle id 都没有**，
+//   "按 App" 这件事只能靠外层传参凑。
+//   v0.0.25 改挂 `SBNCSoundController -canPlaySoundForNotificationRequest:`
+//   —— 一个**返回 BOOL 的总闸门**，参数就是通知请求（自带 sectionIdentifier）。
+//   做法反过来：**先把我们的音播出去，播成功了才让系统别播**。
+//   参考实现见 docs/换提示音-外部插件调研.md（SilentNotifs 就是这么掐原声的）。
+//
+// 返回契约（调用方必须严格照此执行，否则会把用户的通知变成哑巴）：
+//   YES = 这条该换音，**而且我们的声音已经送出去了** ⇒ 调用方 return NO 掐掉系统原声；
+//   NO  = 不适用 / 没配 / 播不出去 ⇒ 调用方**必须**放系统原声。
+// result 非空时写入"发生了什么"，调用方要原样打进日志。
++ (BOOL)playCustomSoundForBundle:(nullable NSString *)bundle
+                       forResult:(NSString * _Nullable * _Nullable)result;
 
 // v0.0.22：这个 App 是不是「该换提示音」（开关开 + 名单里有它 + ID 合法）。
 // 🔴 给诊断用。判定口径与 applySoundForBundle **同源**（都走 soundVerdictForBundle），

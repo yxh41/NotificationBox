@@ -1,4 +1,4 @@
-// Tweak.x —— v0.0.24（当前）：**侦察「正确的造法」**（刀不动，仍然不挂）
+// Tweak.x —— v0.0.25（当前）：**换挂点** —— 不再造 BBSound，改挂 SBNCSoundController 的通知音总闸门
 //
 // 🔴🔴 先认账：v0.0.23 的假设被真机数据**正面否掉了**。
 //
@@ -397,22 +397,19 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         //        而这两者的字段值正是这一轮唯一能抄到正确答案的来源。
         [NBSoundDiag noteForeignSoundIfAny:obj stage:tag];
 
-        // ④.5 按 App 换提示音（v0.0.21，实验）
+        // ④.5 按 App 换提示音 —— 🔴 v0.0.25 起**不在这里做了**。
         //
-        // 🔴 这是本版**唯一"造系统对象"**的地方（alloc 一个 BBSound 再挂到 bulletin 上），
-        //    没有任何官方保证。失败的表现是"这条通知不出声"，不是崩溃。
-        //    ⇒ 默认关闭、必须点名 App、每次尝试都留 SOUND# 行、外层还有一份崩溃自愈。
-        // 🔴 不看 firstTime：三个入口传进来的对象不同，谁先到谁把 sound 挂上即可，
-        //    挂两次的代价只是多 alloc 一个对象（不影响声音），比"漏挂"好。
-        {
-            NSString *sres = nil;
-            if ([NotifyFilter applySoundForBundle:bid toBulletin:obj forResult:&sres]) {
-                gSoundApplied++;
-                if (gSoundApplied <= 8 || (gSoundApplied % 50) == 0) {
-                    NBLog(@"SOUND#%d bundle=%@ tag=%@ %@", gSoundApplied, bid, tag, sres ?: @"?");
-                }
-            }
-        }
+        //    这里原来干的是「alloc 一个 BBSound、填字段、setValue:forKey:@"sound"」，
+        //    也就是**造系统对象**。v0.0.21~v0.0.24 四个版本下来确认了三件事：
+        //      · 造对了不一定响（字段都对，仍然一声不出）；
+        //      · 造错了**整条通知变哑**（v0.0.21 实测，用户直接漏消息）；
+        //      · `BBSound` 上**连 bundle id 都没有** ——"按 App 换音"这件事在这里无从下手。
+        //    v0.0.25 把动手的位置搬到 `SBNCSoundController -canPlaySoundForNotificationRequest:`
+        //    （通知音的**总闸门**，见本文件末尾的 GSC 组）。
+        //
+        //    ⇒ 这段说明留着而不是删干净，是因为「为什么不在 publish 点动手」本身是结论：
+        //      **拦在"要播声音"的那一刻，比拦在"造声音对象"的那一刻更靠下游**，
+        //      而下游 = 更接近最终判定 = 更不容易被后续链路覆盖（本项目吃过太多次亏）。
 
         // ⑤ 朗读（v0.0.13）
         //
@@ -487,6 +484,88 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 %end
 %end
 
+
+// ---------- v0.0.25：按 App 换提示音 · **新挂点** ----------
+//
+// 🔴🔴 为什么整段换掉旧做法：
+//    v0.0.21~v0.0.24 一直在 BulletinBoard 的 `BBSound` 上手工拼字段 ——
+//    那是"造系统对象"，实测造错就**整条通知变哑**，而且 BBSound 上**连 bundle id 都没有**，
+//    "按 App" 只能靠外层传参凑。
+//    `SBNCSoundController -canPlaySoundForNotificationRequest:` 是通知音的**总闸门**
+//    （返回 BOOL 的最终判定），参数就是通知请求，自带 sectionIdentifier。
+//    参考实现见 docs/换提示音-外部插件调研.md（SilentNotifs 就挂这同一个方法实现"静音通知音"）。
+//
+// 流程一句话：**先把我们的声音送出去，送成功了才让系统别播**。
+// 顺序反过来（先掐再播）就是"播失败 ⇒ 哑巴"，所以返回契约在 NotifyFilter.h 里写死了。
+//
+// ⚠️ 这个类/方法名来自外部参考（iOS 14.8 / 16.4.1 实测可用），**本机还没验证**。
+//    所以 %ctor 里先用 class_copyMethodList 确认它存在、名字对得上，再 %init ——
+//    不存在就一个 hook 都不挂，通知照旧原声（绝不因为"我以为有"而变哑）。
+%group GSC
+%hook SBNCSoundController
+- (BOOL)canPlaySoundForNotificationRequest:(id)request {
+    // 🔴 这是系统最热的一条路之一，**任何异常都必须吃掉**：
+    //    抛出去轻则这条通知不出声，重则崩 SpringBoard。
+    @try {
+        // 用 KVC 而不是点语法：这个类是靠 objc_getClass 拿的，没有编译期类型可依赖。
+        NSString *bid = nil;
+        @try {
+            id s = [request valueForKey:@"sectionIdentifier"];
+            if ([s isKindOfClass:[NSString class]]) bid = (NSString *)s;
+        } @catch (__unused NSException *e) {
+            bid = nil;          // 读不到 bundle id 就当"没配"，放原声
+        }
+
+        // 🔴🔴 去重：同一条通知可能在**锁屏 + 横幅**两处各问一次"要不要出声"。
+        //    不判重就是同一个音**连响两遍** —— 用户的第一句反馈必然是"响两次"。
+        //    只在能拿到 notificationIdentifier 时才去重：拿不到就**不去重**。
+        //    理由：没有唯一 ID 时只能按时间窗猜，而"同一个 App 紧接着发的第二条真通知"
+        //    会被那个窗误吞（少响一次）。⇒ **宁可偶尔响两遍，也不要吞掉一条真通知。**
+        NSString *nid = nil;
+        @try {
+            id v = [request valueForKey:@"notificationIdentifier"];
+            if ([v isKindOfClass:[NSString class]]) nid = (NSString *)v;
+        } @catch (__unused NSException *e) {
+            nid = nil;
+        }
+
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        static NSString *gLastNid = nil;
+        static NSTimeInterval gLastNidAt = 0;
+        if (nid.length && gLastNid.length
+            && [nid isEqualToString:gLastNid] && (now - gLastNidAt) < 2.0) {
+            return NO;          // 这条已经响过了 ⇒ 只掐原声，不再播第二遍
+        }
+
+        NSString *sres = nil;
+        if ([NotifyFilter playCustomSoundForBundle:bid forResult:&sres]) {
+            // 🔴 记 nid 必须在**播成功之后**。写在播之前的话，第一次播失败时
+            //    这条 nid 也会被记上 ⇒ 第二次调用就直接 return NO ⇒ 原声被掐 + 我们没响
+            //    = **哑巴**。这个顺序和"先播再掐"是同一条道理的另一面。
+            if (nid.length) {
+                gLastNid = nid;
+                gLastNidAt = now;
+            }
+            gSoundApplied++;
+            // 限流：前 8 次 + 每 50 次一条。日志窗口约 50 行、全局滚动，不许刷屏。
+            if (gSoundApplied <= 8 || (gSoundApplied % 50) == 0) {
+                NBLog(@"SOUND#%d 闸门掐掉原声 bundle=%@ %@",
+                      gSoundApplied, bid ?: @"?", sres ?: @"?");
+            }
+            return NO;          // 🔴 我们的音已经送出去了 ⇒ 别让系统再播一遍（否则双响）
+        }
+    } @catch (__unused NSException *e) {
+        // 我们自己出错 ⇒ 一律退回系统判断。绝不因为我的 bug 让用户漏消息。
+    }
+    @try {
+        return %orig;
+    } @catch (__unused NSException *e) {
+        return YES;             // 系统自己抛 ⇒ 放行（默认允许播，比静音安全）
+    }
+}
+%end
+%end
+
 %ctor {
     gRecent = [NSMutableDictionary dictionary];   // 单线程时机初始化，之后只读引用
 
@@ -505,7 +584,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.24", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.25", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -538,12 +617,12 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.24 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.25 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
           @"可用",
-          @"实验（默认关，v0.0.24 仍未换成功：探测正确造法）");
+          @"实验（默认关，v0.0.25 换了挂点：SBNCSoundController 自播）");
 
     // 只读探针：dump 一次 BBBulletin / BBSound 的类结构（内部自己保证只做一次）
     [NotifyProbe dumpClassesOnce];
@@ -576,12 +655,56 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.24 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.25 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
     if (h2) { NBLog(@"--> 挂 GPBR (publishBulletinRequest:destinations:)"); %init(GPBR); }
     if (h3) { NBLog(@"--> 挂 GPBRS (_publishBulletinRequest:forSectionID:forDestinations:)"); %init(GPBRS); }
+
+    // ---------- v0.0.25：换提示音的新挂点 ----------
+    //
+    // 🔴 先**确认类和闸门存在**再 %init。理由见 GSC 组上面的注释：
+    //    这个名字来自外部参考，本机未验证；类不存在时往 nil 上 hook 是"什么都可能发生"。
+    // 🔴 名字对不上时把含 sound/play/vibrat/alert 的方法名**全打出来** ——
+    //    这是"下一轮不用猜"的唯一来源（本项目因为"名字像"已经白跑过好几轮）。
+    {
+        Class gsc = objc_getClass("SBNCSoundController");
+        if (!gsc) {
+            NBLog(@"!!! v0.0.25 SBNCSoundController 类不存在 ⇒ 换提示音不挂（通知照旧原声）");
+        } else {
+            NSMutableSet *gn = [NSMutableSet set];
+            unsigned int gcnt = 0;
+            Method *gms = class_copyMethodList(gsc, &gcnt);
+            if (gms) {
+                for (unsigned i = 0; i < gcnt; i++) {
+                    [gn addObject:NSStringFromSelector(method_getName(gms[i]))];
+                }
+                free(gms);
+            }
+            BOOL hs = [gn containsObject:@"canPlaySoundForNotificationRequest:"];
+            NBLog(@"=== [%@] SBNCSoundController %u 个方法 · canPlaySoundForNotificationRequest=%@ ===",
+                  NBProc(), gcnt, hs ? @"YES" : @"NO");
+            if (hs) {
+                NBLog(@"--> 挂 GSC (canPlaySoundForNotificationRequest:)");
+                %init(GSC);
+            } else {
+                NSMutableArray *hits = [NSMutableArray array];
+                for (NSString *n in gn) {
+                    NSString *low = [n lowercaseString];
+                    if ([low containsString:@"sound"] || [low containsString:@"play"]
+                        || [low containsString:@"vibrat"] || [low containsString:@"alert"]) {
+                        [hits addObject:n];
+                    }
+                }
+                NBLog(@"!!! 没有 canPlaySoundForNotificationRequest:；"
+                      @"含 sound/play/vibrat/alert 的共 %lu 条：%@",
+                      (unsigned long)hits.count,
+                      [[hits sortedArrayUsingSelector:@selector(compare:)]
+                          componentsJoinedByString:@" , "]);
+            }
+        }
+    }
 
     if (!h1 && !h2 && !h3) {
         // 全不存在时把相关名字打出来（只打名字，省日志）
@@ -597,7 +720,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.24 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.25 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

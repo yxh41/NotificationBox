@@ -419,34 +419,6 @@ static void NBDiagDumpValues(id obj, NSString *label) {
     }
 }
 
-+ (void)probeCreatedSound:(id)snd stage:(NSString *)stage {
-    if (!snd) return;
-    [self dumpClassOnce];
-    // 🔴🔴 v0.0.24：字段名改对了。
-    //    v0.0.23 打的是 `repetitions` —— 那个键**根本不存在**（真机 `rep=!无键`），
-    //    正确的名字是 `repeats`（{TB,N,GisRepeating,V_repeats}，BOOL，是"要不要重复"）。
-    //    病根是我照着上一版 PROBE 截图**凭印象转写**了一个意思相近的名字，
-    //    没有逐字抄。⇒ 键名只能从数据里逐字抄，不能"翻成同义词"。
-    //    ⚠️ 更要紧的是：`repeats` / `maxDuration` 这两个字段**根本不是出声的必要条件** ——
-    //    真机上那个能正常响的样本，repeats=0、maxDuration=0，照样响。
-    //    这两个字段留着继续观测，但不再当作病因。
-    // 一条日志有 200 字上限 ⇒ 拆成两行打，别指望它自己折行。
-    // 🔴 v0.0.24：这两行改成**只写文件**。理由：applySoundForBundle 有三个挂点，
-    //    每次通知会进来 3 遍 ⇒ 设前/设后 ×2 条 = 6 行日志，8 条通知就把 50 行窗口糊满，
-    //    而真正的结论行（banner / SOUND#）会被挤出去。
-    //    日志侧留 SOUND# 那一行就够（它带着 NBSoundFieldSummary 的字段摘要）。
-    NBDiagLogF(@"SD# snd[%@] type=%@ sid=%@ repeats=%@ dur=%@ behavior=%@",
-              stage ?: @"?",
-              NBDiagGet(snd, @"soundType"), NBDiagGet(snd, @"systemSoundID"),
-              NBDiagGet(snd, @"repeats"), NBDiagGet(snd, @"maxDuration"),
-              NBDiagGet(snd, @"soundBehavior"));
-    NBDiagLogF(@"SD# snd[%@] tone=%@ ringtone=%@ songPath=%@ audioCat=%@ alertCfg=%@",
-              stage ?: @"?",
-              NBDiagGet(snd, @"toneIdentifier"), NBDiagGet(snd, @"ringtoneName"),
-              NBDiagGet(snd, @"songPath"), NBDiagGet(snd, @"audioCategory"),
-              NBDiagGet(snd, @"alertConfiguration"));
-}
-
 + (void)noteForeignSoundIfAny:(id)obj stage:(NSString *)stage {
     if (!obj) return;
     [self dumpClassOnce];

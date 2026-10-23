@@ -1,5 +1,6 @@
 #import "NotifyFilter.h"
 #import "NotifyCommon.h"
+#import <AudioToolbox/AudioToolbox.h>   // v0.0.25：AudioServicesPlaySystemSound（换提示音改成「自己播」）
 // 🔴 v0.0.23：造完 BBSound 之后要把它的字段实值打出来（落盘）。
 //    NotifyFilter.m **也被盒子 App 编译**，所以 NotifySoundDiag.m 必须一起进 App 的 FILES，
 //    否则链接期就是 undefined symbol（这种错看着像代码问题，其实是构建配置）。
@@ -8,7 +9,7 @@
                               // 但保留这个 import 无害，且省得下次要加探针时又忘
 
 // 🔴 v0.0.22：换提示音「该不该生效」的判定**只写这一处**。
-//    刀（applySoundForBundle）和诊断（isSoundTargetBundle）都调它。
+//    刀（v0.0.25 起是 playCustomSoundForBundle）和诊断（isSoundTargetBundle）都调它。
 //    理由见本文件顶部那一版说明：两处各写一份，一旦走岔就是
 //    "诊断说该生效、刀说不该生效"，而刀往往才是对的 —— 那一轮直接白跑。
 typedef NS_ENUM(NSInteger, NBSoundVerdict) {
@@ -314,49 +315,6 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
     NBSharedLog(@"%@", msg);
 }
 
-// 🔴 v0.0.22：把 BBSound 上几个关键字段的**当前值**写成一小段文本，塞进 SOUND# 行。
-//
-// 为什么非要这个：我们造完对象、填了两个字段，但从外面**看不到值到底进去了没有**。
-// 写进去但被 setter 忽略（比如 setSoundType: 存在但语义不是我想的那个）时，
-// 现象和"完全没写"一模一样 ⇒ 上一轮就是这样卡住的。
-// 把 src / tone / type / sid 四个值直接打在留痕里，一次就能分清
-// 「没填进去」和「填进去了但不生效」——这两条路的修法完全不同。
-//
-// 🔴 每个字段**单独 @try**：一个字段抛异常不能带走其余的，
-//    否则"没读到"会被误判成"没这个字段"。
-// 🔴 键名用短名（src/tone/type/sid）：单条日志有 200 字硬上限，
-//    这一行本身还要带 bundle 和 tag。
-static NSString *NBSoundFieldSummary(id snd) {
-    if (!snd) return @"snd=nil";
-    // 🔴🔴 v0.0.24：字段名改对了，而且**换了一批**。
-    //    v0.0.23 追的是 rep(=repetitions，根本不存在) / dur(=maxDuration)，
-    //    真机数据证明这两个跟出不出声无关（能响的样本也是 0/0）。
-    //    现在真正要看的是：type / sid / alertCfg / tone / song / ringtone ——
-    //    其中 `alertCfg` 是唯一还没被排除的差异（能响的有值，我们的空壳是 nil）。
-    //    短名控制在 7 字符以内：单个字段一行，日志有 200 字上限。
-    NSArray *pairs = @[@[@"type", @"soundType"], @[@"sid", @"systemSoundID"],
-                       @[@"repeat", @"repeats"], @[@"maxDur", @"maxDuration"],
-                       @[@"tone", @"toneIdentifier"], @[@"song", @"songPath"],
-                       @[@"ring", @"ringtoneName"], @[@"alertCfg", @"alertConfiguration"]];
-    NSMutableString *m = [NSMutableString string];
-    for (NSArray *pair in pairs) {
-        NSString *shortName = pair[0];
-        NSString *key = pair[1];
-        NSString *val = @"!";
-        @try {
-            id v = [snd valueForKey:key];
-            if (!v) val = @"nil";
-            else if ([v isKindOfClass:[NSNumber class]]) val = [(NSNumber *)v stringValue];
-            else if ([v isKindOfClass:[NSString class]]) val = (NSString *)v;
-            else val = NSStringFromClass([v class]);
-        } @catch (__unused NSException *e) {
-            val = @"!抛";
-        }
-        [m appendFormat:@"%@=%@ ", shortName, val];
-    }
-    return m;
-}
-
 // 判定口径的唯一实现。见文件顶部的 NBSoundVerdict。
 + (NBSoundVerdict)soundVerdictForBundle:(NSString *)bundle soundID:(NSInteger *)outSID {
     if (outSID) *outSID = 0;
@@ -389,167 +347,64 @@ static NSString *NBSoundFieldSummary(id snd) {
     return [self soundVerdictForBundle:bundle soundID:NULL] == NBSoundVerdictOK;
 }
 
-+ (BOOL)applySoundForBundle:(NSString *)bundle
-                 toBulletin:(id)bulletin
-                  forResult:(NSString **)result {
+// ---------- v0.0.25：换提示音的**新刀** ----------
+//
+// 🔴🔴 这一版的全部价值：**换挂点**。
+//    旧刀（v0.0.21~v0.0.24 的 applySoundForBundle）是「alloc 一个 BBSound、填字段、
+//    setValue:forKey:@"sound"」，实测**造错就整条通知变哑**，而且 BBSound 上连 bundle id
+//    都没有。现在改由 Tweak.x 的 GSC 组挂在
+//    `SBNCSoundController -canPlaySoundForNotificationRequest:`（返回 BOOL 的总闸门）上。
+//    本函数只负责两件事：判定（走 soundVerdictForBundle）＋ 把声音送出去。
+//
+// 为什么用 AudioServices 而不是 AVAudioPlayer / TLAlert：
+//   · `AudioServicesPlaySystemSound` 播的就是 1000~1035 这段系统提示音，
+//     正好等于用户在设置页里选的那个 ID ⇒ **试听和通知走同一条路**，
+//     所以「试听能响」就能推出「通知也能响」。
+//     这正是 v0.0.21 那个矛盾的解药：当时试听走 AudioServices、通知走 BulletinBoard，
+//     两条路根本不是一回事，我却拿试听的结果去推断通知。
+//   · 它**自动遵循静音开关**，不需要碰 AVAudioSession
+//     （在 SpringBoard 里改 session category 有全局副作用，能不动就不动）。
+//   · 它不打断正在播的音乐 —— 这是系统提示音的固有行为。
+//
+// ⚠️ 诚实的局限：`AudioServicesPlaySystemSound` 返回 void，**拿不到「真播出来了」**。
+//   所以这里返回 YES 只表示「ID 合法 + 播放请求已发出」。
+//   假阴性（发了请求但没声音）的唯一兜底是设置页那个「试听」按钮 ——
+//   两者同一条路，试听能响，通知就能响。这条依赖关系写在这里，别以后忘了。
++ (BOOL)playCustomSoundForBundle:(NSString *)bundle forResult:(NSString **)result {
     if (result) *result = nil;
-    if (!bulletin) return NO;
-
     @try {
-        // 🔴 判定走唯一实现（见 soundVerdictForBundle）。这里只负责"按原因给说法"。
         NSInteger sid = 0;
         NBSoundVerdict verdict = [self soundVerdictForBundle:bundle soundID:&sid];
+
+        // 两种「不适用」静默返回：开关没开 / 这个 App 不在名单。
+        // 这是绝大多数通知的结局 —— 每条都留痕会把约 50 行的日志窗口冲干净（v0.0.22 白跑一轮的同一个病）。
         if (verdict == NBSoundVerdictOff || verdict == NBSoundVerdictNotListed) return NO;
+
         if (verdict == NBSoundVerdictBadID) {
             static BOOL onceBadID = NO;
             NBWarnSoundMisconfig(&onceBadID, @"!!! 换提示音的 ID 不在 1000~1035"
                                              @"（当前值取不到或越界）⇒ 不生效，通知按原声播放");
+            if (result) *result = @"ID 越界 ⇒ 放原声";
             return NO;
         }
         if (verdict == NBSoundVerdictEmptyApps) {
             static BOOL onceEmpty = NO;
             NBWarnSoundMisconfig(&onceEmpty, @"!!! 换提示音开着但 App 名单是空的"
                                              @" ⇒ 不生效（故意的：实验功能不许全量改掉整机通知音）");
+            if (result) *result = @"名单空 ⇒ 放原声";
             return NO;
         }
 
-        if (![bulletin respondsToSelector:@selector(setSound:)]) {
-            if (result) *result = @"这个对象没有 setSound:（不是 bulletin？）";
-            return YES;
-        }
-
-        Class c = NSClassFromString(@"BBSound");
-        if (!c) {
-            if (result) *result = @"拿不到 BBSound 类";
-            return YES;
-        }
-
-        // 崩溃自愈：动手前写 start，做完写 done。**两件事在同一个函数里配对**，
-        // 这是 v0.0.15 那个教训的直接修正（那版只写不读 ⇒ 永久假警报）。
-        NBWriteSoundGuard(kNBGuardStart);
-
-        id snd = [[c alloc] init];
-        if (!snd) {
-            NBWriteSoundGuard(kNBGuardDone);
-            if (result) *result = @"BBSound alloc 失败";
-            return YES;
-        }
-        // 🔴 v0.0.23 起：**设之前**先记一次默认值，设完再记一次（见下面「设后」）。
-        //    v0.0.24 备注：这两条一对比，能分清"值真的写进去了"和"setter 收下了但没存"。
-        //    注意它只证明"写没写进去"，**不能**证明"会不会响" ——
-        //    v0.0.23 就是拿这批字段当病因，结果被真机数据否掉了。
-        [NBSoundDiag probeCreatedSound:snd stage:@"设前"];
-
-        BOOL setType = NO, setID = NO, setRep = NO, setDur = NO;
-        if ([snd respondsToSelector:NSSelectorFromString(@"setSoundType:")]) {
-            [snd setValue:@(1) forKey:@"soundType"];     // 1 = Alert（按可写字段名推的，见上面注释）
-            setType = YES;
-        }
-        if ([snd respondsToSelector:NSSelectorFromString(@"setSystemSoundID:")]) {
-            [snd setValue:@((int)sid) forKey:@"systemSoundID"];
-            setID = YES;
-        }
-
-        // 🔴🔴 v0.0.23 补过这两个字段，**v0.0.24 把键名和结论都改了**。
-        //
-        // ⚠️ 先摆事实：v0.0.23 的推断被真机数据**正面否掉了**。
-        //    v0.0.23 说 `repetitions` / `maxDuration` 是 0 ⇒ 播 0 次 / 0 秒 ⇒ 一声不出。
-        //    真机上系统自己给的、**能正常出声**的那个 BBSound：
-        //        maxDuration=0  repeats=0  soundType=2  systemSoundID=0
-        //        alertConfiguration=<TLAlertConfiguration>
-        //    ⇒ 0/0 是**正常**的，跟出不出声没关系。
-        //    而且 `repetitions` 这个键根本不存在（真机 `rep=!无键`）——
-        //    正确的是 `repeats`（{TB,N,GisRepeating,V_repeats}，BOOL，"要不要重复"）。
-        //    病根：我照着上一版的 PROBE 截图**凭印象转写**了一个意思相近的名字。
-        //
-        //    所以这两个字段现在**只写不看**：写它们是为了让 SD#/SOUND# 行能对照，
-        //    **不再当闸门**。别再拿它们判"能不能响"。
-        if ([snd respondsToSelector:NSSelectorFromString(@"setRepeats:")]) {
-            [snd setValue:@(NO) forKey:@"repeats"];   // 与真机能响的样本一致（repeats=0）
-            setRep = YES;
-        }
-        if ([snd respondsToSelector:NSSelectorFromString(@"setMaxDuration:")]) {
-            [snd setValue:@(30) forKey:@"maxDuration"];
-            setDur = YES;
-        }
-
-        if (!setType && !setID) {
-            NBWriteSoundGuard(kNBGuardDone);
-            if (result) *result = @"BBSound 上没有可写的 soundType/systemSoundID";
-            return YES;
-        }
-
-        // 🔴🔴🔴 v0.0.24：本版**故意不挂**。闸门 = 这个对象上有没有 `alertConfiguration`。
-        //
-        // 为什么是这一项：
-        //   把真机两份数据摊开对比，唯一还没被排除的差异就是它 ——
-        //      能正常响的： soundType=2  systemSoundID=0  alertConfiguration=<非 nil>
-        //      我们的空壳： soundType=1  systemSoundID=1009 alertConfiguration=nil
-        //   iOS 16 的通知音走 **TonesLibrary（TLAlert + TLAlertConfiguration）**，
-        //   `systemSoundID` 是 AudioServices 的老 ID，BulletinBoard 已经不看它了。
-        //   （这也解释了设置页"试听"为什么是响的：试听走 AudioServices 播放，
-        //     和系统投递通知是两条完全不同的路 —— 试听能响≠通知能响。）
-        //
-        // 为什么宁可不换也不能挂：
-        //   v0.0.21 已经实测过 —— 挂一个空壳，通知变成**完全没声音**，
-        //   用户会漏消息。而"没换成"只是功能没生效。两者量级差得远。
-        //
-        // 🔴 闸门刻意写成"这一项必须有值"，而不是"v0.0.24 先关掉"：
-        //    这样下一版**一旦会造 alertConfiguration，这条闸门自动打开**，
-        //    不用再回来改一行 if —— 少一处"改了忘了开"的机会。
-        id alertCfg = nil;
-        @try {
-            alertCfg = [snd valueForKey:@"alertConfiguration"];
-        } @catch (__unused NSException *e) {
-            alertCfg = nil;
-        }
-        if (!alertCfg) {
-            NBWriteSoundGuard(kNBGuardDone);
-            if (result) *result = [NSString stringWithFormat:
-                                   @"!!! 本版不挂（侦察轮）：alertConfiguration 造不出来"
-                                   @" ⇒ iOS 16 靠 TonesLibrary 出声，空壳挂上必然静音。%@",
-                                   NBSoundFieldSummary(snd)];
-            return YES;
-        }
-        // 🔴 v0.0.23：**设之后**再记一次。和上面那条一对比就知道：
-        //    值是"从 0 变成 1/30"（真的写进去了）还是"压根没动"（setter 吞了）。
-        [NBSoundDiag probeCreatedSound:snd stage:@"设后"];
-
-        [bulletin setValue:snd forKey:@"sound"];
-
-        // 🔴 回读验证：分不清"我改了"和"改上了"是这类功能最常见的假象。
-        NSString *cls = @"nil";
-        @try {
-            id back = [bulletin valueForKey:@"sound"];
-            if (!back) {
-                NBWriteSoundGuard(kNBGuardDone);
-                if (result) *result = [NSString stringWithFormat:
-                                       @"写完回读是 nil（id=%ld，setType=%d setID=%d rep=%d dur=%d）",
-                                       (long)sid, (int)setType, (int)setID,
-                                       (int)setRep, (int)setDur];
-                return YES;
-            }
-            cls = NSStringFromClass([back class]);
-        } @catch (__unused NSException *e) {
-            cls = @"回读抛异常";
-        }
-
-        NBWriteSoundGuard(kNBGuardDone);
-        if (result) {
-            // 🔴 v0.0.22：附带 snd 的字段实值 —— 见 NBSoundFieldSummary 上面那段说明。
-            //    v0.0.23 起再加 rep/dur 两个标志位。
-            // 🔴 `set=` 后面保留 `/` 分隔：用户上一版截图里就是 `set=1/1`，
-            //    连写成 `set=%d%d` 会变成 `set=11` —— 能读但一眼看不出是两个字段（别为了省一个字符牺牲可读性）。
-            *result = [NSString stringWithFormat:
-                       @"id=%ld 已挂上 cls=%@ set=%d/%d rep=%d dur=%d %@",
-                       (long)sid, cls, (int)setType, (int)setID,
-                       (int)setRep, (int)setDur, NBSoundFieldSummary(snd)];
-        }
+        // 到这里 verdict == OK：ID 合法且这个 App 在名单里。
+        // 🔴 先把声音送出去，再返回 YES —— 调用方拿到 YES 才会去掐系统原声。
+        //    顺序写反（先掐再播）就是「播失败 ⇒ 哑巴」，见 NotifyFilter.h 里那段返回契约。
+        AudioServicesPlaySystemSound((SystemSoundID)sid);
+        if (result) *result = [NSString stringWithFormat:@"自播 sid=%ld 已发出", (long)sid];
         return YES;
     } @catch (NSException *e) {
-        NBWriteSoundGuard(kNBGuardDone);     // 抛异常也要收尾，否则下次启动误判成崩溃
-        if (result) *result = [NSString stringWithFormat:@"throw:%@", e.name ?: @"?"];
-        return YES;      // 已经试过了，得留痕
+        // 任何异常都退回原声：宁可「没换成」，也绝不能让用户漏消息。
+        if (result) *result = [NSString stringWithFormat:@"throw:%@ ⇒ 放原声", e.name ?: @"?"];
+        return NO;
     }
 }
 
