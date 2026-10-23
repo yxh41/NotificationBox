@@ -1,6 +1,10 @@
 #import "NotifyFilter.h"
 #import "NotifyCommon.h"
 #import <AudioToolbox/AudioToolbox.h>   // v0.0.25：AudioServicesPlaySystemSound（换提示音改成「自己播」）
+// 🔴 v0.0.26：播自定义音频文件。mp3/m4a 走不了 AudioServices（它只吃 caf/wav/aiff 这类），
+//    必须用 AVAudioPlayer 兜底。AVFoundation 在 Makefile 里两个目标都已链接
+//    （朗读早就在用），所以这里只管 import。
+#import <AVFoundation/AVFoundation.h>
 // 🔴 v0.0.23：造完 BBSound 之后要把它的字段实值打出来（落盘）。
 //    NotifyFilter.m **也被盒子 App 编译**，所以 NotifySoundDiag.m 必须一起进 App 的 FILES，
 //    否则链接期就是 undefined symbol（这种错看着像代码问题，其实是构建配置）。
@@ -15,15 +19,27 @@
 typedef NS_ENUM(NSInteger, NBSoundVerdict) {
     NBSoundVerdictOK = 0,      // 该生效
     NBSoundVerdictOff,         // 功能没开 / 设置读不到 / 读的时候抛异常
-    NBSoundVerdictBadID,       // ID 不在 1000~1035
+    NBSoundVerdictBadID,       // ID 不在 1000~1035（且没有选文件）
     NBSoundVerdictEmptyApps,   // App 名单为空（语义与其它名单相反：空 = 不生效）
     NBSoundVerdictNotListed,   // 这个 App 不在名单里
+    NBSoundVerdictBadFile,     // v0.0.26：选了文件，但文件名不合法 / 文件不存在
 };
 
 @interface NotifyFilter ()
-// outSID 可为 NULL。任何异常都返回 NBSoundVerdictOff ——
+// outSID / outFile 都可为 NULL。任何异常都返回 NBSoundVerdictOff ——
 // 这个功能的失效方式必须是"什么都不做"，绝不能影响通知本身。
+//
+// 🔴 v0.0.26：多了一个 outFile。**判定口径仍然只有这一个函数** ——
+//    两个输出的关系是「outFile 非空 ⇒ 播文件（优先）；否则看 outSID」。
+//    旧的两参版本留作包装（诊断在用），内部转调这一个。
++ (NBSoundVerdict)soundVerdictForBundle:(nullable NSString *)bundle
+                                soundID:(NSInteger *)outSID
+                              soundFile:(NSString * _Nullable * _Nullable)outFile;
 + (NBSoundVerdict)soundVerdictForBundle:(nullable NSString *)bundle soundID:(NSInteger *)outSID;
+
+// v0.0.26：文件播放的两条通道（只在内部用）
++ (BOOL)nbPlayViaAudioServices:(NSString *)path why:(NSString **)why;
++ (BOOL)nbPlayViaAVPlayer:(NSString *)path why:(NSString **)why;
 @end
 
 @implementation NotifyFilter
@@ -316,35 +332,234 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
 }
 
 // 判定口径的唯一实现。见文件顶部的 NBSoundVerdict。
-+ (NBSoundVerdict)soundVerdictForBundle:(NSString *)bundle soundID:(NSInteger *)outSID {
+//
+// 🔴 v0.0.26 起两个输出（优先级：**文件 > ID**）：
+//    · outFile 非空 ⇒ 播这个文件，**完全不看 outSID**（用户选了文件就该听到文件）；
+//    · outFile 为 nil ⇒ 才去校验 outSID（1000~1035 系统音区段）。
+//    这样"没选文件"的老配置行为一个字节都没变（v0.0.25 已验证通过的那条路）。
++ (NBSoundVerdict)soundVerdictForBundle:(NSString *)bundle
+                                soundID:(NSInteger *)outSID
+                              soundFile:(NSString * _Nullable * _Nullable)outFile {
     if (outSID) *outSID = 0;
+    if (outFile) *outFile = nil;
     @try {
         NSDictionary *p = [self prefs];
         if (!p.count) return NBSoundVerdictOff;
         if (!NBBoolValue(p[NB_KEY_SOUND_ENABLED])) return NBSoundVerdictOff;
 
-        NSInteger sid = 0;
-        id v = p[NB_KEY_SOUND_ID];
-        if ([v isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)v integerValue];
-        else if ([v isKindOfClass:[NSString class]]) sid = [(NSString *)v integerValue];
-        if (outSID) *outSID = sid;
-        // 只接受系统提示音区段。填错就什么都不做 —— 造一个 id=0 的 BBSound 只会让它变哑。
-        if (sid < 1000 || sid > 1035) return NBSoundVerdictBadID;
+        // ---- ① 先看有没有选文件（v0.0.26）----
+        NSString *fname = nil;
+        id fv = p[NB_KEY_SOUND_FILE];
+        if ([fv isKindOfClass:[NSString class]]) {
+            fname = [(NSString *)fv stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        }
+        BOOL hasFile = (fname.length > 0);
 
-        // 🔴 与 speakApps/dndApps 语义**相反**：这里空名单 = 不生效。
-        //    实验功能默认绝不能"全部 App 都改"，那等于一次性把整台手机的通知声音变掉。
+        // ---- ② 没选文件才算 ID（老路径，v0.0.25 已验证）----
+        if (!hasFile) {
+            NSInteger sid = 0;
+            id v = p[NB_KEY_SOUND_ID];
+            if ([v isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)v integerValue];
+            else if ([v isKindOfClass:[NSString class]]) sid = [(NSString *)v integerValue];
+            if (outSID) *outSID = sid;
+            // 只接受系统提示音区段。填错就什么都不做。
+            if (sid < 1000 || sid > 1035) return NBSoundVerdictBadID;
+        }
+
+        // ---- ③ 名单语义（与 speakApps/dndApps **相反**：空 = 不生效）----
+        // 🔴 顺序讲究：**先判名单、再判文件是否存在**。
+        //    反过来会给用户一堆"文件不存在"的告警，而那些 App 本来就不在名单里。
         NSArray *apps = [self arrayFromPref:p[NB_KEY_SOUND_APPS]];
         if (!apps.count) return NBSoundVerdictEmptyApps;
         if (![apps containsObject:(bundle.length ? bundle : @"")]) return NBSoundVerdictNotListed;
+
+        // ---- ④ 到这里这个 App 确实要换音 ⇒ 才去认真校验文件 ----
+        if (hasFile) {
+            // 🔴 净化 + 存在性检查都在这里做，而且**都在名单判定之后**。
+            //    文件名不合法（含 / 或 ..）不报错，直接当"配置错"处理 ⇒ 放原声。
+            NSString *path = NBSoundFilePath(fname);
+            if (!path) return NBSoundVerdictBadFile;
+            if (!NBIsSoundFileExt(fname)) return NBSoundVerdictBadFile;
+            if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return NBSoundVerdictBadFile;
+            if (outFile) *outFile = fname;
+        }
         return NBSoundVerdictOK;
     } @catch (__unused NSException *e) {
         return NBSoundVerdictOff;
     }
 }
 
+// 旧两参版本：诊断（NotifySoundDiag）还在用，保持签名不变。
+// 🔴 必须是**转调**而不是复制一份实现 —— 否则口径又变成两份。
++ (NBSoundVerdict)soundVerdictForBundle:(NSString *)bundle soundID:(NSInteger *)outSID {
+    return [self soundVerdictForBundle:bundle soundID:outSID soundFile:NULL];
+}
+
 // 给诊断（NotifySoundDiag）用：这个 App 是不是该换音。
+//
+// 🔴 v0.0.26 修了一个**只有换文件之后才会暴露**的洞：
+//    原来这里调的是两参版本，而两参版本在"选了文件、ID 没填"时会判 BadID ⇒
+//    诊断会说"不是目标"，刀却照样换了音。两边口径一岔，下一轮排查就会被自己的日志骗。
+//    ⇒ 现在两参版本内部已经转调三参版本（文件优先），所以这里天然一致。
+//      留着这行注释是为了记住：**加输出的同时必须检查"所有消费者是否还看同一份判定"**。
 + (BOOL)isSoundTargetBundle:(NSString *)bundle {
-    return [self soundVerdictForBundle:bundle soundID:NULL] == NBSoundVerdictOK;
+    return [self soundVerdictForBundle:bundle soundID:NULL soundFile:NULL] == NBSoundVerdictOK;
+}
+
+// ================== v0.0.26：播自定义音频文件 ==================
+//
+// 两条通道，**按"已验证程度"排序**，不是按"哪个更强"：
+//
+//   A) AudioServicesCreateSystemSoundID + AudioServicesPlaySystemSound
+//      · 播放那一步就是 v0.0.25 真机验证过的那个函数（用户："是我们的提示音"）；
+//      · 只吃 caf / wav / aiff 这类（本质是线性 PCM / IMA4），**mp3 会 create 失败**；
+//      · 零 session 副作用，天然遵循静音开关、不打断音乐。
+//      ⇒ 所以它排第一：能在 A 走通就绝不碰 B。
+//
+//   B) AVAudioPlayer
+//      · 为了 mp3/m4a/aac/flac —— A 吃不下的格式全落在这；
+//      · ⚠️ 代价是**必须动 AVAudioSession**。在 SpringBoard 进程里改 session category
+//        是全局副作用，所以只设 Ambient + MixWithOthers（最温和的一档：与别的音频混播、
+//        不抢焦点），绝不设 Playback（那会把用户正在听的歌掐掉）。
+//      ⇒ 只有 A 失败才走这里。
+//
+// ⚠️ 两条都是"发出请求"而不是"真播出来了"：
+//    AudioServicesPlaySystemSound 返回 void；AVAudioPlayer 的 play 返回 BOOL 只代表
+//    "开始播了"。假阴性的兜底仍然是设置页「试听」—— App 进程里能响，不代表
+//    SpringBoard 里能响（**两个进程**），这一点必须对用户讲清楚。
+
+// A 通道的 SystemSoundID 缓存：绝对路径 → SystemSoundID。
+// 🔴 **不 Dispose**：AudioServices 的播放是异步的，create 完立刻 Dispose 会把声音掐断；
+//    而"播完再 Dispose"要么得挂回调、要么得猜时长，两条都比"留着"更容易出错。
+//    代价是每个用过的文件占一个 SystemSoundID（系统资源里很轻的一项），
+//    而用户实际会用到的文件是**个位数** ⇒ 用可控的常驻换掉一整类时序 bug。
+static NSMutableDictionary<NSString *, NSNumber *> *NBSidCache(void) {
+    static NSMutableDictionary *d = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+
+// B 通道的"在播"列表：AVAudioPlayer 被释放就等于停止播放，
+// 所以必须有人持有到播完（ARC 下这是最容易漏的一步）。
+static NSMutableArray<AVAudioPlayer *> *NBLivePlayers(void) {
+    static NSMutableArray *a = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ a = [NSMutableArray array]; });
+    return a;
+}
+
++ (BOOL)nbPlayViaAudioServices:(NSString *)path why:(NSString **)why {
+    NSMutableDictionary *cache = NBSidCache();
+    SystemSoundID sid = 0;
+    @synchronized (cache) {
+        NSNumber *c = cache[path];
+        if (c) sid = (SystemSoundID)[c unsignedIntValue];
+    }
+    if (sid == 0) {
+        CFURLRef url = (__bridge CFURLRef)[NSURL fileURLWithPath:path];
+        OSStatus st = AudioServicesCreateSystemSoundID(url, &sid);
+        if (st != kAudioServicesNoError || sid == 0) {
+            if (why) *why = [NSString stringWithFormat:@"create=%d", (int)st];
+            return NO;
+        }
+        @synchronized (cache) {
+            cache[path] = @((unsigned int)sid);
+        }
+    }
+    AudioServicesPlaySystemSound(sid);
+    return YES;
+}
+
++ (BOOL)nbPlayViaAVPlayer:(NSString *)path why:(NSString **)why {
+    NSError *err = nil;
+    AVAudioPlayer *pl = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path]
+                                                              error:&err];
+    if (!pl) {
+        if (why) *why = err.localizedDescription ?: @"init 失败";
+        return NO;
+    }
+
+    // 🔴 只在真的要用 B 的时候才动 session。Ambient + MixWithOthers = 与别的音频共存。
+    //    设置失败也继续播：宁可"可能打断音乐"，也不要"用户配了提示音却听不到"。
+    @try {
+        AVAudioSession *ses = [AVAudioSession sharedInstance];
+        [ses setCategory:AVAudioSessionCategoryAmbient
+             withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                   error:NULL];
+        [ses setActive:YES error:NULL];
+    } @catch (__unused NSException *e) { }
+
+    pl.volume = 1.0f;
+    [pl prepareToPlay];
+    if (![pl play]) {
+        if (why) *why = @"play 返回 NO";
+        return NO;
+    }
+
+    NSMutableArray *live = NBLivePlayers();
+    @synchronized (live) {
+        // 🔴 上限 6：连环通知（比如群里刷屏）时不能无上限地攒 player。
+        while (live.count >= 6) {
+            AVAudioPlayer *old = live.firstObject;
+            @try { [old stop]; } @catch (__unused NSException *e) { }
+            [live removeObjectAtIndex:0];
+        }
+        [live addObject:pl];
+    }
+
+    // 播完就放掉。duration 不可信时给个短兜底，绝不能出现"永久持有"。
+    NSTimeInterval dur = pl.duration;
+    if (dur <= 0 || dur > 120) dur = 3.0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((dur + 1.0) * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @synchronized (live) { [live removeObject:pl]; }
+    });
+    return YES;
+}
+
+// 公开入口（盒子 App 的「试听」直接调它；tweak 侧由 playCustomSoundForBundle 调）。
+//
+// 🔴 这个函数**不做判定**（不管开关、不管名单）——
+//    它只管"把这一份文件播出去"。判定在 soundVerdictForBundle 里，唯一口径。
+//    分开的好处：试听可以无视名单（用户就是想先听听是不是这个音）。
++ (BOOL)playSoundFileNamed:(NSString *)name forResult:(NSString **)result {
+    if (result) *result = nil;
+    @try {
+        NSString *path = NBSoundFilePath(name);
+        if (!path) {
+            if (result) *result = @"文件名不合法（含 / 或 .. 或以 . 开头）";
+            return NO;
+        }
+        if (!NBIsSoundFileExt(name)) {
+            if (result) *result = [NSString stringWithFormat:@"扩展名不认识（.%@）",
+                                   [name pathExtension] ?: @"?"];
+            return NO;
+        }
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            if (result) *result = @"文件不存在";
+            return NO;
+        }
+
+        NSString *whyA = nil;
+        if ([self nbPlayViaAudioServices:path why:&whyA]) {
+            if (result) *result = [NSString stringWithFormat:@"自播 file=%@ ch=A", name];
+            return YES;
+        }
+        NSString *whyB = nil;
+        if ([self nbPlayViaAVPlayer:path why:&whyB]) {
+            if (result) *result = [NSString stringWithFormat:@"自播 file=%@ ch=B", name];
+            return YES;
+        }
+        // 两条都失败 ⇒ 一定要把两条的原因都带出去，否则下一轮只能猜。
+        if (result) *result = [NSString stringWithFormat:@"播不了 file=%@（A:%@ / B:%@）",
+                               name, whyA ?: @"?", whyB ?: @"?"];
+        return NO;
+    } @catch (NSException *e) {
+        if (result) *result = [NSString stringWithFormat:@"throw:%@", e.name ?: @"?"];
+        return NO;
+    }
 }
 
 // ---------- v0.0.25：换提示音的**新刀** ----------
@@ -374,7 +589,8 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
     if (result) *result = nil;
     @try {
         NSInteger sid = 0;
-        NBSoundVerdict verdict = [self soundVerdictForBundle:bundle soundID:&sid];
+        NSString *srcFile = nil;
+        NBSoundVerdict verdict = [self soundVerdictForBundle:bundle soundID:&sid soundFile:&srcFile];
 
         // 两种「不适用」静默返回：开关没开 / 这个 App 不在名单。
         // 这是绝大多数通知的结局 —— 每条都留痕会把约 50 行的日志窗口冲干净（v0.0.22 白跑一轮的同一个病）。
@@ -394,10 +610,28 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
             if (result) *result = @"名单空 ⇒ 放原声";
             return NO;
         }
+        if (verdict == NBSoundVerdictBadFile) {
+            // v0.0.26。这条必须留痕：用户"明明把文件放进去了"却听不到原声以外的任何东西，
+            // 而原因（名字带 /、扩展名不认识、路径不对）在界面上看不出来。
+            static BOOL onceBadFile = NO;
+            NBWarnSoundMisconfig(&onceBadFile,
+                                 @"!!! 换提示音选的文件不可用（文件名含 / 或 ..、扩展名不认识、"
+                                 @"或者文件不在 /var/mobile/Library/NotifyBox/Sounds/）"
+                                 @"⇒ 不生效，通知按原声播放");
+            if (result) *result = @"文件不可用 ⇒ 放原声";
+            return NO;
+        }
 
-        // 到这里 verdict == OK：ID 合法且这个 App 在名单里。
+        // 到这里 verdict == OK：这个 App 确实要换音。
         // 🔴 先把声音送出去，再返回 YES —— 调用方拿到 YES 才会去掐系统原声。
         //    顺序写反（先掐再播）就是「播失败 ⇒ 哑巴」，见 NotifyFilter.h 里那段返回契约。
+        // 🔴 v0.0.26：**文件优先**。选了文件就只播文件，不播 ID（否则会同时响两个声音）。
+        if (srcFile.length) {
+            NSString *d = nil;
+            BOOL ok = [self playSoundFileNamed:srcFile forResult:&d];
+            if (result) *result = d;
+            return ok;              // 播不出去 ⇒ NO ⇒ 调用方放原声（绝不哑巴）
+        }
         AudioServicesPlaySystemSound((SystemSoundID)sid);
         if (result) *result = [NSString stringWithFormat:@"自播 sid=%ld 已发出", (long)sid];
         return YES;

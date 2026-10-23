@@ -100,6 +100,62 @@
 //   · 路径与 settings.plist 同目录，App 侧直接读，不用 Filza。
 #define NOTIFYBOX_SOUND_DIAG_PATH @"/var/mobile/Library/NotifyBox/sound_diag.log"
 
+// ---------- 自定义音频文件（v0.0.26）----------
+// 语义：`soundFile` 非空 ⇒ 播**这个文件**；为空 ⇒ 退回上面的 `soundID`（1000~1035 系统音）。
+// 🔴 为什么加这一条：v0.0.25 真机验证通过之后（用户："是我们的提示音"），
+//    整条链路（闸门自播 + return NO 掐原声）已经被证明是对的，
+//    剩下的唯一硬限制是 **只能从 30 来个系统提示音里挑**。用户想用自己的音频。
+//
+// 🔴 存的是**纯文件名**，不是路径。理由：
+//   ① 目录是我们定的（下面那个常量），存路径等于让用户在设置里能指定任意路径；
+//   ② `soundFile` 是从 settings.plist 读进来的**外部输入**，一旦含 `../` 就能让
+//      SpringBoard 去读/播任意文件 —— 净化（NBIsSafeSoundFileName）必须做在这里。
+#define NB_KEY_SOUND_FILE @"soundFile"
+
+// 音频目录。tweak（SpringBoard 进程）和盒子 App 都要能读，所以放在数据区。
+// 🔴 不能放 /var/jb/...：那是 roothide 的**代码/框架**前缀，不是数据；
+//    而 /var/mobile/Library/NotifyBox/ 已被真机确认两个进程都能读写（settings.plist 就在这）。
+// 🔴 目录**不由我们自动创建**：App 侧负责建（它一定能写），tweak 侧只读。
+//    SpringBoard 里偷偷建目录是没必要的副作用，而且失败时很吵。
+#define NOTIFYBOX_SOUND_DIR  @"/var/mobile/Library/NotifyBox/Sounds"
+
+// 认哪些扩展名。判断一律**大小写不敏感**（用户从别处拷来的可能是 .MP3）。
+// 🔴 AudioServices 那条路（已验证的出声通道）原生支持 caf/wav/aiff；
+//    mp3/m4a/aac 要靠 AVAudioPlayer 兜底 —— 两条路的区别见 NotifyFilter.m。
+#define NOTIFYBOX_SOUND_EXTS @[@"caf", @"wav", @"aiff", @"aif", @"mp3", @"m4a", @"m4r", @"aac", @"flac", @"ogg"]
+
+// 🔴🔴 文件名净化：只做"拒绝"，不做"改名"。
+//    改名会让"我明明放了这个文件、界面里显示的名字却不是它"这种诡异现象出现；
+//    拒绝 + 留痕才能让人知道为什么没生效。
+static inline BOOL NBIsSafeSoundFileName(NSString *name) {
+    if (![name isKindOfClass:[NSString class]]) return NO;
+    NSString *t = [name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (t.length == 0) return NO;
+    if (t.length > 120) return NO;                        // 文件名长过 120 基本就是异常数据
+    if ([t containsString:@"/"]) return NO;                // 路径分隔符
+    if ([t containsString:@"\\"]) return NO;               // Windows 习惯，也挡一下
+    if ([t containsString:@".."]) return NO;               // 相对路径穿越
+    if ([t hasPrefix:@"."]) return NO;                     // 隐藏文件 / "." ".."
+    if ([t containsString:@"\0"]) return NO;
+    return YES;
+}
+
+// 文件名 → 绝对路径。名字不合法时返回 nil（调用方据此判"配置错"）。
+static inline NSString *NBSoundFilePath(NSString *name) {
+    if (!NBIsSafeSoundFileName(name)) return nil;
+    NSString *t = [name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!t.length) return nil;
+    return [NOTIFYBOX_SOUND_DIR stringByAppendingPathComponent:t];
+}
+
+// 扩展名是不是我们认的音频格式（大小写不敏感）。
+static inline BOOL NBIsSoundFileExt(NSString *name) {
+    if (![name isKindOfClass:[NSString class]] || !name.length) return NO;
+    NSString *e = [[name pathExtension] lowercaseString];
+    if (!e.length) return NO;
+    return [NOTIFYBOX_SOUND_EXTS containsObject:e];
+}
+
 // 🔴 「一组 bundle id」的读法只在这里写一份。
 //    历史数据是**逗号分隔字符串**（v0.0.12 及以前是输入框），
 //    新数据是**数组**（v0.0.13 的选择器写）。

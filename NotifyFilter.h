@@ -97,10 +97,22 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)playCustomSoundForBundle:(nullable NSString *)bundle
                        forResult:(NSString * _Nullable * _Nullable)result;
 
-// v0.0.22：这个 App 是不是「该换提示音」（开关开 + 名单里有它 + ID 合法）。
+// v0.0.22：这个 App 是不是「该换提示音」（开关开 + 名单里有它 + ID 合法 / 或选了可用文件）。
 // 🔴 给诊断用。判定口径与 applySoundForBundle **同源**（都走 soundVerdictForBundle），
 //    不允许在诊断里另写一份 —— 两边走岔的后果见 notifybox/README.md v0.0.22 章。
 + (BOOL)isSoundTargetBundle:(nullable NSString *)bundle;
+
+// ---------- v0.0.26：播一个自定义音频文件 ----------
+//
+// 🔴 这个函数**不做任何判定**（不看开关、不看 App 名单）——
+//    它只管"把这一份文件播出去"。为什么这样切：
+//    设置页的「试听」需要无视名单（用户就是想先听听是不是这个音），
+//    而通知路径必须先判定。两者共用"播"这一步，判定各走各的入口。
+//
+// 返回契约与 playCustomSoundForBundle 一致：YES = 播放请求已发出；NO = 播不出去，调用方回退。
+// result 非空时写入走了哪条通道（ch=A = AudioServices，ch=B = AVAudioPlayer）或失败原因。
++ (BOOL)playSoundFileNamed:(nullable NSString *)name
+                 forResult:(NSString * _Nullable * _Nullable)result;
 
 // v0.0.21：换提示音的崩溃自愈（只在 SpringBoard 的构造函数里调一次）。
 // 返回 YES 表示"上次就是崩在换提示音里，已经把这个开关关掉了"，**并且已回读确认**。

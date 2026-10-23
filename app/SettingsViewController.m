@@ -2,9 +2,14 @@
 #import <AudioToolbox/AudioToolbox.h>   // v0.0.21：试听系统提示音（AudioServicesPlaySystemSound）
 #import "NotifyStore.h"
 #import "NotifyCommon.h"
+// v0.0.26：试听自定义音频文件时必须调**引擎里那同一个**播放函数。
+// 🔴 不能在 App 里再写一份 AVAudioPlayer / AudioServices 调用 ——
+//    两份播放逻辑一旦走岔，试听能响而通知不响，而这正是最难查的一类症状。
+#import "NotifyFilter.h"
 #import "ReplaceRulesViewController.h"
 #import "AppPickerViewController.h"
 #import "VoicePickerViewController.h"
+#import "SoundFilePickerViewController.h"
 #import "InstalledApps.h"
 #import <errno.h>
 #import <string.h>
@@ -78,6 +83,7 @@ static const NSInteger kSubHit = 105;
 - (void)onSpeakApps:(id)sender;
 - (void)onDndApps:(id)sender;
 - (void)onSoundApps:(id)sender;
+- (void)onSoundFile:(id)sender;
 - (void)onSoundPreview:(id)sender;
 - (NSString *)timeText:(id)v;
 - (void)onVoice:(id)sender;
@@ -155,6 +161,10 @@ static const NSInteger kSubHit = 105;
               value:[self strOf:cur[NB_KEY_SOUND_ID]]
            keyboard:UIKeyboardTypeNumberPad
                 key:NB_KEY_SOUND_ID];
+    // 🔴🔴 v0.0.26：自定义音频文件。**排在 ID 下面**，因为它的优先级比 ID 高 ——
+    //    顺序即语义，用户从上往下读："先看有没有文件，没有才用 ID"。
+    [self addActionRow:@"提示音文件（优先于上面的 ID）"
+                    key:@"soundfile" action:@selector(onSoundFile:)];
     [self addActionRow:@"换提示音的 App（空 = 不生效）"
                     key:@"soundapps" action:@selector(onSoundApps:)];
     [self addActionRow:@"试听这个提示音" key:@"soundpreview" action:@selector(onSoundPreview:)];
@@ -383,6 +393,24 @@ static const NSInteger kSubHit = 105;
     id sidNow = d[NB_KEY_SOUND_ID];
     [self setActionValue:(sidNow ? [NSString stringWithFormat:@"%@", sidNow] : @"未设置")
                   forKey:@"soundpreview"];
+
+    // v0.0.26：这一行要一眼看出"到底用哪个" —— 文件优先于 ID。
+    // 🔴 三态必须分开显示，不能把"选了但不合法"混进"没选"：
+    //    用户放了文件、界面却显示"未选"，他只会觉得这个页面坏了。
+    id fNow = d[NB_KEY_SOUND_FILE];
+    NSString *fName = [fNow isKindOfClass:[NSString class]] ? (NSString *)fNow : @"";
+    NSString *fShow = @"未选（用上面的 ID）›";
+    if (fName.length) {
+        if (!NBIsSafeSoundFileName(fName)) {
+            fShow = @"文件名不合法 ›";
+        } else {
+            NSString *p = NBSoundFilePath(fName);
+            BOOL exists = p && [[NSFileManager defaultManager] fileExistsAtPath:p];
+            fShow = exists ? [NSString stringWithFormat:@"%@ ›", fName]
+                           : [NSString stringWithFormat:@"%@（文件不在）›", fName];
+        }
+    }
+    [self setActionValue:fShow forKey:@"soundfile"];
 
     NSString *voiceName = [VoicePickerViewController currentVoiceDisplayName];
     id rid = d[NB_KEY_SPEAK_RATE];
@@ -654,10 +682,41 @@ static const NSInteger kSubHit = 105;
     [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeSound]];
 }
 
-// 试听：直接在 App 里放系统提示音，用户不用去猜 1007 是什么声音。
-// 🔴 播完要恢复音频会话，否则会影响正在播放的音乐（朗读那边踩过同一类问题）。
+- (void)onSoundFile:(id)sender {
+    [self.view endEditing:YES];
+    [self push:[[SoundFilePickerViewController alloc] init]];
+}
+
+// 试听：直接在 App 里放，用户不用去猜 1007 是什么声音 / 也不用等一条真通知。
+//
+// 🔴 v0.0.26 改了两件事：
+//   ① **文件优先**（与引擎的判定顺序一致：选了文件就不看 ID）。
+//      试听如果还按 ID 播，用户会听到"不是他选的那个音"却以为配错了。
+//   ② 播文件的代码**不在本文件里**，一律调 NotifyFilter 那个同一个函数
+//      （见文件顶部 import 处的注释：两份播放逻辑走岔是最难查的症状）。
+//
+// ⚠️ 必须对用户讲清的局限：试听跑在**盒子 App 进程**，通知跑在 **SpringBoard 进程**。
+//    试听响只能证明"这个文件/ID 能解码"，不能 100% 保证通知一定响。
+//    所以这句话要写进状态栏文案，不能只在文档里。
 - (void)onSoundPreview:(id)sender {
     [self.view endEditing:YES];
+
+    // ---- ① 有文件就播文件 ----
+    id fv = [NotifyStore settings][NB_KEY_SOUND_FILE];
+    NSString *fname = [fv isKindOfClass:[NSString class]] ? (NSString *)fv : nil;
+    if (fname.length) {
+        NSString *detail = nil;
+        BOOL ok = [NotifyFilter playSoundFileNamed:fname forResult:&detail];
+        self.statusLabel.textColor = ok ? [UIColor secondaryLabelColor] : [UIColor systemRedColor];
+        self.statusLabel.text = ok
+            ? [NSString stringWithFormat:@"已试听文件 %@（%@）。"
+                                         @"⚠️ 试听在 App 里播，通知在 SpringBoard 里播 —— "
+                                         @"试听响不等于通知一定响。", fname, detail ?: @"?"]
+            : [NSString stringWithFormat:@"这个文件播不出来：%@", detail ?: @"原因未知"];
+        return;
+    }
+
+    // ---- ② 没文件才播 ID（v0.0.25 的老路，真机已验证）----
     NSInteger sid = 0;
     for (NSUInteger i = 0; i < self.fields.count; i++) {
         if (i < self.fieldKeys.count && [self.fieldKeys[i] isEqualToString:NB_KEY_SOUND_ID]) {
@@ -666,7 +725,7 @@ static const NSInteger kSubHit = 105;
         }
     }
     if (sid < 1000 || sid > 1035) {
-        [self fail:@"先填一个 1000~1035 之间的提示音 ID，再点试听"];
+        [self fail:@"先填一个 1000~1035 之间的提示音 ID（或选一个提示音文件），再点试听"];
         return;
     }
     AudioServicesPlaySystemSound((SystemSoundID)sid);

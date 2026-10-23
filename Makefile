@@ -59,7 +59,10 @@ APPLICATION_NAME = NotifyBoxApp
 #      仍然留着不删：它编得过、不产生行为，而"少动一处构建配置"比"少一个文件"值钱
 #      （构建配置出错的表现是 undefined symbol，最像代码 bug、最费轮次）。
 #      真要瘦身的话可以删，删之前先确认 App 侧没有任何 NBSoundDiag 引用。
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/InstalledApps.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m
+# 🔴🔴 v0.0.26 新增 app/SoundFilePickerViewController.m：选自定义提示音文件。
+#      ⚠️ 必须同时把 .h 写好并 import，否则 application.mk 编译期报
+#      "cannot find interface declaration"（看着像代码问题，其实是漏了文件）。
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/InstalledApps.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
 # 🔴 App 侧也要 AVFoundation/AVFAudio：声音选择页要**试听**，那是在 App 里跑的 TTS。
 #    不链的话编译期就找不到 AVSpeechSynthesizer，而 tweak 侧那份救不了 App。
