@@ -30,6 +30,13 @@ NS_ASSUME_NONNULL_BEGIN
 // 放 %ctor 里调，内部容忍"框架还没加载"（拿不到就不置位，留给第一条通知重试）。
 + (void)dumpClassOnce;
 
+// v0.0.23：把我们**自己造出来的**那个 BBSound 的关键字段打出来（type/sid/rep/dur/tone）。
+// stage 只用两个字面量，且必须和 NotifyFilter.m 里那两处调用逐字一致：
+//   "设前" = 刚 alloc/init 完、一个字段都还没写（这是"空壳到底空到什么程度"的唯一证据）
+//   "设后" = soundType/systemSoundID/repetitions/maxDuration 都写完之后
+// 两次一对比就知道值到底进没进对象 —— 写进去但被 setter 吞掉时，现象和"根本没写"一模一样。
++ (void)probeCreatedSound:(nullable id)snd stage:(nullable NSString *)stage;
+
 // 每条通知调一次：只在**目标 App**（开关开 + 名单里有它 + ID 合法）才输出，
 // 否则静默返回 —— 日志窗口只有约 50 行，诊断不许刷屏。
 // stage 形如 "PB" / "PBR" / "PBRS"，用来区分三个入口。

@@ -86,6 +86,20 @@
 //      读取侧必须**回读确认**自己真的把开关关掉了，再打日志。
 #define NOTIFYBOX_SOUND_GUARD_PATH @"/var/mobile/Library/NotifyBox/.sound_guard"
 
+// 🔴 v0.0.23：换提示音的诊断**落盘**。
+//
+// 为什么必须落盘，而不是继续用日志：v0.0.22 那一轮，
+//   `=== SD# 开始 dump 类结构 ===` 和 `SD# BBSound: …` 这几行**已经被挤出 50 行窗口**，
+//   用户截图里只剩后面的 `SOUND#` / `发后①②` / `+0.4s`。
+//   而"BBSound 上到底有哪些属性、哪些可写"正是定位问题的唯一依据 ——
+//   结果数据打出来了、却已经滚没了，等于白跑一轮。
+//
+// 口径：
+//   · 这个文件**每次进程启动覆盖一次**（结构性 dump 只打一次），不做追加，
+//     否则会无限长；每次通知级的诊断行追加在同一份里，App 里能整份看到。
+//   · 路径与 settings.plist 同目录，App 侧直接读，不用 Filza。
+#define NOTIFYBOX_SOUND_DIAG_PATH @"/var/mobile/Library/NotifyBox/sound_diag.log"
+
 // 🔴 「一组 bundle id」的读法只在这里写一份。
 //    历史数据是**逗号分隔字符串**（v0.0.12 及以前是输入框），
 //    新数据是**数组**（v0.0.13 的选择器写）。

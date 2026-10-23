@@ -31,6 +31,7 @@
 - (NSString *)keyLinesFrom:(NSString *)text;
 - (NSString *)selLinesFrom:(NSString *)text;
 - (NSString *)probeLinesFrom:(NSString *)text;
+- (NSString *)soundDiagFileText;
 @end
 
 @implementation ViewController
@@ -92,6 +93,17 @@
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
         [self showText:[self probeLinesFrom:[NotifyStore logText:200000]] title:@"探针数据"];
+    }]];
+    // 🔴🔴 v0.0.23：换提示音的诊断**落盘**了，这里直接读文件。
+    //    为什么单开一个入口、而不是从日志里捞：
+    //      · 日志只有约 50 行窗口，结构性 dump 一小时前就滚没了
+    //        （v0.0.22 就是这么白跑一轮的）；
+    //      · 文件不受窗口/轮转影响，且是"上一个进程完整的一次 dump"。
+    //    路径与 tweak 侧共用 NotifyCommon.h 里的宏 —— 不另写一份字面量。
+    [sheet addAction:[UIAlertAction actionWithTitle:@"声音诊断文件（完整，换提示音必看）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self showText:[self soundDiagFileText] title:@"声音诊断"];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"方法清单（SEL+ENC）"
                                               style:UIAlertActionStyleDefault
@@ -181,9 +193,35 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [kNBKeyLineTable componentsSeparatedByString:@"|"];
 }
 
+// v0.0.23：把落盘的诊断整份读出来。
+// 文件不存在时给"三种可能"，而不是干巴巴一句"没有"——
+// 用户看到空白时必须能自己判断是"没跑过"还是"跑了但没写进去"。
+- (NSString *)soundDiagFileText {
+    // 🔴 路径必须用 NotifyCommon.h 里的宏，**不许在这里再写一遍字面量**。
+    //    上一版我差点写成字面量、注释还写着"共用宏"——注释和代码走岔是本项目
+    //    反复付学费的那类错（改了 tweak 侧路径、App 侧还读老路径，两边都"没错"却谁也看不见）。
+    NSString *path = NOTIFYBOX_SOUND_DIAG_PATH;
+    NSString *body = [NSString stringWithContentsOfFile:path
+                                               encoding:NSUTF8StringEncoding
+                                                  error:nil];
+    if (!body.length) {
+        return [NSString stringWithFormat:
+                @"(%@ 是空的或不存在)\n\n"
+                @"常见原因（按可能性排）：\n"
+                @"① SpringBoard 起来之后还没收到过通知 —— 诊断要等第一条通知到达才写；\n"
+                @"② 换提示音的开关/名单没配好 → 诊断只在**目标 App** 上输出（这是故意的，避免刷屏）；\n"
+                @"③ tweak 没注入 —— 先去「结论行」看有没有 banner 那两行。",
+                path];
+    }
+    NSArray *lines = [body componentsSeparatedByString:@"\n"];
+    NSString *head = [NSString stringWithFormat:@"%@\n共 %lu 行\n",
+                      path, (unsigned long)lines.count];
+    return [head stringByAppendingFormat:@"\n%@", body];
+}
+
 // v0.0.20：只挑探针行。
-// 判据域 = 含 "PROBE" 的行；变异域 = 探针的全部输出（NotifyProbe.m 里每一行都以 PROBE 开头）
-// ⇒ 两者严格对齐。这正是上一版"关键词表漏词"要买的课。
+// 判据域 = 含 "PROBE"（v0.0.23 起加 "SD#"）的行；变异域 = 探针的全部输出。
+// ⇒ 两者必须严格对齐。这正是上一版"关键词表漏词"要买的课。
 // 单独开入口、而不是塞进结论行，有两个**互相独立**的原因：
 //   ① 结论行只看尾部 20KB，而探针是**开机那一刻**打的 —— 手机跑几小时后早被挤出窗口，
 //      光把关键词补进表里也照样看不见（只修一半 = 还是看不到）；
@@ -193,11 +231,16 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     NSArray *all = [text componentsSeparatedByString:@"\n"];
     NSMutableArray *keep = [NSMutableArray array];
     for (NSString *line in all) {
-        if ([line containsString:@"PROBE"]) [keep addObject:line];
+        // 🔴 v0.0.23：把 SD#（换提示音诊断）也收进来。
+        //    同一个病已经犯过三次：加了新留痕、却忘了它能被筛出来。
+        //    这次是"加了 SD#、但入口只认 PROBE"，等于白打。
+        if ([line containsString:@"PROBE"] || [line containsString:@"SD#"]) {
+            [keep addObject:line];
+        }
     }
     NSUInteger total = keep.count;
     if (!total) {
-        return @"(没找到 PROBE 行)\n\n"
+        return @"(没找到 PROBE / SD# 行)\n\n"
                 "常见原因（按可能性排）：\n"
                 "① SpringBoard 起来之后还没收到过通知 —— 探针要等第一条通知到达才跑；\n"
                 "② 日志轮转过了（超过 512KB 切到 .1），开机那几条不在当前文件里；\n"

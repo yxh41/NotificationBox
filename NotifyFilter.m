@@ -1,5 +1,9 @@
 #import "NotifyFilter.h"
 #import "NotifyCommon.h"
+// 🔴 v0.0.23：造完 BBSound 之后要把它的字段实值打出来（落盘）。
+//    NotifyFilter.m **也被盒子 App 编译**，所以 NotifySoundDiag.m 必须一起进 App 的 FILES，
+//    否则链接期就是 undefined symbol（这种错看着像代码问题，其实是构建配置）。
+#import "NotifySoundDiag.h"
 #import <objc/runtime.h>       // v0.0.16 起为探针引入；v0.0.19 删掉延迟后本文件已不用 objc_* 函数，
                               // 但保留这个 import 无害，且省得下次要加探针时又忘
 
@@ -324,8 +328,12 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
 //    这一行本身还要带 bundle 和 tag。
 static NSString *NBSoundFieldSummary(id snd) {
     if (!snd) return @"snd=nil";
+    // 🔴 v0.0.23：加上 rep / dur —— 这两个正是"完全没声音"的嫌疑字段，
+    //    必须能在 SOUND# 行里直接看到它们的实值。
+    //    （src 那两个仍然是 `!无键` 也无所谓，它就是不存在，看见反而证明探针是诚实的）
     NSArray *pairs = @[@[@"src", @"soundSource"], @[@"tone", @"toneIdentifier"],
-                       @[@"type", @"soundType"], @[@"sid", @"systemSoundID"]];
+                       @[@"type", @"soundType"], @[@"sid", @"systemSoundID"],
+                       @[@"rep", @"repetitions"], @[@"dur", @"maxDuration"]];
     NSMutableString *m = [NSMutableString string];
     for (NSArray *pair in pairs) {
         NSString *shortName = pair[0];
@@ -422,8 +430,12 @@ static NSString *NBSoundFieldSummary(id snd) {
             if (result) *result = @"BBSound alloc 失败";
             return YES;
         }
+        // 🔴 v0.0.23：**设之前**先记一次默认值。
+        //    这一行是"空壳到底空到什么程度"的唯一证据：
+        //    如果 rep=0 / dur=0，那我们上一版"播 0 次 / 0 秒"的推断就成立。
+        [NBSoundDiag probeCreatedSound:snd stage:@"设前"];
 
-        BOOL setType = NO, setID = NO;
+        BOOL setType = NO, setID = NO, setRep = NO, setDur = NO;
         if ([snd respondsToSelector:NSSelectorFromString(@"setSoundType:")]) {
             [snd setValue:@(1) forKey:@"soundType"];     // 1 = Alert（按可写字段名推的，见上面注释）
             setType = YES;
@@ -432,11 +444,51 @@ static NSString *NBSoundFieldSummary(id snd) {
             [snd setValue:@((int)sid) forKey:@"systemSoundID"];
             setID = YES;
         }
+
+        // 🔴🔴 v0.0.23：补上「播几次 / 播多久」。
+        //
+        // 真机数据（PROBE BBSound 那 15 个属性）把上一版「完全没声音」解释清楚了：
+        // 挂载没问题、setter 存在、值也进去了（`set=1/1 type=1 sid=1009` 回读成功），
+        // 但 `sound` 是个 **alloc/init 出来的空壳** —— 它的
+        //   repetitions（播几次）和 maxDuration（播多久）大概都是 0
+        // ⇒ 系统认为"有一个声音配置，但播 0 次 / 0 秒" ⇒ **一声都不出**。
+        // 而 sound=nil 时系统走的是"默认提示音"那条路，所以默认通知照样响。
+        // 这一条也解释了为什么"完全没声音"而不是"还是原来的声音"。
+        //
+        // 为什么现在敢直接补：**当前状态已经是"完全没声音"（最差）**，
+        // 补两个"播一次、最多 30 秒"的合理值不可能更差。
+        // 仍然逐个 respondsToSelector 探 —— 键名一个都不赌
+        // （BBSound 上 soundSource / vibrationIdentifier 就是不存在，已被 KVC 抛异常证明）。
+        if ([snd respondsToSelector:NSSelectorFromString(@"setRepetitions:")]) {
+            [snd setValue:@(1) forKey:@"repetitions"];
+            setRep = YES;
+        }
+        if ([snd respondsToSelector:NSSelectorFromString(@"setMaxDuration:")]) {
+            [snd setValue:@(30) forKey:@"maxDuration"];
+            setDur = YES;
+        }
+
         if (!setType && !setID) {
             NBWriteSoundGuard(kNBGuardDone);
             if (result) *result = @"BBSound 上没有可写的 soundType/systemSoundID";
             return YES;
         }
+
+        // 🔴 v0.0.23 安全兜底：万一 rep/dur 的 setter 在本版 BBSound 上不存在，
+        //    那挂上去必然又是一声不出 —— 而「静音」比「声音没换掉」糟得多
+        //    （用户会漏掉消息）。所以宁可不换，也不能让通知变哑巴。
+        //    注意这里**返回 YES**：不是"没做"，是"故意不做"，理由要出现在 SOUND# 行里，
+        //    否则用户只看到"换提示音没生效"，却看不到"是因为这个版本不支持"。
+        if (!setRep || !setDur) {
+            NBWriteSoundGuard(kNBGuardDone);
+            if (result) *result = [NSString stringWithFormat:
+                                   @"!!! 放弃换音：rep=%d dur=%d 设不上（挂上去会静音），本版通知仍按原声%@",
+                                   (int)setRep, (int)setDur, NBSoundFieldSummary(snd)];
+            return YES;
+        }
+        // 🔴 v0.0.23：**设之后**再记一次。和上面那条一对比就知道：
+        //    值是"从 0 变成 1/30"（真的写进去了）还是"压根没动"（setter 吞了）。
+        [NBSoundDiag probeCreatedSound:snd stage:@"设后"];
 
         [bulletin setValue:snd forKey:@"sound"];
 
@@ -447,8 +499,9 @@ static NSString *NBSoundFieldSummary(id snd) {
             if (!back) {
                 NBWriteSoundGuard(kNBGuardDone);
                 if (result) *result = [NSString stringWithFormat:
-                                       @"写完回读是 nil（id=%ld，setType=%d setID=%d）",
-                                       (long)sid, (int)setType, (int)setID];
+                                       @"写完回读是 nil（id=%ld，setType=%d setID=%d rep=%d dur=%d）",
+                                       (long)sid, (int)setType, (int)setID,
+                                       (int)setRep, (int)setDur];
                 return YES;
             }
             cls = NSStringFromClass([back class]);
@@ -459,8 +512,13 @@ static NSString *NBSoundFieldSummary(id snd) {
         NBWriteSoundGuard(kNBGuardDone);
         if (result) {
             // 🔴 v0.0.22：附带 snd 的字段实值 —— 见 NBSoundFieldSummary 上面那段说明。
-            *result = [NSString stringWithFormat:@"id=%ld 已挂上 cls=%@ set=%d/%d %@",
-                       (long)sid, cls, (int)setType, (int)setID, NBSoundFieldSummary(snd)];
+            //    v0.0.23 起再加 rep/dur 两个标志位。
+            // 🔴 `set=` 后面保留 `/` 分隔：用户上一版截图里就是 `set=1/1`，
+            //    连写成 `set=%d%d` 会变成 `set=11` —— 能读但一眼看不出是两个字段（别为了省一个字符牺牲可读性）。
+            *result = [NSString stringWithFormat:
+                       @"id=%ld 已挂上 cls=%@ set=%d/%d rep=%d dur=%d %@",
+                       (long)sid, cls, (int)setType, (int)setID,
+                       (int)setRep, (int)setDur, NBSoundFieldSummary(snd)];
         }
         return YES;
     } @catch (NSException *e) {

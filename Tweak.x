@@ -1,4 +1,22 @@
-// Tweak.x —— v0.0.22（当前）：**只读诊断** —— 换提示音回读成功、但真机听不到
+// Tweak.x —— v0.0.23（当前）：**补字段** —— 上一版诊断已把病因锁死
+//
+// 真机量到的事实（v0.0.22 的诊断数据）：
+//   · `sound` 在 orig 前/后、0.4 秒后**都在** ⇒ 不是挂载失败，也没被系统抹掉；
+//   · `set=1/1` ⇒ setter 存在；回读 `type=1 sid=1009` ⇒ 值真的进了对象；
+//   · 用户症状是**完全没声音**（不是"还是原来的声音"）。
+// 这三条合起来只剩一个解释：**我们挂的是个空壳，系统采纳了它，但它播不出声。**
+//
+// 真机 PROBE 的 `BBSound 有 15 个 property` 里有两个要命的字段：
+//   repetitions（播几次）、maxDuration（播多久）
+// alloc/init 出来的对象里它们大概是 0 ⇒ 播 0 次 / 0 秒 ⇒ 一声不出。
+// （sound=nil 时系统走"默认提示音"路径，所以默认通知照样响 —— 这也解释了症状。）
+// ⇒ 本版补 repetitions=1 / maxDuration=30，逐个 respondsToSelector 探，键名一个都不赌。
+//   还有一条**安全兜底**：万一这俩 setter 在本版不存在，就**不挂**（宁可声音没换掉，
+//   也不能让通知变哑巴 —— 静音会让用户漏消息，比"没换音"严重得多）。
+//   SOUND# 行会写出「!!! 放弃换音」，别把它当成失败，那是故意的。
+//
+// 同时诊断改为**落盘**（sound_diag.log）：上一版的结构性 dump 被 50 行日志窗口吃了，
+// 白跑一轮。App 侧新开「声音诊断文件（完整）」入口直接读文件。
 //
 // 上一版（v0.0.21）上了两个功能：免打扰时段 ✅、按 App 换提示音 ❌（听不到）。
 // 这一版**不出新刀**，只把现场量清楚。理由是本项目已经付过学费的那条：
@@ -468,7 +486,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.22", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.23", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -501,12 +519,12 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.22 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.23 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
           @"可用",
-          @"实验（默认关，v0.0.22 诊断中）");
+          @"实验（默认关，v0.0.23 已补 rep/dur）");
 
     // 只读探针：dump 一次 BBBulletin / BBSound 的类结构（内部自己保证只做一次）
     [NotifyProbe dumpClassesOnce];
@@ -539,7 +557,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.22 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.23 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -560,7 +578,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.22 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.23 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
