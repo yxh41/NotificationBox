@@ -1695,3 +1695,164 @@ nb_v023_src_check 14 条语义判据全过，14 条负向对照全部报红
 
 > 包比 v0.0.22（78516）大了约 3KB，增量对得上：诊断落盘那一段 + 安全兜底 + 两次取样。
 > 没有新增任何依赖（依赖表仍是 `firmware (>=16.0), ellekit`）。
+
+---
+
+## v0.0.24 · 侦察「正确造法」：上一版的假设被真机数据正面否掉
+
+> 一句话：**v0.0.23 推断的「播 0 次 / 0 秒」不成立 —— 一个能正常响的声音，那两个字段也是 0。**
+> 而真正决定出声的是 **TonesLibrary 的 `TLAlertConfiguration`**，
+> `systemSoundID`（AudioServices 老 ID）iOS 16 的 BulletinBoard 已经不看了。
+> 这一版**不改刀**（继续不挂），只把"怎么造一个能响的 BBSound"挖出来。
+
+### 一、决定性证据：真机里有一个「能响的对照组」
+
+v0.0.23 的诊断在用户手机上抓到了一个**系统自己的、能正常出声**的 `BBSound`。
+把它和我们造的空壳并排放：
+
+| 字段 | 能正常响的（系统给的） | 我们的空壳 |
+|---|---|---|
+| `soundType` | **2** | 1 |
+| `systemSoundID` | **0** | 1009 |
+| `alertConfiguration` | **`<TLAlertConfiguration>`** | **nil** |
+| `toneIdentifier` | `""`（空串，只读） | nil |
+| `maxDuration` | **0** | 30（我们写的） |
+| `repeats` | **0** | 0（我们写的） |
+| `alertType` | 17（只读） | 0 |
+
+### 二、这一张表推翻了三件事
+
+**① 「播 0 次 / 0 秒」不是病因。**
+能响的样本 `maxDuration=0` + `repeats=0`，照样响。v0.0.23 的整个推断作废。
+
+**② `repetitions` 这个键根本不存在 —— 我抄错了名字。**
+真机上 `rep=!无键`（`NSUnknownKeyException`），正确名字是：
+
+```
+repeats[W]{TB,N,GisRepeating,V_repeats}     ← BOOL，getter 是 isRepeating，"要不要重复"
+```
+
+而 `repetitions`（"播几次"）是我照着上一版 PROBE 截图**凭印象转写**出来的 ——
+意思相近、名字不对。⇒ **键名只能从数据里逐字抄，不许翻成同义词。**
+（这类错比"猜错方向"更隐蔽：代码能编、能跑、只是永远读不到东西。）
+
+**③ iOS 16 的通知音走 TonesLibrary，不走 `systemSoundID`。**
+
+| | 走哪条路 | 谁能读 |
+|---|---|---|
+| 设置页「试听」 | `AudioServicesPlaySystemSound(1009)` | AudioServices，**能响** |
+| 系统投递通知 | `TLAlert` + `TLAlertConfiguration` | BulletinBoard，**不看 systemSoundID** |
+
+这解释了困扰好几轮的那个矛盾：**试听是响的，通知不响** —— 两条完全不同的路。
+`systemSoundID` 是 iOS 9 时代的东西，留到今天已经不被通知链路采纳了。
+
+### 三、为什么这一版仍然不改刀
+
+v0.0.21 已经实测过：**挂一个空壳，通知变成完全没声音**。
+而"没换成"只是功能没生效 —— 两者量级差得远（静音会让用户漏消息）。
+在不知道正确造法之前再挂一次，等于让用户再聋一轮。
+
+所以闸门改成这一句，并且**刻意不是"本版先关掉"**：
+
+```objc
+id alertCfg = nil;
+@try { alertCfg = [snd valueForKey:@"alertConfiguration"]; } @catch (...) { alertCfg = nil; }
+if (!alertCfg) {
+    // 本版不挂（侦察轮）
+    return YES;          // 返回 YES 才会打 SOUND#，用户看得见"为什么不换"
+}
+```
+
+写成"这一项必须有值"的好处：**下一版一旦会造 `alertConfiguration`，闸门自动打开**，
+不用回头再改一行 `if` —— 少一处"改了忘了开"的机会。
+
+### 四、诊断自己也在说谎：两个 bug
+
+真机那份 `sound_diag.log` 里，这两行紧挨着出现：
+
+```
+SD# BBSound 的 setter: setVibrationPattern: setSoundBehavior: setSystemSoundID: setSoundType: setAlertConfiguration: setRingtoneName:
+SD# BBSound 声音相关 setter: 一个都没有        ← 自相矛盾
+```
+
+**bug 1：判据变量被 flush 污染。**
+旧实现用 `buf.length` 同时表达两件事：「缓冲区还有没有字」和「有没有找到过」。
+6 个 setter 加起来正好 **111 字符**（阈值 110）⇒ 最后一个 append 触发 flush ⇒
+缓冲区被清空 ⇒ 循环结束 `buf.length == 0` ⇒ 落进 else 分支。
+⇒ **"有没有找到过"必须用独立变量记**，不能复用"缓冲区还剩多少"。
+这跟"改的是账本还是账本的读数"是同一类错：拿派生量当事实。
+
+**bug 2：关键词表漏词。**
+旧表只有 `sound/alert/tone/vibrat/source/system`，于是
+`setMaxDuration:` / `setRepeats:` / `setSongPath:` **三个真实存在的 setter 全被筛掉**。
+我却据此以为"BBSound 上只有 6 个可写字段"，差一点又照着一份残缺清单去设计。
+⇒ 过滤器漏词 = **判据域小于变异域**。
+这一版把 `duration/repeat/song/audio/ringtone/behavior/config/play` 全补上，
+并且对 `BBSound` **不做过滤**（它方法总数很少，全打不贵）。
+
+### 五、结构性改进：重型 dump 不许进日志
+
+上一轮白跑一轮的直接原因是"结构性 dump 被 50 行日志窗口吃了"。
+这一版要 dump 的东西**比上一版多得多**（全量方法表几十行 + TLAlertConfiguration +
+最多 4 个样本），如果还走日志，一次就能把窗口糊死，把 banner / `SOUND#` 挤出去。
+
+⇒ 拆成两个出口：
+
+| 出口 | 去哪 | 给谁用 |
+|---|---|---|
+| `NBDiagLog(reset, …)` | 日志 **+** 文件 | 短结论行（`发后①②`、`★ 抓到第 N 种`、dump 边界） |
+| `NBDiagLogF(…)` | **只**文件 | 重型结构 dump（属性/setter/方法/ivar/样本字段/设前设后） |
+
+判据是"这段内容是不是用户靠截图必须看到的" —— 不是就走文件。
+并且写了机器判据 `a18`：五个 dump 函数里**不许出现** `NBDiagLog(`。
+
+### 六、这一版侦察什么
+
+| # | 挖什么 | 为什么 |
+|---|---|---|
+| 1 | `BBSound` 的**类方法**（`object_getClass` 取元类） | 如果有 `+soundWith…` 工厂，就该让系统替我们造，不用再手工拼字段 |
+| 2 | **`TLAlertConfiguration`** 的属性 / setter / 类方法 / ivar | 它是 iOS 16 通知音的真身，我们需要"怎么造一个能用的 cfg" |
+| 3 | 最多 **4 种不同形态**的外来 sound（按指纹去重）+ 各自的 `alertConfiguration` | 上一版只留 1 个样本，等于只认识一种长相；多样性才能看出 `soundType` 的取值规律 |
+| 4 | `BBSound` 的 **ivar** 表 | `toneIdentifier` / `alertType` / `ignoreRingerSwitch` 都是只读 property，KVC 写它们会退化成写 ivar，得先知道 ivar 叫什么 |
+
+### 七、装了这一版要做什么
+
+**行为不变**（通知仍然按原声播，不会变哑巴）。要做的只有一件事：
+
+1. 装包、重启 SpringBoard；
+2. 正常用一会儿，让那个 App 至少响 2–3 条通知（有声音的那种）；
+3. 「诊断」→「声音诊断文件（完整，换提示音必看）」，**整份发我**。
+
+这一版文件会比上一版长不少（多了方法表和 ivar），是正常现象。重点看：
+
+```
+SD# BBSound 的类方法共 N 个 (找工厂：+xxx 形式的最关键)
+SD# BBSound 的类方法: …                                    ← 有没有 +soundWith…
+SD# TLAlertConfiguration 有 N 个属性（[W]=可写 [R]=只读）
+SD# TLAlertConfiguration 的类方法: …
+SD# ★ 抓到非 nil 的 sound 第 N 种 …
+SD# ★ 它的 alertConfiguration cls=… （这就是 TonesLibrary 的真身）
+SD# 该 alertConfiguration 值: toneIdentifier=… soundType=… …
+```
+
+### 八、判据层
+
+- `nb_v024_src_check.py`：**18 条**二进制里查不到的语义判据 + **18 条**负向自测全红。
+  新增两条专门守这次的教训：
+  - `a18` 重型 dump 只写文件（不许把日志窗口糊死）；
+  - `a09` "有没有找到过"必须用独立变量（不许复用 `buf.length`）。
+- `nb_verify_v024.py`：第 16 节**整体反转**。
+  v0.0.23 是"改了刀、想让它响"；v0.0.24 是"**确认没挂** + 侦察真接线"。
+  其中一条反向断言：`repetitions` 必须彻底消失，并配 `repeats` 的正向对照
+  （防止"包是空的也让反向判据通过"）。
+
+### 九、交付
+
+```
+dist/com.yxh41.notifybox_0.0.24_iphoneos-arm64e.deb   83270 bytes
+CI run #47 / run_id 39890251473（zip 83450 bytes，与 API 的 size_in_bytes 对拍一致）
+
+nb_verify_v024.py: 202 项 0 FAIL
+nb_v024_src_check.py: 18 条判据全绿 / 18 条负向自测全红
+nb_lit_check: 64 条全过
+```
