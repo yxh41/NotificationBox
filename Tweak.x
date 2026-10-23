@@ -485,6 +485,18 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 %end
 
 
+// 🔴 v0.0.25：SBNCSoundController 的**前向声明**。
+//
+// 为什么写它：Logos 在 %hook 里生成的函数签名，self 的类型取决于 Logos 版本/配置
+// （本项目 `%hook BBServer` 一直不声明也能编过，说明走的是 id）。
+// 多一个纯声明是零成本的：编过了就等于保险，编不过就说明这个类名得让编译器知道 ——
+// 而"unknown type name"这种报错一轮 CI 就没了，不值得赌。
+// ⚠️ 这个类**可能根本不存在**（名字来自外部参考）。声明只是编译期的东西，
+//    运行时能不能拿到由 %ctor 里的 objc_getClass 决定，拿不到就不 %init。
+@interface SBNCSoundController : NSObject
+- (BOOL)canPlaySoundForNotificationRequest:(id)request;
+@end
+
 // ---------- v0.0.25：按 App 换提示音 · **新挂点** ----------
 //
 // 🔴🔴 为什么整段换掉旧做法：
