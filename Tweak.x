@@ -506,7 +506,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
           @"可用",
-          @@"实验（默认关，v0.0.22 诊断中）");
+          @"实验（默认关，v0.0.22 诊断中）");
 
     // 只读探针：dump 一次 BBBulletin / BBSound 的类结构（内部自己保证只做一次）
     [NotifyProbe dumpClassesOnce];
