@@ -2147,8 +2147,26 @@ B 通道（mp3 那类）是新的，没有真机证据，所以它排在兜底�
 ### 九、交付
 
 ```
-dist/com.yxh41.notifybox_0.0.26_iphoneos-arm64e.deb   ____ bytes
-CI run #__ / run_id __________（zip ____ bytes，与 API 的 size_in_bytes 对拍一致）
+dist/com.yxh41.notifybox_0.0.26_iphoneos-arm64e.deb   87680 bytes
+CI run #49 / run_id 39910177129（zip 87867 bytes，与 API 的 size_in_bytes 对拍一致）
 
 nb_v026_src_check.py:  28 条判据全绿 / 28 条负向对照全红
+nb_verify_v026.py:    229 项全绿（负向对照：拿 v0.0.25 的包喂进去恰好红 30 项）
+nb_lit_check.py:       66 条含中文字面量判据 PASS
 ```
+
+### 十、这一轮又抓到两类「我自己的判据错」
+
+二进制校验第一版报 **2 项假红**，两条都不是代码问题：
+
+| 判据 | 病因 |
+|---|---|
+| `App 内含 '不要文件（用系统提示音 ID）'` | 源码写的是**不**用文件，我凭记忆把断言打成了**不要**文件 ⇒ 一个字之差 = 永远红。字面量必须**从源码逐字抄**（`nb_lit_check` 就是为这类错写的） |
+| `dylib banner 写着「换了挂点」` | 那是 **v0.0.25 的文案**，这一版已改成「可换自定义音频文件」。把上一版的正向断言留在这一版 = 永远红 ⇒ **正反一起翻**：这里守"旧的没了"，第 17 节守"新的在" |
+
+另外 `nb_lit_check.py` 本身也报过 4 条假红：它的**源文件清单是手写的**，
+新加的 `app/SoundFilePickerViewController.m` 没登记 ⇒ 那个文件里的 4 条中文字面量被判"不存在"。
+⇒ 已改成**从 Makefile 的 `NotifyBox_FILES` / `NotifyBoxApp_FILES` 直接读**。
+这多一层保障：**"文件写了但没登记进 Makefile"会被立刻发现** —— 那种错在 CI 里是
+`application.mk` 静默跳过、deb 里少东西，比编译报错难查得多。
+
