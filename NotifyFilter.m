@@ -328,12 +328,16 @@ static void NBWarnSoundMisconfig(BOOL *flag, NSString *msg) {
 //    这一行本身还要带 bundle 和 tag。
 static NSString *NBSoundFieldSummary(id snd) {
     if (!snd) return @"snd=nil";
-    // 🔴 v0.0.23：加上 rep / dur —— 这两个正是"完全没声音"的嫌疑字段，
-    //    必须能在 SOUND# 行里直接看到它们的实值。
-    //    （src 那两个仍然是 `!无键` 也无所谓，它就是不存在，看见反而证明探针是诚实的）
-    NSArray *pairs = @[@[@"src", @"soundSource"], @[@"tone", @"toneIdentifier"],
-                       @[@"type", @"soundType"], @[@"sid", @"systemSoundID"],
-                       @[@"rep", @"repetitions"], @[@"dur", @"maxDuration"]];
+    // 🔴🔴 v0.0.24：字段名改对了，而且**换了一批**。
+    //    v0.0.23 追的是 rep(=repetitions，根本不存在) / dur(=maxDuration)，
+    //    真机数据证明这两个跟出不出声无关（能响的样本也是 0/0）。
+    //    现在真正要看的是：type / sid / alertCfg / tone / song / ringtone ——
+    //    其中 `alertCfg` 是唯一还没被排除的差异（能响的有值，我们的空壳是 nil）。
+    //    短名控制在 7 字符以内：单个字段一行，日志有 200 字上限。
+    NSArray *pairs = @[@[@"type", @"soundType"], @[@"sid", @"systemSoundID"],
+                       @[@"repeat", @"repeats"], @[@"maxDur", @"maxDuration"],
+                       @[@"tone", @"toneIdentifier"], @[@"song", @"songPath"],
+                       @[@"ring", @"ringtoneName"], @[@"alertCfg", @"alertConfiguration"]];
     NSMutableString *m = [NSMutableString string];
     for (NSArray *pair in pairs) {
         NSString *shortName = pair[0];
@@ -430,9 +434,10 @@ static NSString *NBSoundFieldSummary(id snd) {
             if (result) *result = @"BBSound alloc 失败";
             return YES;
         }
-        // 🔴 v0.0.23：**设之前**先记一次默认值。
-        //    这一行是"空壳到底空到什么程度"的唯一证据：
-        //    如果 rep=0 / dur=0，那我们上一版"播 0 次 / 0 秒"的推断就成立。
+        // 🔴 v0.0.23 起：**设之前**先记一次默认值，设完再记一次（见下面「设后」）。
+        //    v0.0.24 备注：这两条一对比，能分清"值真的写进去了"和"setter 收下了但没存"。
+        //    注意它只证明"写没写进去"，**不能**证明"会不会响" ——
+        //    v0.0.23 就是拿这批字段当病因，结果被真机数据否掉了。
         [NBSoundDiag probeCreatedSound:snd stage:@"设前"];
 
         BOOL setType = NO, setID = NO, setRep = NO, setDur = NO;
@@ -445,22 +450,22 @@ static NSString *NBSoundFieldSummary(id snd) {
             setID = YES;
         }
 
-        // 🔴🔴 v0.0.23：补上「播几次 / 播多久」。
+        // 🔴🔴 v0.0.23 补过这两个字段，**v0.0.24 把键名和结论都改了**。
         //
-        // 真机数据（PROBE BBSound 那 15 个属性）把上一版「完全没声音」解释清楚了：
-        // 挂载没问题、setter 存在、值也进去了（`set=1/1 type=1 sid=1009` 回读成功），
-        // 但 `sound` 是个 **alloc/init 出来的空壳** —— 它的
-        //   repetitions（播几次）和 maxDuration（播多久）大概都是 0
-        // ⇒ 系统认为"有一个声音配置，但播 0 次 / 0 秒" ⇒ **一声都不出**。
-        // 而 sound=nil 时系统走的是"默认提示音"那条路，所以默认通知照样响。
-        // 这一条也解释了为什么"完全没声音"而不是"还是原来的声音"。
+        // ⚠️ 先摆事实：v0.0.23 的推断被真机数据**正面否掉了**。
+        //    v0.0.23 说 `repetitions` / `maxDuration` 是 0 ⇒ 播 0 次 / 0 秒 ⇒ 一声不出。
+        //    真机上系统自己给的、**能正常出声**的那个 BBSound：
+        //        maxDuration=0  repeats=0  soundType=2  systemSoundID=0
+        //        alertConfiguration=<TLAlertConfiguration>
+        //    ⇒ 0/0 是**正常**的，跟出不出声没关系。
+        //    而且 `repetitions` 这个键根本不存在（真机 `rep=!无键`）——
+        //    正确的是 `repeats`（{TB,N,GisRepeating,V_repeats}，BOOL，"要不要重复"）。
+        //    病根：我照着上一版的 PROBE 截图**凭印象转写**了一个意思相近的名字。
         //
-        // 为什么现在敢直接补：**当前状态已经是"完全没声音"（最差）**，
-        // 补两个"播一次、最多 30 秒"的合理值不可能更差。
-        // 仍然逐个 respondsToSelector 探 —— 键名一个都不赌
-        // （BBSound 上 soundSource / vibrationIdentifier 就是不存在，已被 KVC 抛异常证明）。
-        if ([snd respondsToSelector:NSSelectorFromString(@"setRepetitions:")]) {
-            [snd setValue:@(1) forKey:@"repetitions"];
+        //    所以这两个字段现在**只写不看**：写它们是为了让 SD#/SOUND# 行能对照，
+        //    **不再当闸门**。别再拿它们判"能不能响"。
+        if ([snd respondsToSelector:NSSelectorFromString(@"setRepeats:")]) {
+            [snd setValue:@(NO) forKey:@"repeats"];   // 与真机能响的样本一致（repeats=0）
             setRep = YES;
         }
         if ([snd respondsToSelector:NSSelectorFromString(@"setMaxDuration:")]) {
@@ -474,16 +479,36 @@ static NSString *NBSoundFieldSummary(id snd) {
             return YES;
         }
 
-        // 🔴 v0.0.23 安全兜底：万一 rep/dur 的 setter 在本版 BBSound 上不存在，
-        //    那挂上去必然又是一声不出 —— 而「静音」比「声音没换掉」糟得多
-        //    （用户会漏掉消息）。所以宁可不换，也不能让通知变哑巴。
-        //    注意这里**返回 YES**：不是"没做"，是"故意不做"，理由要出现在 SOUND# 行里，
-        //    否则用户只看到"换提示音没生效"，却看不到"是因为这个版本不支持"。
-        if (!setRep || !setDur) {
+        // 🔴🔴🔴 v0.0.24：本版**故意不挂**。闸门 = 这个对象上有没有 `alertConfiguration`。
+        //
+        // 为什么是这一项：
+        //   把真机两份数据摊开对比，唯一还没被排除的差异就是它 ——
+        //      能正常响的： soundType=2  systemSoundID=0  alertConfiguration=<非 nil>
+        //      我们的空壳： soundType=1  systemSoundID=1009 alertConfiguration=nil
+        //   iOS 16 的通知音走 **TonesLibrary（TLAlert + TLAlertConfiguration）**，
+        //   `systemSoundID` 是 AudioServices 的老 ID，BulletinBoard 已经不看它了。
+        //   （这也解释了设置页"试听"为什么是响的：试听走 AudioServices 播放，
+        //     和系统投递通知是两条完全不同的路 —— 试听能响≠通知能响。）
+        //
+        // 为什么宁可不换也不能挂：
+        //   v0.0.21 已经实测过 —— 挂一个空壳，通知变成**完全没声音**，
+        //   用户会漏消息。而"没换成"只是功能没生效。两者量级差得远。
+        //
+        // 🔴 闸门刻意写成"这一项必须有值"，而不是"v0.0.24 先关掉"：
+        //    这样下一版**一旦会造 alertConfiguration，这条闸门自动打开**，
+        //    不用再回来改一行 if —— 少一处"改了忘了开"的机会。
+        id alertCfg = nil;
+        @try {
+            alertCfg = [snd valueForKey:@"alertConfiguration"];
+        } @catch (__unused NSException *e) {
+            alertCfg = nil;
+        }
+        if (!alertCfg) {
             NBWriteSoundGuard(kNBGuardDone);
             if (result) *result = [NSString stringWithFormat:
-                                   @"!!! 放弃换音：rep=%d dur=%d 设不上（挂上去会静音），本版通知仍按原声%@",
-                                   (int)setRep, (int)setDur, NBSoundFieldSummary(snd)];
+                                   @"!!! 本版不挂（侦察轮）：alertConfiguration 造不出来"
+                                   @" ⇒ iOS 16 靠 TonesLibrary 出声，空壳挂上必然静音。%@",
+                                   NBSoundFieldSummary(snd)];
             return YES;
         }
         // 🔴 v0.0.23：**设之后**再记一次。和上面那条一对比就知道：

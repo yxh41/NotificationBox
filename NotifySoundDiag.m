@@ -3,55 +3,85 @@
 #import "NotifyFilter.h"
 #import <objc/runtime.h>
 
-// ============ v0.0.23：换提示音的诊断（落盘版） ============
+// ============ v0.0.24：换提示音的诊断（侦察「正确的造法」） ============
 //
-// 上一版（v0.0.22）已经量出三件硬事实：
-//   · `sound` 在 orig 前/后、0.4 秒后都在 ⇒ 不是挂载失败、也没被系统抹掉；
-//   · `set=1/1` ⇒ setter 存在；
-//   · 回读 `type=1 sid=1009` ⇒ 值真的进了对象。
-// 而用户的实际症状是**完全没声音**（不是"还是原来的声音"）。
+// 🔴🔴 v0.0.23 的假设被真机数据**正面否掉**了，先把这事记清楚，
+//     免得下次又从同一个地方开始猜：
 //
-// ⇒ 这个组合只有一种解释：**我们挂的是个空壳，系统采纳了它，但它播不出声。**
-//    真机 PROBE 的 `BBSound 有 15 个 property` 里有两个要命的字段：
-//        repetitions（播几次）、maxDuration（播多久）
-//    alloc/init 出来的对象里它们大概是 0 ⇒ 播 0 次 / 0 秒 ⇒ 一声不出。
-//    而 sound=nil 时系统走"默认提示音"路径，所以默认通知照样响。
+//   v0.0.23 的推断：`repetitions` / `maxDuration` 在 alloc 出来的空壳里是 0
+//                    ⇒ 系统按"播 0 次 / 0 秒"执行 ⇒ 一声不出。
+//   真机数据（v0.0.23 落盘的 sound_diag.log）反驳：
+//     系统自己给的、**能正常出声**的那个 BBSound：
+//        maxDuration=0  repeats=0  soundType=2  systemSoundID=0
+//        alertConfiguration=<TLAlertConfiguration>   toneIdentifier=""  alertType=17
+//     ⇒ `maxDuration/repeats 为 0` 是**正常**的，跟出不出声没关系。
+//     ⇒ 而且 `repetitions` 这个键**根本不存在**（真机 `rep=!无键`）——
+//        正确的是 `repeats`（{TB,N,GisRepeating,V_repeats}，BOOL，是"要不要重复"）。
+//        病根：我照着上一版 PROBE 截图**凭印象转写**了一个意思相近的名字。
+//        ⇒ 键名只能从数据里逐字抄，不能翻成同义词。
 //
-// 这一版做两件事：
-//   ① 刀上补 repetitions=1 / maxDuration=30（见 NotifyFilter.m 里的长注释）；
-//   ② 诊断**写到文件**，把"设之前/设之后"的字段实值全量留下来。
+//   把两边的字段摊开对比，唯一还没被排除的差异是：
+//       能响的： soundType=2   systemSoundID=0   alertConfiguration=<非 nil>
+//       我们的： soundType=1   systemSoundID=1009 alertConfiguration=nil
+//     ⇒ iOS 16 的通知音走 **TonesLibrary（TLAlert + TLAlertConfiguration）**，
+//        `systemSoundID` 是 AudioServices 的老 ID，BulletinBoard 已经不看它了。
+//        （这也能解释为什么设置页里"试听"是响的：试听走的是 AudioServices 播放，
+//          跟系统投递通知是两条完全不同的路。）
 //
-// 🔴🔴 为什么必须落盘（这一条是 v0.0.22 白跑一轮换来的）：
-//    日志窗口只有约 50 行、还是全局滚动的 ⇒ 结构性 dump 早就滚没了，
-//    而它恰恰是定位问题的唯一依据。用户截图里只剩后面的 SOUND# 行。
-//    文件不受这个限制，App 里能整份读。
+//   所以这一版**不改刀**（刀继续保持"造不出能响的对象就不挂"，手机停在
+//   "能响原声"这个安全状态），只做一件事：
+//     **把"怎么造一个能响的 BBSound"挖出来。**
+//   具体三个动作：
+//     ① dump BBSound 的**类方法** —— 如果本来就有 +soundWith… 这样的工厂方法，
+//        那就该让系统替我们造，而不是继续手工拼字段（这是最理想的路）；
+//     ② dump **TLAlertConfiguration** 的属性/类方法/ivar —— 它是 iOS 16 通知音的真身；
+//     ③ 抓到系统给的 sound 时不再只留一个样本，按"长相"去重最多留 4 个，
+//        并把它们的 alertConfiguration 一起 dump —— 只有多样性才能看出
+//        soundType 有哪几个取值、各形态分别靠哪个字段发声。
+//
+// 🔴🔴 为什么这一版仍然只读：v0.0.21 已经实测过"挂一个空壳 ⇒ 通知完全没声音"。
+//    在不知道正确造法之前再挂一次，只会让用户再聋一轮。宁可这一轮慢，下一轮一次改对。
+//
+// 另外修掉两处**诊断自己在说谎**的 bug（真机输出里已经发生了）：
+//   · `NBDiagDumpSetters` 用 `buf.length` 同时表示"缓冲区还有字"和"有没有找到过"，
+//     而 flush 会清空缓冲区 ⇒ 刚好凑满 110 字时打出
+//     "6 个 setter 都在" + "一个都没有" 两行自相矛盾的话；
+//   · 关键词过滤漏了 duration / repeat / song / audio，
+//     把真实存在的 setMaxDuration: / setRepeats: / setSongPath: 全筛掉了。
 
 static BOOL gClsDone = NO;
 static BOOL gClsMissLogged = NO;
-static BOOL gForeignDone = NO;
 static BOOL gFileReset = NO;
 
 #define NB_DIAG_FLUSH_AT 110
 
-// 诊断统一出口：**同时**打日志（App 结论行照旧看得到）和写文件（不受窗口限制）。
+// 诊断有两个出口，**必须分开**：
+//   NBDiagLog  —— 同时写日志 + 写文件。只给"短结论行"用（每通知几条）。
+//   NBDiagLogF —— **只写文件**，不进日志。给"重型结构 dump"用。
+//
+// 🔴🔴 v0.0.24 为什么必须把它们分开（这条是 v0.0.22 白跑一轮的同一个病）：
+//    日志窗口只有约 50 行、还是全局滚动的。这一版要 dump 的东西比上一版多得多 ——
+//    BBSound 的**全量实例方法**（带类型编码，几十行）、TLAlertConfiguration 的
+//    属性/setter/方法/ivar、以及最多 4 个外来 sound 的字段。
+//    如果这些也走 NBSharedLog，一次 dump 就能把日志窗口糊死，
+//    用户之后截的"结论行"里只剩下我们自己的结构 dump ——
+//    真正的判据（banner / DROP# / SOUND# / 发后①②）全被挤出去。
+//    ⇒ **重型只读观测只进文件**；文件不受窗口限制，App 里能整份读。
+//
 // reset=YES 时覆盖旧文件 —— 只给"每个进程一次"的结构性 dump 用。
 //
 // 🔴 为什么这里要挂 NS_FORMAT_FUNCTION：诊断行最怕的不是崩，而是
 //    "格式符数量和参数数量差一个" ⇒ 多出来的那个读进垃圾栈内存，
 //    运气好打出乱码、运气不好直接崩在诊断里（而这正是最不该崩的地方）。
-//    挂上属性以后，编译器会把 22 处调用的 %@ / %u 全对一遍，
+//    挂上属性以后，编译器会把每一处调用的 %@ / %u 全对一遍，
 //    这类错从"真机上才发现"变成"编译期就红"。
 //    参数位置：fmt 是第 2 个参数，第一个可变参数是第 3 个。
+//    ⚠️ 新加的 NBDiagLogF 参数位置是 (1, 2) —— 它没有 reset 那个参数。
 static void NBDiagLog(BOOL reset, NSString *fmt, ...) NS_FORMAT_FUNCTION(2, 3);
-static void NBDiagLog(BOOL reset, NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    if (!line.length) return;
+static void NBDiagLogF(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 
-    NBSharedLog(@"%@", line);
-
+// 真正落盘的地方。两个出口共用，避免"两条写文件逻辑走岔"。
+static void NBDiagWriteFile(NSString *line, BOOL reset) {
     @try {
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *dir = [NOTIFYBOX_SOUND_DIAG_PATH stringByDeletingLastPathComponent];
@@ -89,13 +119,53 @@ static void NBDiagLog(BOOL reset, NSString *fmt, ...) {
     } @catch (__unused NSException *e) { }
 }
 
+// 短结论行：日志 + 文件都要有（用户截图看日志，完整内容进文件）。
+static void NBDiagLog(BOOL reset, NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (!line.length) return;
+    NBSharedLog(@"%@", line);
+    NBDiagWriteFile(line, reset);
+}
+
+// 重型结构 dump：**只写文件**，一个字都不进日志。
+// 🔴 判据：这段内容"是不是用户靠截图必须看到的" —— 不是，就走这里。
+//    走错的后果不是崩溃，是**把真正的判据挤出日志窗口**，比崩溃更难查。
+static void NBDiagLogF(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (!line.length) return;
+    NBDiagWriteFile(line, NO);
+}
+
 // 这些名字一旦出现，就是"换提示音"相关的量。
 // 🔴 比 NotifyProbe 那份过滤器更宽：多收 tone / source / system。
+//
+// 🔴🔴 v0.0.24：关键词表必须补齐 —— v0.0.23 真机数据证明了漏词的代价：
+//    `setMaxDuration:` / `setRepeats:` / `setSongPath:` 三个 setter **存在**，
+//    却没出现在"setter 清单"里，因为旧表只有 sound/alert/tone/vibrat/source/system，
+//    `duration`、`repeat`、`song`、`audio`、`config` 一个都没收。
+//    后果：我据此以为"BBSound 上只有 6 个可写 setter"，
+//    而实际上能写声音的字段比这多 —— 差一点又照着一份残缺清单去设计。
+//    ⇒ 过滤器漏词 = 判据域小于变异域，这类错在本项目已经是第 N 次。
 static BOOL NBDiagWanted(NSString *name) {
+    static NSArray *keys = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = @[@"sound", @"alert", @"tone", @"vibrat", @"source", @"system",
+                 // v0.0.24 补：这些都是 BBSound 上的真实字段名
+                 @"duration", @"repeat", @"song", @"audio", @"ringtone",
+                 @"behavior", @"config", @"play"];
+    });
     NSString *low = [name lowercaseString];
-    return ([low containsString:@"sound"] || [low containsString:@"alert"]
-            || [low containsString:@"tone"] || [low containsString:@"vibrat"]
-            || [low containsString:@"source"] || [low containsString:@"system"]);
+    for (NSString *k in keys) {
+        if ([low containsString:k]) return YES;
+    }
+    return NO;
 }
 
 // 🔴 判"能不能改"的第一道门，判错了后面全白干。
@@ -136,16 +206,16 @@ static NSString *NBDiagGet(id obj, NSString *key) {
 // （BBBulletin 有 68 个属性，全打会把日志吃光；BBSound 只有 15 个，全打正合适）。
 static void NBDiagDumpProps(Class c, NSString *label, BOOL onlyInteresting) {
     if (!c) {
-        NBDiagLog(NO, @"SD# %@ 类不存在", label);
+        NBDiagLogF(@"SD# %@ 类不存在", label);
         return;
     }
     unsigned int cnt = 0;
     objc_property_t *ps = class_copyPropertyList(c, &cnt);
     if (!ps) {
-        NBDiagLog(NO, @"SD# %@ 属性表拿不到", label);
+        NBDiagLogF(@"SD# %@ 属性表拿不到", label);
         return;
     }
-    NBDiagLog(NO, @"SD# %@ 有 %u 个属性（[W]=可写 [R]=只读）", label, cnt);
+    NBDiagLogF(@"SD# %@ 有 %u 个属性（[W]=可写 [R]=只读）", label, cnt);
     NSMutableString *buf = [NSMutableString string];
     for (unsigned i = 0; i < cnt; i++) {
         const char *n = property_getName(ps[i]);
@@ -157,36 +227,122 @@ static void NBDiagDumpProps(Class c, NSString *label, BOOL onlyInteresting) {
         [buf appendFormat:@"%@%@{%@} ",
                           name, NBDiagPropIsReadonly(attr) ? @"[R]" : @"[W]", NBDiagShortAttr(attr)];
         if (buf.length >= NB_DIAG_FLUSH_AT) {
-            NBDiagLog(NO, @"SD# %@: %@", label, buf);
+            NBDiagLogF(@"SD# %@: %@", label, buf);
             [buf setString:@""];
         }
     }
     free(ps);
-    if (buf.length) NBDiagLog(NO, @"SD# %@: %@", label, buf);
+    if (buf.length) NBDiagLogF(@"SD# %@: %@", label, buf);
 }
 
-// dump 一个类的声音相关 setter —— "能不能填进去"的直接答案。
-static void NBDiagDumpSetters(Class c, NSString *label) {
+// dump 一个类的 setter —— "能不能填进去"的直接答案。
+//
+// 🔴🔴 v0.0.24 修一个会让判据说谎的 bug（上一版真机输出里就发生了）：
+//    旧实现用 `buf.length` 同时表达两件事：「现在缓冲区还有没有字」和「有没有找到过」。
+//    而 flush 会 `[buf setString:@""]` —— 于是「刚好在最后一个 setter 处凑满 110 字」时，
+//    循环结束时 buf 是空的 ⇒ 落进 else 分支 ⇒ 打出
+//        `SD# BBSound 的 setter: setVibrationPattern: … setRingtoneName:`
+//        `SD# BBSound 声音相关 setter: 一个都没有`      ← 两行自相矛盾
+//    真机就是这么打的（6 个 setter 加起来正好 111 字符）。
+//    ⇒ **"有没有找到过"必须用独立变量记**，不能复用"缓冲区还剩多少"。
+//      这和"改的是账本还是账本的读数"是同一类错：拿一个派生量当事实。
+//
+// onlyInteresting=NO ⇒ 不做关键词过滤，把**全部** set* 都打出来。
+//    v0.0.24 起对 BBSound 用 NO：它的方法总数很少，而"漏看一个 setter"
+//    的代价是一整个真机轮次（v0.0.23 就是因为过滤器漏了 duration/repeat/song，
+//    误以为只有 6 个可写字段）。
+static void NBDiagDumpSetters(Class c, NSString *label, BOOL onlyInteresting) {
     if (!c) return;
     unsigned int cnt = 0;
     Method *ms = class_copyMethodList(c, &cnt);
     if (!ms) return;
     NSMutableString *buf = [NSMutableString string];
+    BOOL found = NO;                       // 🔴 事实变量，与 buf 无关
     for (unsigned i = 0; i < cnt; i++) {
         NSString *n = NSStringFromSelector(method_getName(ms[i]));
-        if (![n hasPrefix:@"set"] || !NBDiagWanted(n)) continue;
+        if (![n hasPrefix:@"set"] || n.length < 5) continue;
+        if (onlyInteresting && !NBDiagWanted(n)) continue;
+        found = YES;
         [buf appendFormat:@"%@ ", n];
         if (buf.length >= NB_DIAG_FLUSH_AT) {
-            NBDiagLog(NO, @"SD# %@ 的 setter: %@", label, buf);
+            NBDiagLogF(@"SD# %@ 的 setter: %@", label, buf);
+            [buf setString:@""];
+        }
+    }
+    free(ms);
+    if (buf.length) NBDiagLogF(@"SD# %@ 的 setter: %@", label, buf);
+    if (!found) NBDiagLogF(@"SD# %@ 的 setter: 一个都没有", label);
+}
+
+// dump 一个类的**全部方法名**。
+//
+// 🔴🔴 v0.0.24 新增，目的是找「工厂方法」。这一条是这一版的核心动作。
+//    起因：v0.0.21/0.0.23 都是我们自己 alloc/init 一个空壳 BBSound 再手工填字段，
+//    两版都失败。而真机数据里有一个**能正常响**的样本（系统自己的 BBSound），
+//    它带着 `alertConfiguration=<TLAlertConfiguration>`，我们造不出来。
+//    ⇒ 如果 BBSound 上本来就有 +soundWith… 之类的工厂，就该让系统替我们造，
+//      而不是继续猜字段。**先看有没有工厂，再决定要不要继续手拼。**
+//
+// 🔴 两个容易忘的点：
+//    ① 类方法必须用元类取：`class_copyMethodList(object_getClass(c), &n)`。
+//       直接传 c 只会拿到实例方法，然后得出"没有工厂方法"的错结论 ——
+//       这类"查法本身有 bug ⇒ 结论反向"的坑本项目管理已经踩过好几次。
+//    ② 方法名一律用 NSStringFromSelector + method_getTypeEncoding 一起打：
+//       只看名字不知道参数个数/类型，看不出"它接不接受一个 NSUInteger"。
+static void NBDiagDumpMethods(Class c, NSString *label, BOOL classMethods) {
+    if (!c) return;
+    Class target = classMethods ? object_getClass(c) : c;
+    if (!target) return;
+    unsigned int cnt = 0;
+    Method *ms = class_copyMethodList(target, &cnt);
+    if (!ms) return;
+    NBDiagLogF(@"SD# %@ 的%@方法共 %u 个 %@", label,
+              classMethods ? @"类" : @"实例", cnt,
+              classMethods ? @"(找工厂：+xxx 形式的最关键)" : @"");
+    NSMutableString *buf = [NSMutableString string];
+    for (unsigned i = 0; i < cnt; i++) {
+        const char *tn = method_getTypeEncoding(ms[i]);
+        [buf appendFormat:@"%c%@{%@} ",
+                          classMethods ? '+' : '-',
+                          NSStringFromSelector(method_getName(ms[i])),
+                          tn ? [NSString stringWithUTF8String:tn] : @"?"];
+        if (buf.length >= NB_DIAG_FLUSH_AT - 20) {
+            NBDiagLogF(@"SD# %@ 的%@方法: %@", label,
+                      classMethods ? @"类" : @"实例", buf);
             [buf setString:@""];
         }
     }
     free(ms);
     if (buf.length) {
-        NBDiagLog(NO, @"SD# %@ 的 setter: %@", label, buf);
-    } else {
-        NBDiagLog(NO, @"SD# %@ 声音相关 setter: 一个都没有", label);
+        NBDiagLogF(@"SD# %@ 的%@方法: %@", label, classMethods ? @"类" : @"实例", buf);
     }
+}
+
+// dump ivars。
+// 🔴 为什么要它：真机数据里 `alertType` / `toneIdentifier` / `ignoreRingerSwitch` 都是
+//    只读 property（{…,R,…}）。KVC 写只读 property 时，会退化成**直接写 ivar**
+//    （accessInstanceVariablesDirectly 默认 YES）。所以要写 toneIdentifier 这条路，
+//    前提是能确认 ivar 名叫 `_toneIdentifier`。
+//    另外，property 表不一定覆盖全部状态 —— 有些字段只在 ivar 里。
+static void NBDiagDumpIvars(Class c, NSString *label) {
+    if (!c) return;
+    unsigned int cnt = 0;
+    Ivar *ivs = class_copyIvarList(c, &cnt);
+    if (!ivs) return;
+    NBDiagLogF(@"SD# %@ 有 %u 个 ivar", label, cnt);
+    NSMutableString *buf = [NSMutableString string];
+    for (unsigned i = 0; i < cnt; i++) {
+        const char *n = ivar_getName(ivs[i]);
+        const char *t = ivar_getTypeEncoding(ivs[i]);
+        [buf appendFormat:@"%@:%@ ", n ? [NSString stringWithUTF8String:n] : @"?",
+                          t ? [NSString stringWithUTF8String:t] : @"?"];
+        if (buf.length >= NB_DIAG_FLUSH_AT) {
+            NBDiagLogF(@"SD# %@ 的 ivar: %@", label, buf);
+            [buf setString:@""];
+        }
+    }
+    free(ivs);
+    if (buf.length) NBDiagLogF(@"SD# %@ 的 ivar: %@", label, buf);
 }
 
 // 把一个对象的属性名逐个读值打出来。这是"抄真实对象"的核心动作。
@@ -202,12 +358,12 @@ static void NBDiagDumpValues(id obj, NSString *label) {
         NSString *name = [NSString stringWithUTF8String:n];
         [buf appendFormat:@"%@=%@ ", name, NBDiagGet(obj, name)];
         if (buf.length >= NB_DIAG_FLUSH_AT) {
-            NBDiagLog(NO, @"SD# %@ 值: %@", label, buf);
+            NBDiagLogF(@"SD# %@ 值: %@", label, buf);
             [buf setString:@""];
         }
     }
     free(ps);
-    if (buf.length) NBDiagLog(NO, @"SD# %@ 值: %@", label, buf);
+    if (buf.length) NBDiagLogF(@"SD# %@ 值: %@", label, buf);
 }
 
 @implementation NBSoundDiag
@@ -228,12 +384,35 @@ static void NBDiagDumpValues(id obj, NSString *label) {
     gClsDone = YES;
     @try {
         // 这一条 reset=YES：覆盖上一份文件，保证"类结构"永远在最前面。
-        NBDiagLog(YES, @"=== SD# 开始 dump 类结构（只读，一次性；v0.0.23 落盘）===");
+        NBDiagLog(YES, @"=== SD# 开始 dump 类结构（只读，一次性；v0.0.24 侦察造法）===");
         // BBSound 全量：它本来就是个声音对象，15 个属性每个都相关。
         // 🔴 上一版这几行被日志窗口吃了 —— 现在进文件，不会再丢。
         NBDiagDumpProps(snd, @"BBSound", NO);
-        NBDiagDumpSetters(snd, @"BBSound");
+        // 🔴 v0.0.24：setter 改成**不过滤**（onlyInteresting=NO）。
+        //    v0.0.23 因为关键词表漏了 duration/repeat/song，
+        //    把真实存在的 setMaxDuration:/setRepeats:/setSongPath: 全筛掉了，
+        //    我却据此以为"只有一个都没有 / 只有 6 个"。BBSound 方法总数很少，全打不贵。
+        NBDiagDumpSetters(snd, @"BBSound", NO);
+        // 🔴 v0.0.24 的核心：找工厂方法。见 NBDiagDumpMethods 上面那段说明。
+        NBDiagDumpMethods(snd, @"BBSound", YES);    // 类方法：+soundWith… 这类工厂
+        NBDiagDumpMethods(snd, @"BBSound", NO);     // 实例方法：看有没有 copy/encode 之类
+        NBDiagDumpIvars(snd, @"BBSound");
         NBDiagDumpProps(bul, @"BBBulletin", YES);
+
+        // 🔴 v0.0.24：TonesLibrary 的 TLAlertConfiguration 才是 iOS 16 通知音的真身。
+        //    真机样本：一个能正常响的 BBSound 带 `alertConfiguration=<TLAlertConfiguration>`，
+        //    而我们的空壳这一项是 nil —— 这是目前唯一还没被排除的差异。
+        //    ⇒ 必须把这个类的**属性 + 类方法 + ivar** 都摸清，才知道怎么造一个出来。
+        //    类拿不到也无所谓（不链 TonesLibrary，只靠 NSClassFromString），打了就说明情况。
+        Class tlc = objc_getClass("TLAlertConfiguration");
+        if (!tlc) {
+            NBDiagLog(NO, @"!!! SD# 拿不到 TLAlertConfiguration 类（TonesLibrary 没加载？）");
+        } else {
+            NBDiagDumpProps(tlc, @"TLAlertConfiguration", NO);
+            NBDiagDumpSetters(tlc, @"TLAlertConfiguration", NO);
+            NBDiagDumpMethods(tlc, @"TLAlertConfiguration", YES);
+            NBDiagDumpIvars(tlc, @"TLAlertConfiguration");
+        }
         NBDiagLog(NO, @"=== SD# dump 结束 ===");
     } @catch (__unused NSException *e) {
         NBDiagLog(NO, @"!!! SD# dump 抛异常（已忽略，不影响功能）");
@@ -243,18 +422,34 @@ static void NBDiagDumpValues(id obj, NSString *label) {
 + (void)probeCreatedSound:(id)snd stage:(NSString *)stage {
     if (!snd) return;
     [self dumpClassOnce];
-    // 只打关键字段：15 个属性全量太占行，而 rep/dur/type/sid/tone 才是嫌疑犯。
-    NBDiagLog(NO, @"SD# snd[%@] type=%@ sid=%@ rep=%@ dur=%@ tone=%@",
+    // 🔴🔴 v0.0.24：字段名改对了。
+    //    v0.0.23 打的是 `repetitions` —— 那个键**根本不存在**（真机 `rep=!无键`），
+    //    正确的名字是 `repeats`（{TB,N,GisRepeating,V_repeats}，BOOL，是"要不要重复"）。
+    //    病根是我照着上一版 PROBE 截图**凭印象转写**了一个意思相近的名字，
+    //    没有逐字抄。⇒ 键名只能从数据里逐字抄，不能"翻成同义词"。
+    //    ⚠️ 更要紧的是：`repeats` / `maxDuration` 这两个字段**根本不是出声的必要条件** ——
+    //    真机上那个能正常响的样本，repeats=0、maxDuration=0，照样响。
+    //    这两个字段留着继续观测，但不再当作病因。
+    // 一条日志有 200 字上限 ⇒ 拆成两行打，别指望它自己折行。
+    // 🔴 v0.0.24：这两行改成**只写文件**。理由：applySoundForBundle 有三个挂点，
+    //    每次通知会进来 3 遍 ⇒ 设前/设后 ×2 条 = 6 行日志，8 条通知就把 50 行窗口糊满，
+    //    而真正的结论行（banner / SOUND#）会被挤出去。
+    //    日志侧留 SOUND# 那一行就够（它带着 NBSoundFieldSummary 的字段摘要）。
+    NBDiagLogF(@"SD# snd[%@] type=%@ sid=%@ repeats=%@ dur=%@ behavior=%@",
               stage ?: @"?",
               NBDiagGet(snd, @"soundType"), NBDiagGet(snd, @"systemSoundID"),
-              NBDiagGet(snd, @"repetitions"), NBDiagGet(snd, @"maxDuration"),
-              NBDiagGet(snd, @"toneIdentifier"));
+              NBDiagGet(snd, @"repeats"), NBDiagGet(snd, @"maxDuration"),
+              NBDiagGet(snd, @"soundBehavior"));
+    NBDiagLogF(@"SD# snd[%@] tone=%@ ringtone=%@ songPath=%@ audioCat=%@ alertCfg=%@",
+              stage ?: @"?",
+              NBDiagGet(snd, @"toneIdentifier"), NBDiagGet(snd, @"ringtoneName"),
+              NBDiagGet(snd, @"songPath"), NBDiagGet(snd, @"audioCategory"),
+              NBDiagGet(snd, @"alertConfiguration"));
 }
 
 + (void)noteForeignSoundIfAny:(id)obj stage:(NSString *)stage {
     if (!obj) return;
     [self dumpClassOnce];
-    if (gForeignDone) return;
 
     id s = nil;
     @try {
@@ -263,11 +458,48 @@ static void NBDiagDumpValues(id obj, NSString *label) {
         return;
     }
     if (!s) return;              // 绝大多数通知都是 nil（v0.0.20 PROBE 已量到）
-    gForeignDone = YES;
+
+    // 🔴🔴 v0.0.24：不再只抓**第一个**，改成按"长相"去重、最多收 4 个**不同**的样本。
+    //    上一版只抓一次，结果抓到的那一个恰好是我们唯一见过的形态，
+    //    "别的形态长什么样"完全没数据 —— 而这一版最需要的正是**多样性**：
+    //    soundType 到底有哪几个取值、songPath / ringtone / alertConfiguration
+    //    各在什么情况下被用到。只有一个样本就判不了这些。
+    //    为什么不在每个通知上都打：日志/文件空间有限，且同一种形态重复打没有增量信息。
+    static NSMutableSet *seen = nil;
+    static NSUInteger kept = 0;
+    if (!seen) seen = [NSMutableSet set];
+    if (kept >= 4) return;
+
+    // 用"关键字段组合"当指纹 —— 不能只用类名（同一个类会覆盖所有形态）。
+    NSString *sig = [NSString stringWithFormat:@"%@|%@|%@|%@|%@|%@",
+                     NBDiagGet(s, @"soundType"), NBDiagGet(s, @"systemSoundID"),
+                     NBDiagGet(s, @"toneIdentifier"), NBDiagGet(s, @"songPath"),
+                     NBDiagGet(s, @"ringtoneName"), NBDiagGet(s, @"alertType")];
+    if ([seen containsObject:sig]) return;
+    [seen addObject:sig];
+    kept++;
+
     @try {
-        NBDiagLog(NO, @"SD# ★ 抓到非 nil 的 sound（这是最好的对照）stage=%@ cls=%@",
-                  stage ?: @"?", NSStringFromClass([s class]));
+        NBDiagLog(NO, @"SD# ★ 抓到非 nil 的 sound 第 %lu 种（这是最好的对照）stage=%@ cls=%@",
+                  (unsigned long)kept, stage ?: @"?", NSStringFromClass([s class]));
         NBDiagDumpValues(s, @"该 sound 对象");
+        // 🔴 关键：把它的 alertConfiguration 也整份 dump 出来。
+        //    真机样本里，能正常响的那个 BBSound 这一项非 nil，我们的空壳是 nil
+        //    ⇒ 这是目前唯一还没被排除的差异，必须看清它里面到底装了什么。
+        id cfg = nil;
+        @try {
+            cfg = [s valueForKey:@"alertConfiguration"];
+        } @catch (__unused NSException *e) {
+            cfg = nil;
+        }
+        if (cfg) {
+            NBDiagLogF(@"SD# ★ 它的 alertConfiguration cls=%@（这就是 TonesLibrary 的真身）",
+                      NSStringFromClass([cfg class]));
+            NBDiagDumpValues(cfg, @"该 alertConfiguration");
+        } else {
+            NBDiagLogF(@"SD# 这个 sound 的 alertConfiguration 也是 nil"
+                          @"（说明还有别的形态能响，不能只盯着它）");
+        }
     } @catch (__unused NSException *e) {
         NBDiagLog(NO, @"!!! SD# dump sound 对象抛异常（已忽略）");
     }
@@ -307,14 +539,23 @@ static void NBDiagDumpValues(id obj, NSString *label) {
     NBDiagLog(NO, @"SD# %@ 发后⓪ objCls=%@ sound=%@ cls=%@", st,
               NSStringFromClass([obj class]),
               s ? @"有" : @"nil", s ? NSStringFromClass([s class]) : @"-");
-    // playSound 是"这条通知要不要出声"的开关级字段，和 sound 是两个东西。
-    // 只挂 sound 而 playSound=0 的话，系统照样一声不出。
-    NBDiagLog(NO, @"SD# %@ 发后① playSound=%@ alert=%@ type=%@ sid=%@", st,
-              NBDiagGet(obj, @"playSound"), NBDiagGet(obj, @"alertType"),
-              NBDiagGet(obj, @"soundType"), NBDiagGet(obj, @"systemSoundID"));
-    NBDiagLog(NO, @"SD# %@ 发后② tone=%@ src=%@ vibrat=%@", st,
-              NBDiagGet(obj, @"toneIdentifier"), NBDiagGet(obj, @"soundSource"),
-              NBDiagGet(obj, @"vibrationIdentifier"));
+    // 🔴🔴 v0.0.24：①②两行**改从 sound 对象读**，不再从 bulletin 读。
+    //    真机数据说明上一版这里全是废读数：`alert=!无键 type=!无键 sid=!无键` ——
+    //    soundType / systemSoundID / alertType 这三个键在 BBBulletin 上**根本不存在**
+    //    （它们属于 BBSound）。我当时以为是"值没读出来"，白占了两行日志的位置。
+    //    ⇒ 判据要读"那个字段真正属于谁"，不是"我手上正好有哪个对象"。
+    // ⚠️ playSound 保留，但结论已经变了：真机上**连能正常响的通知**也是 playSound=0
+    //    （用户明确听到原声的那几条也在内）⇒ 它**不是**出声的闸门，只是一条参考量。
+    NBDiagLog(NO, @"SD# %@ 发后① playSound=%@（实测非闸门）", st,
+              NBDiagGet(obj, @"playSound"));
+    if (s) {
+        NBDiagLog(NO, @"SD# %@ 发后② sound: type=%@ sid=%@ tone=%@ alertType=%@ cfg=%@", st,
+                  NBDiagGet(s, @"soundType"), NBDiagGet(s, @"systemSoundID"),
+                  NBDiagGet(s, @"toneIdentifier"), NBDiagGet(s, @"alertType"),
+                  NBDiagGet(s, @"alertConfiguration"));
+    } else {
+        NBDiagLog(NO, @"SD# %@ 发后② sound=nil（这条通知本来就没声音）", st);
+    }
 
     // ③ 0.4 秒后再看一次 —— 唯一能区分"当场就在"和"被后续链路换掉"的观测。
     //    🔴 故意用**强引用**捕获：weak 会把"对象被释放"也读成 nil，

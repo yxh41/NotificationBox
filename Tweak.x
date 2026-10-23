@@ -1,36 +1,55 @@
-// Tweak.x —— v0.0.23（当前）：**补字段** —— 上一版诊断已把病因锁死
+// Tweak.x —— v0.0.24（当前）：**侦察「正确的造法」**（刀不动，仍然不挂）
 //
-// 真机量到的事实（v0.0.22 的诊断数据）：
-//   · `sound` 在 orig 前/后、0.4 秒后**都在** ⇒ 不是挂载失败，也没被系统抹掉；
-//   · `set=1/1` ⇒ setter 存在；回读 `type=1 sid=1009` ⇒ 值真的进了对象；
-//   · 用户症状是**完全没声音**（不是"还是原来的声音"）。
-// 这三条合起来只剩一个解释：**我们挂的是个空壳，系统采纳了它，但它播不出声。**
+// 🔴🔴 先认账：v0.0.23 的假设被真机数据**正面否掉了**。
 //
-// 真机 PROBE 的 `BBSound 有 15 个 property` 里有两个要命的字段：
-//   repetitions（播几次）、maxDuration（播多久）
-// alloc/init 出来的对象里它们大概是 0 ⇒ 播 0 次 / 0 秒 ⇒ 一声不出。
-// （sound=nil 时系统走"默认提示音"路径，所以默认通知照样响 —— 这也解释了症状。）
-// ⇒ 本版补 repetitions=1 / maxDuration=30，逐个 respondsToSelector 探，键名一个都不赌。
-//   还有一条**安全兜底**：万一这俩 setter 在本版不存在，就**不挂**（宁可声音没换掉，
-//   也不能让通知变哑巴 —— 静音会让用户漏消息，比"没换音"严重得多）。
-//   SOUND# 行会写出「!!! 放弃换音」，别把它当成失败，那是故意的。
+// v0.0.23 的推断：`repetitions` / `maxDuration` 在空壳里是 0 ⇒ 播 0 次 / 0 秒 ⇒ 没声音。
+// v0.0.23 落盘的 sound_diag.log 反驳（用户手机实测）：
+//   系统自己给的、**能正常出声**的那个 BBSound：
+//       maxDuration=0   repeats=0   soundType=2   systemSoundID=0
+//       alertConfiguration=<TLAlertConfiguration>   toneIdentifier=""   alertType=17
+// ⇒ 0/0 是正常的，与出不出声无关。
+// ⇒ 而且 `repetitions` 这个键**根本不存在**（真机 `rep=!无键`）；
+//    正确的名字是 `repeats`（{TB,N,GisRepeating,V_repeats}，BOOL，是"要不要重复"）。
+//    病根：我照着上一版 PROBE 截图**凭印象转写**了一个意思相近的名字，
+//    没有逐字抄。⇒ 以后键名只能从数据里逐字抄，不许"翻成同义词"。
 //
-// 同时诊断改为**落盘**（sound_diag.log）：上一版的结构性 dump 被 50 行日志窗口吃了，
-// 白跑一轮。App 侧新开「声音诊断文件（完整）」入口直接读文件。
+// 把两边摊开对比，唯一还没被排除的差异：
+//     能响的：   soundType=2   systemSoundID=0     alertConfiguration=<非 nil>
+//     我们的：   soundType=1   systemSoundID=1009  alertConfiguration=nil
+// ⇒ iOS 16 的通知音走 **TonesLibrary（TLAlert + TLAlertConfiguration）**；
+//    `systemSoundID` 是 AudioServices 的老 ID，BulletinBoard 已经不看它了。
+//    这同时解释了设置页"试听"为什么是响的 —— 试听走 AudioServices 播放，
+//    跟系统投递通知是两条完全不同的路。**试听能响 ≠ 通知能响。**
 //
-// 上一版（v0.0.21）上了两个功能：免打扰时段 ✅、按 App 换提示音 ❌（听不到）。
-// 这一版**不出新刀**，只把现场量清楚。理由是本项目已经付过学费的那条：
-//   同一个类+选择器，一条成功一条失败时，"再换把刀猜"等于把多个反常量赌成一个；
-//   正解是先交只读诊断件 —— 一次拿全，别再猜。
+// ⇒ 这一版**不改刀**。刀继续"造不出能响的对象就不挂"，手机停在"能响原声"这个安全状态
+//    （v0.0.21 已实测：挂空壳 = 通知彻底没声音 = 用户漏消息，比"没换成"糟得多）。
 //
-// 这一版要一次量清三件事（缺任何一件都得再来一轮）：
-//   ① BBSound 到底有哪些属性、哪些**可写**（[R]/[W] 标注 + setter 清单）；
-//   ② 我们填进去的值到底有没有进对象（SOUND# 行里直接带 src/tone/type/sid 实值）；
-//   ③ orig 之后 sound 还在不在（同步 + 0.4 秒后各读一次）——
-//      区分"系统当场就抹掉"和"被后续链路换掉"。
+// 这一版只做一件事：**把"怎么造一个能响的 BBSound"挖出来。**
+//   ① dump BBSound 的**类方法** —— 找 +soundWith… 这类工厂。
+//      ⚠️ v0.0.20 的 PROBE 曾记过"只有 1 个类方法且与声音无关"，
+//         但当时那份 dump 是否真的取到了元类（object_getClass）无法确认，
+//         所以再确认一次；有工厂就让它替我们造，不要在字段里继续摸。
+//   ② dump **TLAlertConfiguration** 的属性 + 类方法 + ivar —— iOS 16 通知音的真身。
+//      `alertConfiguration` 是 BBSound 上标 [W] 的字段，我们需要的只是"造一个能用的 cfg"。
+//   ③ 抓到系统给的 sound 时不再只留 1 个样本：按"长相"去重最多留 4 个，
+//      并把它们的 alertConfiguration 一起 dump。
+//      只有多样性才能看出 soundType 有哪几个取值、各形态分别靠哪个字段发声 ——
+//      上一版只留一个样本，等于只认识了一种长相。
 //
-// 另外挂了一个白捡的宝贝：一旦遇到**系统给的、非 nil 的 sound**就整份 dump。
-// 抄一个真实对象的字段值，比猜枚举值强一万倍。
+// 另外修掉两处**诊断自己在说谎**的 bug（真机输出里已经出现了，都是判据类错误）：
+//   · `NBDiagDumpSetters` 拿 `buf.length` 同时当"缓冲区还剩多少"和"有没有找到过"，
+//     而 flush 会清空缓冲区 ⇒ 6 个 setter 加起来正好 111 字触发 flush，
+//     于是打出「setter: setVibrationPattern: … setRingtoneName:」紧跟着
+//     「声音相关 setter: 一个都没有」—— 两行自相矛盾。判据变量必须独立记事实。
+//   · 关键词过滤漏了 duration / repeat / song / audio，把真实存在的
+//     setMaxDuration: / setRepeats: / setSongPath: 全筛掉了 ⇒ 我以为"只有 6 个可写字段"。
+//
+// ⚠️ 顺带记录两条已被数据证伪的猜测，别再回头捡：
+//   · `playSound` **不是**出声的闸门 —— 用户明确听到原声的那几条也是 playSound=0；
+//   · `soundSource` 在 BBSound 上不存在（KVC 抛 NSUnknownKeyException）。
+//
+// 更早一版的白捡经验仍然成立：遇到系统给的、非 nil 的 sound 就整份 dump ——
+// 抄一个真实对象的字段值，比猜枚举值强一万倍。（这一版把它从"一次"扩到"按形态最多 4 次"。）
 //
 // 依据真机 PROBE 数据（v0.0.20 采）定下换提示音的实现方式，一条都不凭猜：
 //   sound{T@"BBSound",&,N,V_sound} 可写；BBSound **只有 1 个类方法且与声音无关 ⇒ 没有工厂方法**；
@@ -486,7 +505,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.23", selfPath];
+                          [NSDate date], NBProc(), @"v0.0.24", selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -519,12 +538,12 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.23 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.24 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
           @"可用",
-          @"实验（默认关，v0.0.23 已补 rep/dur）");
+          @"实验（默认关，v0.0.24 仍未换成功：探测正确造法）");
 
     // 只读探针：dump 一次 BBBulletin / BBSound 的类结构（内部自己保证只做一次）
     [NotifyProbe dumpClassesOnce];
@@ -557,7 +576,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.23 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.24 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -578,7 +597,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.23 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.24 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
