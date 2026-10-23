@@ -1856,3 +1856,148 @@ nb_verify_v024.py: 202 项 0 FAIL
 nb_v024_src_check.py: 18 条判据全绿 / 18 条负向自测全红
 nb_lit_check: 64 条全过
 ```
+
+---
+
+## v0.0.25 · 换挂点：不再造 BBSound，改挂通知音总闸门
+
+> 一句话：**我们一直在错的地方动手。**
+> v0.0.21~v0.0.24 都在 BulletinBoard 的 `BBSound` 里手工拼字段（造系统对象），
+> 而正确的挂点是一个返回 BOOL 的闸门 —— `SBNCSoundController -canPlaySoundForNotificationRequest:`。
+> 这一版在那里**先把我们的音播出去，播成功了才让系统别播**。
+
+### 一、转折点是「去看看别人怎么写」
+
+v0.0.24 之后我去翻了 GitHub 上同类插件（用户提醒的）。四个参考，全部源码存档在 `docs/refs/`：
+
+| 插件 | 作者 | 开源 | 做法 | 价值 |
+|---|---|---|---|---|
+| **SilentNotifs** | dayanch96 | 源码可见 | hook `SBNCSoundController -canPlaySoundForNotificationRequest:` 返回 `NO`；注入 `com.apple.springboard`，arm64+arm64e | 🔴🔴 **通知音总闸门** |
+| **NotchBanners** | ginsudev | 源码可见 | `request.sound.alertConfiguration` → `[TLAlert alertWithConfiguration:]` → `play` | 证明 cfg 能直接播出声音 |
+| **SmartNotifications (iOS16)** | EliasSfeir | ❌ 付费 | 音频放 `/Library/Application Support/SmartNotifications` | 强证据：它**自己播**，不走系统铃声库 |
+| **BootSound** | ginsudev | 源码可见 | 自己播 `/Library/BootSound/` 下 mp3/wav/caf | 自播 mp3 在 SpringBoard 侧可行 |
+| ToneManager | Jesperflodin1 | ✅ MIT | 逆向 GuitarBand，用 TonesLibrary 装 m4r | 「音频→系统铃声」的完整参考（重） |
+
+SilentNotifs 全文只有 **23 行**，核心就这一段：
+
+```objc
+%hook SBNCSoundController
+- (BOOL)canPlaySoundForNotificationRequest:(NCNotificationRequest *)request {
+    if ([request.sectionIdentifier isEqualToString:@"com.apple.mobiletimer"])
+        return %orig;                                  // 闹钟放行
+    BOOL shouldSilent = [[%c(SBMediaController) sharedInstance] isPlaying];
+    return shouldSilent ? NO : %orig;
+}
+```
+
+⚠️ 许可证：SilentNotifs / NotchBanners 的仓库**没有 LICENSE 文件** ⇒ 只参考做法，代码全部自己写。
+
+### 二、这个挂点好在哪（四条，逐条对上我们踩过的坑）
+
+| | `BBSound`（我们做了四版） | `SBNCSoundController`（这一版） |
+|---|---|---|
+| 要造对象吗 | 要手工拼一个"能响的壳" | **不用，纯返回 BOOL** |
+| 有 bundle id 吗 | **没有** —— "按 App"只能靠外层传参凑 | `request.sectionIdentifier` 直接给 |
+| 造错会怎样 | v0.0.21 实测：**整条通知变哑** | 不会，只影响"响不响" |
+| 影响横幅/振动吗 | 未知 | 不会（振动是另一条通道） |
+| 有没有放行先例 | — | 有：闹钟走 `%orig` |
+
+### 三、认知纠正：v0.0.21 那次「完全没声音」不是纯失败
+
+当时我们把「挂了个空壳 ⇒ 系统不响」记成失败。现在看，它验证的正是方案里
+**"静音原声"那一半** —— 我们能影响到"通知出不出声"这件事，只是当时想让它响别人的音。
+
+同理 v0.0.24 的判断只对了一半：`alertConfiguration` 确实是 iOS 16 通知音的真身，
+但**不一定需要我们自己造它** —— `request.sound` 上系统已经给了一个。
+
+### 四、做法：顺序是全部
+
+```objc
+if ([NotifyFilter playCustomSoundForBundle:bid forResult:&sres]) {
+    ...留痕...
+    return NO;          // 我们的音已经送出去 ⇒ 别让系统再播一遍
+}
+return %orig;           // 没播成 / 没配 / 抛异常 ⇒ 老老实实放原声
+```
+
+**顺序反过来（先掐再播）就是"播失败 ⇒ 哑巴"。** 所以返回契约写死在 `NotifyFilter.h` 里：
+`NO` = 调用方**必须**放系统原声。
+
+播放用 `AudioServicesPlaySystemSound(sid)`，不用 `AVAudioPlayer` / `TLAlert`：
+
+| 理由 | 说明 |
+|---|---|
+| 同一条路 | 播的就是 1000~1035 系统提示音，**设置页试听走的是同一条路** ⇒ 试听能响就能推出通知能响 |
+| 静音语义免费 | 自动遵循静音开关；不用碰 `AVAudioSession`（在 SpringBoard 里改 category 有全局副作用） |
+| 不打断音乐 | 系统提示音的固有行为 |
+
+⚠️ 诚实的局限：`AudioServicesPlaySystemSound` 返回 `void`，**拿不到"真的播出来了"**。
+这里的"成功"只表示"ID 合法 + 播放请求已发出"。假阴性的兜底就是设置页的「试听」。
+
+### 五、四道防线（每条都有机器判据）
+
+| # | 防线 | 不做会怎样 | 判据 |
+|---|---|---|---|
+| ① | **先播后掐** | 播失败就是哑巴 | `b03` |
+| ② | **播不出就 `%orig`**，函数尾部必须有出口 | 等于把系统原声彻底废掉 | `b04` |
+| ③ | **按 `notificationIdentifier` 去重** | 同一条通知在锁屏+横幅各问一次 ⇒ **连响两遍** | `b21` |
+| ④ | **记 nid 必须在播成功之后** | 首次播失败也记上 nid ⇒ 第二次直接掐原声且不再播 = 永久哑巴 | `b22` |
+
+第 ③ 条还有个反向保护：**拿不到 nid 就完全不去重**。
+理由：没有唯一 ID 时只能按时间窗猜，而"同一个 App 紧接着发的第二条真通知"会被窗口误吞。
+⇒ **宁可偶尔响两遍，也不要吞掉一条真通知。**
+
+### 六、不挂的情况也留痕
+
+```objc
+Class gsc = objc_getClass("SBNCSoundController");
+if (!gsc) {
+    NBLog(@"!!! v0.0.25 SBNCSoundController 类不存在 ⇒ 换提示音不挂（通知照旧原声）");
+} else {
+    // class_copyMethodList → 集合 → 有没有 canPlaySoundForNotificationRequest:
+    // 有 ⇒ %init(GSC)
+    // 没有 ⇒ 把含 sound/play/vibrat/alert 的方法名**全打出来**（下一轮不用猜）
+}
+```
+
+🔴 名字来自外部参考、本机未验证 ⇒ **不许无条件 `%init`**。类不存在时往 nil 上 hook 是"什么都可能发生"。
+
+### 七、判据层
+
+- `nb_v025_src_check.py`：**22 条**语义判据 + **22 条**负向对照，全绿。
+- 🔴 **负向自测抓到自己 6 条判据是形同虚设的**（工具干对了活）：
+  | 判据 | 病因 |
+  |---|---|
+  | `b01` | 变异锚点 `AudioServicesPlaySystemSound` 第一次出现在**注释**里 ⇒ strip 后变异消失，测的是空气 |
+  | `b06` | 只用"有没有 `@try`"判 ⇒ 内层那个 `@try` 冒充外层，去掉外层也不报红 |
+  | `b07` | `gSoundApplied <= 8` **包含在** `<= 8000` 里 ⇒ 子串陷阱 |
+  | `b15` | 同上：`static int gSoundApplied` 是 `gSoundAppliedX` 的子串 |
+  | `b21` | 同上：`notificationIdentifier` 是 `notificationIdentifierX` 的子串 |
+  | `b08` | 变异锚点跨了两行（中间隔着注释），找不到 |
+- 子串陷阱同一类错误在这一轮出现了 **3 次**。⇒ 判据锚点一律取「带分号的完整语句」或正则，别用裸名字。
+
+### 八、装了这一版要做什么
+
+1. 装包、重启 SpringBoard；
+2. 设置页打开「换提示音」，**先点「试听」确认这个 ID 在你手机上能响**（这是唯一的兜底验证）；
+3. 把目标 App 加进名单；
+4. 让那个 App 发一条通知，听：
+
+| 听到什么 | 说明什么 | 下一步 |
+|---|---|---|
+| **我们的提示音** | ✅ 成 | 收口 |
+| **原声** | 闸门没挂上 / 名字不对 | 看 banner 下面那行 `SBNCSoundController N 个方法 · canPlaySoundForNotificationRequest=YES/NO` |
+| **两个声音叠在一起** | 播成了但`return NO`没生效 | 闸门对了、返回值没被采纳 |
+| **完全没声音** | 🔴 最坏 | 播了 + 掐了原声 = 哑巴。立刻关掉开关，把日志发我 |
+
+第 4 种在代码里已经被"先播后掐 + 播失败就 `%orig`"挡住了，理论上到不了；
+真到了说明 `AudioServicesPlaySystemSound` 发出了请求但系统没出声 —— 那要换 `AVAudioPlayer`。
+
+### 九、交付
+
+```
+dist/com.yxh41.notifybox_0.0.25_iphoneos-arm64e.deb   ____ bytes
+CI run #__ / run_id __________（zip ____ bytes，与 API 的 size_in_bytes 对拍一致）
+
+nb_v025_src_check.py: 22 条判据全绿 / 22 条负向对照全红
+```
