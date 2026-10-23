@@ -12,6 +12,9 @@
 //    NotifyFilter.m **也被盒子 App 编译**，所以 NotifySoundDiag.m 必须一起进 App 的 FILES，
 //    否则链接期就是 undefined symbol（这种错看着像代码问题，其实是构建配置）。
 #import "NotifySoundDiag.h"
+// 🔴 v0.0.29：把"这一声归谁"挂在 AVAudioPlayer 上（objc_setAssociatedObject）。
+//    显式 import 而不是靠 Foundation 间接带进来 —— 后者随 SDK 版本变，不值得赌。
+#import <objc/runtime.h>
 #import <objc/runtime.h>       // v0.0.16 起为探针引入；v0.0.19 删掉延迟后本文件已不用 objc_* 函数，
                               // 但保留这个 import 无害，且省得下次要加探针时又忘
 
@@ -43,9 +46,17 @@ typedef NS_ENUM(NSInteger, NBSoundVerdict) {
 // v0.0.26：文件播放的两条通道（只在内部用）
 + (BOOL)nbPlayViaAudioServices:(NSString *)path why:(NSString **)why;
 // v0.0.27：maxSec > 0 时到点 stop（0 = 不限）。只有 B 通道能截断，A 通道做不到。
+// v0.0.29：owner 是"这一声归谁"（通知 = bundleId；试听 = @preview）。
+//          **同一个 owner 的新音会把旧音停掉**，不同 owner 互不影响 —— 见实现处的注释。
 + (BOOL)nbPlayViaAVPlayer:(NSString *)path
                    maxSec:(NSTimeInterval)maxSec
+                    owner:(NSString *)owner
                       why:(NSString **)why;
+
+// v0.0.29：内部真正干活的播放入口（公开的 playSoundFileNamed: 转调它，owner 传 @preview）
++ (BOOL)nbPlaySoundFile:(NSString *)name
+               forOwner:(NSString *)owner
+                 result:(NSString **)result;
 
 // v0.0.27：时长上限相关（都只在内部用）
 + (NSTimeInterval)nbDurationOfFile:(NSString *)path;   // -1 = 量不出来
@@ -611,6 +622,13 @@ static NSMutableArray<AVAudioPlayer *> *NBLivePlayers(void) {
     return a;
 }
 
+// v0.0.29：「这一声归谁」的关联键。
+//   · 通知 ⇒ owner = bundleId（同一个 App 连发时新的停掉旧的）
+//   · 试听 ⇒ owner = NB_SOUND_OWNER_PREVIEW（试听之间也互斥，避免连点两次两个一起响）
+//   · owner 为空 ⇒ 不做打断（只在内部路径可能出现，保守放行）
+static char kNBPlayerOwnerKeyStorage;
+static void *kNBPlayerOwnerKey = &kNBPlayerOwnerKeyStorage;
+
 // ---------- v0.0.27：时长上限 ----------
 //
 // 这一节只回答两个问题：**这个文件有多长**、**这一次该走哪条通道**。
@@ -713,6 +731,7 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
 
 + (BOOL)nbPlayViaAVPlayer:(NSString *)path
                    maxSec:(NSTimeInterval)maxSec
+                    owner:(NSString *)owner
                       why:(NSString **)why {
     NSError *err = nil;
     AVAudioPlayer *pl = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path]
@@ -739,9 +758,41 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
         return NO;
     }
 
+    // 🔴🔴 v0.0.29：**同一个 owner 的旧音在这里被停掉** —— 修的就是"群里连发三条，
+    //    三个提示音同时响成一团"。
+    //
+    // 三条设计约束，每条都不是随便定的：
+    //
+    // ① **必须排 `play` 成功之后**。反过来的话，一旦 `play` 返回 NO，
+    //    用户既听不到新的、旧的也被掐掉了 ⇒ **哑一下**。先保住"至少有一个在响"。
+    //
+    // ② **按 owner 分桶，不是全局只留一个**。微信和 QQ 同时来通知是两件事，
+    //    两个音都该听到；只有"同一个 App 连发"才是噪音。
+    //
+    // ③ **只对 B 通道有效** —— A 通道没有 stop API（`AudioServicesDisposeSystemSoundID`
+    //    会连播放一起掐断并释放资源，等于"停一次废一个 ID"），所以 A 通道的旧音停不了。
+    //    但这恰好不构成问题：**短音走 A、长音走 B**，只有长音叠加才难听，
+    //    而长音正好是能停的那条。能力落在唯一需要它的地方。
     NSMutableArray *live = NBLivePlayers();
+    NSUInteger killed = 0;
     @synchronized (live) {
-        // 🔴 上限 6：连环通知（比如群里刷屏）时不能无上限地攒 player。
+        if (owner.length) {
+            // owner 挂在 player 上（associated object）而不是另开字典：
+            // player 被释放时它跟着走，不存在"字典里留着已死 player"这种漏。
+            objc_setAssociatedObject(pl, kNBPlayerOwnerKey, owner, OBJC_ASSOCIATION_COPY_NONATOMIC);
+            // 倒着遍历：一边删一边遍历，正着走会跳元素
+            for (NSInteger i = (NSInteger)live.count - 1; i >= 0; i--) {
+                AVAudioPlayer *old = live[(NSUInteger)i];
+                NSString *ob = objc_getAssociatedObject(old, kNBPlayerOwnerKey);
+                if (![ob isEqualToString:owner]) continue;
+                @try { [old stop]; } @catch (__unused NSException *e) { }
+                [live removeObjectAtIndex:(NSUInteger)i];
+                killed++;
+            }
+        }
+        // 🔴 上限 6 保留作兜底：连环通知（比如群里刷屏）时不能无上限地攒 player。
+        //    v0.0.29 之后正常路径不会走到这里（同 owner 已经互斥），
+        //    只有"多个不同 App 同时刷"才会触发。
         while (live.count >= 6) {
             AVAudioPlayer *old = live.firstObject;
             @try { [old stop]; } @catch (__unused NSException *e) { }
@@ -749,6 +800,9 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
         }
         [live addObject:pl];
     }
+    // 🔴 只在真的打断了才留痕：这条在刷屏时每条通知都会触发，无条件打会把 50 行日志窗口冲干净
+    //    （v0.0.22 白跑一轮的同一个病）。不带 bundleId，省字数。
+    if (killed) NBSharedLog(@"SOUND# 同 App 连发 ⇒ 停掉 %lu 个旧音（不叠加）", (unsigned long)killed);
 
     // 到点收工。duration 不可信时给个短兜底，绝不能出现"永久持有"。
     //
@@ -776,6 +830,18 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
 //    它只管"把这一份文件播出去"。判定在 soundVerdictForBundle 里，唯一口径。
 //    分开的好处：试听可以无视名单（用户就是想先听听是不是这个音）。
 + (BOOL)playSoundFileNamed:(NSString *)name forResult:(NSString **)result {
+    // 🔴 v0.0.29：公开入口一律按「试听」的身份播。
+    //    为什么不在签名上加 owner 参数：这个函数**已经被三处界面在用**
+    //    （设置页试听 / 选音页试听 / 选音页选完试播），改签名等于三处一起动，
+    //    而它们本来就都该是"试听"这个语义 ⇒ 默认值就写在转调这一行，一处都说清。
+    //    ⚠️ 通知路径**不许**调这个函数（那会让所有 App 共用一个 owner，又变回全局只留一个音）。
+    return [self nbPlaySoundFile:name forOwner:NB_SOUND_OWNER_PREVIEW result:result];
+}
+
+// 内部真正干活的入口。owner 决定"跟谁互斥"，其余逻辑与 v0.0.27 完全一致。
++ (BOOL)nbPlaySoundFile:(NSString *)name
+               forOwner:(NSString *)owner
+                 result:(NSString **)result {
     if (result) *result = nil;
     @try {
         NSString *path = NBSoundFilePath(name);
@@ -808,9 +874,9 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
         //    那时响得久一点，远好过哑巴。这个取舍要写进 README，不能只在代码里。
         if (aFirst) {
             okA = [self nbPlayViaAudioServices:path why:&whyA];
-            if (!okA) okB = [self nbPlayViaAVPlayer:path maxSec:cap why:&whyB];
+            if (!okA) okB = [self nbPlayViaAVPlayer:path maxSec:cap owner:owner why:&whyB];
         } else {
-            okB = [self nbPlayViaAVPlayer:path maxSec:cap why:&whyB];
+            okB = [self nbPlayViaAVPlayer:path maxSec:cap owner:owner why:&whyB];
             if (!okB) okA = [self nbPlayViaAudioServices:path why:&whyA];
         }
         if (okA || okB) {
@@ -924,9 +990,13 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
         // 🔴 先把声音送出去，再返回 YES —— 调用方拿到 YES 才会去掐系统原声。
         //    顺序写反（先掐再播）就是「播失败 ⇒ 哑巴」，见 NotifyFilter.h 里那段返回契约。
         // 🔴 v0.0.26：**文件优先**。选了文件就只播文件，不播 ID（否则会同时响两个声音）。
+        // 🔴🔴 v0.0.29：这里**必须**走内部入口并把 bundleId 当 owner 传下去，
+        //    ⛔ 不能图省事调公开的 playSoundFileNamed:（它写死了 owner=@preview）——
+        //    那样所有 App 会共用同一个 owner，一个 App 来通知就会掐掉另一个 App 正在响的音，
+        //    而症状（"QQ 把我微信的提示音停了"）几乎没法从日志看出来。
         if (srcFile.length) {
             NSString *d = nil;
-            BOOL ok = [self playSoundFileNamed:srcFile forResult:&d];
+            BOOL ok = [self nbPlaySoundFile:srcFile forOwner:bundle result:&d];
             if (result) *result = d;
             return ok;              // 播不出去 ⇒ NO ⇒ 调用方放原声（绝不哑巴）
         }
