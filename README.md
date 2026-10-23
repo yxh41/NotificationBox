@@ -1964,7 +1964,7 @@ if (!gsc) {
 
 ### 七、判据层
 
-- `nb_v025_src_check.py`：**22 条**语义判据 + **22 条**负向对照，全绿。
+- `nb_v025_src_check.py`：**23 条**语义判据 + **23 条**负向对照，全绿。
 - 🔴 **负向自测抓到自己 6 条判据是形同虚设的**（工具干对了活）：
   | 判据 | 病因 |
   |---|---|
@@ -1975,6 +1975,11 @@ if (!gsc) {
   | `b21` | 同上：`notificationIdentifier` 是 `notificationIdentifierX` 的子串 |
   | `b08` | 变异锚点跨了两行（中间隔着注释），找不到 |
 - 子串陷阱同一类错误在这一轮出现了 **3 次**。⇒ 判据锚点一律取「带分号的完整语句」或正则，别用裸名字。
+- 🔴🔴 二进制校验里还抓到一条**假绿**（比假红危险得多）：`dylib 里已无 NBSoundFieldSummary`
+  在**旧刀还在的 v0.0.24 包上也是绿的**。病因：它是 `static` C 函数，
+  **静态函数名根本不进二进制**（实测 v0.0.24 包里 0 次命中，而那一版源码里明明有这个函数）。
+  ⇒ 断言在"有"和"没有"两种包上都成立 = 没测。已删除，改由源码层 `b01` 覆盖。
+  这类失败不会报错，只会让报告看起来更硬。
 
 ### 八、装了这一版要做什么
 
@@ -1996,8 +2001,10 @@ if (!gsc) {
 ### 九、交付
 
 ```
-dist/com.yxh41.notifybox_0.0.25_iphoneos-arm64e.deb   ____ bytes
-CI run #__ / run_id __________（zip ____ bytes，与 API 的 size_in_bytes 对拍一致）
+dist/com.yxh41.notifybox_0.0.25_iphoneos-arm64e.deb   82196 bytes
+CI run #48 / run_id 39895122132（zip 82375 bytes，与 API 的 size_in_bytes 对拍一致）
 
-nb_v025_src_check.py: 22 条判据全绿 / 22 条负向对照全红
+nb_v025_src_check.py:  23 条判据全绿 / 23 条负向对照全红
+nb_verify_v025.py:    201 项全绿（含 1 条反向对照 → 拿 v0.0.24 的包喂进去恰好红 25 项）
+nb_lit_check.py:       56 条含中文字面量判据 PASS
 ```
