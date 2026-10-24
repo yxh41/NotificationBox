@@ -231,6 +231,24 @@ static AVSpeechSynthesizer *gSynth = nil;
 
 #pragma mark - 诊断
 
+// v0.0.30：现在正在朗读吗？
+//
+// 🔴 只读 `speaking` 属性，不 stop、不 speak —— 这是个**探针**，
+//    探针一旦有副作用，音频会话交还这件事就永远查不清了。
+//
+// ⚠️ 已知精度限制（写在这里免得下一版当成 bug）：`speaking` 变 NO 之后，
+//    硬件缓冲里的尾韵可能还有几十毫秒。所以"交还"可能削掉极短的尾巴。
+//    这一点只能靠真机听感确认，靠静态断言证明不了。
++ (BOOL)isSpeakingNow {
+    @try {
+        AVSpeechSynthesizer *s = gSynth;
+        if (!s) return NO;              // 从没朗读过 ⇒ 当然没在朗读
+        return (BOOL)s.speaking;
+    } @catch (__unused NSException *e) {
+        return NO;                      // 读不到就当作没在朗读：宁可早交还，也不要永久占着会话
+    }
+}
+
 + (NSString *)diagnosticLine {
     @try {
         NSDictionary *d = NBLoadSettings();

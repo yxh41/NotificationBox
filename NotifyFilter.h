@@ -149,6 +149,22 @@ NS_ASSUME_NONNULL_BEGIN
 // 返回 YES 表示"上次就是崩在换提示音里，已经把这个开关关掉了"，**并且已回读确认**。
 + (BOOL)recoverFromSoundCrashIfNeeded;
 
+// ---------- v0.0.30：音频会话交还 ----------
+//
+// 背景（代码事实）：全项目 `setActive:YES` 有两处、`setActive:NO` **一处都没有** ——
+// B 通道（Ambient+MixWithOthers）和 App 内语音试听（Playback+DuckOthers）都把会话激活后就不管了。
+// 后果最实在的是 DuckOthers 那条：它的语义是"把别人正在放的音乐压下去"，
+// 会话不交还时别人的音量能不能恢复，是这类 App 里的经典坑。
+//
+// 这个方法的语义是**保守放行**：只要还有任何东西可能在响，就**不交还**。两个条件都满足才放行：
+//   ① B 通道在播列表 `NBLivePlayers()` 为空
+//   ② 朗读没在播（`NotifySpeaker isSpeakingNow`，用 NSClassFromString 问，见下）
+//
+// 🔴 幂等：连调两次只是让第二次 `setActive:NO` 返回一个错误码（已忽略），不会炸、不会出声。
+// 🔴 **不许在 play 路径上调它** —— 播一半交还就是"声音断在半截"，
+//    那正是 v0.0.27 花了整版才修掉的东西。调用点只有两处：B 通道到点收工之后、语音试听结束之后。
++ (void)releaseAudioSessionIfIdle;
+
 @end
 
 NS_ASSUME_NONNULL_END

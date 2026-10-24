@@ -1,6 +1,7 @@
 #import "VoicePickerViewController.h"
 #import "NotifyStore.h"
 #import "NotifyCommon.h"
+#import "NotifyFilter.h"          // v0.0.30：试听结束后交还音频会话
 #import <AVFoundation/AVFoundation.h>
 #import <math.h>
 #if __has_include(<AVFAudio/AVFAudio.h>)
@@ -29,12 +30,19 @@ static NSArray<NSString *> *NBRateNames(void) {
 @implementation NBVoiceItem
 @end
 
-@interface VoicePickerViewController () <UITableViewDataSource, UITableViewDelegate>
+@interface VoicePickerViewController () <UITableViewDataSource, UITableViewDelegate, AVSpeechSynthesizerDelegate>
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSArray<NBVoiceItem *> *voices;   // 第 0 项 = 跟随系统
 @property (nonatomic, copy)   NSString *selectedId;             // 空 = 跟随系统
 @property (nonatomic, assign) float rate;
 @property (nonatomic, strong) AVSpeechSynthesizer *preview;     // App 侧试听用
+// v0.0.30：标记「这次 stop 是为了接下一句」，用完即复位。
+// 🔴 为什么需要它：`stopSpeakingAtBoundary:` 会异步回调 `didCancelSpeechUtterance:`，
+//    而那个回调里我们要交还音频会话。可"连点两次试听"时，第一次的 stop 回调
+//    是在第二次 `speakUtterance:` 之后才到的 —— 那时新的一句**正在说**。
+//    如果看 `preview.speaking` 判断，就依赖"回调一定晚于 speakUtterance 生效"这个时序推断，
+//    推断一旦不成立就会把正在说的那句掐断。用显式标志位不依赖任何时序。
+@property (nonatomic, assign) BOOL previewStoppedForNew;
 - (void)buildVoices;
 - (void)persist;
 - (void)previewWithText:(NSString *)text;
@@ -158,6 +166,9 @@ static NSArray<NSString *> *NBRateNames(void) {
     if (!text.length) return;
     @try {
         if (!self.preview) self.preview = [[AVSpeechSynthesizer alloc] init];
+        // v0.0.30：必须挂 delegate —— 否则"说完了"这件事没有任何回调可用，
+        // 音频会话也就永远没有交还的时机（这正是这一版要修的东西）。
+        self.preview.delegate = self;
 
         // 🔴 App 里必须自己配 audio session。
         //    不配的话，手机静音键一拨就听不到任何声音 —— 用户会以为"选声音没反应"。
@@ -169,6 +180,8 @@ static NSArray<NSString *> *NBRateNames(void) {
         [s setActive:YES error:nil];
 
         if (self.preview.speaking) {
+            // 先打标记再 stop：这个 stop 是为了接下一句，不是"用户不要听了"
+            self.previewStoppedForNew = YES;
             [self.preview stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
         }
         AVSpeechUtterance *u = [AVSpeechUtterance speechUtteranceWithString:text];
@@ -180,7 +193,41 @@ static NSArray<NSString *> *NBRateNames(void) {
         [self.preview speakUtterance:u];
     } @catch (__unused NSException *e) {
         // 试听失败不影响保存
+        // 但别把会话留在 active 状态：试着交还一次（内部会判断有没有人在响）
+        [NotifyFilter releaseAudioSessionIfIdle];
     }
+}
+
+#pragma mark - v0.0.30：试听结束 ⇒ 交还音频会话
+
+// 说完了 ⇒ 交还。
+// ⚠️ 已知精度限制：`didFinish` 之后硬件缓冲里的尾韵可能还有几十毫秒，
+//    这里立刻交还可能削掉极短的尾巴。这条只能靠真机听感确认，静态判据证明不了。
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)s didFinishSpeechUtterance:(AVSpeechUtterance *)u {
+    self.previewStoppedForNew = NO;         // 正常说完，标志位不该残留
+    [NotifyFilter releaseAudioSessionIfIdle];
+}
+
+// 被 stop 了 ⇒ 只有在"这次停不是为了接下一句"时才交还
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)s didCancelSpeechUtterance:(AVSpeechUtterance *)u {
+    if (self.previewStoppedForNew) {
+        self.previewStoppedForNew = NO;
+        return;                             // 新的一句已经在说了，交还会把它掐断
+    }
+    [NotifyFilter releaseAudioSessionIfIdle];
+}
+
+// 离开这一页 ⇒ 停掉试听并把会话交还（用户可能试听完直接退出 App）
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    @try {
+        if (self.preview.speaking) {
+            self.previewStoppedForNew = NO; // 这次是真的不要了
+            [self.preview stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
+        }
+    } @catch (__unused NSException *e) { }
+    // 幂等：上面没在说也调一次，兜住"回调没来"的情况
+    [NotifyFilter releaseAudioSessionIfIdle];
 }
 
 #pragma mark - 表格
