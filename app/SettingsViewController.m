@@ -80,6 +80,14 @@ static const NSInteger kSubHit = 105;
 - (void)onClose:(id)sender;
 - (void)onReplace:(id)sender;
 - (void)onClearAll:(id)sender;
+// v0.0.45 批量清理。**必须显式声明**：`onBatchClean:` 要调 `pickAppToClean`，
+// 而后者定义在它**之后** —— 项目开 -Werror，靠定义顺序解析选择器会直接编不过。
+- (void)onBatchClean:(id)sender;
+- (void)confirmDeleteTitle:(NSString *)title
+                    bundle:(NSString *)bundle
+                  beforeTs:(NSTimeInterval)beforeTs
+                  readOnly:(BOOL)readOnly;
+- (void)pickAppToClean;
 - (void)onWhite:(id)sender;
 - (void)onBlack:(id)sender;
 - (void)onSpeakApps:(id)sender;
@@ -224,6 +232,10 @@ static const NSInteger kSubHit = 105;
     // ---------- 工具 ----------
     [self addActionRow:@"内容替换规则" key:@"replace" action:@selector(onReplace:)];
     [self addActionRow:@"App 枚举诊断" key:@"appdiag" action:@selector(onAppDiag:)];
+    // v0.0.45：批量清理。**放在「清空全部记录」上面** ——
+    // 用户想清的是"某一批"，而"全清"是那个操作的极端形式；
+    // 把"更常用、更安全的"排在前面，能少一点误点全清。
+    [self addActionRow:@"批量清理记录" key:@"batchclean" action:@selector(onBatchClean:)];
     [self addActionRow:@"清空全部记录" key:@"clear" action:@selector(onClearAll:)];
 
     self.hintLabel = [[UILabel alloc] init];
@@ -238,6 +250,15 @@ static const NSInteger kSubHit = 105;
         @"• 被拦下的通知仍然会记进盒子里，方便回头查本来要推什么。\n"
         @"• 内容替换只改通知上显示的文字；盒子里存的仍是原文。\n"
         @"• 记录上限默认 500；超出后自动淘汰最旧的。\n"
+        // 🔴🔴 v0.0.45：把"填大了会怎样"写进界面。
+        //    列表一次最多显示 2000 条 ⇒ 上限填到 2000 以上时，
+        //    超出那部分**翻不到**，只能用「导出」看。
+        //    不写这句，用户填了 99999 会以为自己留了 10 万条 ——
+        //    那正是本项目最忌的"两个指标互相矛盾"（列表说的和库里的不是一回事）。
+        @"• 列表一次最多显示 2000 条：上限填得更大时，更早的记录翻不到，\n"
+        @"  要用首页的「导出」才能看到（导出不带这个上限）。\n"
+        @"• 「批量清理记录」可按时间（7/30 天前）、按已读、按某个 App 删；\n"
+        @"  确认框里报的条数就是真会删掉的条数。\n"
         @"• 朗读默认关闭。打开后会占用音频通道，可能让正在播放的音乐变小或暂停 ——\n"
         @"  这是系统语音合成的固有行为，不是 bug。\n"
         @"• 朗读只念「替换后」的文字（跟通知上看到的一致）；被过滤规则拦下的通知不念。\n"
@@ -851,6 +872,136 @@ static const NSInteger kSubHit = 105;
         [self.view setNeedsLayout];
         [self.view layoutIfNeeded];
     }]];
+    a.popoverPresentationController.sourceView = self.view;
+    a.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2,
+                                                           self.view.bounds.size.height / 2, 1, 1);
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+#pragma mark - v0.0.45 批量清理
+
+// 统一的「先报数、再删」出口。四个入口（7 天 / 30 天 / 已读 / 按 App）都走这里。
+// 🔴🔴 确认框里的条数**只能**由 `countForDeleteWithBundle:` 算，
+//    不能拿列表条数代替：列表带 `LIMIT 2000`，筛选态下还会被搜索词再切一刀 ——
+//    v0.0.35 的 `onClear:` 就是报了列表条数（3）、实际清了整张表（2000），
+//    那是本项目"两个指标互相矛盾"的第一次，别再买第二次。
+- (void)confirmDeleteTitle:(NSString *)title
+                    bundle:(NSString *)bundle
+                  beforeTs:(NSTimeInterval)beforeTs
+                  readOnly:(BOOL)readOnly {
+    NSInteger n = [NotifyStore countForDeleteWithBundle:bundle beforeTs:beforeTs readOnly:readOnly];
+    if (n < 0) {
+        [self fail:(n == -2) ? @"清理条件不完整（至少要有一个范围）" : @"数据库打不开，无法清理"];
+        return;
+    }
+    if (n == 0) {
+        // 🔴 "删了个空"必须**明确说出来**。静默成功会让用户以为删掉了，
+        //    回头一看记录还在 ⇒ 判定功能坏了。
+        self.statusLabel.textColor = [UIColor labelColor];
+        self.statusLabel.text = [NSString stringWithFormat:@"%@：没有符合条件的记录，什么都没删", title];
+        [self.view setNeedsLayout];
+        [self.view layoutIfNeeded];
+        return;
+    }
+    UIAlertController *a = [UIAlertController
+                            alertControllerWithTitle:title
+                                             message:[NSString stringWithFormat:
+                                                      @"将删除 %ld 条记录，不可恢复。", (long)n]
+                                      preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"删除 %ld 条", (long)n]
+                                         style:UIAlertActionStyleDestructive
+                                       handler:^(UIAlertAction *act) {
+        NSInteger done = [NotifyStore deleteWithBundle:bundle beforeTs:beforeTs readOnly:readOnly];
+        NSInteger after = [NotifyStore count];
+        self.statusLabel.textColor = (done > 0) ? [UIColor labelColor] : [UIColor systemRedColor];
+        self.statusLabel.text = [NSString stringWithFormat:@"%@：删掉 %ld 条，剩余 %ld 条",
+                                 title, (long)done, (long)after];
+        [self refreshActionValues];
+        [self.view setNeedsLayout];
+        [self.view layoutIfNeeded];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)onBatchClean:(id)sender {
+    [self.view endEditing:YES];
+    UIAlertController *a = [UIAlertController
+                            alertControllerWithTitle:@"批量清理记录"
+                                             message:@"只删记录，不影响设置和替换规则。"
+                                      preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) wself = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    // 🔴 `beforeTs` 的语义是"**严格早于**"，所以传"N 天前那一刻"，不是 now。
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    [a addAction:[UIAlertAction actionWithTitle:@"删除 7 天前的记录"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *act) {
+        [wself confirmDeleteTitle:@"删除 7 天前的记录" bundle:nil
+                         beforeTs:now - 7 * 86400.0 readOnly:NO];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"删除 30 天前的记录"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *act) {
+        [wself confirmDeleteTitle:@"删除 30 天前的记录" bundle:nil
+                         beforeTs:now - 30 * 86400.0 readOnly:NO];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"删除全部已读记录"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *act) {
+        [wself confirmDeleteTitle:@"删除全部已读记录" bundle:nil beforeTs:0 readOnly:YES];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"按 App 删除…"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *act) {
+        [wself pickAppToClean];
+    }]];
+    a.popoverPresentationController.sourceView = self.view;
+    a.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2,
+                                                           self.view.bounds.size.height / 2, 1, 1);
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+// 🔴 只列"来过通知的 App"（`bundleCounts` 有值）：没来过通知的 App 删了也是 0 条，
+//    把它们列进来只会把这个清单变成几百项的滚动地狱。
+// 🔴 超过 12 个只列最多的 12 个 —— 这是**删除**操作，清单越长越容易点错。
+- (void)pickAppToClean {
+    NSDictionary<NSString *, NSNumber *> *counts = [NotifyStore bundleCounts];
+    if (!counts.count) {
+        [self fail:@"还没有任何记录"];
+        return;
+    }
+    NSMutableDictionary<NSString *, NSString *> *names = [NSMutableDictionary dictionary];
+    for (InstalledApp *a in [InstalledApps all]) {
+        if (a.bundleId.length) names[a.bundleId] = a.name;
+    }
+    NSArray<NSString *> *bids = [counts keysSortedByValueUsingComparator:
+                                 ^NSComparisonResult(NSNumber *x, NSNumber *y) {
+        return [y compare:x];                    // 条数多的排前面
+    }];
+    NSUInteger lim = MIN(bids.count, (NSUInteger)12);
+    UIAlertController *a = [UIAlertController
+                            alertControllerWithTitle:@"删除某个 App 的全部记录"
+                                             message:[NSString stringWithFormat:
+                                                      @"共 %lu 个 App 有记录%@",
+                                                      (unsigned long)bids.count,
+                                                      (bids.count > lim) ? @"（列出条数最多的 12 个）" : @""]
+                                      preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) wself = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    for (NSUInteger i = 0; i < lim; i++) {
+        NSString *bid = bids[i];
+        NSString *nm = names[bid];
+        if (!nm.length) nm = [[bid componentsSeparatedByString:@"."] lastObject];
+        NSString *row = [NSString stringWithFormat:@"%@（%@ 条）", nm, counts[bid]];
+        [a addAction:[UIAlertAction actionWithTitle:row
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *act) {
+            [wself confirmDeleteTitle:[NSString stringWithFormat:@"删除「%@」的全部记录", nm]
+                               bundle:bid beforeTs:0 readOnly:NO];
+        }]];
+    }
     a.popoverPresentationController.sourceView = self.view;
     a.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2,
                                                            self.view.bounds.size.height / 2, 1, 1);

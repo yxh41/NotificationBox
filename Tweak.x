@@ -1,8 +1,14 @@
-// Tweak.x —— v0.0.44（当前）：**tweak 侧仍无逻辑改动**，只升版本号；本版改的是盒子 App
-//   （App 名改用桌面短名 + 搜索命中高亮 + 导出 CSV）。
-//   🔴 连着七版都写清楚这一点，因为日志里会打出 v0.0.44 —— 不给说明的话，
-//      以后看到这版日志会以为 tweak 也动了，白查一轮。
-//   上一版 v0.0.43：真机反馈两修（App 中文名 + 底部截断提示的未读口径）
+// Tweak.x —— v0.0.45（当前）：**tweak 侧这次真的有逻辑改动了** ——
+//   在 SpringBoard 后台代读 App 显示名、写进 `app_names` 表。
+//   🔴 为什么要由 tweak 来做（这是 v0.0.42/43/44 连着三版没修好的直接原因）：
+//     盒子 App 有沙盒，读不到 /var/containers/Bundle/Application/<UUID>/Xxx.app，
+//     而 App 自己 bundle 里本地化的 CFBundleDisplayName **才是桌面那个字的权威来源**。
+//     ⇒ 不是"在没权限的地方再猜一轮"，而是让有权限的进程（SpringBoard）算好送来。
+//     完整说明见 NBAppName.h。
+// 🔴 连着八版都写清楚"tweak 到底动没动"，因为日志里会打出 v0.0.45 —— 不给说明的话，
+//      以后看到这版日志会以为 tweak 动了别的地方，白查一轮。
+//   上一版 v0.0.44：App 名改用桌面短名 + 搜索命中高亮 + 导出 CSV（**只有 App 侧**）。
+//   上上版 v0.0.43：真机反馈两修（App 中文名 + 底部截断提示的未读口径）
 //   上上版 v0.0.42：列表显示 App 名 + 搜索能搜 App 名和 subtitle + 搜索防抖 + 底部截断提示
 //   上上版 v0.0.41：顶部提示条可点 + 未读派生量收成一个出口（只有 App 侧）
 //   上上上版 v0.0.40：提示条范围从"比时间窗更早"扩成"当前筛选之外"（只有 App 侧）
@@ -105,6 +111,7 @@
 #import "NotifySpeaker.h"
 #import "NotifyProbe.h"
 #import "NotifySoundDiag.h"
+#import "NBAppName.h"
 
 
 static int gHit1 = 0;   // publishBulletin:destinations:
@@ -630,13 +637,67 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         //    和 v0.0.15 那个坏掉的 guard 的区别：这里的 start/done 是**配对写**的
         //    （都在 NotifyFilter 的同一个函数里），而且关开关之后会**回读确认**。
         soundRecovered = [NotifyFilter recoverFromSoundCrashIfNeeded];
+
+        // ---------- v0.0.45：SpringBoard 侧**代读** App 显示名 ----------
+        //
+        // 🔴🔴 病根（v0.0.42/43/44 连着三版没修好的那个）：
+        //     用户报「京东显示的不是『京东』两个字」「信息 App 显示的不是『信息』」。
+        //     三版都在**盒子 App 进程里**打转（换字段、加汉字优先、加"取更短"），
+        //     但没碰一个前提：**盒子 App 有沙盒**。
+        //     名字最权威的来源不是 `LSApplicationProxy.localizedName`（那是 App Store
+        //     的**商品名**，常带「-购物商城」这类副标题），而是 **App 自己 bundle 里
+        //     本地化过的 CFBundleDisplayName** —— 那才是 SpringBoard 画在图标底下的字。
+        //     而桌面上的用户 App 装在 /var/containers/Bundle/Application/<UUID>/Xxx.app，
+        //     **沙盒 App 读不到那一层**。
+        //     ⇒ 正解不是"在没权限的地方再猜一轮"，而是**让有权限的进程算好送来**。
+        //       SpringBoard 有权限，把结果写进 `app_names` 表，盒子 App 只管读。
+        //
+        // 🔴🔴🔴 三条安全约束，一条都不能省：
+        //   ① **必须后台线程** —— 这里是 SpringBoard 的构造函数，
+        //      主线程卡住的表现是白苹果/重启，代价远大于"名字还是差点"。
+        //   ② **必须延迟** —— 刚启动时 LaunchServices 的注册表可能还没建好，
+        //      立刻枚举只会拿到一部分（而且是静默地少）。
+        //   ③ **整段 @try** —— 名字是锦上添花，解析失败最多是名字差一点，
+        //      绝不能把通知录制这条主路径拖下水。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+            @try {
+                // 先跑一遍**不读 bundle**的全量枚举（快），只为拿到完整的 bid 列表
+                NSMutableArray<NSString *> *stats = [NSMutableArray array];
+                NSDictionary<NSString *, NSString *> *fast = NBEnumerateAppNames(NO, stats);
+                if (!fast.count) {
+                    NBLog(@"!!! [SpringBoard] v0.0.45 App 名表：枚举失败 · %@",
+                          [stats componentsJoinedByString:@" · "]);
+                    return;
+                }
+                NSDictionary<NSString *, NSString *> *known = [NotifyStore appNames];
+                // 只精修"表里还没有的"：第一次是全部（表空），之后就是新装的几个
+                // ⇒ 不会每次开机都把 200 多个 bundle 重读一遍。
+                NSMutableDictionary<NSString *, NSString *> *todo = [NSMutableDictionary dictionary];
+                for (NSString *bid in fast) {
+                    if (known[bid].length) continue;
+                    todo[bid] = [fast objectForKey:bid];
+                }
+                NSMutableDictionary<NSString *, NSString *> *refined = [NSMutableDictionary dictionary];
+                for (NSString *bid in todo) {
+                    NSString *nm = NBResolveNameForBundle(bid);
+                    if (nm.length) refined[bid] = nm;
+                }
+                NSInteger written = refined.count ? [NotifyStore saveAppNames:refined] : 0;
+                NBLog(@"=== [SpringBoard] v0.0.45 App 名表：枚举 %lu 个 · 待补 %lu 个 · 写入 %ld 个 · %@ ===",
+                      (unsigned long)fast.count, (unsigned long)todo.count, (long)written,
+                      [stats componentsJoinedByString:@" · "]);
+            } @catch (NSException *e) {
+                NBLog(@"!!! [SpringBoard] v0.0.45 App 名表解析抛异常（不影响录制）：%@", e);
+            }
+        });
     }
 
     // 🔴 v0.0.19：banner 里**不许再出现"延迟"的"已启用/已触发"字样**。
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.44 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.45 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -674,7 +735,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.44 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.45 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -739,7 +800,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.44 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.45 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
