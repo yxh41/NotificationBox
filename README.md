@@ -2692,8 +2692,187 @@ if i_kill < 0 or i < i_kill:      # ← 方向写反了：i < i_kill 恰恰是"�
 
 | 候选 | 用户多久撞上 | 工作量 | 说明 |
 |---|---|---|---|
-| ① **音频会话收尾** | 一周内 | 小 | 现在 `setActive:YES` **没有配对 `setActive:NO`**（全项目只此一处）。别的 App 想放音时可能被压住。判据要写成"live 空了才交还"，不能每条通知都 `setActive:NO`（那样会把正在播的也停掉） |
+| ① **音频会话收尾** ✅ **v0.0.30 已做**（见下一章） | 一周内 | 小 | 现在 `setActive:YES` **没有配对 `setActive:NO`**（全项目只此一处）。别的 App 想放音时可能被压住。判据要写成"live 空了才交还"，不能每条通知都 `setActive:NO`（那样会把正在播的也停掉） |
 | ② 按 App 的音也配"时长" | 一周内 | 小 | 现在「最长播放秒数」是全局一份 |
 | ③ 放着音乐时的行为（验证） | 不一定 | 小 | v0.0.28 列过，一直没验 |
 | ④ 收尾 | — | 小 | 撤销轮换 PAT、归档临时脚本、清掉 `Local Settings\Temp` 里三个硬编码 token 的旧脚本 |
 
+
+## v0.0.30 · 音频会话交还：`setActive:YES` 之后要还回去
+
+### 一、真问题（代码事实）
+
+全项目 `setActive:YES` 有 **两处**，`setActive:NO` **一处都没有**：
+
+| 处 | 类别 / 选项 | 谁会受影响 |
+|---|---|---|
+| `NotifyFilter.m` 换音 B 通道 | Ambient + MixWithOthers | 影响小（Ambient 是混音类别，本来就不打断别人），主要是状态残留 |
+| `app/VoicePickerViewController.m` 语音试听 | Playback + **DuckOthers** | 影响大：DuckOthers 的语义就是「把别人正在放的音乐**压下去**」 |
+
+会话激活后不交还，被压下去的音乐**能不能自己把音量拿回来**，是这类 App 的经典坑；
+除此之外，「音频进行中」这个状态一直挂着，也可能干扰蓝牙路由 / AirPods 自动切换这些系统行为
+（后半句属于推断，只能真机验，写在这里是为了别把它当成已证结论）。
+
+### 二、做法：保守放行式交还
+
+```
+releaseAudioSessionIfIdle:
+  ① B 通道 live 非空        ⇒ 不交还（提示音还在响）
+  ② 朗读在播                ⇒ 不交还（交还就把那句掐断）
+  两条都空 ⇒ setActive:NO with NotifyOthersOnDeactivation
+```
+
+**为什么要 `NotifyOthersOnDeactivation`**：不带这个选项只是"我方放开"，
+被我们压低过的别人的音乐**不会自己恢复音量**。带上了才是真正的"交还"。
+这一条是"交还"和"光放开"的分界，所以单独立了一条判据（a02）。
+
+**为什么两个条件都要判**：只判 live 会把朗读掐断；只判朗读会在提示音还响着的时候交还。
+两者都判才叫"保守"——**只要有任何可能在响，就不交还**。
+
+### 三、四处调用点，以及每一处的顺序理由
+
+| 位置 | 为什么在这里 |
+|---|---|
+| B 通道到点收工的 `dispatch_after` 末尾 | **必须排在 `[live removeObject:pl]` 之后**：反了的话此刻 live 里还留着自己，交还函数会以为"还有人在响" |
+| 试听异常的 `@catch` | 异常路径最容易漏交还，而它恰恰是最可能留下脏状态的那条路 |
+| `didFinishSpeechUtterance`（说完了） | 这是"说完了"这件事**唯一**的回调来源 |
+| `didCancelSpeechUtterance`（被取消） | 连点试听会走这条路，见下 |
+| `viewWillDisappear`（离开页面） | 用户试听完直接退出 App，回调可能来不及；这里幂等地再交还一次 |
+
+### 四、🔴 两个"只能这么写"的地方
+
+**(1) 问朗读必须走反射 + 分类声明**
+
+`NotifySpeaker.m` **只编进 SpringBoard，没有编进盒子 App**（`Makefile` 的 `NotifyBoxApp_FILES` 里没有它）。
+而 `NotifyFilter.m` 是**两边都编**的 ⇒ 直接 `[NotifySpeaker isSpeakingNow]` 在 App 上会在
+**链接期** undefined symbol：编译期完全看不出来，装到手机上才炸。
+
+所以是三步：
+
+```objc
+@interface NSObject (NBSpeakerProbe)     // ① 告诉 clang"类上可能有这个方法"
++ (BOOL)isSpeakingNow;
+@end
+...
+Class spk = NSClassFromString(@"NotifySpeaker");                   // ② 先问"这个进程里有没有"
+if (spk && [spk respondsToSelector:@selector(isSpeakingNow)]) {     // ③ 运行期兜底
+    if ([spk isSpeakingNow]) return;
+}
+```
+
+> 🔴 **不能**写成 `@protocol NBSpeakerProbe` + `[(id<NBSpeakerProbe>)spk isSpeakingNow]`：
+> 给 `id<协议>` 发消息时 clang 只查协议里的**实例方法**，而 `isSpeakingNow` 是**类方法**
+> ⇒ `no known instance method for selector` ⇒ `-Werror` 直接挂。
+> 这个项目没有 Mac、编译只在 CI 上跑，所以这种"编译期才暴露"的写法必须**提前**想清楚。
+> 判据 a04 现在会主动抓这个形状（用 `id<…>` 给类发类方法 ⇒ 报红）。
+
+**(2) 取消回调用显式标志位，不靠 `speaking` 猜时序**
+
+`stopSpeakingAtBoundary:` 触发的 `didCancelSpeechUtterance:` 是**异步投递**的。
+"连点两次试听"的时序是：
+
+```
+第 1 次：speak(A)
+第 2 次：setActive:YES → stopSpeaking(清掉 A) → speak(B)
+         ↑ didCancel(A) 的回调要到这时之后才被投递
+```
+
+回调里如果看 `preview.speaking` 判断"是不是还有新的在说"，就依赖
+「回调一定晚于 speakUtterance 生效」这个**时序推断**——推断一旦不成立，
+就会把**正在说的那句**掐断。所以用一个显式标志位：
+
+```objc
+self.previewStoppedForNew = YES;    // 先打标记，再做 stop
+[self.preview stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
+...
+- (void)speechSynthesizer:didCancelSpeechUtterance: {
+    if (self.previewStoppedForNew) { self.previewStoppedForNew = NO; return; }  // 有新的接上，不交还
+    [NotifyFilter releaseAudioSessionIfIdle];
+}
+```
+
+不依赖任何时序，只依赖"我自己打的标记"。
+
+### 五、判据（12 条语义 + 12 条负向变异）
+
+| 组 | 判据 | 要害 |
+|---|---|---|
+| a01 | 扫**全仓库**：含 `setActive:YES` 的文件必须有交还路径；**实现方自己**必须含 `setActive:NO` | 防止将来新增一处裸激活；也防止"只把激活点藏进函数" |
+| a02 | 交还带 `NotifyOthersOnDeactivation` | 不带 ⇒ 被压低的音乐不恢复 |
+| a03 | 先问朗读，再 `setActive:NO` | 顺序反了 = 无条件交还 |
+| a04 | 反射三件套（`NSClassFromString` + `respondsToSelector` + 分类声明），且**不许** `id<协议>` 给类发类方法 | 链接期 / 编译期两个雷 |
+| a05 | `live` 非空就 return，且守卫在 `setActive:NO` 之前 | 否则掐短正在响的音 |
+| a06 | 交还排在 `[live removeObject:pl]` **之后** | 顺序反了白调一次，且放松一点就掐音 |
+| a07 | 播放函数里不许出现 `setActive:NO` | 播一半交还 = 断在半截 |
+| a08 | `isSpeakingNow` 是纯读（不许 stop / speak / setActive） | 探针有副作用，交还时机永远查不清 |
+| b01 | App 侧：delegate 协议 + `preview.delegate = self` + 说完 + 取消 + 标志位 + 离开页面，且交还点 ≥ 4 处 | 少任何一处就是"不交还" |
+| b02 | 取消回调必须看标志位 | 否则连点试听会掐断新那句 |
+| v01~v02 | 版本 0.0.30 三处齐 · 改过的文件括号与 `@end` 配平 | — |
+
+**反向对照**：喂 v0.0.29 的源码 ⇒ **10 条变红**，剩下 `a07`（v0.0.29 本来就没有裸交还）
+和 `v02`（括号配平）—— 这两条按设计就该绿。
+
+> 顺手修了一处判据自身的老毛病：v0.0.29 的 `v02` 只统计
+> `@interface + @implementation` 与 `@end` 的配平，**漏了 `@protocol`**。
+> 这一版一度真的加了 `@protocol`（后来改成分类），当时那条判据就会**假红**。
+> 现在 `@protocol` 也算进去了。
+>
+> 另外这一轮负向自测抓到一个**老坑的新面向**：变异锚点撞在**注释**上。
+> - `a04` 的锚点 `NSClassFromString(@"NotifySpeaker")` —— 我为了让人看懂，在文件顶部的
+>   说明性注释里把这段代码**抄了一遍** ⇒ `replace(…,1)` 先命中注释 ⇒ 注释被 strip ⇒ 变异白做。
+> - `v02` 的变异把 `{` 加在了**注释行尾** ⇒ 括号统计根本读不到。
+>
+> 教训：**注释里抄代码会给变异埋雷**。锚点要么带缩进取整行代码，要么就别在注释里抄代码原样。
+
+### 六、包级判据（14 条）+ 反向对照
+
+| 组 | 判据 | 为什么这条必须存在 |
+|---|---|---|
+| A1~A2 | control / 文件名是 0.0.30 | — |
+| B1 | tweak 有 `v0.0.30` | — |
+| B2~B3 | `releaseAudioSessionIfIdle` / `isSpeakingNow` 两个**选择器**在包里 | 名字进不了包 = 调用点被优化掉 / 根本没参与编译 |
+| B4 | 字面量 `NotifySpeaker` 在包里 | 不在 ⇒ 反射永远拿 nil ⇒ **永不防掐朗读**（而源码看着完全正常） |
+| B5 | `nbPlaySoundFile:forOwner:result:` 还在 | 回归：v0.0.29 的入口没被这一版带坏 |
+| B6~B9 | App 侧：`releaseAudioSessionIfIdle` / `didFinishSpeechUtterance` / `didCancelSpeechUtterance` / `setPreviewStoppedForNew:` | 任何一个不在 = delegate 没挂上 / 标志位没编进去，都是"看着有代码、实际不交还" |
+| C1 | tweak 里没有 `v0.0.29` 残留 | 反向：版本串真的升上来了 |
+| D1~D2 | `@preview` / `SoundAppsViewController` 还在 | 回归：前两版的功能没被带坏 |
+
+**反向对照**（喂 v0.0.29 的 deb）：**4/14 通过** —— 活下来的正好是 B4 / B5 / D1 / D2
+（这四条在 v0.0.29 里本来就有），其余 **10 条全红**。
+
+### 七、交付
+
+| 项 | 值 |
+|---|---|
+| deb | `com.yxh41.notifybox_0.0.30_iphoneos-arm64e.deb` · **99434 B** |
+| CI | **#58**（`run_id 40071814036`，head `518b1efab0e7`）success |
+| 产物 zip | 99627 B（与 API `size_in_bytes` 对拍一致） |
+| 远端 | `518b1efab0e7` = 本地 `d91db9ceb504`，**51 个文件逐 blob 一致** |
+
+> ✅ 这次 CI 编译一次过。但它**本来是有两个必挂点**的，都在提交前自查掉了：
+> ① `[(id<NBSpeakerProbe>)spk isSpeakingNow]`（protocol 里是类方法，给 `id<Proto>` 发消息
+> clang 只查实例方法 ⇒ `-Werror` 挂）；② 直接 `[NotifySpeaker isSpeakingNow]`
+> （App 目标没链 NotifySpeaker.m ⇒ 链接期 undefined symbol，编译期看不出来）。
+> 没有 Mac、只能靠 CI 编译的项目，"编译期才暴露的写法"必须在写的时候就想清楚 —— 这一条比省事重要。
+
+### 八、装了这一版要验什么（这版判据只能说"写了"，结论得靠耳朵）
+
+| # | 操作 | 期望 |
+|---|---|---|
+| 1 | 放一首歌 → 盒子 App 里试听几条语音（语速、声音）→ 退出 App | 歌的音量**回到原样**，没有一直偏低 |
+| 2 | 放歌的同时收一条**长**提示音（≥8 秒 mp3） | 提示音期间歌被压低，提示音结束后**音量自己回来** |
+| 3 | 开着朗读 + 换提示音，让一条通知同时触发两者 | 朗读**不被打断**（这是 a03 那道闸门在真机上唯一能被验证的地方） |
+| 4 | 在语音页连点两次试听 | 第二次能正常出声（不许"点了没声音"—— 那是交还掐断了新那句） |
+| 5 | 回归：连发、按 App 各自一个音、连发不叠加 | 与 v0.0.29 一致 |
+
+> 第 3 条如果**朗读被打断**：说明闸门没起作用（反射拿到 nil）。这时先确认日志里两次通知是同一进程
+> （`proc=` 一致），再怀疑 `NSClassFromString` 那条。
+
+### 九、下一步候选
+
+| 候选 | 用户多久撞上 | 工作量 | 说明 |
+|---|---|---|---|
+| ① **按 App 配时长** | 一周内 | 中 | 现在「最长播放秒数」是全局一份。要进 entry（`{file, maxSec}`）就得再动一次存储格式 + 迁移 |
+| ② 换音 B 通道也压别人（可选） | 不一定 | 小 | 现在 Ambient 完全混音。若用户希望"来通知时音乐小一点"，可以给个开关切到 DuckOthers —— 但那会引入更多会话状态，**先有需求再做** |
+| ③ 试听削尾（已知精度限制） | 低 | 小 | `didFinish` 之后缓冲尾韵可能被交还削掉几十毫秒。要治就得延迟交还，而"固定延迟"在本项目里是禁忌（见铁律），得先有真机听感证据 |
+| ④ 收尾 | — | 小 | 撤销轮换 PAT、归档临时脚本、清掉 `Local Settings\Temp` 里三个硬编码 token 的旧脚本 |
