@@ -157,22 +157,35 @@ NS_ASSUME_NONNULL_BEGIN
 //    不分成两条查 —— 两条就有可能出现"A 口径的总数 + B 口径的未读"，
 //    而本项目最贵的那次事故（v0.0.37 红点永远消不掉）正是两个指标不同口径。
 // 🔴 `since` 与列表同一口径（`ts >= since`），0 = 全库。
+// 🔴 `beforeTs` 是**自定义时间窗的上界**（`ts < beforeTs`），0 = 不限（配合 `since`）。
 // 🔴 `limit` <= 0 表示不限制。
-+ (NSArray<NSDictionary *> *)statsBundlesSince:(NSTimeInterval)since limit:(NSInteger)limit;
++ (NSArray<NSDictionary *> *)statsBundlesSince:(NSTimeInterval)since
+                                       beforeTs:(NSTimeInterval)beforeTs
+                                          limit:(NSInteger)limit;
 // 按时间桶分组。`byHour` = YES 时返回 **24 个桶（含 0 条的）**，key 是 @"hour"（0~23）；
 // NO 时按天，key 是 @"day"（yyyy-MM-dd），只回有记录的天。
 // 🔴 用 `localtime`：库里存的是 unix 时间戳，**不转换会得到 UTC 的小时**
 //    ⇒ 用户看到"我明明晚上收到的，却算在凌晨"。
-+ (NSArray<NSDictionary *> *)statsBucketsSince:(NSTimeInterval)since byHour:(BOOL)byHour;
++ (NSArray<NSDictionary *> *)statsBucketsSince:(NSTimeInterval)since
+                                     beforeTs:(NSTimeInterval)beforeTs
+                                       byHour:(BOOL)byHour;
 // 统计页顶部那一行：总条数、未读、覆盖多少个 App、最早一条的时间。
 // 🔴 返回的字典里 key 固定为 total / unread / apps / earliest（earliest 是 NSDate 或 nil）。
-+ (NSDictionary *)statsSummarySince:(NSTimeInterval)since;
++ (NSDictionary *)statsSummarySince:(NSTimeInterval)since beforeTs:(NSTimeInterval)beforeTs;
 
 // 设置（App 侧的**唯一**读写入口；tweak 侧读走 NotifyCommon.h 的 NBLoadSettings）
 // 🔴 统一在这里写，别让每个 VC 各写一遍 writeToFile: —— 写入点一多，
 //    "某个页面写了、另一个页面没写" 这类 bug 就必然出现。
 + (NSDictionary *)settings;
 + (BOOL)saveSettings:(NSDictionary *)settings;
+// v0.0.47：自动清理「保留最近 N 天」。`days` = 0 表示关闭（默认）。
+// 🔴 读取/写入都走 settings.plist（和 maxRecords 同一个入口）。
+// 🔴 `runAutoClean` 在 App 启动时调一次：days>0 时把**早于 `now-days*86400`**的记录整批删掉
+//    （连未读一起，因为"保留最近 N 天"的语义就是"更老的都不要了"）。
+//    复用 v0.0.45 的 `deleteWithBundle:beforeTs:readOnly:`（bundle=nil=所有 App，readOnly=NO=全删）。
++ (NSInteger)autoCleanDays;
++ (void)setAutoCleanDays:(NSInteger)days;
++ (NSInteger)runAutoClean;
 
 // 自检（盒子 App 空列表时直接显示，用来判断沙盒可达性）
 + (NSInteger)count;

@@ -50,9 +50,14 @@
     [super layoutSubviews];
     CGFloat w = self.contentView.bounds.size.width;
     CGFloat pad = 14;
-    CGFloat cntW = 96;
-    self.nameLabel.frame = CGRectMake(pad, 7, w - pad * 2 - cntW - 8, 20);
+    // 🔴 右侧条数/未读标签按内容宽度自适应（不再写死 96 ⇒ 长文本被截断「显示不全」）。
+    //    给名字至少留 80pt；超出则截断右侧标签本身，绝不挤压名字到看不见。
+    CGFloat maxCnt = w - pad * 2 - 80;
+    CGFloat cntW = self.cntLabel.intrinsicContentSize.width;
+    if (cntW > maxCnt) cntW = maxCnt;
+    if (cntW < 0) cntW = 0;
     self.cntLabel.frame  = CGRectMake(w - pad - cntW, 9, cntW, 18);
+    self.nameLabel.frame = CGRectMake(pad, 7, w - pad * 2 - cntW - 8, 20);
     self.barBox.frame    = CGRectMake(pad, 32, w - pad * 2, 8);
     // `barFill` 的高度跟着底槽，宽度由外部按占比设（见 cellForRow）
     self.barFill.frame   = CGRectMake(0, 0, self.barFill.frame.size.width,
@@ -80,12 +85,111 @@
 @property (nonatomic, strong) NSArray<NSDictionary *> *rows;
 @property (nonatomic, strong) NSDictionary<NSString *, NSString *> *names;   // bid -> 显示名
 @property (nonatomic, assign) NSInteger max;                   // 本屏最大值，条形按比例
+@property (nonatomic, assign) NSTimeInterval customSince;      // 自定义时间窗起点（0 = 未设）
+@property (nonatomic, assign) NSTimeInterval customBeforeTs;   // 自定义时间窗上界（0 = 未设）
 
 - (void)onDim:(UISegmentedControl *)seg;
 - (void)onRange:(UISegmentedControl *)seg;
 - (void)reloadData;
 - (NSTimeInterval)sinceFromSeg;
+- (NSTimeInterval)beforeTsFromSeg;
 - (NSString *)nameForRow:(NSDictionary *)d;
+@end
+
+#pragma mark - 自定义时间窗：起止日期选择器（模态）
+
+@interface NBDateRangeViewController : UIViewController
+@property (nonatomic, assign) NSTimeInterval initialSince;
+@property (nonatomic, assign) NSTimeInterval initialBeforeTs;
+@property (nonatomic, copy) void (^completion)(NSTimeInterval since, NSTimeInterval beforeTs);
+@property (nonatomic, copy) void (^cancelBlock)(void);
+@end
+
+@implementation NBDateRangeViewController {
+    UIDatePicker *_startPicker;
+    UIDatePicker *_endPicker;
+}
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"自定义时间窗";
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"完成"
+                                         style:UIBarButtonItemStyleDone
+                                        target:self action:@selector(onDone:)];
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"取消"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(onCancel:)];
+
+    UILabel *ls = [[UILabel alloc] init];
+    ls.text = @"开始日期"; ls.font = [UIFont systemFontOfSize:13];
+    ls.textColor = [UIColor secondaryLabelColor];
+    UILabel *le = [[UILabel alloc] init];
+    le.text = @"结束日期"; le.font = [UIFont systemFontOfSize:13];
+    le.textColor = [UIColor secondaryLabelColor];
+
+    _startPicker = [[UIDatePicker alloc] init];
+    _startPicker.datePickerMode = UIDatePickerModeDate;
+    _startPicker.preferredDatePickerStyle = UIDatePickerStyleWheels;
+    if (@available(iOS 15.0, *)) _startPicker.maximumDate = [NSDate date];
+    _endPicker = [[UIDatePicker alloc] init];
+    _endPicker.datePickerMode = UIDatePickerModeDate;
+    _endPicker.preferredDatePickerStyle = UIDatePickerStyleWheels;
+    if (@available(iOS 15.0, *)) _endPicker.maximumDate = [NSDate date];
+
+    // 🔴 默认值：start = 7 天前；end = 今天（都取当地 0 点）。
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDate *today = [cal startOfDayForDate:[NSDate date]];
+    NSDate *weekAgo = [cal dateByAddingUnit:NSCalendarUnitDay value:-7 toDate:today options:0];
+    if (self.initialSince > 0)
+        _startPicker.date = [cal startOfDayForDate:[NSDate dateWithTimeIntervalSince1970:self.initialSince]];
+    else _startPicker.date = weekAgo;
+    if (self.initialBeforeTs > 0)
+        _endPicker.date = [cal startOfDayForDate:
+                           [NSDate dateWithTimeIntervalSince1970:self.initialBeforeTs - 86400.0]];
+    else _endPicker.date = today;
+
+    for (UIView *v in @[ls, le, _startPicker, _endPicker]) [self.view addSubview:v];
+    ls.translatesAutoresizingMaskIntoConstraints = NO;
+    le.translatesAutoresizingMaskIntoConstraints = NO;
+    _startPicker.translatesAutoresizingMaskIntoConstraints = NO;
+    _endPicker.translatesAutoresizingMaskIntoConstraints = NO;
+    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [ls.topAnchor constraintEqualToAnchor:g.topAnchor constant:16],
+        [ls.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:16],
+        [_startPicker.topAnchor constraintEqualToAnchor:ls.bottomAnchor constant:4],
+        [_startPicker.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:8],
+        [_startPicker.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-8],
+        [le.topAnchor constraintEqualToAnchor:_startPicker.bottomAnchor constant:16],
+        [le.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:16],
+        [_endPicker.topAnchor constraintEqualToAnchor:le.bottomAnchor constant:4],
+        [_endPicker.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:8],
+        [_endPicker.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-8],
+    ]];
+}
+
+- (void)onDone:(id)sender {
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDate *sd = [cal startOfDayForDate:_startPicker.date];          // 当地 0 点
+    NSDate *ed = [cal startOfDayForDate:_endPicker.date];
+    // 🔴 上界 = 结束日 + 1 天 0 点 ⇒ 让「结束日当天」整日都包含在内（闭区间语义）。
+    NSDate *edNext = [cal dateByAddingUnit:NSCalendarUnitDay value:1 toDate:ed options:0];
+    if ([edNext timeIntervalSince1970] <= [sd timeIntervalSince1970]) {
+        // 结束早于开始：把结束往后推一天，保证窗口有效，不弹报错打断用户。
+        edNext = [cal dateByAddingUnit:NSCalendarUnitDay value:1 toDate:sd options:0];
+    }
+    if (self.completion) {
+        self.completion([sd timeIntervalSince1970], [edNext timeIntervalSince1970]);
+    }
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onCancel:(id)sender {
+    if (self.cancelBlock) self.cancelBlock();
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
 @end
 
 @implementation NotifyStatsViewController
@@ -101,7 +205,7 @@
           forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.dimSeg];
 
-    self.rangeSeg = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"7 天", @"30 天"]];
+    self.rangeSeg = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"7 天", @"30 天", @"自定义"]];
     self.rangeSeg.selectedSegmentIndex = 0;
     [self.rangeSeg addTarget:self action:@selector(onRange:)
             forControlEvents:UIControlEventValueChanged];
@@ -148,20 +252,53 @@
 // 🔴 时间窗和列表完全同一个口径（`ts >= since`），不另发明一套 ——
 //    两个指标打架是这个项目最贵的一类事故（v0.0.37 的红点）。
 - (NSTimeInterval)sinceFromSeg {
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     NSInteger i = self.rangeSeg.selectedSegmentIndex;
-    if (i == 1) return now - 7 * 86400.0;
-    if (i == 2) return now - 30 * 86400.0;
+    if (i == 1) return [[NSDate date] timeIntervalSince1970] - 7 * 86400.0;
+    if (i == 2) return [[NSDate date] timeIntervalSince1970] - 30 * 86400.0;
+    if (i == 3) return self.customSince;     // 自定义起点
     return 0;
 }
 
+// 🔴 `beforeTs` 是时间窗的上界（`ts < beforeTs`），只有「自定义」才用，其余窗口都不限上界。
+- (NSTimeInterval)beforeTsFromSeg {
+    return (self.rangeSeg.selectedSegmentIndex == 3) ? self.customBeforeTs : 0;
+}
+
 - (void)onDim:(UISegmentedControl *)seg   { [self reloadData]; }
-- (void)onRange:(UISegmentedControl *)seg { [self reloadData]; }
+- (void)onRange:(UISegmentedControl *)seg {
+    if (seg.selectedSegmentIndex == 3) {
+        // 🔴 选「自定义」就弹起止日期选择器；若用户取消（没选就关掉），
+        //    把分段切回「全部」，避免停在"自定义"却没有任何范围可用。
+        NBDateRangeViewController *r = [[NBDateRangeViewController alloc] init];
+        r.initialSince = self.customSince;
+        r.initialBeforeTs = self.customBeforeTs;
+        __weak typeof(self) wself = self;
+        r.completion = ^(NSTimeInterval since, NSTimeInterval beforeTs) {
+            typeof(self) s = wself;
+            if (!s) return;
+            s.customSince = since;
+            s.customBeforeTs = beforeTs;
+            [s reloadData];
+        };
+        // 🔴 取消时把分段切回「全部」—— 否则会出现"标着自定义、却显示全部"的矛盾。
+        r.cancelBlock = ^{
+            typeof(self) s = wself;
+            if (!s) return;
+            s.rangeSeg.selectedSegmentIndex = 0;
+            [s reloadData];
+        };
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:r];
+        [self presentViewController:nav animated:YES completion:nil];
+        return;
+    }
+    [self reloadData];
+}
 
 - (void)reloadData {
     NSTimeInterval since = [self sinceFromSeg];
+    NSTimeInterval before = [self beforeTsFromSeg];
 
-    NSDictionary *sum = [NotifyStore statsSummarySince:since];
+    NSDictionary *sum = [NotifyStore statsSummarySince:since beforeTs:before];
     NSInteger total  = [sum[@"total"] integerValue];
     NSInteger unread = [sum[@"unread"] integerValue];
     NSInteger apps   = [sum[@"apps"] integerValue];
@@ -186,14 +323,14 @@
     if (dim == 0) {
         // 🔴 只取前 30：这是"谁最烦人"的排名，不是完整名单。
         //    全列出来 200 个 App 反而看不出重点。
-        self.rows = [NotifyStore statsBundlesSince:since limit:30];
+        self.rows = [NotifyStore statsBundlesSince:since beforeTs:before limit:30];
         NSMutableDictionary *m = [NSMutableDictionary dictionary];
         for (InstalledApp *a in [InstalledApps all]) {
             if (a.bundleId.length) m[a.bundleId] = a.name;
         }
         self.names = m;
     } else {
-        self.rows = [NotifyStore statsBucketsSince:since byHour:(dim == 1)];
+        self.rows = [NotifyStore statsBucketsSince:since beforeTs:before byHour:(dim == 1)];
         self.names = @{};
     }
 
