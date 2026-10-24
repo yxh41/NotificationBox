@@ -154,11 +154,11 @@
         [wself addRuleWithKeyword:kw star:YES fold:NO];
     }];
     UIAlertAction *fold = [UIAlertAction actionWithTitle:@"⤓ 折叠" style:UIAlertActionStyleDefault
-                                                 handler:^(UIAlertAction * _NonNull action) {
+                                                 handler:^(UIAlertAction * _Nonnull action) {
         [wself addRuleWithKeyword:kw star:NO fold:YES];
     }];
     UIAlertAction *both = [UIAlertAction actionWithTitle:@"★ 标星 · ⤓ 折叠" style:UIAlertActionStyleDefault
-                                                 handler:^(UIAlertAction * _NonNull action) {
+                                                 handler:^(UIAlertAction * _Nonnull action) {
         [wself addRuleWithKeyword:kw star:YES fold:YES];
     }];
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
