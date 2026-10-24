@@ -222,6 +222,16 @@ static const NSInteger kSubHit = 105;
            keyboard:UIKeyboardTypeNumberPad
                 key:@"maxRecords"];
 
+    // v0.0.47：自动清理「保留最近 N 天」（0 = 关闭，默认）。
+    // 🔴 说明写清楚：这是"更老的都不要了"，连未读一起删；和"记录上限"是两件事——
+    //    上限是库里最多留多少条，自动清理是按时间裁。两条都设时各自独立生效。
+    NSInteger acd = [NotifyStore autoCleanDays];
+    [self addGroup:@"自动清理：保留最近 N 天（0=关闭）"
+                 ph:@"0"
+              value:(acd > 0 ? [NSString stringWithFormat:@"%ld", (long)acd] : @"")
+           keyboard:UIKeyboardTypeNumberPad
+                key:@"autoCleanDays"];
+
     // ---------- 推送拦截 ----------
     [self addActionRow:@"白名单（只推送这些）" key:@"white" action:@selector(onWhite:)];
     [self addActionRow:@"黑名单（不推送这些）" key:@"black" action:@selector(onBlack:)];
@@ -254,6 +264,9 @@ static const NSInteger kSubHit = 105;
         @"• 被拦下的通知仍然会记进盒子里，方便回头查本来要推什么。\n"
         @"• 内容替换只改通知上显示的文字；盒子里存的仍是原文。\n"
         @"• 记录上限默认 500；超出后自动淘汰最旧的。\n"
+        @"• 「自动清理：保留最近 N 天」= 每次打开盒子自动删掉 N 天前的记录（连未读一起，\n"
+        @"  因为"保留最近 N 天"就是"更老的都不要了"）；填 0 或清空 = 关闭。\n"
+        @"  它和"记录上限"是两件事：上限管"库里最多留多少条"，清理管"按时间裁"，可同时开。\n"
         // 🔴🔴 v0.0.45：把"填大了会怎样"写进界面。
         //    列表一次最多显示 2000 条 ⇒ 上限填到 2000 以上时，
         //    超出那部分**翻不到**，只能用「导出」看。
@@ -693,6 +706,19 @@ static const NSInteger kSubHit = 105;
                     d[key] = @(n);
                 } else {
                     [self fail:@"记录上限必须是 1~99999 之间的数字（原值未改）"];
+                    return;
+                }
+            }
+        } else if ([key isEqualToString:@"autoCleanDays"]) {
+            if (v.length == 0) {
+                [d removeObjectForKey:key];   // 清空 = 关闭
+            } else {
+                NSInteger n = [v integerValue];
+                if (n >= 0 && n <= 3650) {
+                    if (n > 0) d[key] = @(n);
+                    else [d removeObjectForKey:key];
+                } else {
+                    [self fail:@"自动清理天数要填 0~3650 之间（0 = 关闭，原值未改）"];
                     return;
                 }
             }

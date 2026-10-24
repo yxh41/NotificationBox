@@ -232,10 +232,15 @@ static NSObject *gAppNameLock = nil;
 // 一开始我试过传 key 数组 + 两个 BOOL（"第一列是 int 还是 text"），
 // 结果读起来像谜语 ⇒ 直接传构造 block，列号由调用方自己写清楚。
 static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterval since,
+                                       NSTimeInterval beforeTs,
                                        NSDictionary *(^build)(sqlite3_stmt *st)) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) return @[];
-    if (since > 0) sqlite3_bind_double(st, 1, (double)since);
+    // 🔴 两个时间边界**顺序绑定**：since 占第 1 个 `?`，beforeTs 占第 2 个。
+    //    SQL 里 `AND ts>=? AND ts<?` 的顺序必须和这里一致。
+    int p = 1;
+    if (since > 0) sqlite3_bind_double(st, p++, (double)since);
+    if (beforeTs > 0) sqlite3_bind_double(st, p++, (double)beforeTs);
     NSMutableArray *out = [NSMutableArray array];
     while (sqlite3_step(st) == SQLITE_ROW) {
         NSDictionary *d = build(st);
@@ -245,18 +250,21 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
     return out;
 }
 
-+ (NSArray<NSDictionary *> *)statsBundlesSince:(NSTimeInterval)since limit:(NSInteger)limit {
++ (NSArray<NSDictionary *> *)statsBundlesSince:(NSTimeInterval)since
+                                       beforeTs:(NSTimeInterval)beforeTs
+                                          limit:(NSInteger)limit {
     sqlite3 *db = [self openDB];
     if (!db) return @[];
     NSMutableString *sql = [NSMutableString stringWithString:
         @"SELECT bundle, COUNT(*), SUM(CASE WHEN read=0 THEN 1 ELSE 0 END) "
         @"FROM notifications WHERE 1=1"];
     if (since > 0) [sql appendString:@" AND ts>=?"];
+    if (beforeTs > 0) [sql appendString:@" AND ts<?"];
     [sql appendString:@" GROUP BY bundle ORDER BY COUNT(*) DESC"];
     // 🔴 LIMIT 只能拼字面量（SQLite 不支持 `LIMIT ?` 之外的写法其实支持，
     //    但这里 limit 来自我们自己的常量，且是 long ⇒ 用 %ld 拼，不走用户输入）
     if (limit > 0) [sql appendFormat:@" LIMIT %ld", (long)limit];
-    NSArray *rows = NBRows(db, sql, since, ^NSDictionary *(sqlite3_stmt *st) {
+    NSArray *rows = NBRows(db, sql, since, beforeTs, ^NSDictionary *(sqlite3_stmt *st) {
         const char *b = (const char *)sqlite3_column_text(st, 0);
         return @{
             @"bundle": (b ? [NSString stringWithUTF8String:b] : @""),
@@ -268,7 +276,9 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
     return rows;
 }
 
-+ (NSArray<NSDictionary *> *)statsBucketsSince:(NSTimeInterval)since byHour:(BOOL)byHour {
++ (NSArray<NSDictionary *> *)statsBucketsSince:(NSTimeInterval)since
+                                     beforeTs:(NSTimeInterval)beforeTs
+                                       byHour:(BOOL)byHour {
     sqlite3 *db = [self openDB];
     if (!db) return @[];
     NSString *expr = byHour
@@ -277,8 +287,9 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
     NSMutableString *sql = [NSMutableString stringWithFormat:
         @"SELECT %@ AS k, COUNT(*) FROM notifications WHERE 1=1", expr];
     if (since > 0) [sql appendString:@" AND ts>=?"];
+    if (beforeTs > 0) [sql appendString:@" AND ts<?"];
     [sql appendString:@" GROUP BY k ORDER BY k"];
-    NSArray *rows = NBRows(db, sql, since, ^NSDictionary *(sqlite3_stmt *st) {
+    NSArray *rows = NBRows(db, sql, since, beforeTs, ^NSDictionary *(sqlite3_stmt *st) {
         if (byHour) return @{ @"hour": @(sqlite3_column_int(st, 0)),
                               @"total": @(sqlite3_column_int(st, 1)) };
         const char *s = (const char *)sqlite3_column_text(st, 0);
@@ -301,17 +312,20 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
     return rows;
 }
 
-+ (NSDictionary *)statsSummarySince:(NSTimeInterval)since {
++ (NSDictionary *)statsSummarySince:(NSTimeInterval)since beforeTs:(NSTimeInterval)beforeTs {
     sqlite3 *db = [self openDB];
     if (!db) return @{};
     NSMutableString *sql = [NSMutableString stringWithString:
         @"SELECT COUNT(*), SUM(CASE WHEN read=0 THEN 1 ELSE 0 END), "
         @"COUNT(DISTINCT bundle), MIN(ts) FROM notifications WHERE 1=1"];
     if (since > 0) [sql appendString:@" AND ts>=?"];
+    if (beforeTs > 0) [sql appendString:@" AND ts<?"];
     sqlite3_stmt *st = NULL;
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) == SQLITE_OK) {
-        if (since > 0) sqlite3_bind_double(st, 1, (double)since);
+        int p = 1;
+        if (since > 0) sqlite3_bind_double(st, p++, (double)since);
+        if (beforeTs > 0) sqlite3_bind_double(st, p++, (double)beforeTs);
         if (sqlite3_step(st) == SQLITE_ROW) {
             out[@"total"] = @(sqlite3_column_int(st, 0));
             out[@"unread"] = @(sqlite3_column_int(st, 1));
@@ -801,6 +815,36 @@ static sqlite3_stmt *NBPrepareDelete(sqlite3 *db, NSString *bundle, NSTimeInterv
 + (BOOL)saveSettings:(NSDictionary *)settings {
     [self ensureDir];       // settings.plist 与 DB 同目录，目录建好就能写
     return [(settings ?: @{}) writeToFile:NOTIFYBOX_SETTINGS_PATH atomically:YES];
+}
+
+#pragma mark - v0.0.47 自动清理（保留最近 N 天）
+
++ (NSInteger)autoCleanDays {
+    NSDictionary *p = NBLoadSettings();
+    id v = p[@"autoCleanDays"];
+    NSInteger n = v ? [v integerValue] : 0;
+    // 🔴 0 = 关闭；上限 3650 天（10 年）—— 超出当关闭，避免手滑填个天文数字把库清空。
+    return (n >= 0 && n <= 3650) ? n : 0;
+}
+
++ (void)setAutoCleanDays:(NSInteger)days {
+    NSMutableDictionary *d = [[self settings] mutableCopy] ?: [NSMutableDictionary dictionary];
+    if (days > 0 && days <= 3650) d[@"autoCleanDays"] = @(days);
+    else [d removeObjectForKey:@"autoCleanDays"];
+    [self saveSettings:d];
+}
+
++ (NSInteger)runAutoClean {
+    NSInteger days = [self autoCleanDays];
+    if (days <= 0) return 0;   // 关闭 ⇒ 什么都不做，也不打日志（避免每次启动刷屏）
+    NSTimeInterval cutoff = [[NSDate date] timeIntervalSince1970] - (NSTimeInterval)days * 86400.0;
+    // 🔴 复用 v0.0.45 的批量删除：bundle=nil（所有 App）、readOnly=NO（连未读一起删，
+    //    因为"保留最近 N 天"的语义就是"更老的都不要了"）。
+    NSInteger n = [self deleteWithBundle:nil beforeTs:cutoff readOnly:NO];
+    if (n > 0) {
+        NBStoreLog(@"自动清理：删掉 %ld 天前的 %ld 条（cutoff=%.0f）", (long)days, (long)n, cutoff);
+    }
+    return n;
 }
 
 + (NSInteger)count {

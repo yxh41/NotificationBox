@@ -1,6 +1,7 @@
 #import "AppDelegate.h"
 #import "ViewController.h"
 #import "NotifyFilter.h"
+#import "NotifyStore.h"
 
 @implementation AppDelegate
 
@@ -17,6 +18,12 @@
     //   · 失败无害：迁移放弃时旧回退路径照旧工作（见 soundVerdictForBundle 的 ② 分支），
     //     用户不会因此"换音突然全失效"。
     [NotifyFilter migrateSoundMapIfNeeded];
+
+    // v0.0.47：自动清理「保留最近 N 天」。**同样必须在 App 进程、didFinishLaunching**：
+    //   days=0（默认）时 runAutoClean 直接返回 0、不打日志，等于零开销。
+    //   它复用 v0.0.45 的批量删除（bundle=nil、readOnly=NO），与手动批量清理同一条 SQL 路径。
+    //   失败无害：删不掉下次启动再试，不阻塞界面。
+    [NotifyStore runAutoClean];
 
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     self.window.rootViewController = [[UINavigationController alloc]
