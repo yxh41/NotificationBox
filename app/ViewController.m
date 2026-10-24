@@ -975,11 +975,23 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 //    （v0.0.33 删除场景栽过一次）。
 // 🔴 和顶部提示条的分工：顶部管「**未读**被筛选挡掉了」，这里管「**记录**被列表上限截断了」。
 //    两个场景不会同时成立（顶部说的是未读、这里说的是条数），不会互相吵。
+// v0.0.43：这条提示必须在「只看未读」下也说得通 —— 详见方法体第一段。
+// 🔴 还有个更基本的事实（v0.0.42 真机反馈时澄清过）：`maxRecords` 决定"**以后**最多留多少"，
+//    它**不会**把已经裁掉的记录找回来。用户把上限从 2000 调到 3000、翻到底却什么都没看到，
+//    不是 bug —— 当时库里只有约 500 条，没超列表上限，本来就不该有这条提示。
+//    ⇒ 验收这条提示要先把库填到超过 `listLimit`，否则永远验不到。
 - (void)updateMoreFooter {
+    // v0.0.43：**`unreadOnly` 必须一起传**。
+    // 🔴 v0.0.42 的真机 bug：这个计数当时不分已读未读，而 `self.items` 是带
+    //    `unreadOnly` 查出来的。在「只看未读」模式下，`items.count`=未读条数、
+    //    `scopeCount`=全部条数 ⇒ 底部会报「下面还有 450 条更早的记录」，
+    //    而那 450 条**全是已读的**，和用户此刻要看的完全无关。
+    //    ⇒ 底部说的那个数，必须和列表装的是**同一个集合**，否则它不值得信。
     NSInteger scopeCount = [NotifyStore countWithBundle:self.filterBundle
                                                   since:[self sinceFromSeg]
                                                  search:self.searchText
-                                          searchBundles:[self bundlesMatchingSearch:self.searchText]];
+                                          searchBundles:[self bundlesMatchingSearch:self.searchText]
+                                             unreadOnly:self.unreadOnly];
     NSInteger shown = (NSInteger)self.items.count;
     // scopeCount < 0 ⇒ DB 打不开，宁可不提示（跟 `updateHiddenUnread` 的处理一致）
     NSInteger more = (scopeCount >= 0) ? (scopeCount - shown) : 0;
@@ -998,9 +1010,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         self.moreFooter = l;
     }
     // 🔴 「列表上限」这个数字从 `NotifyStore` 取，**不要**在界面里另写一个 2000
+    // v0.0.43：文案跟着模式改一个字。只改数字不改文案的话，用户会去库里数
+    //    「怎么还有 450 条我看不到」—— 而它们其实是他自己选了"只看未读"挡掉的。
     self.moreFooter.text = [NSString stringWithFormat:
-        @"下面还有 %ld 条更早的记录\n列表一次最多显示 %ld 条，更早的在库里、这里翻不到",
-        (long)more, (long)[NotifyStore listLimit]];
+        @"下面还有 %ld 条更早的%@记录\n列表一次最多显示 %ld 条，更早的在库里、这里翻不到",
+        (long)more, self.unreadOnly ? @"未读" : @"", (long)[NotifyStore listLimit]];
 
     CGFloat w = self.table.bounds.size.width;
     if (w <= 0) w = [UIScreen mainScreen].bounds.size.width;

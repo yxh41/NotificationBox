@@ -85,16 +85,22 @@ NS_ASSUME_NONNULL_BEGIN
                              since:(NSTimeInterval)since
                             search:(nullable NSString *)search
                      searchBundles:(nullable NSArray<NSString *> *)searchBundles;
-// v0.0.42：**当前筛选下的总条数**（不分已读未读，-1 = DB 打不开）。
+// v0.0.42：**当前筛选下的总条数**（-1 = DB 打不开）。
 // 🔴 和 `count`（全库、不分筛选）是两件事，别混用。
 // 唯一用途：底部「还有 N 条更早记录」= 本方法 − `queryWithBundle:` 实际返回的条数。
 // ⇒ 它必须和查询走**同一个** `NBPrepareScope`，否则会出现"列表已经到底了、
 //    底部还在说还有 3 条"。为什么会有条数差：列表是 `LIMIT listLimit`（默认 2000），
 //    而 `maxRecords` 允许用户填到 99999 ⇒ 库里 5000 条时，后 3000 条列表里根本没有。
+// v0.0.43：加 `unreadOnly` —— **这个参数不是可选的礼貌，是必须的**。
+// 🔴 v0.0.42 的真机 bug：`unreadOnly` 模式下列表只装了未读（比如 50 条），
+//    计数却按"不分已读"算（比如 500 条）⇒ 底部报「下面还有 450 条更早的记录」，
+//    而那 450 条**全是已读**、和用户当下要看的东西无关。
+//    「底部说的数」和「列表里的东西」必须是同一个集合，这才是这条提示可信的前提。
 + (NSInteger)countWithBundle:(nullable NSString *)bundle
                        since:(NSTimeInterval)since
                       search:(nullable NSString *)search
-               searchBundles:(nullable NSArray<NSString *> *)searchBundles;
+               searchBundles:(nullable NSArray<NSString *> *)searchBundles
+                  unreadOnly:(BOOL)unreadOnly;
 // v0.0.35：**清空整张表**，返回真正删掉的条数（-1 = DB 打不开）。
 // 🔴 返回条数不是"花式" —— 是沿用 v0.0.33 `deleteRow:` 的同一条纪律：
 //    "没动到账本"和"动了但条数是 0"必须能分辨。`DELETE FROM` 命中 0 行照样

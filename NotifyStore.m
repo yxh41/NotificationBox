@@ -415,17 +415,23 @@ static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nul
 + (NSInteger)countWithBundle:(NSString * _Nullable)bundle
                        since:(NSTimeInterval)since
                       search:(NSString * _Nullable)search
-               searchBundles:(NSArray<NSString *> * _Nullable)searchBundles {
-    // v0.0.42：**当前筛选下的总条数**（不分已读未读）。
+               searchBundles:(NSArray<NSString *> * _Nullable)searchBundles
+                  unreadOnly:(BOOL)unreadOnly {
+    // v0.0.42：**当前筛选下的总条数**。
     // 🔴 和 `count`（全库不分筛选）是两件事，别混用。
     // 用途只有一个：底部「还有 N 条更早记录」= 本方法 − 列表里实际拿到的条数。
     // ⇒ 它必须和 `queryWithBundle:` 走**同一个** `NBPrepareScope`，
     //   否则会出现"列表已经到底了，底部还在说还有 3 条"。
+    // v0.0.43：`unreadOnly` 必须一起传进来 —— 见 `NotifyStore.h` 里那条真机 bug。
+    // 🔴 `head` 里带 `read=0`（而不是另加一个参数）就和 `queryWithBundle:` 一模一样了：
+    //    那个方法也是靠 `head` 区分"只看未读"的。两边用同一种表达，才不会有一边漏改。
     sqlite3 *db = [self openDB];
     if (!db) return -1;
     NSInteger n = -1;
-    sqlite3_stmt *st = NBPrepareScope(db, @"SELECT COUNT(*) FROM notifications WHERE 1=1",
-                                      nil, bundle, since, search, searchBundles);
+    NSString *head = unreadOnly
+        ? @"SELECT COUNT(*) FROM notifications WHERE read=0"
+        : @"SELECT COUNT(*) FROM notifications WHERE 1=1";
+    sqlite3_stmt *st = NBPrepareScope(db, head, nil, bundle, since, search, searchBundles);
     if (st) {
         if (sqlite3_step(st) == SQLITE_ROW) n = (NSInteger)sqlite3_column_int64(st, 0);
         sqlite3_finalize(st);
