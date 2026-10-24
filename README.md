@@ -3840,3 +3840,255 @@ if (self.filterBundle && ![self.bundles containsObject:self.filterBundle]) {
 > 前者验的是"没有整表 reload"，后者验的是 `prepareForReuse` 复位了没有。
 > 两条都不会崩、不会报错，错了也只是"看着不对"——所以必须真的去看。
 > 第 5 条是防灾难的：如果它没弹那句额外提示，先别点确认。
+
+## v0.0.36 · 图标栏未读红点 + 搜索框下「全部 / 未读」切换
+
+### 一、这一版做了什么
+
+v0.0.35 让"未读"在**列表里**看得见了，但还有两个洞：
+
+1. 想知道**哪个 App 还有没看的**，得一个一个点图标进去看；
+2. 想只看未读，只能靠"时间筛选 + 自己记得哪些点过了"。
+
+这一版补上这两块：顶部图标栏给**有未读的 App** 加一个小红点（只要"有没有"，不显示数字），
+搜索框下面加一条 `全部 / 未读` 的 scope bar。
+
+红点刻意**不给「全部」那格**：它聚合了所有 App，给它点红点等于说"全部里还有东西没看"，
+点进去却只是有未读的那几个 App 的集合 —— 语义是乱的。
+
+### 二、三个坑，全是"代码看着没错、屏幕上是错的"（同 v0.0.35 的母题）
+
+#### 坑 1 · 按钮自己 `clipsToBounds = YES`，红点被裁掉一半
+
+图标按钮是圆角方块，`clipsToBounds` 必须开（否则图标溢出圆角）。红点想探出右上角一点点，
+直接挂在按钮上就会被裁成半圆。
+
+修法：给每个图标加一层 **holder 容器**，红点挂 holder 上，图标挂按钮上。
+
+```
+holder (无裁剪)
+├── btn (clipsToBounds = YES，放 icon)
+└── dot (探出右上角)
+```
+
+#### 🔴 坑 2 · 点开一条后刷新红点，把图标栏的横向滚动位置夹回了最左
+
+这是这一版最值得记的一个设计判断。最直接的做法是：点开一条 → 它变已读 → 调 `reloadIconBar` 重建红点。
+
+但 `reloadIconBar` 会**重建所有按钮** ⇒ `contentSize` 重设 ⇒ 图标栏的滚动位置被夹回最左。
+
+> 用户已经横向滚到第 10 个 App，点开一条记录返回后，**图标栏自己弹回最左边了**。
+
+一拍脑袋才想到：红点只是"显示/隐藏"，凭什么要重建按钮？于是拆出 `refreshUnreadDots`：
+
+```objc
+// 只改已有红点的 hidden，绝不重建按钮、绝不碰 contentSize
+for (NSString *b in self.unreadDots) {
+    self.unreadDots[b].hidden = ![fresh containsObject:b];
+}
+```
+
+同理 `reloadIconBar` 自己也补了 contentOffset 的存/恢复（这次重建是"真的要重建"的时候用的）。
+包级判据 `B9` 钉的就是 `setContentOffset:` 这个 setter 消息真的编进去了。
+
+#### 坑 3 · 拿 `bundleCounts` 兼职判未读 ⇒ 所有 App 永远有红点
+
+`bundleCounts` 数的是**每个 App 的全部条数**（图标栏右侧那个数字用的），拿它判断"有没有未读"
+会让每个 App 永远亮红点 —— 因为点开过的记录也在里面。
+
+必须新写一个查询：
+
+```sql
+SELECT DISTINCT bundle FROM notifications
+WHERE read=0 AND bundle IS NOT NULL AND bundle <> ''
+```
+
+`read=0` 而不是 `read<>1`：后者对 **NULL 不成立**，老库里 read 为 NULL 的行会既不进"未读"、
+也不进"已读"，从界面上凭空消失。
+
+### 三、`queryWithBundle:` 加第 4 个参数，旧签名真的删了
+
+```objc
++ (NSArray<NSDictionary *> *)queryWithBundle:(nullable NSString *)bundle
+                                       since:(NSTimeInterval)since
+                                      search:(nullable NSString *)q
+                                  unreadOnly:(BOOL)unreadOnly;
+```
+
+这个改动让包级判据变得**罕见地硬**：`queryWithBundle:since:search:` 是
+`queryWithBundle:since:search:unreadOnly:` 的**前缀**，所以
+
+- `B3` 查四参选择器**在**；
+- `B4` 查三参选择器**不在**。
+
+两条必须用 `\0` 精确匹配（`has_selector` 就是干这个的），否则子串匹配会把"新的在"误判成"旧的还在"。
+
+🔴 而且 `B4` 的前提得说清楚：**它只在"真的删了旧签名"时成立**。v0.0.31 撞过一次反例 ——
+当时的做法是"保留旧签名 + 转调新签名"，旧 selector **必然在包里**，那条判据当场假红。
+这一版是真替换（两个调用点都改了），所以前提成立。
+
+### 四、scope bar：顺序和高度都不能猜
+
+```objc
+self.searchBar.scopeButtonTitles = @[@"全部", @"未读"];
+self.searchBar.selectedScopeButtonIndex = 0;
+self.searchBar.showsScopeBar = YES;          // 🔴 必须在 scopeButtonTitles 之后
+```
+
+顺序反了在某些系统版本上 scope bar **根本不出现**。
+
+高度不能拿 `sizeThatFits:` / `intrinsicContentSize` 去算 —— `UISearchBar` 是普通 `UIView`，
+没布局时回 `(0,0)`，结果搜索框整个消失。直接写死：
+
+```objc
+CGFloat searchH = self.searchBar.showsScopeBar ? 88 : 44;
+```
+
+判据 `b02`（`showsScopeBar` 必须设）和 `b05`（高度必须跟着 `showsScopeBar` 变）就是钉这两条。
+
+### 五、点开一条之后，「未读」列表里它得消失
+
+`didSelectRowAtIndexPath:` 现在有三个分支：
+
+| 条件 | 做法 | 为什么 |
+|---|---|---|
+| `unreadOnly` | 整表 `loadData` + **存/恢复 `contentOffset`** | 数量会变（少一行），必须重查；但要保住滚动位置 |
+| 可变字典 | 只改 `read` + `reloadRowsAtIndexPaths:` | 数量不变 ⇒ 只刷一行，不丢滚动位置（v0.0.35 那条路） |
+| 兜底 | `loadData` | 万一哪天 `query` 返回不可变字典 |
+
+> 同一个 `reloadRowsAtIndexPaths:`，在"删一行"里是禁忌、在"只改一个字段"里是必需 ——
+> 判据永远是**数量变不变**，不是"这个 API 好不好"。
+
+### 六、源码判据（24 条）+ 反向对照
+
+| 组 | 判据 | 说明 |
+|---|---|---|
+| a01~a04 | `.h` 有 `unreadOnly` 参数 / `query` 实现**真的用到**它 / `bundlesWithUnread` 有体 / **所有调用点都传了新参** | 查询层 |
+| b01~b05 | `scopeButtonTitles` / `showsScopeBar` / **两者顺序** / `loadData` 把 `unreadOnly` 传下去 / 高度跟着变 | scope bar |
+| c01~c07 | 红点记进 `unreadDots` / 挂 **holder** 不挂按钮 / 「全部」不点红点 / `refreshUnreadDots` 只改 hidden / `reloadIconBar` 存恢复 contentOffset / `didSelect` 的 `unreadOnly` 分支 / v0.0.35 的"同步内存"分支还在 | 红点 |
+| d01 | 空列表写当前筛选条件 | 防"看着空 = 没有" |
+| e01~e05 | 详情页 / 左滑删除顺序 / `sqlite3_changes` / `prepareForReuse` 复位 / 版本号 6 处 | 回归 |
+| f01 / v01 | 版本串出现次数 / 括号配平（剥字符串） | — |
+
+**负向自测 24/24 全红**。**反向对照**拿 v0.0.35 的 18 个文件喂进去，**16 条当场报红**：
+
+```
+a01 a02 a03 a04  b01 b02 b04 b05  c01 c02 c03 c04 c05 c06 c07  d01
+```
+
+### 七、包级判据（27 条）
+
+| 组 | 判据 | 说明 |
+|---|---|---|
+| A1~A4 | control / 文件名 / tweak `v0.0.36` / App `Info.plist` | — |
+| **B1** | 🔴 **App 二进制 md5 与 v0.0.35 不同** | 硬证据 |
+| B2 | App 二进制大小 —— **只作记录** | 见下 |
+| B3 | 有四参选择器 `queryWithBundle:since:search:unreadOnly:` | 未读筛选接到查询层 |
+| B4 | **三参选择器消失了** | 前提见 §三 |
+| B5 | 有 `bundlesWithUnread` | 红点的数据源在 |
+| B6 | 有 `refreshUnreadDots` | 只刷红点那条路在 |
+| B7 | 同时有 `setScopeButtonTitles:` 与 `setShowsScopeBar:` | scope bar 真的配上去了 |
+| B8 | 有 `setSelectedScopeButtonIndex:` | 默认停在「全部」 |
+| B9 | 有 `setContentOffset:` | 图标栏滚动位置的存/恢复编进去了 |
+| B10 | 有「只看未读」「全部状态」（**弱**） | 只能证空列表文案在 |
+| B11 | 有「当前筛选」（**弱**） | 只能证格式串在 |
+| C1 | tweak 无 `v0.0.35` 显示串 | 防"只改版本号" |
+| D1~D11 | 详情页类 / `deleteRow:` / `viewDidLayoutSubviews` / `setUnread:` / `dotView` / 清空二次确认 / `soundDuckOthers` / `commitMaxSec:` / `releaseAudioSessionIfIdle` / `maxSec` / 包内文件集合一致 | 前七版没被带坏 |
+
+**反向对照**（拿 v0.0.35 的 deb 当"当前成品"）：**12/27 通过**，**15 条变红**
+（`A1~A4`、`B1`、`B3~B11`、`C1`）。存活的 12 条 = `B2`（记录项）+ `D1~D11`（回归保留项）。
+
+### 🔴 八、本版抓到的新坑：选择器"在包里"不等于"我们实现了它"
+
+我本来想用 `searchBar:selectedScopeButtonIndexDidChange:` 当"scope 切换回调真的实现了"的判据。
+做反向对照时发现：**v0.0.35 没实现这个方法，但它的二进制里也有这个串。**
+
+直接扒上下文：
+
+```
+…scrollViewWillEndDragging:withVelocity:targetContentOffset:/0
+searchBar\0
+searchBar:selectedScopeButtonIndexDidChange:/0
+searchBar:shouldChangeTextInRange:repla…
+```
+
+一大块 UIKit delegate 选择器连在一起 —— 它来自 `#import <UISearchBarDelegate>` 的
+**协议方法表**，不是我们的实现。
+
+> 🔴 通则：判据要选「**只有我们发消息 / 只有我们实现才会出现**」的选择器。
+> 凡是**协议里的方法名**（`UITableViewDelegate`、`UIScrollViewDelegate`、`UISearchBarDelegate` 的那一堆），
+> 一律不能单独当判据 —— 编译器会把整套协议方法名列进二进制。
+> 这一条只有负向对照能发现：正向永远是绿的。
+
+### 🔴 九、判据标签说错了它能证明什么（第一种假绿）
+
+`B7` 原来写的是：
+
+```python
+need(has_str(app_bin, '只看未读'), 'B7 App 里有「只看未读」文案（scope bar 那一段在）')
+```
+
+两处都错：
+
+1. **「只看未读」不在 scope bar 里** —— 它在 `ViewController.m:651`，是**空列表筛选描述**的字面量
+   （scope bar 的按钮标题是 `@"全部"` / `@"未读"`，两个字符太短，包级没法当判据）；
+2. 就算它真在 scope bar 里，**"搜到某个字"也只能证那句文案编进去了**，证不了 bar 配上了没有。
+
+改成硬判据：
+
+```python
+need(has_selector(app_bin, 'setScopeButtonTitles:') and has_selector(app_bin, 'setShowsScopeBar:'), ...)
+```
+
+原来的查词退成 `B10` / `B11`，标签如实写成「⚠️ **弱**：只能证文案编进去了」。
+
+> 这正是 v0.0.34 记的第一种假绿（**查词的存在性**）又冒了一次头。
+> 这次的新意是：**假绿不一定来自"判据太松"，也可能来自"标签过度声称"** ——
+> 判据本身没错（那句话确实在包里），错的是我以为它能证明 scope bar。
+
+### 🔴 十、大小又是 +16 字节（第五次）
+
+| | v0.0.35 | v0.0.36 |
+|---|---|---|
+| App 二进制 | `350336 B` | `350352 B` ← **又是 +16** |
+| App md5 | `4345c9b74bee` | `d37555ee9efb` |
+| tweak md5 | `15f5c4a24155` | `920a86803de7`（只改版本串） |
+| 实际改动 | — | **7 文件 +163 / −17** |
+
+改了 163 行、新增 2 个方法、4 个属性、七八条文案、一整个 scope bar，
+二进制涨 **16 字节**。第 5 次了（v0.0.28 / 32 / 34 / 35 / 这次）。
+
+> 判"编进去没"看串 / 选择器 / md5，**永远不看文件大小**；
+> 反过来也成立：**"大小几乎没变"绝不等于"改动很小"**。
+
+### 十一、交付
+
+| 项 | 值 |
+|---|---|
+| deb | `com.yxh41.notifybox_0.0.36_iphoneos-arm64e.deb` · **107920 B** |
+| CI | **#72**（`run_id 40088538309`，head `bc68aab1f59e`）success，一次编译过 |
+| 产物 zip | 108107 B（与 API `size_in_bytes` 对拍一致） |
+| 远端 | `bc68aab1f59e` = 本地 `03650962167b`，**7 个改动文件逐 blob 一致** |
+| 改动 | 7 文件 **+163 / −17** |
+| App 二进制 | `350336 → 350352 B`（+16，md5 变） |
+| tweak 二进制 | `143856 B`（只升版本串） |
+| 源码判据 | 24 条语义 + 24 条负向全红；反向对照 16 条红 |
+| 包级判据 | 27 条全绿；反向对照 15 条红 |
+
+### 十二、装了这一版要验什么
+
+| # | 操作 | 期望 |
+|---|---|---|
+| 1 | 打开盒子看顶部图标栏 | 有**未读**的 App 右上角有**小红点**，全部读过的没有 |
+| 2 | 🔴 **「全部」那一格** | **不能有红点** —— 有就是坑 3 或"全部也点了" |
+| 3 | 🔴 横向滚到第 8~10 个 App，点开一条记录，返回 | 图标栏**还在原来的位置**（不弹回最左）；那个 App 的红点消失 |
+| 4 | 点搜索框 | 下面出现 `全部 / 未读`，默认选中「全部」，**搜索框没被挡住、图标栏没被挤掉** |
+| 5 | 切到「未读」 | 列表只剩未读的；标题计数跟着变 |
+| 6 | 在「未读」下点开一条，返回 | 那一条**从列表里消失了**（已读）；列表**不跳回顶部** |
+| 7 | 🔴 时间选「今天」+ 切「未读」 | 如果真没有，空列表要写出**当前筛选条件**，不能只写「暂无记录」 |
+| 8 | 全部读完后回列表 | 图标栏红点全部消失 |
+| 9 | 回归：清空（含搜索态）、删单条、详情页、左滑删除、按 App 配时长、压低开关 | 与 v0.0.35 一致 |
+
+> 第 2、3 条是这一版**最容易做错且最不容易被发现**的两件事：
+> 第 2 条错了不会崩，只是红点语义混乱；第 3 条错了会让人想摔手机（每点一条，图标栏就归位一次）。
+> 第 7 条是 v0.0.35「看着空 = 没有」那个坑的续集 —— 加了「未读」之后空列表变得非常常见。
