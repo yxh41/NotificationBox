@@ -37,6 +37,20 @@ NS_ASSUME_NONNULL_BEGIN
 
 // 维护
 + (void)markRead:(NSInteger)rowId;
+// v0.0.38：把「当前筛选范围内」的未读**批量**标为已读，返回真正改动的行数
+// （-1 = DB 打不开）。不删记录，只把 read 从 0 改成 1。
+// 🔴 参数只有 bundle + since，**故意不含搜索词**。为什么和 `unreadCountWithBundle:since:`
+//    配成一对：界面上的确认文案必须报「将要改多少条」，而那个数只能由同一套条件算出来。
+//    v0.0.35 的 `onClear:` 已经买过一次教训 —— 确认框报列表条数（3）、实际清整张表（2000）。
+//    这里两边共用同一组 WHERE 条件，搜索框只在「列表显示什么」上生效，不参与标记范围，
+//    并在文案里写清楚这件事。
++ (NSInteger)markAllReadWithBundle:(nullable NSString *)bundle
+                             since:(NSTimeInterval)since;   // 0 = 不限
+// v0.0.38：上面那个方法的「先算一遍」版本 —— 给确认框报数字用。
+// 🔴 不能拿 `queryWithBundle:...unreadOnly:YES].count` 代替：那个会真的 SELECT 出行来
+//    （2000 行的完整字段），而且它带搜索词 ⇒ 和标记范围不同口径。
++ (NSInteger)unreadCountWithBundle:(nullable NSString *)bundle
+                             since:(NSTimeInterval)since;
 // v0.0.35：**清空整张表**，返回真正删掉的条数（-1 = DB 打不开）。
 // 🔴 返回条数不是"花式" —— 是沿用 v0.0.33 `deleteRow:` 的同一条纪律：
 //    "没动到账本"和"动了但条数是 0"必须能分辨。`DELETE FROM` 命中 0 行照样
@@ -59,6 +73,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 // 自检（盒子 App 空列表时直接显示，用来判断沙盒可达性）
 + (NSInteger)count;
+// v0.0.38：库里最大的行 id（空表返回 0），给「列表要不要重新查」当探针。
+// 🔴 为什么不能只看 `count`：记录数到达上限之后，tweak 每来一条新通知都会先裁掉
+//    一条最旧的 ⇒ **条数恒定不变**。只看条数的话，"最需要刷新的场景"恰好检测不到
+//    （库满 2000 条时后台每来一条通知，列表都不会自己更新）。
+//    id 是自增的，新记录一定让 MAX(id) 变大 ⇒ 两个数一起看才盖得住新增和删除。
++ (NSInteger)maxRowId;
 + (NSString *)debugSummary;
 + (NSString *)logText:(NSUInteger)maxBytes;   // 读 tweak.log 尾部，给 App 内查看
 

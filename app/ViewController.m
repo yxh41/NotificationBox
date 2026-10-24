@@ -7,6 +7,11 @@
 // v0.0.33：点开看全文 + 复制 + 删单条
 #import "NotifyDetailViewController.h"
 
+// v0.0.38：「全标已读」按钮的固定宽度。「全标已读」4 个汉字 @14pt ≈ 56pt，
+// 加左右各 16pt 内边距 ⇒ 88 够宽裕。写常量是因为布局里要拿它算分段控件的宽度，
+// 两处各写一个数字的话，改了其中一个就会出现"按钮压住分段控件"。
+static const CGFloat kNBMarkAllWidth = 88;
+
 // 🔴 盒子 App：读 NotifyStore 的 SQLite，展示通知列表
 //    - 顶部横向 App 图标栏（抖音聊天页那种）：点击筛选对应 bundle
 //    - 时间分段：近24小时 / 近7天 / 不限时间（v0.0.37 起如实命名）
@@ -39,6 +44,19 @@
 // 🔴 存引用是为了**只刷新红点、不重建按钮** —— 重建会让 `contentSize` 重设，
 //    把图标栏的滚动位置重置到最左（选了第 10 个 App，点开一条就跳回开头）。
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *unreadDots;
+// v0.0.38：「只看未读」时右侧多一个「全标已读」。
+// 🔴 为什么放在分段控件同一行、而不是导航栏：右边已经有「诊断」「清空」两个，
+//    再塞一个会把标题「消息盒子 (N)」挤没 —— iPhone 竖屏导航栏就只有那么宽。
+//    这一行是我们自己布局的（v0.0.37 起 unreadSeg 是自绘的），加宽加窄都说了算。
+@property (nonatomic, strong) UIButton *markAllBtn;
+// v0.0.38：上一次刷新时的**库指纹**（条数 + 最大行 id）。
+// 🔴 为什么不能只看条数：记录数到达上限以后，tweak 每来一条新通知都会先裁掉一条
+//    最旧的 ⇒ 条数恒定。只看条数的话，"库满了以后每次来通知"这个最常见的场景
+//    恰好检测不到 —— 而它正是用户最需要列表自己更新的场景。
+//    id 是自增的，新记录一定让 MAX(id) 变大；删除只会让条数变小。
+//    两个数一起看，新增和删除都盖得住。
+@property (nonatomic, assign) NSInteger lastTotal;
+@property (nonatomic, assign) NSInteger lastMaxId;
 
 - (void)onDiag:(id)sender;
 - (void)onSettings:(id)sender;
@@ -52,6 +70,18 @@
 - (void)refreshUnreadDots;
 // v0.0.37：全部 / 只看未读（自己的分段控件，替掉没渲染出来的系统 scope bar）
 - (void)onUnread:(UISegmentedControl *)seg;
+// v0.0.38：批量把当前筛选范围内的未读标成已读
+- (void)onMarkAllRead:(id)sender;
+- (void)doMarkAllRead;
+// v0.0.38：库里变了才重查（保住滚动位置）；以及那个"保住滚动位置的重查"本身
+- (void)refreshIfChanged;
+- (void)reloadKeepingOffset;
+- (void)onForeground:(NSNotification *)note;
+// v0.0.38：时间段的显示名 / 「App + 时间」两维的范围描述
+// 🔴 抽出来是因为确认框文案和空列表文案都用到它，字面量写两处就会不一致
+- (NSArray<NSString *> *)timeNames;
+- (NSString *)timeName;
+- (NSString *)scopeDesc;
 // v0.0.36：当前筛选条件的一行文字描述（空列表时写出来，避免"看着空 = 没有"的误判）
 - (NSString *)filterDesc;
 - (void)showText:(NSString *)text title:(NSString *)title;
@@ -65,6 +95,12 @@
 @end
 
 @implementation ViewController
+
+- (void)dealloc {
+    // 🔴 显式移除。iOS 9 起 target-action 形式的观察者已经不会被野指针调用了，
+    //    但"读代码的人不用去查这条规则"本身有价值 —— 而且 `removeObserver:` 是幂等的。
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -96,6 +132,27 @@
                                         action:@selector(onSettings:)];
     [self buildUI];
     [self loadData];
+
+    // v0.0.38：App 从后台回前台时**不会**走 `viewWillAppear:` —— VC 一直活着，
+    //    只是 window 换了前台。不单独听这个通知的话，"后台来了新通知 → 切回来 →
+    //    列表还是老样子"就一直存在，用户只能靠切筛选/搜索来手动触发重查。
+    // 🔴 通知回在主线程，可以随便碰 UI。
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onForeground:)
+                                                 name:UIApplicationWillEnterForegroundNotification
+                                               object:nil];
+}
+
+// v0.0.38：从详情页/设置页返回。`viewWillAppear:` 在**首次显示**时也会调用，
+// 那时 `viewDidLoad` 里的 `loadData` 刚跑过、库指纹没变 ⇒ `refreshIfChanged` 直接返回，
+// 不会白 reload 一次（否则每次进入 App 都闪一下）。
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self refreshIfChanged];
+}
+
+- (void)onForeground:(NSNotification *)note {
+    [self refreshIfChanged];
 }
 
 - (void)onSettings:(id)sender {
@@ -154,6 +211,72 @@
                     text:@"库里没有可删的记录（可能已被「记录上限」自动清掉）。列表已刷新。"];
     } else {
         [self alertTitle:@"清空失败"
+                    text:@"打不开数据库。列表已刷新，可以重启 App 再试。"];
+    }
+}
+
+#pragma mark - 全标已读（v0.0.38）
+
+// 为什么只在「只看未读」时出现：见 `buildUI` 里 `markAllBtn` 的注释。
+- (void)onMarkAllRead:(id)sender {
+    NSTimeInterval since = [self sinceFromSeg];
+    // 🔴 先算一遍再问 —— 和 `onClear:` 同一条纪律：确认框里的数字必须是**这次真正会改的
+    //    行数**，不能拿 `self.items.count`（那是列表显示了几条，受搜索和单次上限影响）。
+    //    这个数由 `unreadCountWithBundle:since:` 算，和后面 `markAllReadWithBundle:since:`
+    //    共用同一套 WHERE 条件（见 NotifyStore.m 里 `NBPrepareUnreadScope`）。
+    NSInteger n = [NotifyStore unreadCountWithBundle:self.filterBundle since:since];
+    if (n == 0) {
+        [self alertTitle:@"没有未读" text:@"这个范围里已经没有未读记录了。"];
+        return;
+    }
+    if (n < 0) {
+        [self alertTitle:@"读不到数据库" text:@"打不开数据库，没法统计未读条数。"];
+        return;
+    }
+
+    NSMutableString *msg = [NSMutableString stringWithFormat:
+        @"将把「%@」范围内的 %ld 条未读标成已读。\n\n只改「已读」标记，不会删除记录。",
+        [self scopeDesc], (long)n];
+    // 🔴 搜索词只影响**列表显示**，不参与标记范围。不说清楚就会出现
+    //    "我搜了验证码、只看到 3 条，一点却全标了" —— 和 v0.0.35 `onClear:` 的坑同源。
+    if (self.searchText.length) {
+        [msg appendFormat:@"\n\n⚠️ 搜索框里的「%@」只影响列表显示，不限制标记范围。",
+         self.searchText];
+    } else if ((NSInteger)self.items.count < n) {
+        [msg appendFormat:@"\n\n当前列表只显示 %ld 条（超出单次上限），标记范围仍是上面说的 %ld 条。",
+         (long)self.items.count, (long)n];
+    }
+
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"全部标为已读？"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [al addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    // 不用 `UIAlertActionStyleDestructive`：不删数据，红字会让人以为要清库。
+    [al addAction:[UIAlertAction actionWithTitle:@"标为已读" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *a) {
+        [weakSelf doMarkAllRead];
+    }]];
+    [self presentViewController:al animated:YES completion:nil];
+}
+
+- (void)doMarkAllRead {
+    NSInteger n = [NotifyStore markAllReadWithBundle:self.filterBundle
+                                               since:[self sinceFromSeg]];
+    // 🔴 先改库 → 再整表重查。和 `doClear` / 左滑删除是同一条纪律：
+    //    列表的数据只有一个来源（数据库），内存数组永远从它重建。
+    //    这一句同时会把图标栏红点重算一遍（`loadData` 里先调 `reloadIconBar`）。
+    [self loadData];
+
+    if (n > 0) {
+        [self alertTitle:@"已标记"
+                    text:[NSString stringWithFormat:@"把 %ld 条标成了已读。", (long)n]];
+    } else if (n == 0) {
+        // `UPDATE ... WHERE read=0` 命中 0 行照样返回 SQLITE_DONE ⇒ 不能当成功。
+        [self alertTitle:@"没有变化"
+                    text:@"这个范围里已经没有未读了（可能刚被标过）。列表已刷新。"];
+    } else {
+        [self alertTitle:@"标记失败"
                     text:@"打不开数据库。列表已刷新，可以重启 App 再试。"];
     }
 }
@@ -424,7 +547,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // v0.0.37：第 0 段原名「今天」，但它实际返回的是 `now - 86400`（最近 24 小时），
     //    不是今天 00:00 —— 名不符实。今天 19:30 时，「今天」会把昨天 19:30 之后的
     //    记录也算进来。改成如实写「近24小时」，行为不变、标签不再说谎。
-    self.timeSeg = [[UISegmentedControl alloc] initWithItems:@[@"近24小时", @"近7天", @"不限时间"]];
+    // v0.0.38：段名改从 `timeNames` 取，不再在这里写字面量。
+    self.timeSeg = [[UISegmentedControl alloc] initWithItems:[self timeNames]];
     self.timeSeg.selectedSegmentIndex = 0;
     [self.timeSeg addTarget:self action:@selector(onTime:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.timeSeg];
@@ -442,6 +566,20 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.unreadSeg.selectedSegmentIndex = 0;
     [self.unreadSeg addTarget:self action:@selector(onUnread:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.unreadSeg];
+
+    // v0.0.38：「只看未读」时才出现的批量入口。
+    // 🔴 为什么默认隐藏、而不是常驻：在「全部」模式下，列表里已读未读混在一起，
+    //    「全标已读」的作用对象不明确（是这一屏？是整个库？），容易被当成"清空"。
+    //    只在"只看未读"时出现，范围就是眼睛看到的这一批。
+    self.markAllBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.markAllBtn setTitle:@"全标已读" forState:UIControlStateNormal];
+    self.markAllBtn.titleLabel.font = [UIFont systemFontOfSize:14];
+    self.markAllBtn.layer.cornerRadius = 7;
+    self.markAllBtn.backgroundColor = [UIColor secondarySystemFillColor];
+    [self.markAllBtn addTarget:self action:@selector(onMarkAllRead:)
+              forControlEvents:UIControlEventTouchUpInside];
+    self.markAllBtn.hidden = YES;
+    [self.view addSubview:self.markAllBtn];
 
     // 顶部 App 图标栏（横向滚动）
     self.iconBar = [[UIScrollView alloc] init];
@@ -478,7 +616,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     y += 44 + 4;
 
     // v0.0.37：全部 / 只看未读，自己的一段（原来这里是系统的 scope bar，不显示）
-    self.unreadSeg.frame = CGRectMake(12, y, w - 24, 30);
+    // v0.0.38：「只看未读」模式下右侧腾出 `kNBMarkAllWidth` 给「全标已读」，
+    //    分段控件相应收窄。收窄后剩下约 `w-24-94`，两个四字/两字标题放得下。
+    // 🔴 可见性在这里同步一次，而不是只在 `onUnread:` 里改 —— 布局可能因为
+    //    别的原因此后重跑，两处状态必须由同一个判据（`self.unreadOnly`）决定。
+    CGFloat unreadW = w - 24;
+    self.markAllBtn.hidden = !self.unreadOnly;
+    if (self.unreadOnly) unreadW -= (kNBMarkAllWidth + 6);
+    self.unreadSeg.frame = CGRectMake(12, y, MAX(120, unreadW), 30);
+    self.markAllBtn.frame = CGRectMake(12 + MAX(120, unreadW) + 6, y, kNBMarkAllWidth, 30);
     y += 30 + 6;
 
     self.iconBar.frame = CGRectMake(0, y, w, 56);
@@ -635,6 +781,44 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    即使列表因为取图标崩了，用户也能从标题看出「库里到底有没有东西」。
     NSInteger total = [NotifyStore count];
     self.title = [NSString stringWithFormat:@"消息盒子 (%ld)", (long)total];
+
+    // v0.0.38：记下这次刷新对应的**库指纹**，给 `refreshIfChanged` 比对。
+    // 🔴 必须放在上面那些查询**之后**：指纹的语义是"这一屏列表现实对应库里的哪个状态"。
+    //    放在查询之前取，就等于把还没进列表的新记录算了进去 ⇒ 下次永远比不出差异。
+    // 🔴 `maxRowId` 是一次 `SELECT MAX(id)`，很便宜；但它不可省（见 NotifyStore.h 的注释：
+    //    库满之后条数恒定，只看条数会漏掉"最该刷新"的场景）。
+    self.lastTotal = total;
+    self.lastMaxId = [NotifyStore maxRowId];
+}
+
+// v0.0.38：库里变了才重查一次。给「从详情页/设置页返回」和「App 回前台」用。
+- (void)refreshIfChanged {
+    NSInteger total = [NotifyStore count];
+    NSInteger topId = [NotifyStore maxRowId];
+    // 🔴 两个都得比：库满之后新增记录不会让条数变大（tweak 先裁掉一条最旧的），
+    //    只有 `MAX(id)` 会变；反过来，删记录通常只让条数变小。
+    if (total == self.lastTotal && topId == self.lastMaxId) return;
+    // 🔴 DB 打不开时 `count` / `maxRowId` 双双回 -1，和上一次的 -1 相等 ⇒ 这里直接返回，
+    //    列表保持原样。这是**故意的**：打不开库的时候"刷新"只会把好数据换成空列表。
+    [self reloadKeepingOffset];
+}
+
+// v0.0.38：整表重查，但保住滚动位置。
+// 🔴 为什么必须有它：本项目一条硬规矩是「改完数据库必须整表重查」（内存数组永远从
+//    数据库重建，只改内存 = 只改账本的读数）。而整表 reload 会把 `contentOffset`
+//    清零 —— v0.0.35 的注释里已经写明"滚到中间点开一条再返回，列表跳回顶部"。
+//    这段逻辑原来只写在 `didSelectRow:` 的「只看未读」分支里，现在抽出来当**唯一来源**：
+//    `refreshIfChanged` 和它共用一份。
+// 🔴 顺序不能换：存 offset → 重查 → `layoutIfNeeded` → 写回。
+//    少了 `layoutIfNeeded`，`contentSize` 还是旧值，clamp 会按旧高度算 ⇒ 位置仍然错。
+// 🔴 这里**保持 `off.y` 不变**是有意的：新记录插在最前面，用户会看到内容整体下移一行、
+//    新行出现在原来的位置 —— 这比"位置纹丝不动、新行藏在上面要自己往上滚"更符合直觉。
+- (void)reloadKeepingOffset {
+    CGPoint off = self.table.contentOffset;
+    [self loadData];
+    [self.table layoutIfNeeded];
+    CGFloat maxY = MAX(0, self.table.contentSize.height - self.table.bounds.size.height);
+    self.table.contentOffset = CGPointMake(0, MIN(off.y, maxY));
 }
 
 // 空列表时直接把自检信息打在屏幕上（判断 tweak 有没有写库、App 能不能读到）
@@ -672,18 +856,36 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.table.backgroundView = l;
 }
 
+// v0.0.38：时间段的段名 —— **唯一来源**。
+// 🔴 v0.0.36 之前 `buildUI` 里写一份 `@[@"今天", …]`、`filterDesc` 里又写一份，
+//    结果"标签改了、另一处没改"（更糟的是当时的标签本身就说谎：叫「今天」、实际
+//    `now-86400`）。现在只有这一处字面量，`timeSeg` 的 items 和所有文案都从它取。
+// 🔴 顺序必须和 `sinceFromSeg` 的分支顺序严格对应（0=24小时、1=7天、2=不限）。
+- (NSArray<NSString *> *)timeNames {
+    return @[@"近24小时", @"近7天", @"不限时间"];
+}
+
+// v0.0.38：时间段的显示名。
+// 🔴 必须和 `sinceFromSeg` 的实现一致：第 0 段实际是 `now - 86400` ⇒ 叫「近24小时」，
+//    不叫「今天」（v0.0.36 就是这么名不符实的，v0.0.37 改掉了）。
+- (NSString *)timeName {
+    NSArray<NSString *> *times = [self timeNames];
+    NSInteger ti = self.timeSeg.selectedSegmentIndex;
+    return (ti >= 0 && ti < (NSInteger)times.count) ? times[ti] : @"时间?";
+}
+
+// v0.0.38：「App + 时间」两维的范围描述 = 「全标已读」的**作用范围**。
+// 🔴 **故意不含**未读状态和搜索词：标记用的 SQL 只按 bundle + since 过滤。
+//    把搜索词写进这句里，用户就会以为"只标搜索出来的那几条"，而实际标的是整个范围。
+- (NSString *)scopeDesc {
+    NSString *app = self.filterBundle.length ? [self shortName:self.filterBundle] : @"全部 App";
+    return [NSString stringWithFormat:@"%@ · %@", app, [self timeName]];
+}
+
 // v0.0.36：把当前四个筛选维度拼成一行。
 - (NSString *)filterDesc {
     NSMutableArray *a = [NSMutableArray array];
-    [a addObject:(self.filterBundle.length ? [self shortName:self.filterBundle] : @"全部 App")];
-
-    // v0.0.37：时间段的显示名必须和 `sinceFromSeg` 的实现一致。
-    //    第 0 段实际是 `now - 86400` ⇒ 叫「近24小时」，不叫「今天」。
-    NSArray *times = @[@"近24小时", @"近7天", @"不限时间"];
-    NSInteger ti = self.timeSeg.selectedSegmentIndex;
-    NSString *t = (ti >= 0 && ti < (NSInteger)times.count) ? times[ti] : @"时间?";
-    [a addObject:t];
-
+    [a addObject:[self scopeDesc]];
     [a addObject:(self.unreadOnly ? @"只看未读" : @"全部状态")];
     if (self.searchText.length) {
         [a addObject:[NSString stringWithFormat:@"搜索「%@」", self.searchText]];
@@ -703,6 +905,12 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 // v0.0.37：改由自己的 `unreadSeg` 驱动（系统 scope bar 在 iOS 16 上没渲染出来）。
 - (void)onUnread:(UISegmentedControl *)seg {
     self.unreadOnly = (seg.selectedSegmentIndex == 1);
+    // v0.0.38：「全标已读」跟着这一段进出。
+    // 🔴 必须 `setNeedsLayout`：分段控件的宽度在「只看未读」时要收窄
+    //    （给按钮腾位置），而宽度只在 `viewDidLayoutSubviews` 里算。
+    //    只改 hidden 不重布局的话，按钮会压在分段控件上。
+    self.markAllBtn.hidden = !self.unreadOnly;
+    [self.view setNeedsLayout];
     [self loadData];
 }
 
@@ -754,12 +962,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         // 🔴 v0.0.36：「只看未读」模式下点开一条，它变已读后**不该再出现在列表里**。
         //    这是**数量会变**的场景 ⇒ 禁用 `reloadRowsAtIndexPaths:`（它要求内存下标
         //    与行严格对应，少一行之后就对不上了），必须整表重查。
-        //    但为了不把滚动位置清零，重查前后手动存/恢复 contentOffset。
-        CGPoint off = tableView.contentOffset;
-        [self loadData];
-        [tableView layoutIfNeeded];
-        CGFloat maxY = MAX(0, tableView.contentSize.height - tableView.bounds.size.height);
-        tableView.contentOffset = CGPointMake(0, MIN(off.y, maxY));
+        // v0.0.38：那套「存 offset → 重查 → 恢复」抽成了 `reloadKeepingOffset`，
+        //    这里改成调它 —— 同一个动作只留一份实现（原来有两处，改一处必然漏另一处）。
+        [self reloadKeepingOffset];
     } else if ([d isKindOfClass:[NSMutableDictionary class]]) {
         [(NSMutableDictionary *)d setObject:@1 forKey:@"read"];
         [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
