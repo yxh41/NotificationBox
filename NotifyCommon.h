@@ -181,6 +181,21 @@ static inline BOOL NBIsSoundFileExt(NSString *name) {
 #define NB_DEFAULT_SOUND_MAX_SEC 8.0             // 键缺失时的默认
 #define NB_SOUND_MAX_SEC_CEIL   120.0            // 手填上限，防止有人写 86400
 
+// v0.0.32：来通知时把**别人正在播的音乐压低**（AVAudioSessionCategoryOptionDuckOthers）。
+//
+// 🔴 只对 B 通道（AVAudioPlayer，长音）有效。A 通道走 AudioServicesPlaySystemSound，
+//    它自己不管 AVAudioSession，所以短音永远是"混着播、不压别人"。这一条必须写在界面上，
+//    否则用户打开开关后短音照旧（因为他配的就是短音），只会得出"开关没用"的结论。
+//
+// 🔴 缺省 = **关**：默认仍是 v0.0.27~v0.0.31 验收过的 Ambient + MixWithOthers（与音乐共存、互不打扰）。
+//    这个开关只负责"多压一层"，**绝不改"能不能共存"** —— 共存那条已经上线验收过，不能赌。
+//
+// 🔴 压低的恢复**依赖 v0.0.30 的交还**：`releaseAudioSessionIfIdle` 里那句
+//    `setActive:NO withOptions:NotifyOthersOnDeactivation`。没有那条，被压低的音乐永远不会自己回来
+//    （症状：听歌时来一条通知，之后音乐一直闷着，直到用户手动调音量或切歌）。
+//    ⇒ 动这个开关之前先确认交还那条路还在（源码判据 a02/a06 覆盖）。
+#define NB_KEY_SOUND_DUCK_OTHERS @"soundDuckOthers"   // NSNumber(BOOL) 或 "1"/"0"，缺省 = 关
+
 // A 通道（AudioServicesPlaySystemSound）的系统硬上限：超过 30 秒的音频它只播前 30 秒。
 // 🔴 v0.0.27 起这个数**不再是一个要跟用户解释的局限**，而是一条选路依据：
 //    时长 > 30 秒一律不走 A（走 B，B 想播多久播多久）⇒ 界面上不会出现"我设了 60 秒只响 30 秒"。
