@@ -4287,3 +4287,242 @@ SQL 漏拼时间条件、拼了占位符不 bind、`filterDesc` 名字变回「�
 
 > 第 1 条是这一版的主修（系统 scope bar 在 iOS 16 上不渲染）。
 > 第 3、4 条是"红点消不掉"那个病的验收：**判据不是"红点没了"，而是"红点和列表不再互相矛盾"**。
+## v0.0.38 · 列表会自己更新了 +「只看未读」下能一次全标已读
+
+v0.0.37 真机确认通过之后（用户：「可以了」），这一版是我扫了一遍代码挑出来的两个缺口，
+让用户从候选里选的。选的是 **A+B 一起交付**：
+
+| 候选 | 用户能不能感知 |
+|---|---|
+| **A 列表不会自己更新** | 能。后台来通知 → 点进盒子还是老样子，得手动切一下筛选或搜索才刷新 |
+| **B「只看未读」下没有批量入口** | 能。积了 50 条未读只能一条条点开 |
+| C `markRead:` 还在拼 SQL | 不能（整数无注入面），顺手清 |
+| D `hash` 字段是死代码 | 不能。**故意不动** —— 删列要改 schema + 迁移，风险远大于收益 |
+| E 图标栏没有「更早也有未读」的提示 | 半能。v0.0.37 只在**空列表**里补了引导 |
+
+> 顺手改的还有一处：**时间段的段名原来写了两份**（`buildUI` 里一份、`filterDesc` 里一份）。
+> v0.0.36 的「今天」名不符实，根子就是"两处写同一个数组，改一处漏一处"。
+> 这版抽成 `timeNames`，全文件只有一处字面量。
+
+### 一、A：列表自动更新的三个坑
+
+刷新动作本身很简单，难的是**在哪儿刷**和**怎么判断该不该刷**。
+
+#### 坑 1：不能在 `viewWillAppear:` 里直接 `loadData`
+
+`ViewController.m` 里 v0.0.35 就写着这段注释：
+
+```objc
+// 🔴 为什么不在 `viewWillAppear:` 里 `loadData`（这是最容易想到的做法）：
+//    整表 reload 会让**滚到中间点开一条再返回，列表跳回顶部** —— 真机上一碰就发现。
+```
+
+所以这版没有推翻它，而是把 `didSelectRow:` 里已经在用的那套「存 `contentOffset` →
+重查 → `layoutIfNeeded` → 恢复」抽成一个方法：
+
+```objc
+- (void)reloadKeepingOffset {
+    CGPoint off = self.table.contentOffset;
+    [self loadData];
+    [self.table layoutIfNeeded];
+    CGFloat maxY = MAX(0, self.table.contentSize.height - self.table.bounds.size.height);
+    self.table.contentOffset = CGPointMake(0, MIN(off.y, maxY));
+}
+```
+
+`viewWillAppear:` 里调的是 `refreshIfChanged`，它只在库里真的变了时才转调上面那个：
+
+```objc
+- (void)refreshIfChanged {
+    NSInteger total = [NotifyStore count];
+    NSInteger topId = [NotifyStore maxRowId];
+    if (total == self.lastTotal && topId == self.lastMaxId) return;
+    [self reloadKeepingOffset];
+}
+```
+
+> `layoutIfNeeded` 不能省：少了它 `contentSize` 还是旧值，clamp 会按旧高度算，
+> 结果位置照样错。判据里专门有一条盯这个调用顺序（a13）。
+
+#### 坑 2：只看 `count` 会漏掉最该刷新的场景
+
+这是这一版唯一一个"不写下来下次一定还会犯"的点：
+
+> **记录数到达上限之后，tweak 每来一条新通知都会先裁掉一条最旧的 ⇒ 条数恒定不变。**
+> 只看条数的话，`count == lastCount` 恒成立 ⇒ **库满之后列表永远不会自己更新**。
+> 而"库满了还在收通知"恰恰是最常见的状态。
+
+所以加了 `+ (NSInteger)maxRowId`（`SELECT IFNULL(MAX(id),0)`），两个数一起看：
+
+- 新增记录 ⇒ `MAX(id)` 变大
+- 删除记录 ⇒ `count` 变小
+- 库满时来新通知 ⇒ 条数不变、`MAX(id)` 变大 ✅
+
+`IFNULL` 是为了让"空表 = 0"在 SQL 里就说清楚，而不是靠 C 层读 NULL 恰好也是 0 的巧合。
+
+#### 坑 3：App 回前台**不走** `viewWillAppear:`
+
+VC 一直活着，只是 window 换了前台。只加 `viewWillAppear:` 的话，
+"后台来通知 → 切回 App → 列表还是老的"这个场景一点没治。所以另外听一个通知：
+
+```objc
+[[NSNotificationCenter defaultCenter] addObserver:self
+                                         selector:@selector(onForeground:)
+                                             name:UIApplicationWillEnterForegroundNotification
+                                           object:nil];
+```
+
+`dealloc` 里 `removeObserver:self`（iOS 9 起已经自动了，写出来是为了让读代码的人不用查版本）。
+
+#### 库指纹在哪儿记
+
+必须在 `loadData` 的查询**之后**：
+
+```objc
+self.lastTotal = total;
+self.lastMaxId = [NotifyStore maxRowId];
+```
+
+指纹的语义是「这一屏列表现实对应库里的哪个状态」。记早了就等于把还没进列表的新记录
+算进去了 ⇒ 下次永远比不出差异。判据 a14 盯的就是这个先后。
+
+### 二、B：「全标已读」的口径一致性
+
+#### 按钮为什么放在分段控件同一行
+
+导航栏右边已经有「诊断」「清空」两个，再塞一个会把标题「消息盒子 (N)」挤没。
+「只看未读」时把 `unreadSeg` 收窄、右侧腾出 `kNBMarkAllWidth`（88pt）给按钮；
+「全部」模式下按钮 `hidden`，分段控件恢复占满整行（和 v0.0.37 一致）。
+
+「全部」模式下**不显示**这个按钮是有意的：那时列表里已读未读混在一起，
+"全标已读"的作用对象不明确（是这一屏？是整个库？），很容易被当成"清空"。
+
+#### 确认框的数字必须等于实际改动的行数
+
+v0.0.35 的 `onClear:` 栽过一次：确认框报列表的 3 条、实际清整张表 2000 条。
+这次两边由**同一个函数**产出条件：
+
+```objc
+// NotifyStore.m —— 拼 WHERE 和绑参在同一个函数里，顺序不可能错
+static sqlite3_stmt *NBPrepareUnreadScope(sqlite3 *db, NSString *sqlHead,
+                                          NSString * _Nullable bundle, NSTimeInterval since) {
+    NSMutableString *sql = [NSMutableString stringWithString:sqlHead];
+    if (bundle.length) [sql appendString:@" AND bundle=?"];
+    if (since > 0) [sql appendString:@" AND ts>=?"];
+    ...
+}
+```
+
+| 用途 | 方法 | SQL |
+|---|---|---|
+| 确认框报数字 | `unreadCountWithBundle:since:` | `SELECT COUNT(*) … WHERE read=0` + 共享条件 |
+| 真正改动 | `markAllReadWithBundle:since:` | `UPDATE … SET read=1 WHERE read=0` + 共享条件 |
+
+拼条件与绑参**故意写在同一个函数里**：拆成「拼一个函数、绑一个函数」就有两边顺序不一致的可能，
+而这类错不会报错，只会静默少筛一个条件。
+
+`markAllRead` 查 `sqlite3_changes`（`UPDATE … WHERE read=0` 命中 0 行照样返回 `SQLITE_DONE`，
+不查 changes 就会把"什么都没改"报成成功）。
+
+#### 搜索词**不**参与标记范围
+
+这是本版第二处"口径"问题。用户搜「验证码」时列表只显示 3 条，
+如果标记范围也跟着搜索走，`SQL` 里就得多一个 `LIKE`；如果跟着走但不说，用户会以为"只标这 3 条"。
+
+选择：**标记范围只按 App + 时间**，搜索只影响列表显示，并**在确认框里写明**：
+
+```objc
+if (self.searchText.length) {
+    [msg appendFormat:@"\n\n⚠️ 搜索框里的「%@」只影响列表显示，不限制标记范围。", self.searchText];
+}
+```
+
+同理，范围描述用的是 `scopeDesc`（只含 App + 时间），**不是** `filterDesc`（含未读状态和搜索词）。
+判据 d05 专门盯这一条：`scopeDesc` 里出现 `searchText` 就报红。
+
+### 三、顺手清：`markRead:` 不再拼 SQL
+
+v0.0.33 在 `deleteRow:` 上写过这段注释：
+
+```objc
+// 🔴 用参数绑定而不是拼 SQL：rowId 虽然来自数据库（整数、无注入面），
+//    但这里保持和 queryWithBundle 同一口径 —— 一处拼串、一处绑参，
+//    以后有人把某个参数换成字符串时就会在拼串那处出事。
+```
+
+而 `markRead:` 一直是 `stringWithFormat` 拼的 —— 同文件里注释和代码自相矛盾了五版。
+现在改成 `UPDATE notifications SET read=1 WHERE id=?` + `sqlite3_bind_int64`。
+不是因为 rowId 有注入面（它没有），而是因为"按 id 改一行"这件事在本文件里应该只有一种写法。
+
+### 四、源码判据
+
+`nb_v038_src_check.py`：**72 条**判据，正向 / 反向对照 / 负向变异**同一份文件、同一批判据**。
+
+| 跑法 | 结果 |
+|---|---|
+| 正向 | **72/72 通过** |
+| 负向变异（22 条，逐条把语义改坏） | **22/22 全被抓住** |
+| 反向对照（拿 v0.0.37 的 `d47d9dc` 喂进同一批判据） | **报红 58 条** |
+
+反向对照存活的 14 条全是**回归组**（`e01~e12` 是 v0.0.32~v0.0.37 的行为，本来就该在旧版上也绿）
+加 `d08`（`filterDesc` 区分只看未读 —— v0.0.36 就有）和 `f03`（括号配平）。
+
+这一版判据自身踩的坑（都记在脚本注释里）：
+
+1. **`a07` 假红**：通知注册的形参叫 `selector:`，我照 UIButton 的写法写成 `action:`。
+2. **`f02` 期望本身错了**：我写「旧版本串必须从 Tweak.x 消失」，但 Tweak.x 首行**有意**保留了
+   「上一版 v0.0.37：…」—— 这版 tweak 侧没改逻辑，不写清楚的话以后看到 v0.0.38 的日志
+   会以为 tweak 也动了、白查一轮。按纪律**改期望不改判据**：改成"旧版本号只许出现在『上一版』那几行"。
+3. **三条变异锚点重名被 SKIP**：`if (since > 0) [sql appendString:@" AND ts>=?"];` 在
+   `bundlesWithUnreadSince:`（226 行）和 `NBPrepareUnreadScope`（296 行）里逐字相同。
+   这正是 v0.0.37 立的「**SKIP 必须算失败**」规矩抓到的 —— 锚点改成两行连排才唯一。
+4. **`a14` 的变异设计错了**：我原本只交换了 `lastTotal` / `lastMaxId` 两行的顺序，
+   而那两行都还在查询之后 ⇒ 判据当然不红。改成"真的挪到 `loadData` 开头"才测到东西。
+5. **`b10` 判据太弱**：原本只判"两个方法都调了共享函数"，而实参写成 `nil, 0`（等于全库全时间）
+   照样能过。改成连实参一起判，同时发现正则少写了一个 `)`（`bundle, since);`）⇒ 假红。
+6. **两条空洞通过**：`a03`/`d05` 是否定式判据（`'x' not in body`），而旧版里那两个方法
+   根本不存在 ⇒ 函数体是空串 ⇒ `not in ''` 恒为真 ⇒ 反向对照里假绿。
+   修法：否定式判据一律带前置 `vwa and …` / `sd and …`。
+
+### 五、装了这一版要验什么
+
+| # | 操作 | 期望 |
+|---|---|---|
+| 1 | 🔴 **切「只看未读」** | 分段控件右侧出现 **`全标已读`** 按钮；切回「全部」它消失、分段控件恢复占满整行 |
+| 2 | 🔴 点「全标已读」 | 弹确认框，文案里报**条数**和范围（App + 时间段）；点取消什么都不变 |
+| 3 | 🔴 确认后 | 弹出「把 N 条标成了已读」；列表变空并写出「当前筛选」；**对应图标栏红点全部消失** |
+| 4 | 在「只看未读」下先搜索再点「全标已读」 | 确认框里要出现「⚠️ 搜索框里的「…」只影响列表显示，不限制标记范围」 |
+| 5 | 🔴 **列表滚到中间 → 退到后台 → 来一条新通知 → 切回 App** | 列表**自己出现新记录**，且**当前可见位置不动**（不会跳回顶部） |
+| 6 | 🔴 滚到中间 → 点开一条 → 返回 | 位置仍然不动（这是老行为，别被第 5 条带坏） |
+| 7 | 列表滚到中间 → 进「设置」→ 返回 | 位置不动，且列表内容是最新的 |
+| 8 | 没有任何新通知时切回 App | 列表**不重绘、不闪** |
+| 9 | 回归：时间分段、搜索、详情页、左滑删除、清空（含搜索态）、顶部图标栏横向滚动位置、按 App 配时长、压低开关 | 与 v0.0.37 一致 |
+
+> 第 5 条是这一版的主修。判据不是"刷新了没有"，而是**"刷新了但位置没跳"** ——
+> 这两个要求是会打架的（整表 reload 必然清零 offset），所以必须一起验。
+> 第 8 条同样重要：只判"变了会刷"不够，还要判"没变不刷"，否则每切一次 App 就闪一下。
+> 第 4 条是"两个指标同口径"那个病的验收 —— 判据不在"标了几条"，而在**"说的和做的是不是同一批"**。
+
+### 六、交付记录
+
+| 项 | 值 |
+|---|---|
+| deb | `com.yxh41.notifybox_0.0.38_iphoneos-arm64e.deb` · **110198 B** |
+| CI | **#76**（`run_id 40095651248`，head `51249b8eb050`）success，一次编译过 |
+| 产物 zip | 110386 B（与 API `size_in_bytes` 对拍一致） |
+| 远端 | `51249b8eb050` = 本地 `bcae9de`，**6 个改动文件逐 blob 一致** |
+| 改动 | 6 文件 **+337 / −25** |
+| App 二进制 | `350352 → 350576 B`（**+224**，md5 `9dd8124 → 67da260`） |
+| tweak dylib | `160528 B`（本版 tweak 只改版本号，逻辑未动） |
+| 源码判据 | 72 条全绿；负向变异 22/22 全抓住；反向对照（`d47d9dc`）58 条红 |
+| 包级判据 | 44 条全绿；反向对照 20 条红 |
+
+> 反向对照的 20 条红分布很说明问题：`A1~A5`（版本）+ `B1`（md5）+ **`B3~B16` 一条不漏**。
+> B 组就是这一版新增的 14 个自研选择器 / 文案 —— 全部在旧包里不存在，全部在旧包上当场报红。
+> 这比"正向全绿"更能说明判据有效：**正向绿可能是因为判据太松，反向红不可能。**
+>
+> 存活的 24 条也都有解释：`C1~C6` 是"旧包里必须没有"的判据（在旧包上当然绿），
+> `D1~D17` 是回归项（本来就该在两版上都绿）。
+>
+> 顺便记一笔：撞了六次「二进制大小与改动量完全脱钩」之后，这次 350352 → 350576 真的涨了 224 B。
+> **但这不说明下次可以靠大小判断** —— 判据永远是选择器 / 串 / md5。
