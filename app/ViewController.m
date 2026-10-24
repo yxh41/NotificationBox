@@ -26,6 +26,12 @@
 @property (nonatomic, strong) NSArray<NSString *> *bundles;
 @property (nonatomic, copy)   NSString *filterBundle;   // nil = 全部
 @property (nonatomic, copy)   NSString *searchText;
+// v0.0.36：只看未读（搜索框下的 scope bar 第 2 段）
+@property (nonatomic, assign) BOOL unreadOnly;
+// v0.0.36：每个 App 图标右上角那个红点，key = bundle。
+// 🔴 存引用是为了**只刷新红点、不重建按钮** —— 重建会让 `contentSize` 重设，
+//    把图标栏的滚动位置重置到最左（选了第 10 个 App，点开一条就跳回开头）。
+@property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *unreadDots;
 
 - (void)onDiag:(id)sender;
 - (void)onSettings:(id)sender;
@@ -35,6 +41,10 @@
 //    （v0.0.33 的 `doDelete`/`str:` 就是这么挂过一次）。
 - (void)onClear:(id)sender;
 - (void)doClear;
+// v0.0.36：只刷新图标栏红点（不重建按钮，避免图标栏滚动位置被重置）
+- (void)refreshUnreadDots;
+// v0.0.36：当前筛选条件的一行文字描述（空列表时写出来，避免"看着空 = 没有"的误判）
+- (NSString *)filterDesc;
 - (void)showText:(NSString *)text title:(NSString *)title;
 // v0.0.33：轻量一行提示（左滑删除失败时用）。
 // 不走 showText: —— 那个是"长文本可滚动页"，弹一句"这条已经没了"太重。
@@ -411,6 +421,13 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.searchBar = [[UISearchBar alloc] init];
     self.searchBar.delegate = self;
     self.searchBar.placeholder = @"搜索标题或正文";
+    // v0.0.36：搜索框下面挂两个 scope（全部 / 未读）。
+    // 🔴 顺序有讲究：**先设 scopeButtonTitles，再设 showsScopeBar** ——
+    //    反过来的话某些系统版本上 scope bar 不会出现（网上常见的坑）。
+    // 🔴 常显而不是"搜索时才出现"：这是个筛选开关，藏起来等于没有。
+    self.searchBar.scopeButtonTitles = @[@"全部", @"未读"];
+    self.searchBar.selectedScopeButtonIndex = 0;
+    self.searchBar.showsScopeBar = YES;
     [self.view addSubview:self.searchBar];
 
     // 顶部 App 图标栏（横向滚动）
@@ -441,8 +458,13 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.timeSeg.frame = CGRectMake(12, y, w - 24, 30);
     y += 30 + 6;
 
-    self.searchBar.frame = CGRectMake(0, y, w, 44);
-    y += 44;
+    // v0.0.36：开了 scope bar 之后搜索框整体是 44 + 44（搜索框一行、scope 一行）。
+    // 🔴 不能用 `sizeThatFits:` / `intrinsicContentSize` 去"自动算" ——
+    //    UISearchBar 是普通 UIView，`sizeThatFits:` 默认只回 bounds.size，
+    //    未布局时是 (0,0) ⇒ 搜索框直接消失。按"开没开 scope"直接算最稳。
+    CGFloat searchH = self.searchBar.showsScopeBar ? 88 : 44;
+    self.searchBar.frame = CGRectMake(0, y, w, searchH);
+    y += searchH;
 
     self.iconBar.frame = CGRectMake(0, y, w, 56);
     y += 56;
@@ -451,15 +473,29 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 }
 
 - (void)reloadIconBar {
+    // 🔴 v0.0.36：重建按钮会动 `contentSize`，而图标栏是横向滚动的 ——
+    //    不清醒地保住 offset 的话，用户滚到右边选了第 10 个 App、点开一条通知，
+    //    一返回图标栏就跳回最左。这里手动存、算完再夹回去。
+    CGPoint barOff = self.iconBar.contentOffset;
+
     [self.iconBar.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
     self.bundles = [NotifyStore distinctBundles];
+    // v0.0.36：一次查出来，下面建每个图标时直接用（别在循环里一个个查库）
+    NSSet *unread = [NotifyStore bundlesWithUnread];
+    self.unreadDots = [NSMutableDictionary dictionary];
 
     CGFloat x = 8;
     CGFloat size = 44;
     NSArray *list = [@[@"全部"] arrayByAddingObjectsFromArray:self.bundles];
     for (NSString *bid in list) {
+        // 🔴 v0.0.36：按钮外面套一层容器。
+        //    按钮自己要 `clipsToBounds`（圆角得把图标裁进去），红点如果挂在按钮上、
+        //    又想压在角上探出一点，就会被裁掉一半。容器不裁剪，红点挂容器。
+        UIView *holder = [[UIView alloc] initWithFrame:CGRectMake(x, 6, size, size)];
+        [self.iconBar addSubview:holder];
+
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(x, 6, size, size);
+        b.frame = CGRectMake(0, 0, size, size);   // ← 相对容器
         b.layer.cornerRadius = 8;
         b.clipsToBounds = YES;
         b.backgroundColor = [UIColor secondarySystemFillColor];
@@ -496,10 +532,38 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
             b.layer.borderColor = [UIColor systemBlueColor].CGColor;
         }
         b.imageView.contentMode = UIViewContentModeScaleAspectFit;
-        [self.iconBar addSubview:b];
+        [holder addSubview:b];
+
+        // v0.0.36：有未读就在右上角点一个红点。「全部」不点 —— 它不是某个 App，
+        // 而且"全部"聚合了所有 App，「红点 = 全部还有未读」会让人以为没有。
+        if (![bid isEqualToString:@"全部"]) {
+            UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(size - 9, -1, 9, 9)];
+            dot.backgroundColor = [UIColor systemRedColor];
+            dot.layer.cornerRadius = 4.5;
+            // 描边用页面底色：红点压在图标上时轮廓更清楚
+            dot.layer.borderWidth = 1.5;
+            dot.layer.borderColor = [UIColor systemBackgroundColor].CGColor;
+            dot.hidden = ![unread containsObject:bid];
+            [holder addSubview:dot];
+            self.unreadDots[bid] = dot;
+        }
         x += size + 8;
     }
     self.iconBar.contentSize = CGSizeMake(x, 56);
+    // 夹回滚动位置（内容变短时也安全）
+    CGFloat maxX = MAX(0, x - self.iconBar.bounds.size.width);
+    self.iconBar.contentOffset = CGPointMake(MIN(barOff.x, maxX), barOff.y);
+}
+
+// v0.0.36：只刷新红点，**不重建按钮**。
+// 🔴 为什么点开一条通知后不能直接 `reloadIconBar`：那会让 `contentSize` 重设，
+//    图标栏的滚动位置被夹回最左 —— 用户滚到第 10 个 App、点开一条、返回，位置没了。
+//    这里只改已有红点的 hidden，按钮和 contentSize 都不碰。
+- (void)refreshUnreadDots {
+    NSSet *unread = [NotifyStore bundlesWithUnread];
+    for (NSString *bid in self.unreadDots) {
+        self.unreadDots[bid].hidden = ![unread containsObject:bid];
+    }
 }
 
 - (NSString *)shortName:(NSString *)bid {
@@ -544,7 +608,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 
     self.items = [NotifyStore queryWithBundle:self.filterBundle
                                         since:[self sinceFromSeg]
-                                       search:self.searchText];
+                                       search:self.searchText
+                                   unreadOnly:self.unreadOnly];
     [self.table reloadData];
     [self updateEmptyView];
 
@@ -565,13 +630,42 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     l.textAlignment = NSTextAlignmentCenter;
     l.font = [UIFont systemFontOfSize:13];
     l.textColor = [UIColor secondaryLabelColor];
-    l.text = [@"暂无记录\n\n" stringByAppendingString:[NotifyStore debugSummary]];
+    // v0.0.36：多写一行「当前筛选」。
+    // 🔴 加了「只看未读」之后空列表变得很常见：时间选「今天」+ 只看未读 是空的，
+    //    而昨天有未读。不把条件写出来的话，用户会直接断定"没有未读"。
+    l.text = [NSString stringWithFormat:@"暂无记录\n\n当前筛选：%@\n\n%@",
+              [self filterDesc], [NotifyStore debugSummary]];
     self.table.backgroundView = l;
+}
+
+// v0.0.36：把当前四个筛选维度拼成一行。
+- (NSString *)filterDesc {
+    NSMutableArray *a = [NSMutableArray array];
+    [a addObject:(self.filterBundle.length ? [self shortName:self.filterBundle] : @"全部 App")];
+
+    NSArray *times = @[@"今天", @"近7天", @"不限时间"];
+    NSInteger ti = self.timeSeg.selectedSegmentIndex;
+    NSString *t = (ti >= 0 && ti < (NSInteger)times.count) ? times[ti] : @"时间?";
+    [a addObject:t];
+
+    [a addObject:(self.unreadOnly ? @"只看未读" : @"全部状态")];
+    if (self.searchText.length) {
+        [a addObject:[NSString stringWithFormat:@"搜索「%@」", self.searchText]];
+    }
+    return [a componentsJoinedByString:@" · "];
 }
 
 #pragma mark - UISearchBarDelegate
 - (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
     self.searchText = searchText.length ? searchText : nil;
+    [self loadData];
+}
+
+// v0.0.36：scope 切换（全部 / 未读）。
+// 🔴 走 `loadData` 而不是自己过滤 `self.items` —— 后者只能过滤"已经查出来的 2000 条"，
+//    而"只看未读"应该是在数据库层筛（数量完全不同的两类查询）。
+- (void)searchBar:(UISearchBar *)searchBar selectedScopeButtonIndexDidChange:(NSInteger)selectedScope {
+    self.unreadOnly = (selectedScope == 1);
     [self loadData];
 }
 
@@ -619,9 +713,21 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    判据从来不是"这个 API 好不好"，而是**数量变不变**。这里只把一个字段 0→1，
     //    行数不变 ⇒ 内存下标和 row 仍然一一对应；而删除会改数量 ⇒ 必须整表重查。
     // 🔴 顺序不能反：先 markRead（写库），再改内存，再刷新 —— 反了刷出来的还是旧值。
-    if ([d isKindOfClass:[NSMutableDictionary class]]) {
+    if (self.unreadOnly) {
+        // 🔴 v0.0.36：「只看未读」模式下点开一条，它变已读后**不该再出现在列表里**。
+        //    这是**数量会变**的场景 ⇒ 禁用 `reloadRowsAtIndexPaths:`（它要求内存下标
+        //    与行严格对应，少一行之后就对不上了），必须整表重查。
+        //    但为了不把滚动位置清零，重查前后手动存/恢复 contentOffset。
+        CGPoint off = tableView.contentOffset;
+        [self loadData];
+        [tableView layoutIfNeeded];
+        CGFloat maxY = MAX(0, tableView.contentSize.height - tableView.bounds.size.height);
+        tableView.contentOffset = CGPointMake(0, MIN(off.y, maxY));
+    } else if ([d isKindOfClass:[NSMutableDictionary class]]) {
         [(NSMutableDictionary *)d setObject:@1 forKey:@"read"];
         [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+        // 红点要跟着变：这可能正是该 App 的最后一条未读
+        [self refreshUnreadDots];
     } else {
         // 兜底：万一哪天 query 改成返回不可变字典，退回整表重查（会丢滚动位置，但不会错）
         [self loadData];

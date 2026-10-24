@@ -145,7 +145,8 @@ void NBSharedLog(NSString *fmt, ...) {
 
 + (NSArray<NSDictionary *> *)queryWithBundle:(NSString *)bundle
                                        since:(NSTimeInterval)since
-                                      search:(NSString *)q {
+                                      search:(NSString *)q
+                                  unreadOnly:(BOOL)unreadOnly {
     NSMutableArray *res = [NSMutableArray array];
     sqlite3 *db = [self openDB];
     if (!db) return res;
@@ -155,6 +156,10 @@ void NBSharedLog(NSString *fmt, ...) {
     if (bundle.length) [sql appendString:@" AND bundle=?"];     // 顶部 App 图标筛选
     if (since > 0)     [sql appendString:@" AND ts>=?"];         // 时间筛选
     if (q.length)      [sql appendString:@" AND (title LIKE ? OR message LIKE ?)"]; // 搜索
+    // v0.0.36：只看未读。`read=0` 是未读（建表默认值），1 是已读。
+    // 🔴 用 `read=0` 而不是 `read<>1`：后者对 NULL 不成立，老库若有 read 为 NULL 的行
+    //    会既不进"未读"也不进"已读"，凭空消失。
+    if (unreadOnly)    [sql appendString:@" AND read=0"];
     [sql appendString:@" ORDER BY ts DESC LIMIT 2000"];
 
     sqlite3_stmt *st;
@@ -198,6 +203,30 @@ void NBSharedLog(NSString *fmt, ...) {
     }
     sqlite3_close(db);
     return a;
+}
+
++ (NSSet<NSString *> *)bundlesWithUnread {
+    // v0.0.36：图标栏红点用。只回"这个 App 有没有未读"，不回条数。
+    // 🔴 为什么不复用 `bundleCounts`：它 `SELECT bundle, COUNT(*)` 数的是**全部**记录
+    //    （v0.0.13 给 App 选择器排序用），拿它判未读 ⇒ 所有 App 永远都有红点，
+    //    红点变成装饰，等于没有。
+    NSMutableSet *s = [NSMutableSet set];
+    sqlite3 *db = [self openDB];
+    if (!db) return s;
+    sqlite3_stmt *st;
+    const char *sql = "SELECT DISTINCT bundle FROM notifications "
+                      "WHERE read=0 AND bundle IS NOT NULL AND bundle <> ''";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *t = (const char *)sqlite3_column_text(st, 0);
+            if (!t) continue;
+            NSString *bid = [NSString stringWithUTF8String:t];
+            if (bid.length) [s addObject:bid];
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return s;
 }
 
 + (NSDictionary<NSString *, NSNumber *> *)bundleCounts {

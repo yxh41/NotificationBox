@@ -12,10 +12,18 @@ NS_ASSUME_NONNULL_BEGIN
                     date:(nullable NSDate *)date;
 
 // 查询（盒子 App 调用）
+// v0.0.36：加 `unreadOnly`（只看未读）。四种筛选是**独立叠加**的
+// （App / 时间 / 搜索 / 未读），和之前三个参数的组合方式一致。
 + (NSArray<NSDictionary *> *)queryWithBundle:(nullable NSString *)bundle
                                        since:(NSTimeInterval)since   // 0 = 不限
-                                      search:(nullable NSString *)q; // nil = 不限
+                                      search:(nullable NSString *)q  // nil = 不限
+                                  unreadOnly:(BOOL)unreadOnly;        // YES = 只回 read=0
 + (NSArray<NSString *> *)distinctBundles;          // 顶部 App 图标栏
+// v0.0.36：**有未读记录的 App 集合**，给图标栏红点用。
+// 🔴 只回"有没有"，不回条数 —— 红点不显示数字，查询越轻越好。
+// 🔴 别拿 `bundleCounts` 兼职：它数的是**全部**条数（v0.0.13 给 App 选择器排序用的），
+//    拿它判未读会"所有 App 永远都有红点"。
++ (NSSet<NSString *> *)bundlesWithUnread;
 // v0.0.13：bundle -> 通知条数。App 选择器用它把「经常来通知的」排前面。
 + (NSDictionary<NSString *, NSNumber *> *)bundleCounts;
 + (NSInteger)maxRecords;                           // 从 prefs 读上限
