@@ -23,6 +23,12 @@ NS_ASSUME_NONNULL_BEGIN
 // 维护
 + (void)markRead:(NSInteger)rowId;
 + (void)clearAll;
+// v0.0.33：删**单条**。返回 YES 表示真的删掉了（id 不存在时返回 NO）。
+// 🔴 界面那边删完必须**重新 query**，不能只从内存数组里 removeObjectAtIndex: ——
+//    在「搜索 / 顶部 App 筛选 / 时间段」这三种状态下，内存下标和数据库根本对不上，
+//    只改内存就等于"只改账本的读数、不改账本"（本项目数量契约三问的第 2 问）。
+//    症状具体是：删完那一行仍然在（重进又有），或者删了 A 却少了一条 B。
++ (BOOL)deleteRow:(NSInteger)rowId;
 
 // 设置（App 侧的**唯一**读写入口；tweak 侧读走 NotifyCommon.h 的 NBLoadSettings）
 // 🔴 统一在这里写，别让每个 VC 各写一遍 writeToFile: —— 写入点一多，
