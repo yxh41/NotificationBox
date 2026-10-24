@@ -205,10 +205,6 @@ void NBSharedLog(NSString *fmt, ...) {
     return a;
 }
 
-+ (NSSet<NSString *> *)bundlesWithUnread {
-    return [self bundlesWithUnreadSince:0];   // 全库口径（空列表提示要用它做对照）
-}
-
 + (NSSet<NSString *> *)bundlesWithUnreadSince:(NSTimeInterval)since {
     // v0.0.36：图标栏红点用。只回"这个 App 有没有未读"，不回条数。
     // 🔴 为什么不复用 `bundleCounts`：它 `SELECT bundle, COUNT(*)` 数的是**全部**记录
