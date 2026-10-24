@@ -18,7 +18,10 @@ TWEAK_NAME = NotifyBox
 #    在盒子 App 进程里那些类根本不存在，编进去也是死代码。
 #    也**不要**塞进 NotifyFilter.m：重型只读观测和"刀"必须分开，
 #    否则刀被观测代码拖出异常时，两个都成了嫌疑犯，一轮下来解释不清。
-NotifyBox_FILES = Tweak.x NotifyStore.m NotifyFilter.m NotifySpeaker.m NotifyProbe.m NotifySoundDiag.m
+# 🔴🔴 v0.0.45 新增 NBAppName.m：**tweak 侧也要编**。
+#    它是「让 SpringBoard 代读 App 名」那一半 —— 名字解析必须两边同一份代码，
+#    否则又变成「两处抄两遍、必有一处先改」的老毛病。
+NotifyBox_FILES = Tweak.x NotifyStore.m NotifyFilter.m NotifySpeaker.m NotifyProbe.m NotifySoundDiag.m NBAppName.m
 # 🔴 AVFoundation 必须显式链接，否则 AVSpeechSynthesizer 的符号在加载期解析不到
 #    ⇒ 整条 dylib 加载失败 ⇒ 表面上"tweak 没注入"，实际是链接问题。
 #    SpringBoard 本身就用 AVFoundation（系统提示音），所以链接是安全的；
@@ -76,7 +79,12 @@ APPLICATION_NAME = NotifyBoxApp
 #      ViewController 里 import 了它、也 alloc 了它，但 application.mk 不会自动收目录里的新文件
 #      ⇒ 编译期过、**链接期**报 `undefined symbol _OBJCCLASS_$_NotifyDetailViewController`。
 #      看到这个符号名先查这里，不要跑去查代码。
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m app/NotifyExport.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m
+# 🔴🔴 v0.0.45 新增 NBAppName.m：**App 侧也要编**（读 app_names 表 + 复用同一份解析）。
+#    ⚠️ 这是**同一个坑的第四次**（v0.0.28 / v0.0.33 / v0.0.44 各栽一次）：
+#      application.mk 不会自动收目录里的新文件，漏了这一行就是
+#      「编译期过、链接期 undefined symbol」—— 那种报错看着像代码问题，
+#      其实是构建配置。看到 undefined symbol 先查这里。
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m app/NotifyExport.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m NBAppName.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
 # 🔴 App 侧也要 AVFoundation/AVFAudio：声音选择页要**试听**，那是在 App 里跑的 TTS。
 #    不链的话编译期就找不到 AVSpeechSynthesizer，而 tweak 侧那份救不了 App。

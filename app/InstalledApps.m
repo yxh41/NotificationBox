@@ -1,9 +1,28 @@
 #import "InstalledApps.h"
 #import "NotifyStore.h"
 #import "NotifyCommon.h"
-#import <objc/runtime.h>
-#import <objc/message.h>
-#import <dlfcn.h>
+#import "NBAppName.h"
+
+// 🔴🔴 v0.0.45：名字解析的所有工具函数**搬走**了（现在在根目录的 NBAppName.h/.m，
+//    tweak 和 App 两个目标共用一份）。
+//    搬的原因不是"整理代码"，是一个修不动的 bug：
+//    京东显示「京东-购物商城」、信息 App 显示不出「信息」，连着三版都在 App 进程里
+//    换字段 / 加汉字优先 / 加"取更短"，都没碰真正的前提 ——
+//    **盒子 App 有沙盒，读不到 /var/containers/Bundle/Application/<UUID>/Xxx.app**，
+//    而"读 bundle 里本地化的 CFBundleDisplayName"才是桌面那个字的唯一权威来源。
+//    ⇒ 正解是让注入 SpringBoard（有权限）的 tweak 把名字算好写进 `app_names` 表，
+//      两边用**同一份**解析代码，否则又变成两处抄两遍。
+
+// 🔴 私有方法**必须**在这里显式声明：项目开 -Werror，
+//    靠"定义写在调用点之前"来解析选择器太脆（本项目栽过三次：
+//    kAutoChainTrigger / uiscrollerInternalVelocity / forceLayoutVisibleCells）。
+//    这里 `pickNameForBundle:` 定义在 `+all` **之后**，而 `+all` 要调它 ⇒ 不声明就编不过。
+@interface InstalledApps ()
++ (NSString *)pickNameForBundle:(NSString *)bid
+                          table:(NSDictionary<NSString *, NSString *> *)table
+                         refine:(NSDictionary<NSString *, NSString *> *)refine
+                          enum1:(NSDictionary<NSString *, NSString *> *)enum1;
+@end
 
 @implementation InstalledApp
 - (NSString *)description {
@@ -14,39 +33,6 @@
 
 static NSArray<InstalledApp *> *gCache = nil;
 static NSMutableArray<NSString *> *gDiag = nil;
-
-// 无参、返回对象的消息。用它访问 LSApplicationWorkspace 这类私有 API：
-// 🔴 不用 performSelector: —— 项目开 -Werror，传变量 SEL 会触发
-//    -Warc-performSelector-leaks，直接编译失败。
-// 🔴 也不用声明假 @interface —— 私有 API 的方法名/签名会随系统版本变，
-//    声明错了链接期不报、运行期崩。走 objc_msgSend + respondsToSelector 探一次最稳。
-typedef id (*NBIdMsgSend)(id, SEL);
-static id NBCallId(id target, NSString *selName) {
-    if (!target || !selName.length) return nil;
-    SEL s = NSSelectorFromString(selName);
-    if (!s) return nil;
-    @try {
-        if (![target respondsToSelector:s]) return nil;
-        return ((NBIdMsgSend)objc_msgSend)(target, s);
-    } @catch (__unused NSException *e) {
-        return nil;
-    }
-}
-
-// 一个对象参数版本（v0.0.43：`+[LSApplicationProxy applicationProxyForIdentifier:]`）。
-// 同上，不走 performSelector:（带参版本触发的是 -Warc-performSelector-leaks 的另一条路径）。
-typedef id (*NBIdMsgSend1)(id, SEL, id);
-static id NBCallId1(id target, NSString *selName, id arg) {
-    if (!target || !selName.length) return nil;
-    SEL s = NSSelectorFromString(selName);
-    if (!s) return nil;
-    @try {
-        if (![target respondsToSelector:s]) return nil;
-        return ((NBIdMsgSend1)objc_msgSend)(target, s, arg);
-    } @catch (__unused NSException *e) {
-        return nil;
-    }
-}
 
 // 🔴 必须是可变参数。写的时候很容易先写成单参数（"反正就是往数组里塞一行"），
 //    然后调用处全是 NBAddDiag(@"...%lu...", n) —— 编译器报的是
@@ -60,279 +46,11 @@ static void NBAddDiag(NSString *fmt, ...) {
     [gDiag addObject:line ?: @"?"];
 }
 
-#pragma mark - v0.0.43 取值工具（**每个键单独 @try**）
+#pragma mark - 路 1：LSApplicationWorkspace（不读 bundle，快）
 
-// 读一个**字符串**属性。键不存在、值类型不符、读的时候抛异常 —— 一律返回 nil。
-// 🔴🔴 为什么坚持"逐键"而不是"逐项"：
-//      v0.0.42 的真机 bug 现场是三个键共用一个 @try（`bundleIdentifier` 读成功了，
-//      随后 `localizedName` 抛异常 ⇒ 整个 App 被丢弃，连已经读到的 bundle 一起丢）。
-//      `LSApplicationProxy` 是私有类，占位 App / 扩展 / 已删记录都可能让某个键抛。
-//      ⇒ 一个键读不出来，只该让**这个键**作废，不该让这个 App 作废。
-// 🔴 顺带把首尾空白去掉：真机上见过 `@" 微信 "` 这种值，直接显示会多出空隙。
-static NSString *NBStrForKey(id obj, NSString *key) {
-    if (!obj || !key.length) return nil;
-    @try {
-        id v = [obj valueForKey:key];
-        if ([v isKindOfClass:[NSString class]]) {
-            NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:
-                           [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (s.length) return s;
-        }
-    } @catch (__unused NSException *e) {
-        return nil;
-    }
-    return nil;
-}
-
-// 读一个**路径**属性。私有 API 有的回 `NSURL`、有的回 `NSString`（不同系统版本不一样）。
-static NSString *NBPathForKey(id obj, NSString *key) {
-    if (!obj || !key.length) return nil;
-    @try {
-        id v = [obj valueForKey:key];
-        if ([v isKindOfClass:[NSURL class]]) return [(NSURL *)v path];
-        if ([v isKindOfClass:[NSString class]]) {
-            NSString *s = (NSString *)v;
-            if (s.length) return s;
-        }
-    } @catch (__unused NSException *e) {
-        return nil;
-    }
-    return nil;
-}
-
-// 名字里有没有汉字（含 CJK 部首 / 兼容汉字 / 全角标点）。
-static BOOL NBHasCJK(NSString *s) {
-    for (NSUInteger i = 0; i < s.length; i++) {
-        unichar c = [s characterAtIndex:i];
-        if (c >= 0x2E80 && c <= 0x9FFF) return YES;
-        if (c >= 0xF900 && c <= 0xFAFF) return YES;
-        if (c >= 0xFF00 && c <= 0xFFEF) return YES;
-    }
-    return NO;
-}
-
-// 在若干候选里挑一个：**先"有汉字"优先，再"同档里取更短"**。
-// 🔴 第一档（有汉字优先）：v0.0.42 真机反馈「云闪付 / 米家 / 京东 / 小红书显示的不是中文名」。
-//    用户的手机是中文环境，界面上出现 `Mi Home`、`UPay`、`jdmobile` 就是 bug。
-//    而这个项目里能拿到名字的地方有三处（系统短名 / 系统全名 / Info.plist），
-//    它们谁给英文、谁给中文并不固定 ⇒ 不能只按候选顺序碰运气。
-// 🔴 第二档（v0.0.44 真机反馈加的"更短"）：用户原话
-//    「追剧日历就追剧日历，京东就京东，不用把后面的都带上，就跟桌面上显示的 app 名称一样」。
-//    系统注册表里有两套名字 —— `localizedName`（完整显示名，常带「-购物商城」这类后缀）
-//    和 `localizedShortName`（桌面/搜索里那个短标签）。**两者都带汉字时，短的才是眼睛里那个**。
-// 🟢 两个边界都守住了：
-//    · 都有汉字 ⇒ 取更短的（「京东-购物商城」→「京东」）
-//    · 都没汉字 ⇒ **不比长度**，保持候选顺序 —— 否则 `WhatsApp` 可能被某个内部短名干掉
-//    · 永远不做"把这一个切开"的截断：`WPS Office` 这种真名不会被削成 `WPS`
-static NSString *NBPickName(NSArray<NSString *> *cands) {
-    NSString *best = nil;
-    BOOL bestCJK = NO;
-    for (NSString *s in cands) {
-        if (!s.length) continue;
-        BOOL cjk = NBHasCJK(s);
-        if (!best) { best = s; bestCJK = cjk; continue; }
-        if (cjk && !bestCJK) { best = s; bestCJK = YES; continue; }   // 有汉字 > 没汉字
-        if (cjk && bestCJK && s.length < best.length) { best = s; }   // 都有汉字 ⇒ 更短
-    }
-    return best;
-}
-
-// 最后一层兜底：bundle 末段（`com.xiaomi.mihome` → `mihome`）。
-// 🔴 这是**最坏情况**，不是"默认值"：调用它之前应该已经试过系统名和 Info.plist。
-//    在 v0.0.43 之前它被当成主路径用，所以云闪付显示 `cup`、米家显示 `mihome`。
-static NSString *NBLastSegmentName(NSString *bid) {
-    NSString *last = [[bid componentsSeparatedByString:@"."] lastObject];
-    return last.length ? last : bid;
-}
-
-// 从一个 `.app` 目录里读显示名。读不到返回 nil（**不要**在这里兜底，兜底是调用方的事）。
-// 取值顺序：本地化 DisplayName → DisplayName → 本地化 Name → Name，然后按"有汉字优先"挑。
-// 🔴 为什么要读 `zh-Hans.lproj/InfoPlist.strings`：很多 App 顶层 `CFBundleDisplayName`
-//    写的是英文（或干脆没有这个键），中文名放在本地化表里。只读 Info.plist 顶层，
-//    就会"名字拿到了、但是英文"—— 在用户眼里和"没拿到"一样糟。
-// 🔴 `InfoPlist.strings` 在设备上是 **bplist**（不是文本），`dictionaryWithContentsOfFile:` 能读。
-static NSString *NBNameFromAppBundle(NSString *path) {
-    if (!path.length) return nil;
-    NSFileManager *fm = [NSFileManager defaultManager];
-
-    // `bundleContainerURL` 给的是容器目录（`.../<UUID>`），里面才是 `Xxx.app`
-    NSString *app = path;
-    if (![app hasSuffix:@".app"]) {
-        NSString *hit = nil;
-        NSArray *subs = [fm contentsOfDirectoryAtPath:app error:nil];
-        for (NSString *s in subs) {
-            if (![s hasSuffix:@".app"]) continue;
-            hit = [app stringByAppendingPathComponent:s];
-            break;
-        }
-        if (!hit) return nil;
-        app = hit;
-    }
-
-    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
-                          [app stringByAppendingPathComponent:@"Info.plist"]];
-    if (![info isKindOfClass:[NSDictionary class]]) return nil;
-
-    // 本地化表只读**一次**（上面两个循环各读一遍的话，每个 App 要多读两次文件）
-    NSMutableArray<NSDictionary *> *tables = [NSMutableArray array];
-    for (NSString *lp in @[@"zh-Hans.lproj", @"zh_CN.lproj"]) {
-        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:
-                           [[app stringByAppendingPathComponent:lp]
-                            stringByAppendingPathComponent:@"InfoPlist.strings"]];
-        if ([d isKindOfClass:[NSDictionary class]]) [tables addObject:d];
-    }
-
-    // 优先级：本地化 DisplayName → 顶层 DisplayName → 本地化 Name → 顶层 Name
-    // （`NBPickName` 会在这些候选里优先挑带汉字的那个，所以顺序只是"同等条件下"的次序）
-    NSMutableArray<NSString *> *c = [NSMutableArray array];
-    for (NSString *key in @[@"CFBundleDisplayName", @"CFBundleName"]) {
-        for (NSDictionary *d in tables) {
-            // 复用 NBStrForKey：KVC 在 NSDictionary 上等价于 objectForKey:，同样带 @try
-            NSString *v = NBStrForKey(d, key);
-            if (v.length) [c addObject:v];
-        }
-        NSString *v = NBStrForKey(info, key);
-        if (v.length) [c addObject:v];
-    }
-
-    return NBPickName(c);
-}
-
-// 从一个 `LSApplicationProxy` 上解析显示名。全部来源都失败返回 nil。
-// `srcOut`（可为 NULL）回报名字是从哪儿来的，只用于诊断。
-// 🔴 只有"手上一个汉字都没有"时才去读 Info.plist —— 读文件是 I/O，
-//    200 个 App 全都读一遍没必要；系统本地化名已经是中文时它就是最权威的答案。
-static NSString *NBNameFromProxy(id proxy, NSString **srcOut) {
-    if (srcOut) *srcOut = nil;
-    if (!proxy) return nil;
-
-    NSMutableArray<NSString *> *c = [NSMutableArray array];
-    // 🔴 v0.0.44：`localizedShortName` **排在第一位** —— 它就是桌面图标底下那个短标签
-    //    （完整名常带「-购物商城」这类后缀）。`NBPickName` 在"都有汉字"时会取更短的那个，
-    //    所以把短名放进来 = 让"用户眼睛里的名字"优先胜出。
-    // 🔴 这四个键有的系统版本有、有的没有。**逐键读**，不存在的键不构成失败。
-    for (NSString *k in @[@"localizedShortName", @"localizedName", @"displayName", @"itemName"]) {
-        NSString *v = NBStrForKey(proxy, k);
-        if (v.length) [c addObject:v];
-    }
-    NSString *shortName = c.count ? c[0] : nil;
-    NSString *picked = NBPickName(c);
-    NSString *src = nil;
-    if (picked.length) {
-        // 诊断要能看出"这个名字是短名还是完整名" —— 下一回再有人说名字不对，
-        // 一眼就能判断是"系统给的完整名太长"还是"短名本身就是那个"。
-        src = (shortName.length && [picked isEqualToString:shortName]) ? @"短名" : @"系统名";
-    }
-
-    if (!(picked.length && NBHasCJK(picked))) {
-        NSString *path = NBPathForKey(proxy, @"bundleURL");
-        if (!path.length) path = NBPathForKey(proxy, @"resolvedInstallationURL");
-        if (!path.length) path = NBPathForKey(proxy, @"bundleContainerURL");
-        NSString *fromPlist = path.length ? NBNameFromAppBundle(path) : nil;
-        if (fromPlist.length) {
-            if (!picked.length || NBHasCJK(fromPlist)) {
-                picked = fromPlist;
-                src = @"Info.plist";
-            }
-        }
-    }
-    if (srcOut) *srcOut = src;
-    return picked;
-}
-
-// 把 CoreServices 带进来（`LSApplicationWorkspace` / `LSApplicationProxy` 都在里面）。
-// 🔴 绝对路径在 roothide 上可能被重定向，所以先用裸名让 dyld 自己找，再退回绝对路径。
-static BOOL NBEnsureCoreServices(void) {
-    if (NSClassFromString(@"LSApplicationWorkspace")) return YES;
-    const char *cands[] = {
-        "CoreServices",
-        "/System/Library/Frameworks/CoreServices.framework/CoreServices",
-        "/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices",
-    };
-    for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
-        void *h = dlopen(cands[i], RTLD_LAZY);
-        if (h && NSClassFromString(@"LSApplicationWorkspace")) return YES;
-    }
-    return NO;
-}
-
-// 定向解析**单个** bundle 的显示名（不做全量枚举）。
-// 用途：库里来过通知、但枚举没列出它的 App（已卸载 / 某个键抛异常被跳过的那几个）。
-// 🔴 为什么不靠 `NBViaScan`：那个要遍历上万个目录，为几个 App 跑一遍不值。
-//    这条只需要一次 `+applicationProxyForIdentifier:` + 一次 Info.plist 读。
-static NSString *NBNameForBundle(NSString *bid) {
-    if (!bid.length) return nil;
-    NBEnsureCoreServices();
-    Class pcls = NSClassFromString(@"LSApplicationProxy");
-    if (!pcls) return nil;
-    id proxy = NBCallId1((id)pcls, @"applicationProxyForIdentifier:", bid);
-    if (!proxy) return nil;
-    return NBNameFromProxy(proxy, NULL);
-}
-
-#pragma mark - 路 1：LSApplicationWorkspace
-
-// 返回 @{bid: name}；失败返回 nil
+// 返回 @{bid: name}；失败返回 nil。
 static NSDictionary<NSString *, NSString *> *NBViaWorkspace(void) {
-    if (!NBEnsureCoreServices()) {
-        NBAddDiag(@"LSApplicationWorkspace：类找不到（CoreServices 没能加载）");
-        return nil;
-    }
-    Class cls = NSClassFromString(@"LSApplicationWorkspace");
-    id ws = NBCallId((id)cls, @"defaultWorkspace");
-    if (!ws) {
-        NBAddDiag(@"LSApplicationWorkspace：defaultWorkspace 返回 nil");
-        return nil;
-    }
-    id raw = NBCallId(ws, @"allInstalledApplications");
-    if (![raw isKindOfClass:[NSArray class]]) {
-        NBAddDiag(@"LSApplicationWorkspace：allInstalledApplications 没给数组（cls=%@）",
-                  raw ? NSStringFromClass([raw class]) : @"nil");
-        return nil;
-    }
-
-    NSMutableDictionary *out = [NSMutableDictionary dictionary];
-    NSMutableArray<NSString *> *fallbacks = [NSMutableArray array];
-    NSInteger skipped = 0, fromShort = 0, fromSys = 0, fromPlist = 0, fromLastSeg = 0;
-
-    for (id proxy in (NSArray *)raw) {
-        // 🔴🔴 v0.0.43 的修法：**先只读 bundleIdentifier**，读到了这个 App 就归属了。
-        //     后面不管哪个键抛异常、返回空，都只影响"名字"，不许把这个 App 丢掉。
-        //     v0.0.42 是三个键共用一个 @try，`localizedName` 一抛就 `continue` 到
-        //     下一条 ⇒ App 从名单里消失 ⇒ 列表那行退化成 bundle 末段（真机 bug 症状）。
-        NSString *bid = NBStrForKey(proxy, @"bundleIdentifier");
-        if (!bid.length) {
-            skipped++;
-            continue;
-        }
-
-        NSString *src = nil;
-        NSString *name = NBNameFromProxy(proxy, &src);
-        if (name.length) {
-            if ([src isEqualToString:@"Info.plist"]) fromPlist++;
-            else if ([src isEqualToString:@"短名"]) fromShort++;
-            else fromSys++;
-        } else {
-            name = NBLastSegmentName(bid);
-            fromLastSeg++;
-            if (fallbacks.count < 8) [fallbacks addObject:bid];
-        }
-        out[bid] = name;
-    }
-
-    NBAddDiag(@"LSApplicationWorkspace：拿到 %lu 个 App（跳过 %ld 个读不出 bundle 的）",
-              (unsigned long)out.count, (long)skipped);
-    // 🔴 v0.0.43 新增：名字**从哪来的**也要报。上一版只有"拿到几个"，
-    //    于是"拿到的名字是 bundle 末段"这种情况在报告里完全看不见 ——
-    //    而那恰好就是用户看到的那一堆英文小字。
-    // v0.0.44：把「短名」单独计一档 —— 下回再有人说名字不对，看这一行就知道
-    // 是"系统短名本身就是那个"还是"完整名太长没被短名压住"。
-    NBAddDiag(@"名字来源：短名 %ld / 系统全名 %ld / Info.plist %ld / 兜底末段 %ld",
-              (long)fromShort, (long)fromSys, (long)fromPlist, (long)fromLastSeg);
-    if (fallbacks.count) {
-        NBAddDiag(@"兜底的 bundle：%@", [fallbacks componentsJoinedByString:@", "]);
-    }
-    return out.count ? out : nil;
+    return NBEnumerateAppNames(NO, gDiag);
 }
 
 #pragma mark - 路 2：目录扫描
@@ -356,7 +74,7 @@ static void NBScanAppsIn(NSString *dir, BOOL descend, NSMutableDictionary *out, 
             if (!bid.length) continue;
             // v0.0.43：走和 workspace 完全同一条解析（含 zh-Hans 本地化），
             // 不再自己抄一份"DisplayName → Name"的顺序 —— 两处抄两遍必然有一处先改。
-            NSString *name = NBNameFromAppBundle(p);
+            NSString *name = NBNameFromAppBundle(p, NULL);
             out[bid] = name.length ? name : NBLastSegmentName(bid);
         } else if (descend && ![it hasSuffix:@".appex"] && ![it hasSuffix:@".bundle"]) {
             // /var/containers/Bundle/Application/<UUID>/Foo.app 这一层
@@ -405,9 +123,13 @@ static NSDictionary<NSString *, NSString *> *NBViaScan(void) {
     if (gCache) return gCache;
     gDiag = [NSMutableArray array];
 
-    // 三条来源依次来，前面的优先（workspace 给的名字最准，扫描给的是 Info.plist）
-    NSMutableDictionary<NSString *, NSString *> *names = [NSMutableDictionary dictionary];
+    // ① **名字表优先**（v0.0.45）。这份是 tweak 在 SpringBoard 里算好写进库的，
+    //    那一侧能读 /var/containers/Bundle/Application/<UUID>/Xxx.app ⇒ 最权威。
+    NSDictionary<NSString *, NSString *> *tableNames = [NotifyStore appNames];
+    NBAddDiag(@"名字表（tweak 写入）：%lu 个", (unsigned long)tableNames.count);
 
+    // ② 本进程枚举（**不读 bundle**，只吃注册表里的名字，快）
+    NSMutableDictionary<NSString *, NSString *> *names = [NSMutableDictionary dictionary];
     NSDictionary *viaWs = NBViaWorkspace();
     if (viaWs) [names addEntriesFromDictionary:viaWs];
 
@@ -429,13 +151,39 @@ static NSDictionary<NSString *, NSString *> *NBViaScan(void) {
     NSDictionary<NSString *, NSNumber *> *counts = [NotifyStore bundleCounts];
     NBAddDiag(@"数据库历史：%lu 个 App 来过通知", (unsigned long)counts.count);
 
+    // ③ **精修**：对"来过通知的 App"（用户眼睛里真正会出现的那几十个）
+    //    逐个去读它的 bundle（I/O），拿到本地化的 CFBundleDisplayName。
+    //    🔴 只对这批做：全量 200 多个都读一遍没必要，而没来过通知的 App
+    //    就算名字差点也不影响列表阅读。
+    //    🔴 精修成功的**写回名字表** —— 下一次打开就不用再读一遍文件了
+    //    （表是两边共享的，App 侧写它和 tweak 侧写它是同一件事）。
+    NSInteger refined = 0, refineFailed = 0;
+    NSMutableDictionary<NSString *, NSString *> *refinedNames = [NSMutableDictionary dictionary];
+    for (NSString *bid in counts) {
+        NSString *t = tableNames[bid];
+        if (t.length) continue;                       // 表里已有 ⇒ 不用再读一次文件
+        NSString *nm = NBResolveNameForBundle(bid);
+        if (nm.length) {
+            refined++;
+            refinedNames[bid] = nm;
+            names[bid] = nm;                          // 精修结果压过枚举结果
+        } else {
+            refineFailed++;
+        }
+    }
+    if (refined) [NotifyStore saveAppNames:refinedNames];
+    NBAddDiag(@"精修（读 bundle）：成功 %ld / 失败 %ld", (long)refined, (long)refineFailed);
+
     NSMutableArray<InstalledApp *> *list = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
 
     for (NSString *bid in names) {
         InstalledApp *a = [[InstalledApp alloc] init];
         a.bundleId = bid;
-        a.name = names[bid] ?: NBLastSegmentName(bid);
+        a.name = [self pickNameForBundle:bid
+                                   table:tableNames
+                                  refine:refinedNames
+                                   enum1:names];
         a.noteCount = [counts[bid] integerValue];
         a.onlyInHistory = NO;
         [list addObject:a];
@@ -450,10 +198,18 @@ static NSDictionary<NSString *, NSString *> *NBViaScan(void) {
         if ([seen containsObject:bid]) continue;
         InstalledApp *a = [[InstalledApp alloc] init];
         a.bundleId = bid;
-        NSString *nm = NBNameForBundle(bid);
+        NSString *nm = tableNames[bid];
+        if (!nm.length) {
+            nm = NBResolveNameForBundle(bid);
+            if (nm.length) {
+                [NotifyStore saveAppName:nm forBundle:bid];
+                histResolved++;
+            }
+        } else {
+            histResolved++;
+        }
         if (nm.length) {
             a.name = nm;
-            histResolved++;
         } else {
             a.name = NBLastSegmentName(bid);
             if (histFallback.count < 8) [histFallback addObject:bid];
@@ -477,15 +233,47 @@ static NSDictionary<NSString *, NSString *> *NBViaScan(void) {
         return [x.name localizedStandardCompare:y.name];
     }];
 
+    // 🔴 **把"来过通知的 App 最终显示成什么"直接打进诊断**（v0.0.45 新增）。
+    //    没有这一行，用户说"京东显示的不是京东"时我只能猜 ——
+    //    到底是"表里就是那个值"还是"表没写、走了兜底"，一眼看不出来。
+    //    有了它，用户截一张诊断图就能定位到具体是哪一个环节。
+    NSMutableArray<NSString *> *samples = [NSMutableArray array];
+    for (InstalledApp *a in list) {
+        if (samples.count >= 8) break;
+        if (a.noteCount <= 0) continue;
+        [samples addObject:[NSString stringWithFormat:@"%@=%@", a.bundleId, a.name]];
+    }
+    if (samples.count) {
+        NBAddDiag(@"来过通知的 App 最终名：%@", [samples componentsJoinedByString:@" | "]);
+    }
+
     NSInteger histOnly = 0;
     for (InstalledApp *a in list) {
         if (a.onlyInHistory) histOnly++;
     }
-    NBAddDiag(@"合计：%lu 个候选（含仅历史 %ld 个，其中 %ld 个定向查到了名字）",
+    NBAddDiag(@"合计：%lu 个候选（含仅历史 %ld 个，其中 %ld 个查到了名字）",
               (unsigned long)list.count, (long)histOnly, (long)histResolved);
 
     gCache = list;
     return gCache;
+}
+
+// 名字的四级优先级。**越靠前越权威**：
+//   ① 名字表（tweak 在 SpringBoard 里读 bundle 算出来的 —— 只有它有权限）
+//   ② 本轮精修（App 进程自己试着读了一次 bundle，读到了就用）
+//   ③ 本进程枚举（只读注册表，快，但 `localizedName` 常带「-购物商城」这类副标题）
+//   ④ bundle 末段（`com.xiaomi.mihome` → `mihome`，最坏情况，不是默认值）
++ (NSString *)pickNameForBundle:(NSString *)bid
+                          table:(NSDictionary<NSString *, NSString *> *)table
+                         refine:(NSDictionary<NSString *, NSString *> *)refine
+                          enum1:(NSDictionary<NSString *, NSString *> *)enum1 {
+    NSString *t = table[bid];
+    if (t.length) return t;
+    NSString *r = refine[bid];
+    if (r.length) return r;
+    NSString *e = enum1[bid];
+    if (e.length) return e;
+    return NBLastSegmentName(bid);
 }
 
 + (NSString *)diagReport {

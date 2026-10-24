@@ -97,17 +97,130 @@ void NBSharedLog(NSString *fmt, ...) {
                       "bundle TEXT, title TEXT, message TEXT, subtitle TEXT, "
                       "ts REAL, read INTEGER DEFAULT 0, hash TEXT);"
                       "CREATE INDEX IF NOT EXISTS idx_bundle ON notifications(bundle);"
-                      "CREATE INDEX IF NOT EXISTS idx_ts ON notifications(ts);";
+                      "CREATE INDEX IF NOT EXISTS idx_ts ON notifications(ts);"
+                      // v0.0.45：App 显示名表。**SpringBoard 写、盒子 App 读**。
+                      // 为什么要有这张表：见 NBAppName.h 的说明 —— 桌面上的用户 App
+                      // 装在 /var/containers/Bundle/Application/<UUID>/Xxx.app，
+                      // **盒子 App 的沙盒读不到那一层**，于是"读 bundle 里的
+                      // CFBundleDisplayName"这条最权威的路在 App 进程里根本走不通
+                      // （v0.0.42/43/44 三版就是卡在这里）。
+                      // ⇒ 由注入 SpringBoard 的 tweak（有权限）算好名字写进来。
+                      // 🔴 用 `IF NOT EXISTS` + 没有 NOT NULL 约束：老库升级时
+                      //    这张表是新增的，INSERT 前不许有任何迁移前置条件。
+                      "CREATE TABLE IF NOT EXISTS app_names ("
+                      "bid TEXT PRIMARY KEY, name TEXT);";
     sqlite3_exec(db, sql, NULL, NULL, NULL);
     return db;
 }
 
 + (NSInteger)maxRecords {
     // v0.0.8：走统一入口（新 settings.plist 优先，旧 Preferences 域兜底、只读）
+    // 🔴🔴 v0.0.45：上界从 100000 收紧到 `kNBRMaxRecordsHardCap`（20000）。
+    //    原来的 100000 是个"反正不会有人填"的占位，但它意味着：
+    //    用户可以设一个**列表永远显示不完**的上限（`listLimit` 是 2000），
+    //    于是库里常年堆着几千条"只能通过导出才能看见"的记录 ——
+    //    用户以为自己留了 10 万条，其实能翻到的永远只有最新 2000 条。
+    //    ⇒ 上界必须是一个**能被解释**的数：填大了要能在界面上说清楚代价。
     NSDictionary *p = NBLoadSettings();
     id v = p[@"maxRecords"];
     NSInteger n = v ? [v integerValue] : 500;
-    return (n > 0 && n < 100000) ? n : 500;
+    return (n >= kNBRMinRecords && n <= kNBRMaxRecordsHardCap) ? n : 500;
+}
+
+#pragma mark - v0.0.45 App 显示名表（**tweak 写 / App 读**）
+
+// 🔴 进程内缓存。tweak 每收到一条通知都会走到 `saveAppName:`，
+//    同一个 App 第二次之后必须是 **no-op** —— 否则每来一条通知都多一次写锁竞争，
+//    而写锁竞争的对象正是 SpringBoard 记通知那条路径（v0.0.15 就栽在 BUSY 上）。
+// 🔴 两个进程各有一份缓存没关系：写的是同一张表，且 `INSERT OR REPLACE` 是幂等的。
+static NSMutableDictionary<NSString *, NSString *> *gAppNameCache = nil;
+static NSObject *gAppNameLock = nil;
+
++ (void)saveAppName:(NSString *)name forBundle:(NSString *)bundle {
+    if (!bundle.length || !name.length) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gAppNameCache = [NSMutableDictionary dictionary];
+        gAppNameLock = [[NSObject alloc] init];
+    });
+    @synchronized (gAppNameLock) {
+        NSString *old = gAppNameCache[bundle];
+        if (old && [old isEqualToString:name]) return;   // 名字没变 ⇒ 不写
+    }
+    sqlite3 *db = [self openDB];
+    if (!db) return;
+    const char *sql = "INSERT OR REPLACE INTO app_names (bid, name) VALUES (?, ?);";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return;
+    }
+    sqlite3_bind_text(st, 1, bundle.UTF8String, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name.UTF8String, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_DONE) {
+        @synchronized (gAppNameLock) { gAppNameCache[bundle] = name; }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+}
+
+// 🔴 一次性写入多个（tweak 后台全量刷新用）。
+//    为什么不能循环调 `saveAppName:`：那条每次都开关一次数据库连接，
+//    200 个 App 就是 200 次 `openDB`（每次都要跑一遍 CREATE TABLE IF NOT EXISTS）。
+//    批量版本**只开一次库、只开一个事务**。
++ (NSInteger)saveAppNames:(NSDictionary<NSString *, NSString *> *)names {
+    if (!names.count) return 0;
+    sqlite3 *db = [self openDB];
+    if (!db) return 0;
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    const char *sql = "INSERT OR REPLACE INTO app_names (bid, name) VALUES (?, ?);";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+        sqlite3_close(db);
+        return 0;
+    }
+    NSInteger done = 0;
+    for (NSString *bid in names) {
+        NSString *name = names[bid];
+        if (!bid.length || !name.length) continue;
+        sqlite3_reset(st);
+        sqlite3_bind_text(st, 1, bid.UTF8String, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, name.UTF8String, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_DONE) done++;
+    }
+    sqlite3_finalize(st);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    sqlite3_close(db);
+    return done;
+}
+
++ (NSDictionary<NSString *, NSString *> *)appNames {
+    sqlite3 *db = [self openDB];
+    if (!db) return @{};
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    const char *sql = "SELECT bid, name FROM app_names;";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return @{};
+    }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *b = (const char *)sqlite3_column_text(st, 0);
+        const char *n = (const char *)sqlite3_column_text(st, 1);
+        if (!b || !n) continue;
+        NSString *bid = [NSString stringWithUTF8String:b];
+        NSString *name = [NSString stringWithUTF8String:n];
+        if (bid.length && name.length) out[bid] = name;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return out;
+}
+
++ (NSString *)appNameForBundle:(NSString *)bundle {
+    if (!bundle.length) return nil;
+    return [self appNames][bundle];
 }
 
 + (void)recordWithBundle:(NSString *)bundle
@@ -491,6 +604,75 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     if (!ok) NBStoreLog(@"DELETE 未删到 id=%ld err=%s", (long)rowId, sqlite3_errmsg(db));
     sqlite3_close(db);
     return ok;
+}
+
+#pragma mark - v0.0.45 批量删除
+
+// 🔴 删除的 WHERE **故意不复用** `NBPrepareScope`。
+//    那一份是"列表筛选"（bundle + 时间**下界** + 搜索词 + 未读），
+//    这一份是"删除范围"（bundle + 时间**上界** + 只读已读）。两组量的语义就不同
+//    （一个要新于、一个要旧于），硬凑一份只会让两边都难改。
+//    ⇒ 同理，删除**故意不含搜索词**：搜索只决定列表显示什么，不缩小清理范围
+//    （v0.0.38 在 `markAllRead` 上对用户承诺过这条口径，这里必须一致）。
+static sqlite3_stmt *NBPrepareDelete(sqlite3 *db, NSString *bundle, NSTimeInterval beforeTs,
+                                     BOOL readOnly, BOOL forCount) {
+    NSMutableString *sql = [NSMutableString string];
+    // `WHERE 1=1` 让后面每个条件都能一律写成 `AND ...`，不用判断"是第一个条件吗"。
+    [sql appendString:forCount ? @"SELECT COUNT(*) FROM notifications WHERE 1=1"
+                               : @"DELETE FROM notifications WHERE 1=1"];
+    if (bundle.length) [sql appendString:@" AND bundle=?"];
+    if (beforeTs > 0)  [sql appendString:@" AND ts<?"];
+    if (readOnly)      [sql appendString:@" AND read=1"];
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) return NULL;
+    // 🔴 绑参顺序必须和上面 append 的顺序逐条对应（少绑一条不会报错，
+    //    SQLite 把没绑的参数当 NULL ⇒ 条件恒不成立 ⇒ 静默删了个空）。
+    int i = 1;
+    if (bundle.length) sqlite3_bind_text(st, i++, [bundle UTF8String], -1, SQLITE_TRANSIENT);
+    if (beforeTs > 0)  sqlite3_bind_double(st, i++, (double)beforeTs);
+    return st;
+}
+
++ (NSInteger)countForDeleteWithBundle:(NSString *)bundle
+                             beforeTs:(NSTimeInterval)beforeTs
+                             readOnly:(BOOL)readOnly {
+    // 🔴🔴 三个条件全空 = 删整张表。这**不是**"批量清理"该触发的动作
+    //    （清空有专门的 `clearAll`，确认文案是另一套）。
+    //    ⇒ 这里直接拒绝、返回 -2。宁可让调用方多走一步，也不要留一条
+    //      "参数拼错了就清空用户所有记录"的路 —— 这是真账本，删了没有回头路。
+    if (!bundle.length && beforeTs <= 0 && !readOnly) return -2;
+    sqlite3 *db = [self openDB];
+    if (!db) return -1;
+    NSInteger n = -1;
+    sqlite3_stmt *st = NBPrepareDelete(db, bundle, beforeTs, readOnly, YES);
+    if (st) {
+        if (sqlite3_step(st) == SQLITE_ROW) n = (NSInteger)sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return n;
+}
+
++ (NSInteger)deleteWithBundle:(NSString *)bundle
+                     beforeTs:(NSTimeInterval)beforeTs
+                     readOnly:(BOOL)readOnly {
+    if (!bundle.length && beforeTs <= 0 && !readOnly) return -2;   // 同上，拒绝无条件全删
+    sqlite3 *db = [self openDB];
+    if (!db) return -1;
+    NSInteger n = -1;
+    sqlite3_stmt *st = NBPrepareDelete(db, bundle, beforeTs, readOnly, NO);
+    if (st) {
+        if (sqlite3_step(st) == SQLITE_DONE) {
+            // 🔴 必须查 `sqlite3_changes()`：`DELETE` 命中 0 行照样返回 SQLITE_DONE，
+            //    不查的话"条件写错了删了个空"和"删掉了 800 条"在界面上长得一样。
+            n = (NSInteger)sqlite3_changes(db);
+        } else {
+            NBStoreLog(@"批量删除失败 err=%s", sqlite3_errmsg(db));
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return n;
 }
 
 // v0.0.35：返回真正删掉的条数（-1 = DB 打不开）。

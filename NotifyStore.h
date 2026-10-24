@@ -122,6 +122,33 @@ NS_ASSUME_NONNULL_BEGIN
 //    只改内存就等于"只改账本的读数、不改账本"（本项目数量契约三问的第 2 问）。
 //    症状具体是：删完那一行仍然在（重进又有），或者删了 A 却少了一条 B。
 + (BOOL)deleteRow:(NSInteger)rowId;
+// v0.0.45：**批量删除**（真账本级）。四个条件都是"可空 = 不限"，独立叠加。
+//   bundle     nil = 所有 App
+//   beforeTs   0   = 不限时间；否则删**严格早于**它的
+//   readOnly   NO  = 连未读一起删；YES = 只删已读（read=1）
+// 🔴 返回真正删掉的条数（-1 = DB 打不开）。
+//    🔴🔴 为什么必须返回条数：`DELETE` 命中 0 行照样返回 SQLITE_DONE，
+//    不查 `sqlite3_changes()` 的话，"条件写错了删了个空"和"删掉了 800 条"
+//    在界面上是同一个"操作成功" —— 本项目数量契约三问的第 2 问。
+// 🔴 调用方约定：删完必须**整表重查**（`loadData`），
+//    不许 `deleteRowsAtIndexPaths:` / `removeObjectAtIndex:` ——
+//    搜索态/筛选态下内存下标和库 id 根本对不上（v0.0.33 的老教训）。
++ (NSInteger)deleteWithBundle:(nullable NSString *)bundle
+                     beforeTs:(NSTimeInterval)beforeTs
+                     readOnly:(BOOL)readOnly;
+// 上面那个的"先算一遍"版本 —— 给确认框报数字用。
+// 🔴 不能拿列表条数代替：列表带 `LIMIT 2000`，筛选态下还会被搜索词再切一刀。
++ (NSInteger)countForDeleteWithBundle:(nullable NSString *)bundle
+                             beforeTs:(NSTimeInterval)beforeTs
+                             readOnly:(BOOL)readOnly;
+// v0.0.45：App 显示名表（**tweak 写 / App 读**，理由见 NBAppName.h）。
+// 🔴 盒子 App 沙盒读不到 /var/containers/Bundle/Application/<UUID>/Xxx.app，
+//    所以"读 bundle 里本地化的 CFBundleDisplayName"这条最权威的路，
+//    只能由注入 SpringBoard（有权限）的 tweak 走一遍，把结果写进这张表。
++ (void)saveAppName:(NSString *)name forBundle:(NSString *)bundle;
++ (NSInteger)saveAppNames:(NSDictionary<NSString *, NSString *> *)names;   // 批量，只开一次库
++ (NSDictionary<NSString *, NSString *> *)appNames;
++ (nullable NSString *)appNameForBundle:(NSString *)bundle;
 
 // 设置（App 侧的**唯一**读写入口；tweak 侧读走 NotifyCommon.h 的 NBLoadSettings）
 // 🔴 统一在这里写，别让每个 VC 各写一遍 writeToFile: —— 写入点一多，

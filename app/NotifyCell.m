@@ -7,6 +7,8 @@
 // v0.0.42：App 名（标题上方一行小字）
 @property (nonatomic, strong) UILabel *appLabel;
 @property (nonatomic, strong) UILabel *titleLabel2;
+// v0.0.45：subtitle **单独成行**（以前只能在"正文为空"时顶替正文，见 setTitleText:）
+@property (nonatomic, strong) UILabel *subLabel;
 @property (nonatomic, strong) UILabel *msgLabel;
 @property (nonatomic, strong) UILabel *timeLabel;
 @property (nonatomic, strong) UIView *dotView;      // v0.0.35 未读点
@@ -14,6 +16,7 @@
 // 谁先到都只是记下来，真正写字在 `nbRender` 里一次做完。
 @property (nonatomic, copy) NSString *rawAppName;
 @property (nonatomic, copy) NSString *rawTitle;
+@property (nonatomic, copy) NSString *rawSubtitle;   // v0.0.45
 @property (nonatomic, copy) NSString *rawBody;
 @property (nonatomic, strong) UIColor *rawBodyColor;
 @property (nonatomic, copy) NSString *hlQuery;
@@ -119,6 +122,24 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     self.timeLabel.textAlignment = NSTextAlignmentRight;
     [self.contentView addSubview:self.timeLabel];
 
+    // v0.0.45：subtitle 单独一行。
+    // 🔴 为什么以前根本看不到它：旧逻辑是"**正文为空**才拿 subtitle 顶替正文"，
+    //    而正文为空是少数情况 ⇒ 绝大多数记录的 subtitle **一个字都显示不出来**，
+    //    用户明明有这条数据、搜也搜得到（v0.0.42 已把 subtitle 加进 LIKE），
+    //    界面上却看不见 —— 属于"数据层有、视图层没有"。
+    //    iOS 自己的通知就是「标题 / 副标题 / 正文」三行，跟着系统排用户不用学。
+    // 🔴🔴 行高**不变**（仍是 98）：subtitle 抢的是正文的竖向空间
+    //    （正文两行 40pt → 副标题 16pt + 正文 34pt），
+    //    没有副标题时布局**完全回到原样** ⇒ 不会为了偶尔才有的一行把整屏都撑高
+    //    （行高是常量、被 `tableView.rowHeight` 直接用，撑高的代价是每一屏都少看两条）。
+    self.subLabel = [[UILabel alloc] init];
+    self.subLabel.font = [UIFont systemFontOfSize:13];
+    // 比正文稍浅：它是"标题的补充"，不是内容本体，不能和正文抢注意力
+    self.subLabel.textColor = [UIColor secondaryLabelColor];
+    self.subLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    self.subLabel.hidden = YES;                      // 默认藏：没给值时宁可少一行
+    [self.contentView addSubview:self.subLabel];
+
     self.msgLabel = [[UILabel alloc] init];
     self.msgLabel.font = [UIFont systemFontOfSize:13];
     self.msgLabel.textColor = [UIColor secondaryLabelColor];
@@ -160,7 +181,15 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     self.appLabel.frame     = CGRectMake(textX, 10, w - textX - pad, 14);
     self.titleLabel2.frame  = CGRectMake(textX, 25, w - textX - timeW - pad, 20);
     self.timeLabel.frame    = CGRectMake(w - pad - timeW, 26, timeW, 16);
-    self.msgLabel.frame     = CGRectMake(textX, 47, w - textX - pad, 40);
+    // v0.0.45：有副标题时正文下移一行；没有就完全回到原来的 47/40。
+    // 🔴 判据用 `rawSubtitle`（原始串），**不用** `subLabel.text` ——
+    //    `attributedText` 赋值之后 `.text` 的取值时机不保证早于本方法，
+    //    拿视图状态反推数据状态这种事在本项目已经栽过（观测者把被观测量改了）。
+    BOOL hasSub = (self.rawSubtitle.length > 0);
+    self.subLabel.hidden    = !hasSub;
+    self.subLabel.frame     = CGRectMake(textX, 47, w - textX - pad, 16);
+    self.msgLabel.frame     = CGRectMake(textX, hasSub ? 63 : 47,
+                                         w - textX - pad, hasSub ? 34 : 40);
 }
 
 - (void)setIcon:(UIImage *)icon letter:(NSString *)letter {
@@ -185,6 +214,19 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
 
 - (void)setTitleText:(NSString *)title message:(NSString *)message subtitle:(NSString *)subtitle {
     self.rawTitle = title.length ? title : @"(无标题)";
+
+    // 🔴🔴 v0.0.45：subtitle **单独成行**，不再"只在正文为空时才顶替正文"。
+    //    两个分支的判据是"正文有没有"，不是"副标题有没有"：
+    //      ① 正文非空 ⇒ 副标题单独占一行（这才是绝大多数情况）
+    //      ② 正文为空 ⇒ 副标题顶上当正文，**不再单独占一行**
+    //         —— 否则同一句话在屏幕上出现两遍，比不显示更糟。
+    //    🔴 还要排除"副标题和正文一模一样"（不少 App 把同一段文字两处都填）：
+    //       那种情况下单独显示一行等于原样复制一遍正文。
+    if (message.length && subtitle.length && ![subtitle isEqualToString:message]) {
+        self.rawSubtitle = subtitle;
+    } else {
+        self.rawSubtitle = nil;
+    }
 
     // 🔴 正文为空时**明确写出「(无正文)」**，不要留空。
     //    留空的话，「库里没存到正文」和「存了但没画出来」看起来一模一样 ——
@@ -215,6 +257,10 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
                                                [UIColor secondaryLabelColor]);
     self.titleLabel2.attributedText = NBHighlight(self.rawTitle, self.hlQuery,
                                                   [UIColor labelColor]);
+    // v0.0.45：副标题也参与高亮（搜索本来就命中 subtitle，界面上必须能看出命中的是哪一处）
+    self.subLabel.attributedText = NBHighlight(self.rawSubtitle, self.hlQuery,
+                                               [UIColor secondaryLabelColor]);
+    self.subLabel.hidden = !self.rawSubtitle.length;
     self.msgLabel.attributedText = NBHighlight(self.rawBody, self.hlQuery,
                                                self.rawBodyColor ?: [UIColor secondaryLabelColor]);
 }
@@ -243,9 +289,14 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     //      就会拿上一行的原始串重新渲染一遍（显示上一条的标题）。
     self.appLabel.attributedText = nil;
     self.titleLabel2.attributedText = nil;
+    // v0.0.45：副标题**两个都要清**（attributedText + 原始串），理由和上面那三个一样：
+    //   不清原始串 ⇒ 下一行 `layoutSubviews` 会按"有副标题"排，凭空空出一行。
+    self.subLabel.attributedText = nil;
+    self.subLabel.hidden = YES;
     self.msgLabel.attributedText = nil;
     self.rawAppName = nil;
     self.rawTitle = nil;
+    self.rawSubtitle = nil;
     self.rawBody = nil;
     self.rawBodyColor = nil;
     self.hlQuery = nil;
