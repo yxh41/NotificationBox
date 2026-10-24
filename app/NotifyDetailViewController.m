@@ -119,14 +119,22 @@
     CGRect b = self.view.bounds;
     CGFloat w = b.size.width;
     CGFloat pad = 16;
+    // 🔴 v0.0.34：必须加 safeAreaInsets.top。
+    //    这一页在 UINavigationController 里，`edgesForExtendedLayout` 默认是 .all ⇒
+    //    `self.view.bounds` 的 (0,0) 在**屏幕顶点**（状态栏之上），不是导航栏下沿。
+    //    写成 `y = 12` 的直接后果就是 App 图标顶进状态栏里（v0.0.33 的真机反馈）。
+    //    底部那半边本来就用的是 safeAreaInsets.bottom，所以只有上半截会顶上去 ——
+    //    "整体偏上"这个描述的来源就在这里。
+    UIEdgeInsets si = self.view.safeAreaInsets;
+    CGFloat top = si.top;
 
-    self.headerBox.frame = CGRectMake(pad, 12, w - pad * 2, 52);
+    self.headerBox.frame = CGRectMake(pad, top + 12, w - pad * 2, 52);
     self.iconView.frame = CGRectMake(10, 8, 36, 36);
     CGFloat tx = CGRectGetMaxX(self.iconView.frame) + 10;
     self.appLabel.frame = CGRectMake(tx, 8, CGRectGetWidth(self.headerBox.frame) - tx - 10, 20);
     self.timeLabel.frame = CGRectMake(tx, 28, CGRectGetWidth(self.headerBox.frame) - tx - 10, 16);
 
-    CGFloat y = CGRectGetMaxY(self.headerBox.frame) + 12;
+    CGFloat y = CGRectGetMaxY(self.headerBox.frame) + 14;
 
     CGSize ts = [self.titleLabel sizeThatFits:CGSizeMake(w - pad * 2, CGFLOAT_MAX)];
     self.titleLabel.frame = CGRectMake(pad, y, w - pad * 2, ts.height);
@@ -138,8 +146,8 @@
         y = CGRectGetMaxY(self.subtitleLabel.frame) + 8;
     }
 
-    // 正文吃满剩余高度（自己会滚），但留出安全区
-    CGFloat bottomInset = self.view.safeAreaInsets.bottom + 12;
+    // 正文吃满剩余高度（自己会滚），但上下都要留出安全区
+    CGFloat bottomInset = si.bottom + 12;
     CGFloat h = b.size.height - y - bottomInset;
     self.bodyView.frame = CGRectMake(pad, y, w - pad * 2, MAX(h, 80));
 }
