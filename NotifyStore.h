@@ -54,6 +54,16 @@ NS_ASSUME_NONNULL_BEGIN
 //    （2000 行的完整字段），而且它带搜索词 ⇒ 和标记范围不同口径。
 + (NSInteger)unreadCountWithBundle:(nullable NSString *)bundle
                              since:(NSTimeInterval)since;
+// v0.0.40：带搜索词版本。**只给「当前筛选之外还有多少未读」这个计算用**。
+// 🔴 为什么要加它：顶部提示条要回答的是「全库未读 − 当前筛选下的未读」，
+//    而"当前筛选"包含 App 图标 + 时间 + **搜索**三项。搜索只在
+//    `queryWithBundle:` 里生效、计数那边没有的话，两边永远对不上 ——
+//    症状是"列表里明明都读完了，顶部还在喊还有 3 条"。
+// 🔴 与 `markAllReadWithBundle:since:` 的分工：**标记永远不带搜索词**
+//    （搜索只决定列表显示什么，不缩小标记范围，v0.0.38 的确认文案里对用户承诺过）。
++ (NSInteger)unreadCountWithBundle:(nullable NSString *)bundle
+                             since:(NSTimeInterval)since
+                            search:(nullable NSString *)search;
 // v0.0.35：**清空整张表**，返回真正删掉的条数（-1 = DB 打不开）。
 // 🔴 返回条数不是"花式" —— 是沿用 v0.0.33 `deleteRow:` 的同一条纪律：
 //    "没动到账本"和"动了但条数是 0"必须能分辨。`DELETE FROM` 命中 0 行照样

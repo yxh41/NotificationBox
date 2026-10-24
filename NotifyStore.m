@@ -143,6 +143,41 @@ void NBSharedLog(NSString *fmt, ...) {
     sqlite3_close(db);
 }
 
+// 🔴🔴 v0.0.40：**筛选条件的唯一出口**。
+//    列表（`queryWithBundle:`）、图标栏红点（`bundlesWithUnreadSince:`）、
+//    未读计数（`unreadCountWithBundle:`）、批量标记（`markAllRead…`）四条路全走这里。
+//    拼 WHERE 和绑参必须在同一个函数里完成 —— 拆成"拼一处、绑一处"就有顺序走岔的可能，
+//    而这类错**不报错、只静默少筛或多筛一个条件**。
+//    v0.0.35 的 `onClear:` 已经买过一次教训：确认框报列表条数（3）、实际清整张表（2000）。
+// v0.0.40 为什么必须加 `search`：顶部提示条要回答「当前筛选之外还有多少条未读」，
+//    这个数 = 全库未读 − **当前筛选下的未读**，而"当前筛选"包含 App 图标 + 时间 + 搜索三项。
+//    如果搜索只在 `queryWithBundle:` 里生效、计数那边没有，两边的未读数就永远对不上，
+//    症状是"列表里明明全读完了，顶部还在喊还有 3 条"。
+// 🔴 `search` 只给**查询**用：`markAllRead…` 一律传 nil —— 搜索只决定列表显示什么，
+//    不缩小标记范围（v0.0.38 的确认文案里对用户就是这么承诺的）。
+// `head` 里可以预置 `read=0`（未读专用）；`tail` 放 ORDER BY / LIMIT。
+static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nullable tail,
+                                    NSString * _Nullable bundle, NSTimeInterval since,
+                                    NSString * _Nullable search) {
+    NSMutableString *sql = [NSMutableString stringWithString:head];
+    if (bundle.length) [sql appendString:@" AND bundle=?"];
+    if (since > 0)     [sql appendString:@" AND ts>=?"];
+    if (search.length) [sql appendString:@" AND (title LIKE ? OR message LIKE ?)"];
+    if (tail.length)   [sql appendString:tail];
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) return NULL;
+    // 绑参顺序**必须**和上面 append 的顺序逐条对应。
+    int i = 1;
+    if (bundle.length) sqlite3_bind_text(st, i++, [bundle UTF8String], -1, SQLITE_TRANSIENT);
+    if (since > 0)     sqlite3_bind_double(st, i++, (double)since);
+    if (search.length) {
+        NSString *like = [NSString stringWithFormat:@"%%%@%%", search];
+        sqlite3_bind_text(st, i++, [like UTF8String], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, i++, [like UTF8String], -1, SQLITE_TRANSIENT);
+    }
+    return st;
+}
+
 + (NSArray<NSDictionary *> *)queryWithBundle:(NSString *)bundle
                                        since:(NSTimeInterval)since
                                       search:(NSString *)q
@@ -151,27 +186,16 @@ void NBSharedLog(NSString *fmt, ...) {
     sqlite3 *db = [self openDB];
     if (!db) return res;
 
-    NSMutableString *sql = [NSMutableString stringWithString:
-        @"SELECT id,bundle,title,message,subtitle,ts,read FROM notifications WHERE 1=1"];
-    if (bundle.length) [sql appendString:@" AND bundle=?"];     // 顶部 App 图标筛选
-    if (since > 0)     [sql appendString:@" AND ts>=?"];         // 时间筛选
-    if (q.length)      [sql appendString:@" AND (title LIKE ? OR message LIKE ?)"]; // 搜索
     // v0.0.36：只看未读。`read=0` 是未读（建表默认值），1 是已读。
     // 🔴 用 `read=0` 而不是 `read<>1`：后者对 NULL 不成立，老库若有 read 为 NULL 的行
     //    会既不进"未读"也不进"已读"，凭空消失。
-    if (unreadOnly)    [sql appendString:@" AND read=0"];
-    [sql appendString:@" ORDER BY ts DESC LIMIT 2000"];
-
-    sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) == SQLITE_OK) {
-        int i = 1;
-        if (bundle.length) sqlite3_bind_text(st, i++, [bundle UTF8String], -1, SQLITE_TRANSIENT);
-        if (since > 0)     sqlite3_bind_double(st, i++, (double)since);
-        if (q.length) {
-            NSString *like = [NSString stringWithFormat:@"%%%@%%", q];
-            sqlite3_bind_text(st, i++, [like UTF8String], -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, i++, [like UTF8String], -1, SQLITE_TRANSIENT);
-        }
+    // v0.0.40：WHERE 部分交给 `NBPrepareScope`，本方法只负责"读哪些列、怎么排序"。
+    NSString *head = unreadOnly
+        ? @"SELECT id,bundle,title,message,subtitle,ts,read FROM notifications WHERE read=0"
+        : @"SELECT id,bundle,title,message,subtitle,ts,read FROM notifications WHERE 1=1";
+    sqlite3_stmt *st = NBPrepareScope(db, head, @" ORDER BY ts DESC LIMIT 2000",
+                                      bundle, since, q);
+    if (st) {
         while (sqlite3_step(st) == SQLITE_ROW) {
             NSMutableDictionary *d = [NSMutableDictionary dictionary];
             d[@"id"]       = @(sqlite3_column_int(st, 0));
@@ -215,13 +239,13 @@ void NBSharedLog(NSString *fmt, ...) {
     NSMutableSet *s = [NSMutableSet set];
     sqlite3 *db = [self openDB];
     if (!db) return s;
-    sqlite3_stmt *st;
-    NSMutableString *sql = [NSMutableString stringWithString:
+    // v0.0.40：时间条件改成走 `NBPrepareScope`（以前这里自己拼了一份 `AND ts>=?`，
+    //    和列表那份是两处代码 —— 只要有一处改了，红点和列表就会不同口径）。
+    sqlite3_stmt *st = NBPrepareScope(db,
         @"SELECT DISTINCT bundle FROM notifications "
-        @"WHERE read=0 AND bundle IS NOT NULL AND bundle <> ''"];
-    if (since > 0) [sql appendString:@" AND ts>=?"];
-    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) == SQLITE_OK) {
-        if (since > 0) sqlite3_bind_double(st, 1, (double)since);
+        @"WHERE read=0 AND bundle IS NOT NULL AND bundle <> ''",
+        nil, nil, since, nil);
+    if (st) {
         while (sqlite3_step(st) == SQLITE_ROW) {
             const char *t = (const char *)sqlite3_column_text(st, 0);
             if (!t) continue;
@@ -276,36 +300,22 @@ void NBSharedLog(NSString *fmt, ...) {
     sqlite3_close(db);
 }
 
-// v0.0.38：批量标记 / 批量计数的**共用条件**。
+// v0.0.38：批量标记 / 批量计数的共用条件 → **v0.0.40 起并入 `NBPrepareScope`**。
+// 保留这段注释是因为它立的两条规矩仍然有效，只是实现搬到了统一的那个函数里：
 // 🔴 拼 WHERE 和绑参必须在同一个函数里，不能拆成「拼一个函数、绑一个函数」——
 //    拆开就有"两边顺序不一致"的可能，而这类错不会报错，只会静默少筛一个条件。
 // 🔴 两个调用方必须用同一套条件：界面上的确认文案报的是「将要改多少条」，
 //    计数和实际改动只要有一点点不一样，就会出现"说改 5 条、实际改了 200 条"
 //    （v0.0.35 的 `onClear:` 已经栽过一次：报列表 3 条、实际清整张表）。
-// 🔴 值一律绑参：bundle 是字符串，来自 App 侧调用，是这里唯一真正的注入面。
-static sqlite3_stmt *NBPrepareUnreadScope(sqlite3 *db,
-                                          NSString *sqlHead,
-                                          NSString * _Nullable bundle,
-                                          NSTimeInterval since) {
-    NSMutableString *sql = [NSMutableString stringWithString:sqlHead];
-    if (bundle.length) [sql appendString:@" AND bundle=?"];
-    if (since > 0) [sql appendString:@" AND ts>=?"];
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) return NULL;
-    int i = 1;
-    if (bundle.length) sqlite3_bind_text(st, i++, [bundle UTF8String], -1, SQLITE_TRANSIENT);
-    if (since > 0) sqlite3_bind_double(st, i++, (double)since);
-    return st;
-}
-
 + (NSInteger)markAllReadWithBundle:(NSString * _Nullable)bundle since:(NSTimeInterval)since {
     sqlite3 *db = [self openDB];
     if (!db) return -1;
     NSInteger n = -1;
     // `WHERE read=0` 不只是优化：`sqlite3_changes` 数的是"真的被改写的行"，
     // 已经 read=1 的行不会重复计数 ⇒ 返回值正好是"这次标掉了多少条未读"。
-    sqlite3_stmt *st = NBPrepareUnreadScope(db, @"UPDATE notifications SET read=1 WHERE read=0",
-                                            bundle, since);
+    // 🔴 search 传 nil：搜索只影响列表显示，**不缩小标记范围**（确认文案里对用户承诺过）。
+    sqlite3_stmt *st = NBPrepareScope(db, @"UPDATE notifications SET read=1 WHERE read=0",
+                                      nil, bundle, since, nil);
     if (st) {
         if (sqlite3_step(st) == SQLITE_DONE) n = (NSInteger)sqlite3_changes(db);
         sqlite3_finalize(st);
@@ -316,18 +326,26 @@ static sqlite3_stmt *NBPrepareUnreadScope(sqlite3 *db,
     return n;
 }
 
-+ (NSInteger)unreadCountWithBundle:(NSString * _Nullable)bundle since:(NSTimeInterval)since {
++ (NSInteger)unreadCountWithBundle:(NSString * _Nullable)bundle
+                             since:(NSTimeInterval)since
+                            search:(NSString * _Nullable)search {
     sqlite3 *db = [self openDB];
     if (!db) return -1;
     NSInteger n = -1;
-    sqlite3_stmt *st = NBPrepareUnreadScope(db, @"SELECT COUNT(*) FROM notifications WHERE read=0",
-                                            bundle, since);
+    sqlite3_stmt *st = NBPrepareScope(db, @"SELECT COUNT(*) FROM notifications WHERE read=0",
+                                      nil, bundle, since, search);
     if (st) {
         if (sqlite3_step(st) == SQLITE_ROW) n = (NSInteger)sqlite3_column_int64(st, 0);
         sqlite3_finalize(st);
     }
     sqlite3_close(db);
     return n;
+}
+
++ (NSInteger)unreadCountWithBundle:(NSString * _Nullable)bundle since:(NSTimeInterval)since {
+    // v0.0.40：变成上面那个三参版本的薄封装。**不要**在这里另写一份 SQL ——
+    // 那样又会出现"两处条件各写一遍"的老问题。
+    return [self unreadCountWithBundle:bundle since:since search:nil];
 }
 
 // v0.0.33：删单条。返回 YES = 真的删掉了（id 不存在 ⇒ NO，界面据此提示"这条已经没了"）。
