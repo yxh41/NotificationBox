@@ -230,6 +230,23 @@ static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nul
     return kNBListLimit;
 }
 
+// v0.0.44：把"一行结果 → 字典"抽成一份。
+// 🔴 列表和导出现在共用它 —— 两处各抄一遍列号，改 SELECT 时必然有一处漏改，
+//    而那种错不会报错，只会让某一列悄悄变成空串。
+static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"id"]       = @(sqlite3_column_int(st, 0));
+    // 🔴 `sqlite3_column_text` 对 NULL 返回 NULL，直接塞给 `stringWithUTF8String:` 会崩
+    //    ⇒ 每个文本列都要有 `?: ""` 这个兜底。
+    d[@"bundle"]   = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 1) ?: ""];
+    d[@"title"]    = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 2) ?: ""];
+    d[@"message"]  = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 3) ?: ""];
+    d[@"subtitle"] = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 4) ?: ""];
+    d[@"ts"]       = @(sqlite3_column_double(st, 5));
+    d[@"read"]     = @(sqlite3_column_int(st, 6));
+    [res addObject:d];
+}
+
 + (NSArray<NSDictionary *> *)queryWithBundle:(NSString *)bundle
                                        since:(NSTimeInterval)since
                                       search:(NSString *)q
@@ -249,17 +266,34 @@ static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nul
     NSString *tail = [NSString stringWithFormat:@" ORDER BY ts DESC LIMIT %ld", (long)kNBListLimit];
     sqlite3_stmt *st = NBPrepareScope(db, head, tail, bundle, since, q, searchBundles);
     if (st) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            NSMutableDictionary *d = [NSMutableDictionary dictionary];
-            d[@"id"]       = @(sqlite3_column_int(st, 0));
-            d[@"bundle"]   = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 1) ?: ""];
-            d[@"title"]    = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 2) ?: ""];
-            d[@"message"]  = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 3) ?: ""];
-            d[@"subtitle"] = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 4) ?: ""];
-            d[@"ts"]       = @(sqlite3_column_double(st, 5));
-            d[@"read"]     = @(sqlite3_column_int(st, 6));
-            [res addObject:d];
-        }
+        while (sqlite3_step(st) == SQLITE_ROW) NBAppendRow(st, res);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return res;
+}
+
+// v0.0.44：导出专用 —— **没有 LIMIT**。
+// 🔴 为什么不复用 `queryWithBundle:`：它带 `LIMIT listLimit`（2000）⇒
+//    导出来的文件会"刚好少掉最旧的几千条"，而用户拿到手时**根本看不出来**
+//    （这正是备份功能最不能犯的错：你以为备份了，其实没有）。
+// 🔴🔴 但 WHERE 条件**必须**和列表走同一个 `NBPrepareScope`，不能自己另拼一份 ——
+//    否则"导出的"和"看到的"不是一批数据（v0.0.40 那条坑的同一族）。
+//    这里只有 `tail` 和列表那一份不一样（一个不带 LIMIT）。
++ (NSArray<NSDictionary *> *)exportRowsWithBundle:(NSString * _Nullable)bundle
+                                            since:(NSTimeInterval)since
+                                           search:(NSString * _Nullable)q
+                                    searchBundles:(NSArray<NSString *> * _Nullable)searchBundles
+                                       unreadOnly:(BOOL)unreadOnly {
+    NSMutableArray *res = [NSMutableArray array];
+    sqlite3 *db = [self openDB];
+    if (!db) return res;
+    NSString *head = unreadOnly
+        ? @"SELECT id,bundle,title,message,subtitle,ts,read FROM notifications WHERE read=0"
+        : @"SELECT id,bundle,title,message,subtitle,ts,read FROM notifications WHERE 1=1";
+    sqlite3_stmt *st = NBPrepareScope(db, head, @" ORDER BY ts DESC", bundle, since, q, searchBundles);
+    if (st) {
+        while (sqlite3_step(st) == SQLITE_ROW) NBAppendRow(st, res);
         sqlite3_finalize(st);
     }
     sqlite3_close(db);

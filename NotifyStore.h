@@ -26,6 +26,14 @@ NS_ASSUME_NONNULL_BEGIN
                                       search:(nullable NSString *)q  // nil = 不限
                               searchBundles:(nullable NSArray<NSString *> *)searchBundles
                                   unreadOnly:(BOOL)unreadOnly;        // YES = 只回 read=0
+// v0.0.44：**导出专用**的查询 —— 和 `queryWithBundle:` 唯一的区别是**没有 LIMIT**。
+// 🔴 别拿带 LIMIT 的那个去导出：会"刚好少掉最旧的几千条"，而用户拿到文件时看不出来。
+//    WHERE 条件仍然走同一个 `NBPrepareScope`（导出的 = 看到的那批）。
++ (NSArray<NSDictionary *> *)exportRowsWithBundle:(nullable NSString *)bundle
+                                            since:(NSTimeInterval)since
+                                           search:(nullable NSString *)q
+                                    searchBundles:(nullable NSArray<NSString *> *)searchBundles
+                                       unreadOnly:(BOOL)unreadOnly;
 // v0.0.42：列表一次最多取多少条（`queryWithBundle:` 的 LIMIT）。
 // 🔴 底部「还有 N 条更早记录（列表上限 N）」要把它写进文案里 ——
 //    界面里另写一个字面量，这个数以后一改就会对不上。

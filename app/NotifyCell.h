@@ -28,6 +28,14 @@ NS_ASSUME_NONNULL_BEGIN
 //    不能因为某个 App 的名字取不到就参差不齐。
 - (void)setAppName:(nullable NSString *)name;
 
+// v0.0.44：搜索命中高亮。传当前搜索词（nil / 空串 = 不高亮）。
+// 🔴 为什么必须有：搜索现在能命中**标题 / 正文 / 副标题 / App 名**四处，
+//    列表里却一个字都不标 ⇒ 用户看到一条"标题里根本没有这个词"的记录，
+//    第一反应是"搜索坏了"，而它其实是被正文或 App 名命中的。
+// 🔴 调用顺序无关：`setHighlightQuery:` 和 `setTitleText:`/`setAppName:` 谁先谁后都一样
+//    —— 它们都只存原始串，真正的渲染统一在 `nbRender` 里做。
+- (void)setHighlightQuery:(nullable NSString *)query;
+
 // v0.0.35：未读标记（左侧 8pt 蓝点）。
 // 🔴 为什么用"点"而不是"标题加粗/变灰"：
 //    15pt semibold 到 bold 在小屏上几乎看不出差别；而"已读标题变灰"会让整屏发灰，
