@@ -845,8 +845,21 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
     //    设置失败也继续播：宁可"可能打断音乐"，也不要"用户配了提示音却听不到"。
     @try {
         AVAudioSession *ses = [AVAudioSession sharedInstance];
+        // ---------- v0.0.32：可选的「压低别人音乐」 ----------
+        // 用 `MixWithOthers | DuckOthers`，**不是**只用 DuckOthers：
+        //   Ambient + MixWithOthers 是 v0.0.27 起就上线验收过的行为（与音乐共存、不打断）。
+        //   只给 DuckOthers 有可能把"共存"这条一起改掉，而那不是这个开关要卖的东西。
+        //   ⇒ 开关只负责"多压一层"，绝不改"能不能共存"。
+        //
+        // 🔴 这是**每次播放都重新读设置**（NBLoadSettings 是最朴素的 plist 读取，没有缓存）。
+        //    故意如此：用户改完开关，下一条通知就该生效，不用重启、不用重进 App。
+        //    开销 = 一条通知读一次几 KB 的 plist，和"通知到达时本来就要读的那次"同量级。
+        AVAudioSessionCategoryOptions opt = AVAudioSessionCategoryOptionMixWithOthers;
+        if (NBBoolValue(NBLoadSettings()[NB_KEY_SOUND_DUCK_OTHERS])) {
+            opt |= AVAudioSessionCategoryOptionDuckOthers;
+        }
         [ses setCategory:AVAudioSessionCategoryAmbient
-             withOptions:AVAudioSessionCategoryOptionMixWithOthers
+             withOptions:opt
                    error:NULL];
         [ses setActive:YES error:NULL];
     } @catch (__unused NSException *e) { }

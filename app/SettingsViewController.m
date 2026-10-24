@@ -186,6 +186,14 @@ static const NSInteger kSubHit = 105;
     [self addActionRow:@"按 App 分配提示音"
                     key:@"soundapps" action:@selector(onSoundApps:)];
     [self addActionRow:@"试听这个提示音" key:@"soundpreview" action:@selector(onSoundPreview:)];
+    // ---------- v0.0.32：来通知时压低别人音乐 ----------
+    // 排在"播什么/播多久"之后：这三项是同一个话题（这条提示音怎么响）。
+    // 🔴 文案里必须写「只对长提示音」：A 通道（AudioServicesPlaySystemSound）不管 AVAudioSession，
+    //    短音无论如何都压不住别人。不写这句，用户配了个 1 秒的短音、打开开关、发现音乐没变，
+    //    会认定"开关坏了"—— 而代码完全正常。
+    [self addSwitchRow:@"来通知时压低音乐（只对长提示音有效）"
+                    on:[self boolOf:cur[NB_KEY_SOUND_DUCK_OTHERS]]
+                   key:NB_KEY_SOUND_DUCK_OTHERS];
 
     // ---------- 延迟推送：v0.0.19 已整体移除 ----------
     // 🔴 这里**故意连这个开关都不放**。历史上它两次把用户手机搞坏：
@@ -580,7 +588,11 @@ static const NSInteger kSubHit = 105;
     NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[NotifyStore settings]];
 
     // 🔴 v0.0.21：开关从字典里按 key 取（三个开关，不可能再共用一个属性）
-    for (NSString *k in @[NB_KEY_SPEAK_ENABLED, NB_KEY_DND_ENABLED, NB_KEY_SOUND_ENABLED]) {
+    // 🔴🔴 v0.0.32：这个数组是**手写的**，新增开关忘了加进来 ⇒ 开关状态永远不落盘。
+    //    症状：点开、保存、再进来又变回关；而保存时没有任何报错，盘上压根没这个键。
+    //    ⇒ 加开关时必须同时改这里（源码判据 s0x 盯着这一点）。
+    for (NSString *k in @[NB_KEY_SPEAK_ENABLED, NB_KEY_DND_ENABLED, NB_KEY_SOUND_ENABLED,
+                          NB_KEY_SOUND_DUCK_OTHERS]) {
         UISwitch *sw = self.switches[k];
         d[k] = @(sw ? sw.isOn : NO);
     }
