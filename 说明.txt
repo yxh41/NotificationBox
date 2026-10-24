@@ -1,0 +1,4 @@
+本分支由 CI 自动发布，请勿手改。
+commit: e48f477
+deb   : com.yxh41.notifybox_0.0.48_iphoneos-arm64e.deb
+下载  : https://raw.githubusercontent.com/yxh41/NotificationBox/ci-deb/com.yxh41.notifybox_0.0.48_iphoneos-arm64e.deb
