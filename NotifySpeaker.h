@@ -27,6 +27,20 @@ NS_ASSUME_NONNULL_BEGIN
 // 返回 YES ⇒ 检测到「上次朗读没走完」⇒ 已把 speakEnabled 强制写回 NO。
 + (BOOL)recoverFromCrashIfNeeded;
 
+// v0.0.30：**现在正在朗读吗？** 纯读，无副作用。
+//
+// 谁需要它：音频会话的"交还"时机（`NotifyFilter releaseAudioSessionIfIdle`）。
+// 朗读自己从不碰 AVAudioSession（靠 AVSpeechSynthesizer 内部激活），
+// 所以换音通道收工时如果不管三七二十一就 `setActive:NO`，**会把正在朗读的那句掐断** ——
+// 这种"音被掐一半"的症状用户只会描述成"插件坏了"，极难查。
+//
+// 🔴 为什么必须是公开的类方法：`gSynth` 是 NotifySpeaker.m 里的 static 私有变量，
+//    NotifyFilter.m 拿不到 ⇒ 只能由本类出面回答。
+// 🔴 为什么 NotifyFilter 那边要用 NSClassFromString 问：NotifyFilter.m 同时被编进
+//    盒子 App，而 App 目标**没有链接 NotifySpeaker.m**（Makefile 的 App_FILES 里没有它），
+//    直接发消息会在**链接期** undefined symbol。反射调用则在 App 里自然返回 nil ⇒ 放行。
++ (BOOL)isSpeakingNow;
+
 // 诊断用：当前朗读子系统的可用性一行摘要（盒子 App 的日志页会读它）
 + (NSString *)diagnosticLine;
 

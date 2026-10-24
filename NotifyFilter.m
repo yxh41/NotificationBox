@@ -31,6 +31,29 @@ typedef NS_ENUM(NSInteger, NBSoundVerdict) {
     NBSoundVerdictBadFile,     // v0.0.26：选了文件，但文件名不合法 / 文件不存在
 };
 
+// v0.0.30：**跨模块探针的"接口声明"**。
+//
+// 为什么要绕这么一圈：交给音频会话之前必须问"朗读在播吗"，而朗读在 NotifySpeaker 里；
+// 可 NotifySpeaker.m **只编进 SpringBoard，没有编进盒子 App**（Makefile 的 App_FILES 里没有它）。
+// ⇒ 直接 `[NotifySpeaker isSpeakingNow]` 在 App 上会在**链接期** undefined symbol，
+//   编译期看不出来、真机装上去才炸。
+//
+// 正确姿势是三步：
+//   ① `NSClassFromString(@"NotifySpeaker")` 查"这个进程里有没有这个类"（App 里没有 ⇒ nil）；
+//   ② 下面这个 **NSObject 的分类**告诉 clang "任何类都可能响应 +isSpeakingNow"
+//      —— 拿裸 Class 变量发类方法消息，clang 会说 "no known class method"，-Werror 直接挂；
+//   ③ 运行期 `respondsToSelector:` 兜底，声明与实现不一致时也不会崩。
+//
+// 🔴🔴 这里**不能**写成 `@protocol NBSpeakerProbe` + `[(id<NBSpeakerProbe>)spk isSpeakingNow]`：
+//    给 `id<协议>` 发消息时 clang 只查协议里的**实例方法**，而 isSpeakingNow 是**类方法**
+//    ⇒ 报 `no known instance method for selector` ⇒ -Werror 挂。
+//    （这个项目没有 Mac、编译只能在 CI 上跑，所以这种"编译期才暴露"的写法必须提前想清楚。）
+//    分类声明 + `Class` 变量才是对的路子：给 Class 发消息，clang 查的是类方法。
+//    声明与实现分离也不违规 —— 只有 `@interface` 的分类是合法的"informal protocol"写法。
+@interface NSObject (NBSpeakerProbe)
++ (BOOL)isSpeakingNow;
+@end
+
 @interface NotifyFilter ()
 // outSID / outFile 都可为 NULL。任何异常都返回 NBSoundVerdictOff ——
 // 这个功能的失效方式必须是"什么都不做"，绝不能影响通知本身。
@@ -820,8 +843,52 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
             @try { [pl stop]; } @catch (__unused NSException *e) { }
         }
         @synchronized (live) { [live removeObject:pl]; }
+        // 🔴 v0.0.30：交还音频会话**必须排在从 live 摘掉之后**。
+        //    反过来的话，此刻 `live` 里还留着自己这一个 ⇒ 交还函数会以为"还有人在响"，
+        //    于是白调一次；更糟的是如果哪天判据改成"live 非空才不交还"的宽松版，
+        //    顺序一反就会在自己还在响的时候交还 ⇒ 声音断在半截。
+        //    收紧到"摘掉之后再问"，两种写法都安全。
+        [NotifyFilter releaseAudioSessionIfIdle];
     });
     return YES;
+}
+
+// v0.0.30：音频会话交还。**保守放行**：只要还有任何东西可能在响，就不交还。
+//
+// 两个条件必须同时满足：
+//   ① B 通道在播列表为空（A 通道走 AudioServices，不占我们的会话，所以不用管它）
+//   ② 朗读没在播 —— 朗读自己从不碰 AVAudioSession，靠 AVSpeechSynthesizer 内部激活；
+//      我们要是在它说话时 `setActive:NO`，**会把那句掐断**。
+//
+// 🔴 为什么用 NSClassFromString 问而不是直接发消息：见文件顶部 NBSpeakerProbe 的注释 ——
+//    本文件同时编进盒子 App，而 App 目标没有链接 NotifySpeaker.m。
+//    在 App 里 `NSClassFromString` 返回 nil ⇒ 条件②自然放行，正是我们要的行为。
+//
+// 🔴 为什么交还要带 NotifyOthersOnDeactivation：不带的话，"被我们压低过的别人的音乐"
+//    不会自己恢复音量（尤其 App 内试听那条 Playback+DuckOthers）。带了才是"交还"，不带只是"放开"。
++ (void)releaseAudioSessionIfIdle {
+    @try {
+        // ① B 通道还有 player 在响 ⇒ 绝不交还
+        NSMutableArray *live = NBLivePlayers();
+        @synchronized (live) {
+            if (live.count) return;
+        }
+
+        // ② 朗读在播 ⇒ 绝不交还
+        Class spk = NSClassFromString(@"NotifySpeaker");
+        if (spk && [spk respondsToSelector:@selector(isSpeakingNow)]) {
+            if ([spk isSpeakingNow]) return;
+        }
+
+        AVAudioSession *ses = [AVAudioSession sharedInstance];
+        if (!ses) return;
+        [ses setActive:NO
+           withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                 error:NULL];
+    } @catch (__unused NSException *e) {
+        // 交还失败不影响任何功能：下一次播放还会重新 setActive:YES。
+        // 这一路故意不留日志 —— 它可能在每条通知收尾时都跑一次，打日志会冲掉 50 行窗口。
+    }
 }
 
 // 公开入口（盒子 App 的「试听」直接调它；tweak 侧由 playCustomSoundForBundle 调）。
