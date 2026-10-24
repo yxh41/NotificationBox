@@ -33,8 +33,13 @@
 - (NSInteger)currentSID;
 - (void)reloadFiles;
 - (void)pop;
+// v0.0.31：写 entry 一律走这两个"做差"函数，不许在别处直接拼字典
+- (NSDictionary *)entryBySettingFile:(NSString *)pick;
+- (NSDictionary *)entryBySettingSID:(NSInteger)sid;
 - (BOOL)commitFile:(NSString *)pick;
 - (BOOL)commitSID:(NSInteger)sid;
+- (BOOL)commitMaxSec:(double)v;
+- (void)pickMaxSec;
 - (void)failSave;
 - (UITableViewCell *)fileCell:(UITableView *)tv at:(NSIndexPath *)ip;
 - (void)previewCurrent;
@@ -165,9 +170,38 @@
 // 写"这个目标"的文件名。per-App 写 soundMap[bundle] = {file}；全局写 soundFile。
 // 🔴 **写一处、删一处**：per-App 模式下不许同时留 id —— 一个 App 只有一个"音"，
 //    两个字段并存会让界面不知道该显示哪个（引擎侧 file 优先，但界面上会看着有两个值）。
+#pragma mark - v0.0.31：entry 做差（改一个键，其余原样保留）
+
+// 🔴🔴 这两个函数是 v0.0.31 的**关键修补**，不是可选优化。
+//
+// v0.0.31 之前 entry 只有 file / id 两个键，所以 `commitFile:` 里直接
+// `@{NB_KEY_SOUND_ENTRY_FILE: pick}` 整条替换也没问题。
+// 一旦加了第三个键 maxSec，整条替换就变成：
+//   · 改"音" ⇒ 把这个 App 的时长**悄悄清掉**（回到跟随全局）
+//   · 改"时长" ⇒ 把这个 App 的音**悄悄清掉**（变成空壳 ⇒ 连提示音都不会换）
+// 两种都**在界面上完全看不出来**（值都在，只是少了另一个），
+// 而后者更毒：空壳 entry 会让判定以为"有分配"，然后拿空音去播 ⇒ **通知变哑**。
+//
+// ⇒ 所有写 entry 的地方都必须"以现有 entry 为基底、只改目标键"。
+//   （v0.0.28 在 persistSoundMap 上已经踩过同一个坑，那次叫「做差而非重建」。）
+- (NSDictionary *)entryBySettingFile:(NSString *)pick {
+    NSMutableDictionary *e = [NSMutableDictionary dictionaryWithDictionary:self.entry ?: @{}];
+    [e removeObjectForKey:NB_KEY_SOUND_ENTRY_ID];        // 文件优先：选了文件就清掉 id
+    if (pick.length) e[NB_KEY_SOUND_ENTRY_FILE] = pick;
+    else [e removeObjectForKey:NB_KEY_SOUND_ENTRY_FILE];
+    return e.count ? e : nil;                            // 空 ⇒ nil ⇒ 删除这条分配
+}
+
+- (NSDictionary *)entryBySettingSID:(NSInteger)sid {
+    NSMutableDictionary *e = [NSMutableDictionary dictionaryWithDictionary:self.entry ?: @{}];
+    [e removeObjectForKey:NB_KEY_SOUND_ENTRY_FILE];      // 改成 ID 就清掉文件（否则文件优先，ID 白填）
+    e[NB_KEY_SOUND_ENTRY_ID] = @(sid);
+    return e.count ? e : nil;
+}
+
 - (BOOL)commitFile:(NSString *)pick {
     if ([self isPerApp]) {
-        NSDictionary *entry = pick.length ? @{NB_KEY_SOUND_ENTRY_FILE: pick} : nil;
+        NSDictionary *entry = [self entryBySettingFile:pick];
         BOOL ok = [NotifyFilter setSoundEntry:entry forBundle:self.bundleId];
         if (ok) {
             self.entry = entry;
@@ -187,7 +221,8 @@
 // 写系统提示音 ID。per-App 写 {id}（清掉 file），全局写 soundID。
 - (BOOL)commitSID:(NSInteger)sid {
     if ([self isPerApp]) {
-        NSDictionary *entry = @{NB_KEY_SOUND_ENTRY_ID: @(sid)};
+        // v0.0.31：走做差函数 —— 整条替换会把 maxSec 清掉
+        NSDictionary *entry = [self entryBySettingSID:sid];
         BOOL ok = [NotifyFilter setSoundEntry:entry forBundle:self.bundleId];
         if (ok) {
             self.entry = entry;
@@ -215,13 +250,14 @@
 #pragma mark - UITableView
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
-    return [self isPerApp] ? 4 : 2;
+    // v0.0.31：per-App 多一节「最长播放秒数」（放在最后，前面几节的索引都不用动）
+    return [self isPerApp] ? 5 : 2;
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     if ([self isPerApp]) {
         if (section == 2) return (NSInteger)self.files.count;
-        return 1;                                   // 0=当前 / 1=系统音 ID / 3=删除
+        return 1;                                   // 0=当前 / 1=系统音 ID / 3=删除 / 4=时长
     }
     return section == 0 ? 1 : (NSInteger)self.files.count;
 }
@@ -232,6 +268,7 @@
             case 0: return @"当前用的音";
             case 1: return @"或改用系统提示音（1000~1035）";
             case 2: return self.files.count ? @"或选一个音频文件" : @"音频文件（目录里是空的）";
+            case 4: return @"最长播放秒数（只影响这个 App）";
             default: return nil;
         }
     }
@@ -249,6 +286,11 @@
                     @"试听响不等于通知一定响。", NOTIFYBOX_SOUND_DIR];
         }
         if (section == 3) return @"只影响这个 App；其它 App 各自的分配不变。";
+        if (section == 4) {
+            return @"「跟随全局」= 用设置页里那个秒数。\n"
+                   @"只有长音频才需要单独设：同一份文件，这个 App 想响久一点就调大它。\n"
+                   @"⚠️ 0 = 不限（长音响到底）；填乱值会被忽略并回到「跟随全局」，不会让通知变哑。";
+        }
         return nil;
     }
 
@@ -306,6 +348,12 @@
             c.textLabel.textColor = [UIColor systemRedColor];
             return c;
         }
+        if (ip.section == 4) {                              // v0.0.31：时长
+            c.textLabel.text = @"最长播放秒数";
+            c.detailTextLabel.text = [NotifyFilter soundEntryLimitSummary:self.entry];
+            c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            return c;
+        }
         // section 2：文件
         return [self fileCell:tv at:ip];
     }
@@ -343,9 +391,13 @@
     NSString *sizeText = sz ? [NSByteCountFormatter stringFromByteCount:sz.longLongValue
                                                              countStyle:NSByteCountFormatterCountStyleFile]
                             : @"?";
-    c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@",
-                              sizeText,
-                              [NotifyFilter playbackPlanForFileNamed:name]];
+    // v0.0.31：per-App 模式下必须按**这个 App 的时长**算计划。
+    // 🔴 用只读全局的那个版本会写错：给微信配了 30 秒，这里还会显示「8 秒后停」——
+    //    正是"界面写的和实际做的走岔"，而用户是照着这行字判断的。
+    NSString *plan = [self isPerApp]
+                   ? [NotifyFilter playbackPlanForFileNamed:name forBundle:self.bundleId]
+                   : [NotifyFilter playbackPlanForFileNamed:name];
+    c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@", sizeText, plan];
     c.accessoryType = [name isEqualToString:self.selected] ? UITableViewCellAccessoryCheckmark
                                                           : UITableViewCellAccessoryNone;
     return c;
@@ -366,6 +418,10 @@
         }
         if (ip.section == 3) {                                  // 删除分配
             [self confirmRemove];
+            return;
+        }
+        if (ip.section == 4) {                                  // v0.0.31：时长
+            [self pickMaxSec];
             return;
         }
     } else {
@@ -423,6 +479,82 @@
         return;
     }
     [self toast:@"这个 App 还没有音：选个文件，或填一个 1000~1035 的系统音 ID"];
+}
+
+// v0.0.31：写「这个 App 的最长播放秒数」。v < 0 = 跟随全局（= 删键）。
+- (BOOL)commitMaxSec:(double)v {
+    if (![self isPerApp]) return NO;
+    // 🔴 没音就不许设时长：只带 maxSec 的 entry 会被判定层当**空壳整条丢掉**
+    //    （NBSanitizedSoundMap 要求 file / id 至少有一个），
+    //    那时用户会觉得"我明明设了 30 秒，结果什么都没有"，
+    //    而且这个值随时会在下次净化时被清掉 —— 与其留个留不住的设置，不如当场拒绝。
+    if (!self.entry || (!self.selected.length && [self currentSID] == 0)) {
+        [self toast:@"先给这个 App 选一个音，再设时长"];
+        return NO;
+    }
+    NSMutableDictionary *e = [NSMutableDictionary dictionaryWithDictionary:self.entry ?: @{}];
+    if (v < 0) [e removeObjectForKey:NB_KEY_SOUND_ENTRY_MAXSEC];
+    else e[NB_KEY_SOUND_ENTRY_MAXSEC] = @(v);
+    NSDictionary *entry = e.count ? e : nil;
+    BOOL ok = [NotifyFilter setSoundEntry:entry forBundle:self.bundleId];
+    if (ok) {
+        self.entry = entry;
+        NBSharedLog(@"SOUNDMAP 设 %@ ⇒ 时长 %@", self.bundleId,
+                    v < 0 ? @"跟随全局" : [NSString stringWithFormat:@"%.0f 秒", v]);
+    }
+    return ok;
+}
+
+// 选项做成固定几档，而不是让用户填数字：
+// 🔴 填数字这条路在本项目里已经证明容易出错（手填 "abc" 会被 doubleValue 读成 0 = **不限**，
+//    也就是"写错一个字母 ⇒ 长音响到底"，而界面上看不出来）。
+//    固定档位没有这个风险；真要 3 秒这种值，改 settings.plist 也能生效（文档里写了）。
+- (void)pickMaxSec {
+    if (![self isPerApp]) return;
+    if (!self.entry || (!self.selected.length && [self currentSID] == 0)) {
+        [self toast:@"先给这个 App 选一个音，再设时长"];
+        return;
+    }
+    double cur = -1;
+    id curV = self.entry[NB_KEY_SOUND_ENTRY_MAXSEC];
+    // 手改过的 plist 里这个键可能是任何东西 ⇒ 先验类型再用，否则 doubleValue 会 unrecognized selector（崩）
+    if (![curV isKindOfClass:[NSNumber class]] && ![curV isKindOfClass:[NSString class]]) curV = nil;
+    if (curV) cur = [curV doubleValue];
+
+    double g = NBSoundMaxSecFromValue([NotifyStore settings][NB_KEY_SOUND_MAX_SEC]);
+    NSString *gText = (g <= 0) ? @"不限" : [NSString stringWithFormat:@"%.0f 秒", g];
+
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"最长播放秒数"
+                         message:[NSString stringWithFormat:
+                                  @"只影响这个 App。当前：%@\n「跟随全局」= %@（在设置页改）",
+                                  [NotifyFilter soundEntryLimitSummary:self.entry], gText]
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+
+    // v < 0 表示"跟随全局"（删键）；0 表示不限
+    NSArray *opts = @[@[@(-1), [NSString stringWithFormat:@"跟随全局（%@）", gText]],
+                      @[@5,  @"5 秒"],
+                      @[@8,  @"8 秒"],
+                      @[@15, @"15 秒"],
+                      @[@30, @"30 秒"],
+                      @[@0,  @"不限时长（长音响到底）"]];
+    for (NSArray *o in opts) {
+        double v = [(NSNumber *)o[0] doubleValue];
+        NSString *title = (NSString *)o[1];
+        BOOL hit = (v < 0) ? (curV == nil) : (curV != nil && cur >= 0 && cur == v);
+        if (hit) title = [@"✓ " stringByAppendingString:title];
+        [sheet addAction:[UIAlertAction actionWithTitle:title
+                                                 style:UIAlertActionStyleDefault
+                                               handler:^(UIAlertAction *a) {
+            // 失败分两种：没音（commitMaxSec 内部已 toast）和写盘失败（要另弹一次）。
+            // 用"self.entry 还在不在"区分：它只在成功时被更新。
+            BOOL ok = [self commitMaxSec:v];
+            if (ok) [self.table reloadData];
+            else if (self.entry) [self failSave];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 - (void)askSID {
