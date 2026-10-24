@@ -13,6 +13,7 @@
 // v0.0.28：按 App 分配提示音的总览页（列表 + 进子页改音）
 #import "SoundAppsViewController.h"
 #import "InstalledApps.h"
+#import "NotifyStatsViewController.h"
 #import <errno.h>
 #import <string.h>
 
@@ -83,6 +84,7 @@ static const NSInteger kSubHit = 105;
 // v0.0.45 批量清理。**必须显式声明**：`onBatchClean:` 要调 `pickAppToClean`，
 // 而后者定义在它**之后** —— 项目开 -Werror，靠定义顺序解析选择器会直接编不过。
 - (void)onBatchClean:(id)sender;
+- (void)onStats:(id)sender;
 - (void)confirmDeleteTitle:(NSString *)title
                     bundle:(NSString *)bundle
                   beforeTs:(NSTimeInterval)beforeTs
@@ -231,6 +233,8 @@ static const NSInteger kSubHit = 105;
 
     // ---------- 工具 ----------
     [self addActionRow:@"内容替换规则" key:@"replace" action:@selector(onReplace:)];
+    // v0.0.46：统计。**排在"诊断"之前** —— 诊断是排查用的，统计是天天想看的。
+    [self addActionRow:@"统计（哪个 App 最烦人）" key:@"stats" action:@selector(onStats:)];
     [self addActionRow:@"App 枚举诊断" key:@"appdiag" action:@selector(onAppDiag:)];
     // v0.0.45：批量清理。**放在「清空全部记录」上面** ——
     // 用户想清的是"某一批"，而"全清"是那个操作的极端形式；
@@ -876,6 +880,14 @@ static const NSInteger kSubHit = 105;
     a.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2,
                                                            self.view.bounds.size.height / 2, 1, 1);
     [self presentViewController:a animated:YES completion:nil];
+}
+
+#pragma mark - v0.0.46 统计
+
+- (void)onStats:(id)sender {
+    [self.view endEditing:YES];
+    NotifyStatsViewController *v = [[NotifyStatsViewController alloc] init];
+    [self.navigationController pushViewController:v animated:YES];
 }
 
 #pragma mark - v0.0.45 批量清理

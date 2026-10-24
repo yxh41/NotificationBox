@@ -80,11 +80,12 @@ APPLICATION_NAME = NotifyBoxApp
 #      ⇒ 编译期过、**链接期**报 `undefined symbol _OBJCCLASS_$_NotifyDetailViewController`。
 #      看到这个符号名先查这里，不要跑去查代码。
 # 🔴🔴 v0.0.45 新增 NBAppName.m：**App 侧也要编**（读 app_names 表 + 复用同一份解析）。
-#    ⚠️ 这是**同一个坑的第四次**（v0.0.28 / v0.0.33 / v0.0.44 各栽一次）：
+# 🔴🔴 v0.0.46 新增 app/NotifyStatsViewController.m（统计页）。
+#    ⚠️ 这是**同一个坑的第四、五次**（v0.0.28 / v0.0.33 / v0.0.44 各栽一次）：
 #      application.mk 不会自动收目录里的新文件，漏了这一行就是
 #      「编译期过、链接期 undefined symbol」—— 那种报错看着像代码问题，
 #      其实是构建配置。看到 undefined symbol 先查这里。
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m app/NotifyExport.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m NBAppName.m
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m app/NotifyExport.m app/NotifyStatsViewController.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m NBAppName.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
 # 🔴 App 侧也要 AVFoundation/AVFAudio：声音选择页要**试听**，那是在 App 里跑的 TTS。
 #    不链的话编译期就找不到 AVSpeechSynthesizer，而 tweak 侧那份救不了 App。
