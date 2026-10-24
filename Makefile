@@ -67,12 +67,16 @@ APPLICATION_NAME = NotifyBoxApp
 #      也 new 了它，但 application.mk 不会自动去收目录里的新文件 ⇒
 #      编译期过、**链接期**报 `undefined symbol _OBJCCLASS_$_SoundAppsViewController`。
 #      看到这个符号名先查这里，不要去查代码。
+# 🔴🔴 v0.0.44 新增 app/NotifyExport.m：导出记录成 CSV。
+#     ⚠️ 和 v0.0.28 / v0.0.33 是**同一个坑的第三次**：application.mk 不会自动收目录里的新文件，
+#       漏了这一行就是"编译期过、链接期 undefined symbol _OBJC_CLASS_$_NotifyExport"。
+#        看到这个符号名先查这里，不要跑去查代码。
 # 🔴🔴 v0.0.33 新增 app/NotifyDetailViewController.m：通知详情页（看全文 / 复制 / 删单条）。
 #      ⚠️ 和 v0.0.28 那次同一个坑：**必须加进这一行**，而且失败得很安静 ——
 #      ViewController 里 import 了它、也 alloc 了它，但 application.mk 不会自动收目录里的新文件
 #      ⇒ 编译期过、**链接期**报 `undefined symbol _OBJCCLASS_$_NotifyDetailViewController`。
 #      看到这个符号名先查这里，不要跑去查代码。
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m app/NotifyExport.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
 # 🔴 App 侧也要 AVFoundation/AVFAudio：声音选择页要**试听**，那是在 App 里跑的 TTS。
 #    不链的话编译期就找不到 AVSpeechSynthesizer，而 tweak 侧那份救不了 App。

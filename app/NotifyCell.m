@@ -10,7 +10,53 @@
 @property (nonatomic, strong) UILabel *msgLabel;
 @property (nonatomic, strong) UILabel *timeLabel;
 @property (nonatomic, strong) UIView *dotView;      // v0.0.35 未读点
+// v0.0.44：高亮要"先存原始串、最后统一渲染" —— 两个 setter 的调用顺序不固定，
+// 谁先到都只是记下来，真正写字在 `nbRender` 里一次做完。
+@property (nonatomic, copy) NSString *rawAppName;
+@property (nonatomic, copy) NSString *rawTitle;
+@property (nonatomic, copy) NSString *rawBody;
+@property (nonatomic, strong) UIColor *rawBodyColor;
+@property (nonatomic, copy) NSString *hlQuery;
+// 🔴 内部方法必须显式声明：项目开 -Werror，靠"定义在前面"来解析选择器太脆
+//    （本项目栽过三次：kAutoChainTrigger / uiscrollerInternalVelocity / forceLayoutVisibleCells）。
+- (void)nbRender;
 @end
+
+// v0.0.44：把 `query` 在 `text` 里出现的每一处都标出来。
+// 🔴 匹配用 `NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch`，
+//    和 `ViewController -bundlesMatchingSearch:` 的口径一致 ——
+//    否则会出现"App 名那一栏明明命中了，字却没标"这种对不上的情况。
+// 🔴 高亮只改**背景色 + 字色**，不动字体：换字号会让那一行基线跳动，
+//    滚动时一片一片地抖，比不高亮更难受。
+static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor *baseColor) {
+    NSMutableAttributedString *s = [[NSMutableAttributedString alloc] initWithString:text ?: @""];
+    if (!text.length) return s;
+    NSDictionary *base = @{ NSForegroundColorAttributeName: baseColor ?: [UIColor labelColor] };
+    [s setAttributes:base range:NSMakeRange(0, text.length)];
+    if (!query.length) return s;
+
+    NSDictionary *hit = @{
+        NSForegroundColorAttributeName: [UIColor labelColor],
+        NSBackgroundColorAttributeName: [[UIColor systemYellowColor] colorWithAlphaComponent:0.40],
+    };
+    NSString *hay = text, *needle = query;
+    NSRange search = NSMakeRange(0, hay.length);
+    NSUInteger guard = 0;
+    while (search.length > 0 && guard++ < 64) {
+        NSRange r = [hay rangeOfString:needle
+                              options:NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch
+                                range:search];
+        if (r.location == NSNotFound) break;
+        [s addAttributes:hit range:r];
+        NSUInteger next = NSMaxRange(r);
+        if (next >= hay.length) break;
+        search = NSMakeRange(next, hay.length - next);
+        // 🔴 空匹配会死循环（`needle` 为空时 `rangeOfString:` 返回 {0,0}）。
+        //    上面已经挡了 `query.length`，这里再挡一次"找到的位置没前进"。
+        if (r.length == 0) break;
+    }
+    return s;
+}
 
 @implementation NotifyCell
 
@@ -133,25 +179,44 @@
 - (void)setAppName:(NSString *)name {
     // 🔴 取不到名字时**留空**、不写「未知」：这一行是上下文，写个「未知」反而抢眼，
     //    而且实际路径上不会发生（`ViewController` 的 `appNameForBundle:` 会兜底成 bundle 末段）。
-    self.appLabel.text = name.length ? name : nil;
+    self.rawAppName = name.length ? name : nil;
+    [self nbRender];
 }
 
 - (void)setTitleText:(NSString *)title message:(NSString *)message subtitle:(NSString *)subtitle {
-    self.titleLabel2.text = title.length ? title : @"(无标题)";
+    self.rawTitle = title.length ? title : @"(无标题)";
 
     // 🔴 正文为空时**明确写出「(无正文)」**，不要留空。
     //    留空的话，「库里没存到正文」和「存了但没画出来」看起来一模一样 ——
     //    上一版就是因为这个把两种病因混在一起了。
     if (message.length) {
-        self.msgLabel.text = message;
-        self.msgLabel.textColor = [UIColor secondaryLabelColor];
+        self.rawBody = message;
+        self.rawBodyColor = [UIColor secondaryLabelColor];
     } else if (subtitle.length) {
-        self.msgLabel.text = subtitle;
-        self.msgLabel.textColor = [UIColor secondaryLabelColor];
+        self.rawBody = subtitle;
+        self.rawBodyColor = [UIColor secondaryLabelColor];
     } else {
-        self.msgLabel.text = @"(无正文)";
-        self.msgLabel.textColor = [UIColor tertiaryLabelColor];
+        self.rawBody = @"(无正文)";
+        self.rawBodyColor = [UIColor tertiaryLabelColor];
     }
+    [self nbRender];
+}
+
+- (void)setHighlightQuery:(NSString *)query {
+    self.hlQuery = query.length ? query : nil;
+    [self nbRender];
+}
+
+// v0.0.44：三个 label 的唯一写字出口。
+// 🔴 为什么集中在这里：高亮依赖"原始串 + 搜索词"两样东西，而它们由两个不同的 setter 给。
+//    分开写就会出现"后调的那个把前一个的高亮冲掉"（高亮只在 App 名上、正文没标）。
+- (void)nbRender {
+    self.appLabel.attributedText = NBHighlight(self.rawAppName, self.hlQuery,
+                                               [UIColor secondaryLabelColor]);
+    self.titleLabel2.attributedText = NBHighlight(self.rawTitle, self.hlQuery,
+                                                  [UIColor labelColor]);
+    self.msgLabel.attributedText = NBHighlight(self.rawBody, self.hlQuery,
+                                               self.rawBodyColor ?: [UIColor secondaryLabelColor]);
 }
 
 - (void)setTimeText:(NSString *)text {
@@ -172,9 +237,18 @@
     self.letterLabel.text = nil;
     // v0.0.42：App 名也要清 —— 复用池里留着上一行的名字，
     // 会出现"新记录显示的是上一个 App 的名字"，而且只闪一下就很难复现。
-    self.appLabel.text = nil;
-    self.titleLabel2.text = nil;
-    self.msgLabel.text = nil;
+    // v0.0.44：高亮是 `attributedText`，**两个都要清**：
+    //   ① 只清 `.text` 不清 `attributedText` ⇒ 上一行的黄底会跟着复用过来；
+    //   ② 只清 `attributedText` 不清原始串 ⇒ 下一行若先调 `setHighlightQuery:`
+    //      就会拿上一行的原始串重新渲染一遍（显示上一条的标题）。
+    self.appLabel.attributedText = nil;
+    self.titleLabel2.attributedText = nil;
+    self.msgLabel.attributedText = nil;
+    self.rawAppName = nil;
+    self.rawTitle = nil;
+    self.rawBody = nil;
+    self.rawBodyColor = nil;
+    self.hlQuery = nil;
     self.timeLabel.text = nil;
     // 🔴 v0.0.35：未读点**必须**在这里复位。
     //    不复位的话，第 3 行（未读）被复用到第 30 行（已读）时会把蓝点一起带过去 ——

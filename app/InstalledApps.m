@@ -111,20 +111,30 @@ static BOOL NBHasCJK(NSString *s) {
     return NO;
 }
 
-// 在若干候选里挑一个：**优先带汉字的**，其次第一个非空。
-// 🔴 为什么需要这条规则：v0.0.42 真机反馈「云闪付 / 米家 / 京东 / 小红书显示的不是中文名」。
+// 在若干候选里挑一个：**先"有汉字"优先，再"同档里取更短"**。
+// 🔴 第一档（有汉字优先）：v0.0.42 真机反馈「云闪付 / 米家 / 京东 / 小红书显示的不是中文名」。
 //    用户的手机是中文环境，界面上出现 `Mi Home`、`UPay`、`jdmobile` 就是 bug。
-//    而这个项目里能拿到名字的地方有三处（系统本地化名 / Info.plist / 本地化 strings），
-//    它们谁给英文、谁给中文并不固定 ⇒ 候选全收进来，再按"有汉字优先"挑一次。
-// 🟢 副作用可控：英文名本来就是英文的 App（QQ / Telegram）不受影响 —— 没有汉字候选时取第一个。
+//    而这个项目里能拿到名字的地方有三处（系统短名 / 系统全名 / Info.plist），
+//    它们谁给英文、谁给中文并不固定 ⇒ 不能只按候选顺序碰运气。
+// 🔴 第二档（v0.0.44 真机反馈加的"更短"）：用户原话
+//    「追剧日历就追剧日历，京东就京东，不用把后面的都带上，就跟桌面上显示的 app 名称一样」。
+//    系统注册表里有两套名字 —— `localizedName`（完整显示名，常带「-购物商城」这类后缀）
+//    和 `localizedShortName`（桌面/搜索里那个短标签）。**两者都带汉字时，短的才是眼睛里那个**。
+// 🟢 两个边界都守住了：
+//    · 都有汉字 ⇒ 取更短的（「京东-购物商城」→「京东」）
+//    · 都没汉字 ⇒ **不比长度**，保持候选顺序 —— 否则 `WhatsApp` 可能被某个内部短名干掉
+//    · 永远不做"把这一个切开"的截断：`WPS Office` 这种真名不会被削成 `WPS`
 static NSString *NBPickName(NSArray<NSString *> *cands) {
-    NSString *first = nil;
+    NSString *best = nil;
+    BOOL bestCJK = NO;
     for (NSString *s in cands) {
         if (!s.length) continue;
-        if (!first) first = s;
-        if (NBHasCJK(s)) return s;
+        BOOL cjk = NBHasCJK(s);
+        if (!best) { best = s; bestCJK = cjk; continue; }
+        if (cjk && !bestCJK) { best = s; bestCJK = YES; continue; }   // 有汉字 > 没汉字
+        if (cjk && bestCJK && s.length < best.length) { best = s; }   // 都有汉字 ⇒ 更短
     }
-    return first;
+    return best;
 }
 
 // 最后一层兜底：bundle 末段（`com.xiaomi.mihome` → `mihome`）。
@@ -197,13 +207,22 @@ static NSString *NBNameFromProxy(id proxy, NSString **srcOut) {
     if (!proxy) return nil;
 
     NSMutableArray<NSString *> *c = [NSMutableArray array];
-    // 这四个键有的系统版本有、有的没有。**逐键读**，不存在的键不构成失败。
-    for (NSString *k in @[@"localizedName", @"localizedShortName", @"displayName", @"itemName"]) {
+    // 🔴 v0.0.44：`localizedShortName` **排在第一位** —— 它就是桌面图标底下那个短标签
+    //    （完整名常带「-购物商城」这类后缀）。`NBPickName` 在"都有汉字"时会取更短的那个，
+    //    所以把短名放进来 = 让"用户眼睛里的名字"优先胜出。
+    // 🔴 这四个键有的系统版本有、有的没有。**逐键读**，不存在的键不构成失败。
+    for (NSString *k in @[@"localizedShortName", @"localizedName", @"displayName", @"itemName"]) {
         NSString *v = NBStrForKey(proxy, k);
         if (v.length) [c addObject:v];
     }
+    NSString *shortName = c.count ? c[0] : nil;
     NSString *picked = NBPickName(c);
-    NSString *src = picked.length ? @"系统名" : nil;
+    NSString *src = nil;
+    if (picked.length) {
+        // 诊断要能看出"这个名字是短名还是完整名" —— 下一回再有人说名字不对，
+        // 一眼就能判断是"系统给的完整名太长"还是"短名本身就是那个"。
+        src = (shortName.length && [picked isEqualToString:shortName]) ? @"短名" : @"系统名";
+    }
 
     if (!(picked.length && NBHasCJK(picked))) {
         NSString *path = NBPathForKey(proxy, @"bundleURL");
@@ -274,7 +293,7 @@ static NSDictionary<NSString *, NSString *> *NBViaWorkspace(void) {
 
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     NSMutableArray<NSString *> *fallbacks = [NSMutableArray array];
-    NSInteger skipped = 0, fromSys = 0, fromPlist = 0, fromLastSeg = 0;
+    NSInteger skipped = 0, fromShort = 0, fromSys = 0, fromPlist = 0, fromLastSeg = 0;
 
     for (id proxy in (NSArray *)raw) {
         // 🔴🔴 v0.0.43 的修法：**先只读 bundleIdentifier**，读到了这个 App 就归属了。
@@ -291,6 +310,7 @@ static NSDictionary<NSString *, NSString *> *NBViaWorkspace(void) {
         NSString *name = NBNameFromProxy(proxy, &src);
         if (name.length) {
             if ([src isEqualToString:@"Info.plist"]) fromPlist++;
+            else if ([src isEqualToString:@"短名"]) fromShort++;
             else fromSys++;
         } else {
             name = NBLastSegmentName(bid);
@@ -305,8 +325,10 @@ static NSDictionary<NSString *, NSString *> *NBViaWorkspace(void) {
     // 🔴 v0.0.43 新增：名字**从哪来的**也要报。上一版只有"拿到几个"，
     //    于是"拿到的名字是 bundle 末段"这种情况在报告里完全看不见 ——
     //    而那恰好就是用户看到的那一堆英文小字。
-    NBAddDiag(@"名字来源：系统名 %ld / Info.plist %ld / 兜底末段 %ld",
-              (long)fromSys, (long)fromPlist, (long)fromLastSeg);
+    // v0.0.44：把「短名」单独计一档 —— 下回再有人说名字不对，看这一行就知道
+    // 是"系统短名本身就是那个"还是"完整名太长没被短名压住"。
+    NBAddDiag(@"名字来源：短名 %ld / 系统全名 %ld / Info.plist %ld / 兜底末段 %ld",
+              (long)fromShort, (long)fromSys, (long)fromPlist, (long)fromLastSeg);
     if (fallbacks.count) {
         NBAddDiag(@"兜底的 bundle：%@", [fallbacks componentsJoinedByString:@", "]);
     }

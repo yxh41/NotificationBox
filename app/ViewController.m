@@ -8,6 +8,7 @@
 #import "NotifyDetailViewController.h"
 // v0.0.42：App 显示名（bundle -> 名字）。列表要显示它，搜索也要用它匹配。
 #import "InstalledApps.h"
+#import "NotifyExport.h"     // v0.0.44 导出
 
 // v0.0.38：「全标已读」按钮的固定宽度。「全标已读」4 个汉字 @14pt ≈ 56pt，
 // 加左右各 16pt 内边距 ⇒ 88 够宽裕。写常量是因为布局里要拿它算分段控件的宽度，
@@ -120,6 +121,9 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    （v0.0.33 的 `doDelete`/`str:` 就是这么挂过一次）。
 - (void)onClear:(id)sender;
 - (void)doClear;
+// v0.0.44：导出当前筛选的记录成 CSV（`onExport:` 挂按钮，`doExport` 在确认框之后跑）
+- (void)onExport:(id)sender;
+- (void)doExport;
 // v0.0.36：只刷新图标栏红点（不重建按钮，避免图标栏滚动位置被重置）
 - (void)refreshUnreadDots;
 // v0.0.37：全部 / 只看未读（自己的分段控件，替掉没渲染出来的系统 scope bar）
@@ -201,7 +205,14 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
                                         target:self
                                         action:@selector(onClear:)];
     clear.tintColor = [UIColor systemRedColor];   // 不可撤销 ⇒ 和详情页的「删除」同一套视觉
-    self.navigationItem.rightBarButtonItems = @[diag, clear];
+    // v0.0.44：导出。放在「诊断」和「清空」中间 —— 它比诊断常用、比清空安全，
+    //    而最右上角留给最常用的「诊断」（`rightBarButtonItems` 里第一个在最右）。
+    UIBarButtonItem *export =
+        [[UIBarButtonItem alloc] initWithTitle:@"导出"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onExport:)];
+    self.navigationItem.rightBarButtonItems = @[diag, export, clear];
     // 🔴 v0.0.8：设置留在自己 App 里，不再往设置 App 装 PreferenceLoader 载荷
     self.navigationItem.leftBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"设置"
@@ -291,6 +302,96 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
         [self alertTitle:@"清空失败"
                     text:@"打不开数据库。列表已刷新，可以重启 App 再试。"];
     }
+}
+
+#pragma mark - 导出（v0.0.44）
+
+// 🔴 导出的是**当前筛选**的那批记录（App 图标 + 时间窗 + 搜索 + 未读），不是整库。
+//    为什么：用户要备份的通常是"我正在看的这一堆"（比如某个 App 的验证码历史），
+//    而全量导出他没法用 —— 几万行塞进一个 CSV，打开就卡死。
+//    🔴 当前筛选为空 = 没有限定条件 ⇒ 那就是整库，和"全量"不冲突。
+- (void)onExport:(id)sender {
+    NSArray<NSString *> *searchBundles = [self bundlesMatchingSearch:self.searchText];
+    NSInteger n = [NotifyStore countWithBundle:self.filterBundle
+                                         since:[self sinceFromSeg]
+                                        search:self.searchText
+                                 searchBundles:searchBundles
+                                    unreadOnly:self.unreadOnly];
+    if (n <= 0) {
+        // 和 `onClear:` 同一条纪律：没有可导出的东西就别弹确认框。
+        [self alertTitle:@"没有可导出的记录"
+                    text:@"当前筛选下一条记录都没有。把筛选调宽（或清空搜索框）再试。"];
+        return;
+    }
+
+    // 🔴 确认框里的数必须就是**这次真正会写进文件的条数**：
+    //    它来自同一个 `NBPrepareScope`（`countWithBundle:`），和下面 `doExport` 查的是一批数据。
+    //    这里如果拿 `self.items.count` 就会少算 —— 列表被 `LIMIT 2000` 截断过，
+    //    而导出**不带** LIMIT（v0.0.35 的 `onClear:` 已经为"报列表条数、实际动全表"买过一次单）。
+    NSMutableString *msg = [NSMutableString stringWithFormat:
+        @"将把当前筛选下的 %ld 条记录导出成 CSV。", (long)n];
+    if ((NSInteger)self.items.count != n) {
+        [msg appendFormat:@"\n\n（列表里只显示了 %ld 条 —— 它一次最多显示 %ld 条，"
+                           "导出的文件里是完整的 %ld 条。）",
+         (long)self.items.count, (long)[NotifyStore listLimit], (long)n];
+    }
+
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"导出记录"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [al addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [al addAction:[UIAlertAction actionWithTitle:@"导出" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *a) {
+        [weakSelf doExport];
+    }]];
+    [self presentViewController:al animated:YES completion:nil];
+}
+
+- (void)doExport {
+    NSArray<NSString *> *searchBundles = [self bundlesMatchingSearch:self.searchText];
+    NSArray<NSDictionary *> *rows =
+        [NotifyStore exportRowsWithBundle:self.filterBundle
+                                    since:[self sinceFromSeg]
+                                   search:self.searchText
+                            searchBundles:searchBundles
+                               unreadOnly:self.unreadOnly];
+    if (!rows.count) {
+        [self alertTitle:@"导出失败" text:@"一条记录都没读到。列表已刷新，可以再试一次。"];
+        [self loadData];
+        return;
+    }
+
+    // App 显示名只有界面层有（库里存的是 bundle id）⇒ 把映射传进去
+    NSString *csv = [NotifyExport csvFromRows:rows appNames:self.appNameMap];
+    NSString *base = self.filterBundle.length ? [self appNameForBundle:self.filterBundle]
+                                              : @"消息盒子";
+    NSURL *url = [NotifyExport writeTempCSV:csv baseName:base];
+    if (!url) {
+        [self alertTitle:@"导出失败" text:@"写临时文件失败。可以重启 App 再试。"];
+        return;
+    }
+
+    UIActivityViewController *act =
+        [[UIActivityViewController alloc] initWithActivityItems:@[url]
+                                          applicationActivities:nil];
+    // 🔴 iPad 上 `UIActivityViewController` 必须挂 popover，不挂就是**直接崩**。
+    act.popoverPresentationController.barButtonItem =
+        self.navigationItem.rightBarButtonItems.count > 1
+            ? self.navigationItem.rightBarButtonItems[1]     // 「导出」那个按钮
+            : self.navigationItem.rightBarButtonItem;
+    __weak typeof(self) weakSelf = self;
+    act.completionWithItemsHandler = ^(UIActivityType type, BOOL done,
+                                       NSArray *items, NSError *err) {
+        // 分享完把临时文件删掉 —— 里面是一整份通知记录，不该留在临时目录里
+        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        if (done) {
+            [weakSelf alertTitle:@"已导出"
+                            text:[NSString stringWithFormat:@"%ld 条记录已导出。",
+                                  (long)rows.count]];
+        }
+    };
+    [self presentViewController:act animated:YES completion:nil];
 }
 
 #pragma mark - 全标已读（v0.0.38）
@@ -1340,6 +1441,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    恰恰是这个盒子最需要回答的问题（用户来查的就是"谁在打扰我"）。
     [c setAppName:[self appNameForBundle:bid]];
     [c setTitleText:title message:msg subtitle:sub];
+    // v0.0.44：搜索命中高亮。**必须传当前搜索词**，且放在两个 set 之后也不影响
+    // （cell 内部是"先存后渲"，顺序无关）。传 nil 时不高亮 —— 正常浏览不该有黄底。
+    [c setHighlightQuery:self.searchText];
     [c setTimeText:[fmt stringFromDate:date]];
     // v0.0.35：`read` 字段数据层早就有了（`queryWithBundle:` 的 SELECT 里一直带着），
     // 只是 cell 从来没用过 ⇒ `markRead:` 写了等于没写，用户看不出哪条看过。

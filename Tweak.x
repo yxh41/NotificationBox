@@ -1,8 +1,9 @@
-// Tweak.x —— v0.0.43（当前）：**tweak 侧仍无逻辑改动**，只升版本号；本版改的是盒子 App
-//   （真机反馈两修：① 部分 App 显示的不是中文名 ② 底部截断提示在「只看未读」下报错数）。
-//   🔴 连着六版都写清楚这一点，因为日志里会打出 v0.0.43 —— 不给说明的话，
+// Tweak.x —— v0.0.44（当前）：**tweak 侧仍无逻辑改动**，只升版本号；本版改的是盒子 App
+//   （App 名改用桌面短名 + 搜索命中高亮 + 导出 CSV）。
+//   🔴 连着七版都写清楚这一点，因为日志里会打出 v0.0.44 —— 不给说明的话，
 //      以后看到这版日志会以为 tweak 也动了，白查一轮。
-//   上一版 v0.0.42：列表显示 App 名 + 搜索能搜 App 名和 subtitle + 搜索防抖 + 底部截断提示
+//   上一版 v0.0.43：真机反馈两修（App 中文名 + 底部截断提示的未读口径）
+//   上上版 v0.0.42：列表显示 App 名 + 搜索能搜 App 名和 subtitle + 搜索防抖 + 底部截断提示
 //   上上版 v0.0.41：顶部提示条可点 + 未读派生量收成一个出口（只有 App 侧）
 //   上上上版 v0.0.40：提示条范围从"比时间窗更早"扩成"当前筛选之外"（只有 App 侧）
 //
@@ -635,7 +636,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.43 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.44 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -673,7 +674,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.43 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.44 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -738,7 +739,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.43 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.44 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
