@@ -70,10 +70,20 @@ static const CGFloat kNBMarkAllWidth = 88;
 //    名不符实在这个项目里栽过（第 0 段时间曾叫「今天」而实际是 now-86400）。
 @property (nonatomic, assign) NSInteger hiddenUnread;
 // v0.0.40：上面那个数的常驻出口（一行小字，`hiddenUnread > 0` 才占位）。
-// 🔴 不放导航栏标题、也不放分段控件里：那两处都要**赌系统怎么排**（标题会被压缩/截断，
-//    分段控件段宽是系统算的）。v0.0.37 已经被系统 scope bar 教过一次 ——
-//    凡是"只能靠系统内部布局才出现"的东西，都不赌，自己画、自己算高度。
-@property (nonatomic, strong) UILabel *hiddenHint;
+// v0.0.41：**从 UILabel 改成 UIButton** —— 提示条现在可点。
+// 🔴 为什么可点：它说的是"还有 N 条未读你看不到"，那就必须给一条一步到位的路。
+//    原来只在文案里点名出口（"点顶部「全部」图标"），用户还得自己去找那个图标、
+//    还要记得把时间和搜索也清掉 —— 三个筛选叠加时文案甚至不能点名。
+//    改成点一下就**三样一次清干净**，文案就可以只说事实、不教操作。
+// 🔴 为什么不用"给 UILabel 加 tap 手势"：按钮自带按压高亮，用户按下去知道点到了；
+//    UILabel 加手势按下去毫无反馈，用户第二次就不点了。
+// 🔴 为什么不在文案里写"点这里"：文案已经 20 来字，再塞就换行。
+//    统一在末尾加 `›` 当"可以点"的暗示 —— `hiddenHintText` 只产**纯文案**，
+//    `›` 是 UI 装饰，只加在按钮上（空列表正中那句是 UILabel、不能点，不能加）。
+// 🔴 位置照旧是自己画、自己在 `viewDidLayoutSubviews` 里算 y ——
+//    不放导航栏标题、也不放分段控件里：那两处都要**赌系统怎么排**（标题会被压缩/截断，
+//    分段控件段宽是系统算的）。v0.0.37 已经被系统 scope bar 教过一次。
+@property (nonatomic, strong) UIButton *hiddenHint;
 
 - (void)onDiag:(id)sender;
 - (void)onSettings:(id)sender;
@@ -98,6 +108,14 @@ static const CGFloat kNBMarkAllWidth = 88;
 - (void)updateHiddenUnread;
 // v0.0.40：提示文案的**唯一来源**（顶部提示条 + 空列表正中那句都用它产出）
 - (NSString *)hiddenHintText;
+// v0.0.41：所有**由未读数派生**的界面元素只准从这一个函数更新
+// 🔴 为什么必须有它：v0.0.40 把顶部提示条只接在 `loadData` 里，而"点开一条记录"
+//    走的是「只刷一行」那条路（不重查库）⇒ 筛选内未读少一条、筛选外那个数变大，
+//    提示条却不动。真机复现：点某个 App 图标 → 把它 3 条未读依次读完 →
+//    顶部该出现"其它 App 还有 N 条"却不出现。
+- (void)refreshUnreadDerived;
+// v0.0.41：点顶部提示条 ⇒ 三个筛选一次清干净
+- (void)onHiddenHintTap;
 // v0.0.38：时间段的显示名 / 「App + 时间」两维的范围描述
 // 🔴 抽出来是因为确认框文案和空列表文案都用到它，字面量写两处就会不一致
 - (NSArray<NSString *> *)timeNames;
@@ -603,15 +621,21 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self.view addSubview:self.markAllBtn];
 
     // v0.0.40：筛选之外还有未读的常驻提示（`hiddenUnread > 0` 才显示，见属性注释）。
+    // v0.0.41：改成按钮（可点）。创建方式对齐同屏已有的 `markAllBtn`：
+    //    一样是 `UIButtonTypeSystem` + 手动设字体/颜色，不引第二套写法。
     // 🔴 用 `secondaryLabelColor` + 12pt：它是"补充说明"，不该比列表本身更抢眼。
     //    但前面带 ⚠️，因为不说的话用户会当成"全都读完了"。
-    self.hiddenHint = [[UILabel alloc] init];
-    self.hiddenHint.font = [UIFont systemFontOfSize:12];
-    self.hiddenHint.textColor = [UIColor secondaryLabelColor];
-    self.hiddenHint.numberOfLines = 1;
-    self.hiddenHint.adjustsFontSizeToFitWidth = YES;
-    self.hiddenHint.minimumScaleFactor = 0.85;
+    self.hiddenHint = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.hiddenHint.titleLabel.font = [UIFont systemFontOfSize:12];
+    self.hiddenHint.titleLabel.adjustsFontSizeToFitWidth = YES;
+    self.hiddenHint.titleLabel.minimumScaleFactor = 0.85;
+    // 🔴 system 按钮的标题默认**居中**；不改成左对齐的话，一行小字会飘在屏幕中间，
+    //    看起来像个孤立标签、而不是"挂在列表上方的一条说明"。
+    self.hiddenHint.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    [self.hiddenHint setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
     self.hiddenHint.hidden = YES;
+    [self.hiddenHint addTarget:self action:@selector(onHiddenHintTap)
+              forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.hiddenHint];
 
     // 顶部 App 图标栏（横向滚动）
@@ -870,7 +894,62 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         // 🔴 `inScope < 0`（DB 打不开）时宁可不提示，也不显示一个可能是瞎猜的数。
         if (inScope >= 0) self.hiddenUnread = MAX(0, all - inScope);
     }
-    self.hiddenHint.text = [self hiddenHintText];
+    // v0.0.41：按钮用 `setTitle:forState:`，不再设 `.text`（UIButton 没有 text 属性）。
+    // `›` 是"可以点"的暗示，只加在按钮上 —— 空列表正中那句是 UILabel、点不了，不能加。
+    NSString *hint = [self hiddenHintText];
+    [self.hiddenHint setTitle:(hint ? [hint stringByAppendingString:@" ›"] : nil)
+                     forState:UIControlStateNormal];
+}
+
+// v0.0.41：**所有由"未读数"派生出来的界面元素，只准从这里更新**。
+// 🔴 为什么必须收成一个出口：v0.0.40 只把顶部提示条接在 `loadData` 里，
+//    而"点开一条记录"走的是「只刷一行」那条路（`reloadRowsAtIndexPaths:`，不重查库）——
+//    那条路上筛选内的未读少了一条、筛选之外那个数可能变大，提示条却纹丝不动。
+//    真机复现：点某个 App 图标 → 把它 3 条未读依次读完 → 顶部该出现
+//    「其它 App 还有 N 条」却不出现，要切个时间才冒出来。
+// 🔴 这是"同一个量只算一次"的反面纪律：**一个量有几处派生出口，改的时候就得全改**。
+//    与其每次都记得，不如让它只有一个入口。
+- (void)refreshUnreadDerived {
+    [self refreshUnreadDots];      // 图标栏红点（按 App 汇总）
+    [self updateHiddenUnread];     // 顶部提示条（筛选之外还有多少）
+    // 🔴 `setNeedsLayout` 不能省：提示条出现/消失会改图标栏和列表的**起始 y**。
+    [self.view setNeedsLayout];
+}
+
+// v0.0.41：点顶部提示条 ⇒ 把三个筛选一次清干净，直接看到全部未读。
+// 🔴 为什么清三样而不是只清文案里点名的那个：三种筛选任意叠加时，
+//    只清一样还是看不到（这也正是 v0.0.40 在叠加时不点名出口的原因）。
+//    点一下全清，文案就永远不需要教用户"点哪里"。
+// 🔴 为什么连着 `searchBar.text` 一起清：只清 `self.searchText` 的话搜索框里还留着字，
+//    用户会以为"还在搜"，然后自己再清一次。程序设 `text` **不会**回调
+//    `searchBar:textDidChange:`，所以 `self.searchText = nil` 那一行不能省。
+// 🔴 为什么不动 `unreadOnly`：提示条说的是"未读"，用户本来就在看未读时，
+//    跳过去仍然只看未读才符合他的意图；强行切回「全部」等于替他改了个无关的选择。
+- (void)onHiddenHintTap {
+    BOOL changed = NO;
+    if (self.filterBundle.length) {
+        self.filterBundle = nil;
+        changed = YES;
+    }
+    if (self.searchText.length) {
+        self.searchText = nil;
+        self.searchBar.text = nil;
+        changed = YES;
+    }
+    if (self.timeSeg.selectedSegmentIndex != 2) {   // 2 = 不限时间（见 timeNames / sinceFromSeg）
+        self.timeSeg.selectedSegmentIndex = 2;
+        changed = YES;
+    }
+    if (!changed) {
+        // 三个筛选本来都是开的 ⇒ 这个数只可能是"库里条数超过列表能显示的上限"造成的，
+        // 点它没有地方可跳。如实说明，别让用户白点一下还以为坏了。
+        [self alertTitle:@"记录太多"
+                    text:@"当前已经是「全部 App · 不限时间 · 无搜索」，"
+                         @"但库里的记录超过了列表能显示的上限，有一部分翻不到。"
+                         @"可以到「设置 → 记录上限」把它调小一些，让列表能一次装下。"];
+        return;
+    }
+    [self loadData];
 }
 
 // v0.0.40：提示文案的唯一来源 —— 顶部提示条和空列表正中那句都从这里拿。
@@ -1090,8 +1169,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     } else if ([d isKindOfClass:[NSMutableDictionary class]]) {
         [(NSMutableDictionary *)d setObject:@1 forKey:@"read"];
         [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
-        // 红点要跟着变：这可能正是该 App 的最后一条未读
-        [self refreshUnreadDots];
+        // v0.0.41：红点**和顶部提示条**一起重算。
+        // 🔴 原来这里只调了 `refreshUnreadDots` —— 红点跟着变了，提示条没变。
+        //    "这行刚变已读"影响的正是**两个**派生量：该 App 的未读数（红点）、
+        //    以及"筛选之外还有多少"（提示条，筛选内的未读少了一条）。
+        [self refreshUnreadDerived];
     } else {
         // 兜底：万一哪天 query 改成返回不可变字典，退回整表重查（会丢滚动位置，但不会错）
         [self loadData];
