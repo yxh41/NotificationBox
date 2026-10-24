@@ -9,7 +9,7 @@
 
 // 🔴 盒子 App：读 NotifyStore 的 SQLite，展示通知列表
 //    - 顶部横向 App 图标栏（抖音聊天页那种）：点击筛选对应 bundle
-//    - 时间分段：今天 / 近7天 / 全部
+//    - 时间分段：近24小时 / 近7天 / 不限时间（v0.0.37 起如实命名）
 //    - 搜索框：标题/正文模糊搜
 //    - 列表：图标占位 + 标题 + 正文 + 时间
 //
@@ -21,6 +21,13 @@
 @property (nonatomic, strong) UIScrollView *iconBar;
 @property (nonatomic, strong) UISearchBar *searchBar;
 @property (nonatomic, strong) UISegmentedControl *timeSeg;
+// v0.0.37：全部 / 只看未读。**自己画一个分段控件**，不用 UISearchBar 的 scope bar。
+// 🔴 v0.0.36 用的是 `searchBar.showsScopeBar = YES`，代码没错（顺序也是先 titles 后 shows），
+//    但真机 iOS 16 上 scope bar 根本没渲染出来 —— 用户反馈"没看到未读这些字眼"。
+//    没有 Mac/调试器的情况下，去赌系统的内部布局行为不划算：
+//    同一屏里「今天/近7天/全部」这个 UISegmentedControl 一直是好的，
+//    那就用同一种控件，行为 100% 可预期，也顺手去掉 88/44 的高度赌博。
+@property (nonatomic, strong) UISegmentedControl *unreadSeg;
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSArray<NSDictionary *> *items;
 @property (nonatomic, strong) NSArray<NSString *> *bundles;
@@ -43,6 +50,8 @@
 - (void)doClear;
 // v0.0.36：只刷新图标栏红点（不重建按钮，避免图标栏滚动位置被重置）
 - (void)refreshUnreadDots;
+// v0.0.37：全部 / 只看未读（自己的分段控件，替掉没渲染出来的系统 scope bar）
+- (void)onUnread:(UISegmentedControl *)seg;
 // v0.0.36：当前筛选条件的一行文字描述（空列表时写出来，避免"看着空 = 没有"的误判）
 - (NSString *)filterDesc;
 - (void)showText:(NSString *)text title:(NSString *)title;
@@ -412,7 +421,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 
 - (void)buildUI {
     // 时间分段
-    self.timeSeg = [[UISegmentedControl alloc] initWithItems:@[@"今天", @"近7天", @"全部"]];
+    // v0.0.37：第 0 段原名「今天」，但它实际返回的是 `now - 86400`（最近 24 小时），
+    //    不是今天 00:00 —— 名不符实。今天 19:30 时，「今天」会把昨天 19:30 之后的
+    //    记录也算进来。改成如实写「近24小时」，行为不变、标签不再说谎。
+    self.timeSeg = [[UISegmentedControl alloc] initWithItems:@[@"近24小时", @"近7天", @"不限时间"]];
     self.timeSeg.selectedSegmentIndex = 0;
     [self.timeSeg addTarget:self action:@selector(onTime:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.timeSeg];
@@ -421,14 +433,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.searchBar = [[UISearchBar alloc] init];
     self.searchBar.delegate = self;
     self.searchBar.placeholder = @"搜索标题或正文";
-    // v0.0.36：搜索框下面挂两个 scope（全部 / 未读）。
-    // 🔴 顺序有讲究：**先设 scopeButtonTitles，再设 showsScopeBar** ——
-    //    反过来的话某些系统版本上 scope bar 不会出现（网上常见的坑）。
-    // 🔴 常显而不是"搜索时才出现"：这是个筛选开关，藏起来等于没有。
-    self.searchBar.scopeButtonTitles = @[@"全部", @"未读"];
-    self.searchBar.selectedScopeButtonIndex = 0;
-    self.searchBar.showsScopeBar = YES;
     [self.view addSubview:self.searchBar];
+
+    // v0.0.37：全部 / 只看未读。
+    // 🔴 不用 `searchBar.showsScopeBar` 了 —— v0.0.36 实测 iOS 16 上不显示（见属性注释）。
+    //    用和上面时间分段同款控件，看得见摸得着。
+    self.unreadSeg = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"只看未读"]];
+    self.unreadSeg.selectedSegmentIndex = 0;
+    [self.unreadSeg addTarget:self action:@selector(onUnread:) forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:self.unreadSeg];
 
     // 顶部 App 图标栏（横向滚动）
     self.iconBar = [[UIScrollView alloc] init];
@@ -458,13 +471,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.timeSeg.frame = CGRectMake(12, y, w - 24, 30);
     y += 30 + 6;
 
-    // v0.0.36：开了 scope bar 之后搜索框整体是 44 + 44（搜索框一行、scope 一行）。
-    // 🔴 不能用 `sizeThatFits:` / `intrinsicContentSize` 去"自动算" ——
-    //    UISearchBar 是普通 UIView，`sizeThatFits:` 默认只回 bounds.size，
-    //    未布局时是 (0,0) ⇒ 搜索框直接消失。按"开没开 scope"直接算最稳。
-    CGFloat searchH = self.searchBar.showsScopeBar ? 88 : 44;
-    self.searchBar.frame = CGRectMake(0, y, w, searchH);
-    y += searchH;
+    // v0.0.37：搜索框回到固定 44 —— 不再有 scope bar 要挤进来。
+    // 🔴 别用 `sizeThatFits:` / `intrinsicContentSize` 去"自动算"：
+    //    UISearchBar 是普通 UIView，未布局时回 (0,0) ⇒ 搜索框直接消失。
+    self.searchBar.frame = CGRectMake(0, y, w, 44);
+    y += 44 + 4;
+
+    // v0.0.37：全部 / 只看未读，自己的一段（原来这里是系统的 scope bar，不显示）
+    self.unreadSeg.frame = CGRectMake(12, y, w - 24, 30);
+    y += 30 + 6;
 
     self.iconBar.frame = CGRectMake(0, y, w, 56);
     y += 56;
@@ -481,7 +496,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self.iconBar.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
     self.bundles = [NotifyStore distinctBundles];
     // v0.0.36：一次查出来，下面建每个图标时直接用（别在循环里一个个查库）
-    NSSet *unread = [NotifyStore bundlesWithUnread];
+    // v0.0.37：红点只算**当前时间窗内**的未读 —— 和列表同口径，点得进去也清得掉。
+    NSSet *unread = [NotifyStore bundlesWithUnreadSince:[self sinceFromSeg]];
     self.unreadDots = [NSMutableDictionary dictionary];
 
     CGFloat x = 8;
@@ -560,7 +576,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 //    图标栏的滚动位置被夹回最左 —— 用户滚到第 10 个 App、点开一条、返回，位置没了。
 //    这里只改已有红点的 hidden，按钮和 contentSize 都不碰。
 - (void)refreshUnreadDots {
-    NSSet *unread = [NotifyStore bundlesWithUnread];
+    NSSet *unread = [NotifyStore bundlesWithUnreadSince:[self sinceFromSeg]];
     for (NSString *bid in self.unreadDots) {
         self.unreadDots[bid].hidden = ![unread containsObject:bid];
     }
@@ -588,6 +604,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 }
 
 - (NSTimeInterval)sinceFromSeg {
+    // 🔴 第 0 段是「近24小时」= now-86400，**不是**今天 00:00。
+    //    v0.0.36 之前它叫「今天」（名不符实），v0.0.37 改了标签没改行为。
     NSTimeInterval now = [NSDate date].timeIntervalSince1970;
     if (self.timeSeg.selectedSegmentIndex == 0) return now - 86400;
     if (self.timeSeg.selectedSegmentIndex == 1) return now - 7 * 86400;
@@ -633,8 +651,24 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // v0.0.36：多写一行「当前筛选」。
     // 🔴 加了「只看未读」之后空列表变得很常见：时间选「今天」+ 只看未读 是空的，
     //    而昨天有未读。不把条件写出来的话，用户会直接断定"没有未读"。
-    l.text = [NSString stringWithFormat:@"暂无记录\n\n当前筛选：%@\n\n%@",
-              [self filterDesc], [NotifyStore debugSummary]];
+    NSMutableString *t = [NSMutableString stringWithFormat:@"暂无记录\n\n当前筛选：%@",
+                          [self filterDesc]];
+    // 🔴 v0.0.37：真机上用户卡在这里过 —— 红点（当时是全库口径）亮着，点进某个 App
+    //    却是空的，于是"红点永远消不掉"。现在红点已经改成同口径了，但**更早的未读
+    //    仍然存在**，只是被时间窗挡住。不说清楚的话，用户会以为记录丢了。
+    NSSet *globalUnread = [NotifyStore bundlesWithUnread];      // 全库
+    BOOL olderUnread = self.filterBundle.length
+        ? [globalUnread containsObject:self.filterBundle]
+        : (globalUnread.count > 0);
+    if (olderUnread && self.timeSeg.selectedSegmentIndex != 2) {
+        [t appendString:@"\n\n⚠️ 还有更早的未读记录，被时间筛选挡住了 —— "
+                      @"把时间切到「不限时间」就能看到。"];
+    }
+    if (self.unreadOnly) {
+        [t appendString:@"\n\n（当前是「只看未读」，切上面「全部」可以看所有记录）"];
+    }
+    [t appendFormat:@"\n\n%@", [NotifyStore debugSummary]];
+    l.text = t;
     self.table.backgroundView = l;
 }
 
@@ -643,7 +677,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     NSMutableArray *a = [NSMutableArray array];
     [a addObject:(self.filterBundle.length ? [self shortName:self.filterBundle] : @"全部 App")];
 
-    NSArray *times = @[@"今天", @"近7天", @"不限时间"];
+    // v0.0.37：时间段的显示名必须和 `sinceFromSeg` 的实现一致。
+    //    第 0 段实际是 `now - 86400` ⇒ 叫「近24小时」，不叫「今天」。
+    NSArray *times = @[@"近24小时", @"近7天", @"不限时间"];
     NSInteger ti = self.timeSeg.selectedSegmentIndex;
     NSString *t = (ti >= 0 && ti < (NSInteger)times.count) ? times[ti] : @"时间?";
     [a addObject:t];
@@ -664,8 +700,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 // v0.0.36：scope 切换（全部 / 未读）。
 // 🔴 走 `loadData` 而不是自己过滤 `self.items` —— 后者只能过滤"已经查出来的 2000 条"，
 //    而"只看未读"应该是在数据库层筛（数量完全不同的两类查询）。
-- (void)searchBar:(UISearchBar *)searchBar selectedScopeButtonIndexDidChange:(NSInteger)selectedScope {
-    self.unreadOnly = (selectedScope == 1);
+// v0.0.37：改由自己的 `unreadSeg` 驱动（系统 scope bar 在 iOS 16 上没渲染出来）。
+- (void)onUnread:(UISegmentedControl *)seg {
+    self.unreadOnly = (seg.selectedSegmentIndex == 1);
     [self loadData];
 }
 
