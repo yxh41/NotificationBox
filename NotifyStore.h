@@ -14,10 +14,22 @@ NS_ASSUME_NONNULL_BEGIN
 // 查询（盒子 App 调用）
 // v0.0.36：加 `unreadOnly`（只看未读）。四种筛选是**独立叠加**的
 // （App / 时间 / 搜索 / 未读），和之前三个参数的组合方式一致。
+// v0.0.42：加 `searchBundles` —— **搜索从此也匹配 App 名**。
+// 🔴 为什么 App 名要由外面传进来：「微信」「招商银行」这些字**不在库里**
+//    （库里只有 `com.tencent.xin` / `cmb.pb`），tweak 侧写记录时也没有 App 显示名可存。
+//    ⇒ 只有界面层能拿到 `InstalledApps` 的显示名表，先把搜索词匹配成 bundle 列表再传下来。
+//    好处是**不用改 schema**：对库里已有的老记录立即生效，不需要迁移、不需要重装重记。
+// 🔴 调用方约定：`search` 为空时 `searchBundles` 一律传 nil（两者是同一个括号组里的 OR，
+//    只传 bundles 不传 search 没有意义）。
 + (NSArray<NSDictionary *> *)queryWithBundle:(nullable NSString *)bundle
                                        since:(NSTimeInterval)since   // 0 = 不限
                                       search:(nullable NSString *)q  // nil = 不限
+                              searchBundles:(nullable NSArray<NSString *> *)searchBundles
                                   unreadOnly:(BOOL)unreadOnly;        // YES = 只回 read=0
+// v0.0.42：列表一次最多取多少条（`queryWithBundle:` 的 LIMIT）。
+// 🔴 底部「还有 N 条更早记录（列表上限 N）」要把它写进文案里 ——
+//    界面里另写一个字面量，这个数以后一改就会对不上。
++ (NSInteger)listLimit;
 + (NSArray<NSString *> *)distinctBundles;          // 顶部 App 图标栏
 // v0.0.36：**有未读记录的 App 集合**，给图标栏红点用。
 // 🔴 只回"有没有"，不回条数 —— 红点不显示数字，查询越轻越好。
@@ -64,6 +76,25 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSInteger)unreadCountWithBundle:(nullable NSString *)bundle
                              since:(NSTimeInterval)since
                             search:(nullable NSString *)search;
+// v0.0.42：再带一层 App 名匹配。**`updateHiddenUnread` 必须用这个版本**。
+// 🔴 为什么不能省：搜索现在能命中 App 名，列表里因此多显示了若干条。
+//    如果计数还用不带 `searchBundles` 的版本，「筛选内未读」就偏小 ⇒
+//    `hiddenUnread` 偏大 ⇒ 顶部又变成"列表里都读完了还在喊还有 N 条"。
+//    这条坑 v0.0.40 已经花整版买过一次，别再犯。
++ (NSInteger)unreadCountWithBundle:(nullable NSString *)bundle
+                             since:(NSTimeInterval)since
+                            search:(nullable NSString *)search
+                     searchBundles:(nullable NSArray<NSString *> *)searchBundles;
+// v0.0.42：**当前筛选下的总条数**（不分已读未读，-1 = DB 打不开）。
+// 🔴 和 `count`（全库、不分筛选）是两件事，别混用。
+// 唯一用途：底部「还有 N 条更早记录」= 本方法 − `queryWithBundle:` 实际返回的条数。
+// ⇒ 它必须和查询走**同一个** `NBPrepareScope`，否则会出现"列表已经到底了、
+//    底部还在说还有 3 条"。为什么会有条数差：列表是 `LIMIT listLimit`（默认 2000），
+//    而 `maxRecords` 允许用户填到 99999 ⇒ 库里 5000 条时，后 3000 条列表里根本没有。
++ (NSInteger)countWithBundle:(nullable NSString *)bundle
+                       since:(NSTimeInterval)since
+                      search:(nullable NSString *)search
+               searchBundles:(nullable NSArray<NSString *> *)searchBundles;
 // v0.0.35：**清空整张表**，返回真正删掉的条数（-1 = DB 打不开）。
 // 🔴 返回条数不是"花式" —— 是沿用 v0.0.33 `deleteRow:` 的同一条纪律：
 //    "没动到账本"和"动了但条数是 0"必须能分辨。`DELETE FROM` 命中 0 行照样

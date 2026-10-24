@@ -4,6 +4,8 @@
 @property (nonatomic, strong) UIView *iconBox;
 @property (nonatomic, strong) UIImageView *iconView;
 @property (nonatomic, strong) UILabel *letterLabel;
+// v0.0.42：App 名（标题上方一行小字）
+@property (nonatomic, strong) UILabel *appLabel;
 @property (nonatomic, strong) UILabel *titleLabel2;
 @property (nonatomic, strong) UILabel *msgLabel;
 @property (nonatomic, strong) UILabel *timeLabel;
@@ -12,7 +14,14 @@
 
 @implementation NotifyCell
 
-+ (CGFloat)height { return 82.0; }
+// v0.0.42：82 → 98。多出来的 16pt 给「App 名」那一行。
+// 🔴 为什么宁可加高也不把 App 名塞进标题或正文：
+//    ① 塞进标题（如「微信 · 你好」）会让标题能显示的字变少，而标题是用户扫列表时最先看的；
+//    ② 塞进正文前面会被当成正文的一部分，而且正文本来只有两行、已经不够用。
+//    ③ iOS 自己的通知就是这样排的：App 名一行小字在最上面。用户不需要学。
+// 🔴 行高是 **常量**（`tableView.rowHeight` 直接用它），所以某个 App 名字取不到时
+//    也不能让那一行变矮 —— 否则整屏行高参差不齐，比空一行难看得多。
++ (CGFloat)height { return 98.0; }
 
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
     self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
@@ -42,6 +51,15 @@
     self.letterLabel.font = [UIFont boldSystemFontOfSize:18];
     self.letterLabel.textColor = [UIColor secondaryLabelColor];
     [self.iconBox addSubview:self.letterLabel];
+
+    // v0.0.42：App 名。
+    // 🔴 字号 11 / secondaryLabel —— 和 `timeLabel` 同一规格。它是"上下文"，不是内容：
+    //    比标题抢眼就等于把最该看的东西挤下去了。
+    self.appLabel = [[UILabel alloc] init];
+    self.appLabel.font = [UIFont systemFontOfSize:11];
+    self.appLabel.textColor = [UIColor secondaryLabelColor];
+    self.appLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.contentView addSubview:self.appLabel];
 
     self.titleLabel2 = [[UILabel alloc] init];
     self.titleLabel2.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
@@ -88,9 +106,15 @@
 
     CGFloat textX = iconX + side + 12;
     CGFloat timeW = 78;
-    self.titleLabel2.frame = CGRectMake(textX, 12, w - textX - timeW - pad, 20);
-    self.timeLabel.frame = CGRectMake(w - pad - timeW, 13, timeW, 16);
-    self.msgLabel.frame = CGRectMake(textX, 34, w - textX - pad, 40);
+    // v0.0.42 竖向排版（总高 98）：
+    //   App 名  y=10~24    ← 新增那一行
+    //   标题    y=25~45    （时间跟标题同一水平线）
+    //   正文    y=47~87    （两行 13pt）
+    // 🔴 标题和时间的 y 差 1pt 是**故意的**：时间 11pt、标题 15pt，基线对齐靠这一格补。
+    self.appLabel.frame     = CGRectMake(textX, 10, w - textX - pad, 14);
+    self.titleLabel2.frame  = CGRectMake(textX, 25, w - textX - timeW - pad, 20);
+    self.timeLabel.frame    = CGRectMake(w - pad - timeW, 26, timeW, 16);
+    self.msgLabel.frame     = CGRectMake(textX, 47, w - textX - pad, 40);
 }
 
 - (void)setIcon:(UIImage *)icon letter:(NSString *)letter {
@@ -104,6 +128,12 @@
         self.letterLabel.hidden = NO;
         self.letterLabel.text = letter.length ? letter : @"?";
     }
+}
+
+- (void)setAppName:(NSString *)name {
+    // 🔴 取不到名字时**留空**、不写「未知」：这一行是上下文，写个「未知」反而抢眼，
+    //    而且实际路径上不会发生（`ViewController` 的 `appNameForBundle:` 会兜底成 bundle 末段）。
+    self.appLabel.text = name.length ? name : nil;
 }
 
 - (void)setTitleText:(NSString *)title message:(NSString *)message subtitle:(NSString *)subtitle {
@@ -140,6 +170,9 @@
     self.iconView.hidden = YES;
     self.letterLabel.hidden = NO;
     self.letterLabel.text = nil;
+    // v0.0.42：App 名也要清 —— 复用池里留着上一行的名字，
+    // 会出现"新记录显示的是上一个 App 的名字"，而且只闪一下就很难复现。
+    self.appLabel.text = nil;
     self.titleLabel2.text = nil;
     self.msgLabel.text = nil;
     self.timeLabel.text = nil;
