@@ -249,11 +249,20 @@ void NBSharedLog(NSString *fmt, ...) {
     return ok;
 }
 
-+ (void)clearAll {
+// v0.0.35：返回真正删掉的条数（-1 = DB 打不开）。
+// 🔴 `sqlite3_changes` 必须在 `exec` 之后、**任何别的语句之前**取 ——
+//    它是"最近一条语句改了 N 行"，插一句别的就串了。
++ (NSInteger)clearAll {
     sqlite3 *db = [self openDB];
-    if (!db) return;
-    sqlite3_exec(db, "DELETE FROM notifications", NULL, NULL, NULL);
+    if (!db) return -1;
+    NSInteger n = -1;
+    if (sqlite3_exec(db, "DELETE FROM notifications", NULL, NULL, NULL) == SQLITE_OK) {
+        n = (NSInteger)sqlite3_changes(db);
+    } else {
+        NBStoreLog(@"clearAll 失败 err=%s", sqlite3_errmsg(db));
+    }
     sqlite3_close(db);
+    return n;
 }
 
 + (NSDictionary *)settings {

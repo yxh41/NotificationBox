@@ -29,6 +29,12 @@
 
 - (void)onDiag:(id)sender;
 - (void)onSettings:(id)sender;
+// v0.0.35：清空整张表。两个都必须在这里声明 ——
+// 🔴 `onClear:` 要用于 `@selector(...)`，`doClear` 在 alert 的 block 里被 `[weakSelf ...]` 调用。
+//    未声明 ⇒ ARC 下返回类型被推断成 `id` ⇒ 警告 ⇒ CI 的 `-Werror` 直接挂
+//    （v0.0.33 的 `doDelete`/`str:` 就是这么挂过一次）。
+- (void)onClear:(id)sender;
+- (void)doClear;
 - (void)showText:(NSString *)text title:(NSString *)title;
 // v0.0.33：轻量一行提示（左滑删除失败时用）。
 // 不走 showText: —— 那个是"长文本可滚动页"，弹一句"这条已经没了"太重。
@@ -48,11 +54,21 @@
     // 在同一日志里打一条「App 活着」，用来和 tweak 的日志对照（见 NotifyStore.h 注释）
     [NotifyStore markAppAlive];
     // 诊断入口：把 tweak.log 尾部搬进 App，免去用 Filza 翻文件
-    self.navigationItem.rightBarButtonItem =
+    // v0.0.35：右侧多一个「清空」。`rightBarButtonItems` 里**第一个在最右**，
+    // 所以「诊断」放第一位（更常用），「清空」在它左边 —— 一个不可撤销的动作
+    // 不该占着最显眼的右上角。
+    UIBarButtonItem *diag =
         [[UIBarButtonItem alloc] initWithTitle:@"诊断"
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(onDiag:)];
+    UIBarButtonItem *clear =
+        [[UIBarButtonItem alloc] initWithTitle:@"清空"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onClear:)];
+    clear.tintColor = [UIColor systemRedColor];   // 不可撤销 ⇒ 和详情页的「删除」同一套视觉
+    self.navigationItem.rightBarButtonItems = @[diag, clear];
     // 🔴 v0.0.8：设置留在自己 App 里，不再往设置 App 装 PreferenceLoader 载荷
     self.navigationItem.leftBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"设置"
@@ -68,6 +84,59 @@
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationFormSheet;
     [self presentViewController:nav animated:YES completion:nil];
+}
+
+#pragma mark - 清空（v0.0.35）
+
+// 之前「清空」只有设置页有入口（SettingsViewController.m），要清记录得跑进设置里找。
+- (void)onClear:(id)sender {
+    NSInteger total = [NotifyStore count];
+    if (total == 0) {
+        // 空库时**不弹确认**：弹了用户点"清空"，结果什么都没发生，反而以为坏了。
+        [self alertTitle:@"没有记录" text:@"数据库里是空的，不用清。"];
+        return;
+    }
+
+    // 🔴 文案必须报**数据库总数**，不是 `self.items.count`。
+    //    这是这一版最容易做错的一处：搜索「验证码」时列表只有 3 条，
+    //    而 `clearAll` 清的是整张表。拿列表条数写确认文案 ⇒ 用户以为只删这 3 条。
+    NSMutableString *msg = [NSMutableString stringWithFormat:
+        @"将删除全部 %ld 条记录，删了不能恢复。", (long)total];
+    if ((NSInteger)self.items.count != total) {
+        [msg appendFormat:@"\n\n当前列表只显示 %ld 条（有筛选/搜索，或超出单次上限），但会一起清掉。",
+         (long)self.items.count];
+    }
+
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"清空所有记录？"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [al addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [al addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a) {
+        [weakSelf doClear];
+    }]];
+    [self presentViewController:al animated:YES completion:nil];
+}
+
+- (void)doClear {
+    NSInteger n = [NotifyStore clearAll];
+    // 🔴 先清库 → 再整表重查。和 v0.0.33 的删除是同一条纪律：
+    //    列表的数据只有一个来源（数据库），内存数组永远是从它重建出来的。
+    [self loadData];
+
+    if (n > 0) {
+        [self alertTitle:@"已清空"
+                    text:[NSString stringWithFormat:@"删掉了 %ld 条记录。", (long)n]];
+    } else if (n == 0) {
+        // `DELETE FROM` 命中 0 行照样返回 SQLITE_OK ⇒ 不能当成功。
+        // 最常见的原因是清之前已经被「记录上限」裁光了。
+        [self alertTitle:@"没清到"
+                    text:@"库里没有可删的记录（可能已被「记录上限」自动清掉）。列表已刷新。"];
+    } else {
+        [self alertTitle:@"清空失败"
+                    text:@"打不开数据库。列表已刷新，可以重启 App 再试。"];
+    }
 }
 
 #pragma mark - 诊断
@@ -463,6 +532,16 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 
 - (void)loadData {
     [self reloadIconBar];
+
+    // v0.0.35：当前筛选的 App 可能已经一条记录都不剩了（删掉它的最后一条、
+    // 或者刚点了「清空」）。此时 `reloadIconBar` 重建的图标栏里已经没有它，
+    // 而 `filterBundle` 还指着它 ⇒ 列表永远是空的，用户看着"空列表 + 顶部没有任何
+    // 图标被选中"，第一反应是"记录全丢了"。这里让它自愈回「全部」。
+    // 🔴 顺序：必须排在 `reloadIconBar`（它才更新 self.bundles）之后、query 之前。
+    if (self.filterBundle && ![self.bundles containsObject:self.filterBundle]) {
+        self.filterBundle = nil;
+    }
+
     self.items = [NotifyStore queryWithBundle:self.filterBundle
                                         since:[self sinceFromSeg]
                                        search:self.searchText];
@@ -521,6 +600,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [c setIcon:ic letter:[self shortName:bid]];
     [c setTitleText:title message:msg subtitle:sub];
     [c setTimeText:[fmt stringFromDate:date]];
+    // v0.0.35：`read` 字段数据层早就有了（`queryWithBundle:` 的 SELECT 里一直带着），
+    // 只是 cell 从来没用过 ⇒ `markRead:` 写了等于没写，用户看不出哪条看过。
+    // 0 = 未读（建表默认值），非 0 = 已读。
+    [c setUnread:([d[@"read"] integerValue] == 0)];
     return c;
 }
 
@@ -528,6 +611,21 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     NSDictionary *d = self.items[indexPath.row];
     [NotifyStore markRead:[d[@"id"] integerValue]];
+
+    // v0.0.35：把「已读」同步回内存并只刷这一行。
+    // 🔴 为什么不在 `viewWillAppear:` 里 `loadData`（这是最容易想到的做法）：
+    //    整表 reload 会让**滚到中间点开一条再返回，列表跳回顶部** —— 真机上一碰就发现。
+    // 🔴 为什么这里用 `reloadRowsAtIndexPaths:` 是安全的（v0.0.33 删除场景里它是禁忌）：
+    //    判据从来不是"这个 API 好不好"，而是**数量变不变**。这里只把一个字段 0→1，
+    //    行数不变 ⇒ 内存下标和 row 仍然一一对应；而删除会改数量 ⇒ 必须整表重查。
+    // 🔴 顺序不能反：先 markRead（写库），再改内存，再刷新 —— 反了刷出来的还是旧值。
+    if ([d isKindOfClass:[NSMutableDictionary class]]) {
+        [(NSMutableDictionary *)d setObject:@1 forKey:@"read"];
+        [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+    } else {
+        // 兜底：万一哪天 query 改成返回不可变字典，退回整表重查（会丢滚动位置，但不会错）
+        [self loadData];
+    }
 
     // v0.0.33：点开看**全文**。列表 cell 的正文 `numberOfLines = 2`、超了截断，
     // 而在这之前点一行只做 markRead ⇒ 长通知永远看不全、也复制不了。
