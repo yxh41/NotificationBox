@@ -3425,3 +3425,211 @@ SQL 里的 `(SELECT id FROM … LIMIT %ld)`、日志里的 `[%@]`、提示文案
 | ③ 试听削尾 | 低 | 小 | `didFinish` 之后缓冲尾韵可能被交还削掉几十毫秒。要治就得延迟交还，而"固定延迟"在本项目里是禁忌，得先有真机听感证据 |
 | ④ 收尾 | — | 小 | 归档临时脚本、清掉 `Local Settings\Temp` 里三个硬编码 token 的旧脚本；**PAT 留到最后一版交付完再撤** |
 
+
+---
+
+## v0.0.34 · 修详情页顶部顶进状态栏（只补 `safeAreaInsets.top`）
+
+用户原话：**「详情页整体有点偏上了，图标都顶到状态栏最顶端了」**。
+
+### 一、病因：`self.view.bounds` 的 (0,0) 到底在哪
+
+详情页在 `UINavigationController` 里，而 `edgesForExtendedLayout` 默认是 `.all`。
+这意味着 VC 的 `view` 是**铺满整个屏幕**的（含状态栏和导航栏下方），
+`self.view.bounds` 的 `(0,0)` 在**屏幕顶点**，不是导航栏下沿。
+
+v0.0.33 写的是：
+
+```objc
+self.headerBox.frame = CGRectMake(pad, 12, w - pad * 2, 52);   // ← 12 是相对屏幕顶点的
+```
+
+于是 `headerBox`（那个装着 App 图标 + 名字 + 时间的灰盒子）被放到离屏幕顶 12pt ——
+正好压在状态栏里的时间/信号图标上。
+
+**为什么只有上半截偏上、下半截是对的**：这一页底部从一开始就写的是
+`safeAreaInsets.bottom + 12`，只有顶部那个 `12` 没加安全区。
+所以观感是"整体偏上"而不是"整体上移"——**同一页里两种坐标基准混用**，
+这比整页都错更难看出来。
+
+修法就一行：
+
+```objc
+UIEdgeInsets si = self.view.safeAreaInsets;
+CGFloat top = si.top;
+self.headerBox.frame = CGRectMake(pad, top + 12, w - pad * 2, 52);
+```
+
+顺带把 header → 标题的间距从 12 调到 14（盒子下沉后视觉上会显得挤）。
+
+### 二、为什么不用 `edgesForExtendedLayout = UIRectEdgeNone`
+
+这是最容易被想到的"一行解决"：设了它，`self.view.bounds` 就变成"导航栏下沿"，
+原来的 `y = 12` 立刻就对。
+
+**但它是把坐标系整个换掉**，代价是三处：
+
+1. `toast:` 里用 `self.view.bounds.size.height - 120` 定位 —— bounds 一变，提示条位置跟着变；
+2. 以后想在这页加"图标模糊背景"这类延伸到导航栏下面的装饰，就做不了了；
+3. **项目里另外 6 个页面全是 `.all` + `safeArea` 的写法**，唯独详情页改基准 ⇒
+   下一个改这页的人会按另外 6 页的约定来写，然后发现它不按常理出牌。
+
+所以判据里专门有一条 `b01` 把这条路堵掉：详情页**不许**出现 `edgesForExtendedLayout`。
+
+### 三、全仓扫描：这是「一类错误」，不是「一个 bug」
+
+写判据之前先把 7 个手写 `viewDidLayoutSubviews` 的 VC 全看了一遍：
+
+| 页面 | 布局写法 | 要不要 safeArea |
+|---|---|---|
+| `ViewController`（主列表） | `CGFloat top = self.view.safeAreaInsets.top;` 然后逐个 `CGRectMake` | ✅ 早已正确 |
+| `NotifyDetailViewController` | 同上 —— **本版修的就是它** | ✅ 本版补上 |
+| `AppPickerViewController` | `self.table.frame = self.view.bounds;` | ❌ 不需要 |
+| `ReplaceRulesViewController` | 同上 | ❌ 不需要 |
+| `SoundAppsViewController` | 同上 | ❌ 不需要 |
+| `SoundFilePickerViewController` | 同上 | ❌ 不需要 |
+| `VoicePickerViewController` | 同上 | ❌ 不需要 |
+| `SettingsViewController` | `self.scroll.frame = CGRectMake(0, 0, w, h);` 里面再排 box | ❌ 不需要 |
+
+中间那 5 个"不需要"是**关键区分**，也是判据最容易写错的地方：
+
+> `self.table.frame = self.view.bounds;` **不是**同一个错误。
+> `UITableView` / `UIScrollView` 会自己按 `contentInsetAdjustmentBehavior` 加 contentInset，
+> 铺满全屏正是 UIKit 的常规用法，第一个 cell 自然落在导航栏下沿。
+
+所以判据的切口**不能**是"用了 `self.view.bounds` 就要求读 safeArea"——
+那样 5 个正确页面会一起报红，然后判据本身会被当成噪音删掉。
+真正的病征是另一件事：
+
+> **给「直接挂在 `self.view` 上的普通 UIView」用 `CGRectMake` 定位，且 y 是一个正整数常量。**
+
+那个常量就是"我以为 0 点是导航栏下沿"的错觉。`SettingsViewController` 的 `scroll`
+也是直接子视图，但它的 y 是 `0` ⇒ 不触发（`0` 就是屏幕顶点，本来就该是 0）。
+
+### 四、源码判据（11 条）+ 反向对照
+
+| # | 判据 | 说明 |
+|---|---|---|
+| a01 | 详情页必须**真的**取到 `safeAreaInsets.top` | 顺着变量→源查，见下面「坑 2」 |
+| a02 | `headerBox` 的 y 必须是含 `top` 的表达式 | 不许是常数 |
+| a03 | **全仓**：直接挂 `self.view` 的子视图，y 不许是正整数常量 | 一类错误的扫描判据 |
+| b01 | 详情页不许出现 `edgesForExtendedLayout` | 防"换基准"式绕过 |
+| b02 | **总闸**：每个手写布局的 VC 必须有明确的安全区策略 | 三条命中其一即可，见下 |
+| c01~c04 | 回归：正文 `selectable` / 图标 36×36 / `MAX(h, 80)` 下限 / `si.bottom` | 别顺手改坏 v0.0.33 的成果 |
+| d01 | `0.0.34` 六处齐（Tweak.x 三处显示串 + control + plist 两处），且无 v0.0.33 残留 | — |
+| v01 | 括号 / `@end` 配平（统计时**剥掉字符串内容**） | — |
+
+`b02` 的三条合格路径：
+
+1. 取了**顶部**安全区（`CGFloat top = … safeAreaInsets.top` / `si.top`）；
+2. frame 全是 `= self.view.bounds` 整块拷贝（交给 table/scroll 自动 inset）；
+3. 直接挂 `self.view` 的子视图里，没有一个是正整数常数 y。
+
+**负向自测 11/11 全部报红**，**反向对照 PASS**：拿 v0.0.33 的
+`NotifyDetailViewController.m`（`git show HEAD:…`）喂进去，`a01 / a02 / a03 / b02`
+四条当场报红 —— 这正是"判据能证伪自己"的样子。
+
+### 🔴 五、这一版判据自己踩的四个坑（都值得记）
+
+**坑 1 · 查"有没有出现过某个词"抓不到"用错了方向"。**
+`a01` 最初写的是"函数体里含 `safeAreaInsets` 就算过"。反向对照当场戳穿：
+v0.0.33 的**底部**写的是 `self.view.safeAreaInsets.bottom`，这个字样在，
+判据就放行了 —— 而病恰恰在**顶部**。必须钉死到 `.top`。
+
+**坑 2 · 查 `si.top` 字样放过了「`si` 本身被换掉」。**
+改完坑 1，`b02` 的负向变异（`UIEdgeInsets si = UIEdgeInsetsZero;`）依然假装通过，
+因为 `si.top` 这几个字符还在。教训很硬：**凡"间接变量"都必须在判据里把它的源头一起验**，
+否则判据验的是**名字**不是**行为**。修法是加 `takes_top_safe_area()`：
+先建 `变量 → 赋值源` 的映射，再顺着 `si.top` 反查 `si` 是不是真的来自 `safeAreaInsets`。
+
+**坑 3 · 负向变异框架自己有 bug：多锚点变异从来没同时生效过。**
+原来的写法是每轮循环 `mraw = dict(raw)` 重置，然后改一处、跑一次。
+于是"同一条判据配两个锚点"时，两次跑的是**两个只改了一半的副本**，
+从来没有一份是"全都改坏"的 —— `b02` 的 `si→Zero` 和 `headerBox y→12` 就是这样互相覆盖，
+导致一条真判据被误判成"形同虚设"。修法：`mraw` 提到循环外，累积应用。
+（v0.0.33 的脚本也是同样写法，只是那一版没有多锚点判据，所以没暴露。）
+
+**坑 4 · 同一个文件被加载了两份，变异改一份、扫描读另一份。**
+`FILES` 里有 `detail_m`，`glob` 又把 `app/*.m` 整个收进来（key 是 `app:NotifyDetailViewController.m`）。
+负向变异改的是前者，`a03`/`b02` 这两个"全仓扫描"判据读的是后者 ⇒ 改坏了也照样绿。
+修法：glob 时若该文件已按 `FILES` 加载过，**复用同一个 key**。
+
+> 四个坑同一个母题：**判据"绿"的原因，和它本来要证的那件事，是不是同一件事。**
+> 坑 1 是问错了方向，坑 2 是认名字不认行为，坑 3 是变异没落地，
+> 坑 4 是看的和改的不是同一份数据。
+
+### 六、包级判据（16 条）
+
+这一版是最难验的一类改动：**没有新增选择器、没有新增字符串、二进制大小没变**。
+
+| 组 | 判据 | 说明 |
+|---|---|---|
+| A1~A2 | control / 文件名是 `0.0.34` | — |
+| A3 | tweak 二进制有 `v0.0.34` | 子串口径 |
+| A4 | `NotifyBox.app/Info.plist` 的 `CFBundleVersion = 0.0.34` | — |
+| **B1** | 🔴 **App 二进制 md5 与 v0.0.33 不同** | **唯一硬证据**：指令序列真的改了 |
+| B2 | App 二进制大小 —— **只作记录，不是判据** | 见下 |
+| B3 | App 有 `viewDidLayoutSubviews`（**弱**） | 旧版也有 ⇒ 反向对照会存活 |
+| C1 | tweak 里没有 `NotifyBox v0.0.33` 残留 | 防"只改版本号" |
+| D1~D8 | 回归：详情页类 / `deleteRow:` / `soundDuckOthers` / `commitMaxSec:` / `releaseAudioSessionIfIdle` / 查询入口 / `maxSec` / 包内文件集合与基准一致 | 前六版没被带坏 |
+
+**反向对照**（拿 v0.0.33 的 deb 当"当前成品"）：**10/16 通过**，6 条变红
+（`A1~A4`、`B1`、`C1`）。存活的是 `B2/B3`（记录项与弱判据）和 `D1~D8`（回归保留项）。
+
+#### 🔴 大小一字不变、内容全变（第三次）
+
+| | v0.0.33 | v0.0.34 |
+|---|---|---|
+| App 二进制 | `350320 B` | `350320 B` ← **完全相同** |
+| App md5 | `868f5a754205` | `6ffeeb41b24d` ← 变了 |
+| tweak md5 | `9c13d4d19ffa` | `01185e754f6d` ← 变了（只改版本串） |
+
+这是本项目第三次撞上同一件事：
+v0.0.28 是「**段内**缩小 ≠ 文件缩小」，v0.0.32 是「两个二进制字节数全同、md5 全变」，
+这一次连**指令条数变了**（`12` → `top + 12`）而文件大小一位不变 ——
+原因是 Mach-O 段按固定对齐填充，多出来的几十字节被填进 padding 里。
+
+> 通则：**判"编进去没"看串 / 选择器 / md5，永远不看文件大小。**
+
+### 🔴 七、我自己的期望表也错了一次
+
+包级 `D8` 最初写的是 `len(files) >= 37`，跑出来 `[FAIL] 只有 4 个`。
+查下去发现 **37 是源码目录的文件数**，不是 deb 内的 —— deb 里只有 4 个：
+
+```
+    467 B  Applications/NotifyBoxApp.app/Info.plist
+ 350320 B  Applications/NotifyBoxApp.app/NotifyBoxApp
+ 143856 B  Library/MobileSubstrate/DynamicLibraries/NotifyBox.dylib
+    118 B  Library/MobileSubstrate/DynamicLibraries/NotifyBox.plist
+```
+
+按纪律处理：**期望表自己错了就改期望，不许把闸门放宽去迁就它。**
+于是 `D8` 改成"包内文件集合与基准 deb **完全一致**"（比数个数更硬：既防丢文件，也防多塞东西）。
+
+### 八、交付
+
+| 项 | 值 |
+|---|---|
+| deb | `com.yxh41.notifybox_0.0.34_iphoneos-arm64e.deb` · **106014 B** |
+| CI | **#68**（`run_id 40084566201`，head `35f48badf0a6`）success，一次编译过 |
+| 产物 zip | 106204 B（与 API `size_in_bytes` 对拍一致） |
+| 远端 | `35f48badf0a6` = 本地 `33931539af0f`，**53 个文件逐 blob 一致** |
+| 改动 | 4 文件 **+19 / −11**（全部在布局与版本串上，无逻辑改动） |
+| App 二进制 | `350320 B`（与 v0.0.33 **大小相同**，md5 变） |
+| tweak 二进制 | `143856 B`（只升版本串，md5 变） |
+
+### 九、装了这一版要验什么
+
+| # | 操作 | 期望 |
+|---|---|---|
+| 1 | 🔴 进任意一条通知的详情页 | **灰色盒子（图标+App名+时间）在导航栏下方**，不再压到状态栏的时间和信号图标上 |
+| 2 | 同一页往下看 | 标题 / 副标题 / 正文的位置整体下移了约一个状态栏的高度，**正文底部不会压到 Home 指示条** |
+| 3 | 长标题 + 副标题都在的通知 | 正文区域自动变矮，但**至少还有 80pt 高**，不会消失 |
+| 4 | 点右上「复制」 | 「已复制」提示条出现在**屏幕下方**（它的位置没被这次改动影响） |
+| 5 | 回归：详情页删除 / 左滑删除 / 搜索态删一条 / 主列表布局 | 与 v0.0.33 一致 |
+| 6 | 回归：按 App 配时长 / 压低音乐开关 / 试听 | 与 v0.0.32 一致 |
+
+> **第 1 条是这一版唯一的判据**：盒子顶边到屏幕顶的距离，应当等于「状态栏 + 导航栏 + 12pt」。
+> 如果它还是贴着状态栏，说明装上的不是这一版（先看日志里那行 `v0.0.34`）。
+> 第 2 条的下半句（正文不压 Home 指示条）验的是"**同一页两种坐标基准**已经统一"，
+> v0.0.33 里底部本来就是对的，所以它更该是绿的 —— 如果它反而坏了，说明改错了方向。
