@@ -24,6 +24,13 @@ NS_ASSUME_NONNULL_BEGIN
 // 🔴 别拿 `bundleCounts` 兼职：它数的是**全部**条数（v0.0.13 给 App 选择器排序用的），
 //    拿它判未读会"所有 App 永远都有红点"。
 + (NSSet<NSString *> *)bundlesWithUnread;
+// v0.0.37：带时间窗的版本 —— 红点必须和列表**看同一个范围**。
+// 🔴 v0.0.36 的真机 bug：红点用的是全库口径，列表却只查 `now-86400` 之后，
+//    结果「有红点 → 点进去暂无记录 → 红点永远消不掉」。用户看到的是一个
+//    自己清不掉的提示，比不打红点更糟。
+//    ⇒ 红点语义改成「**当前时间窗内**有未读」，永远点得进去、清得掉。
+//    `since <= 0` 等价于全库（= 上面那个不带参的版本）。
++ (NSSet<NSString *> *)bundlesWithUnreadSince:(NSTimeInterval)since;
 // v0.0.13：bundle -> 通知条数。App 选择器用它把「经常来通知的」排前面。
 + (NSDictionary<NSString *, NSNumber *> *)bundleCounts;
 + (NSInteger)maxRecords;                           // 从 prefs 读上限

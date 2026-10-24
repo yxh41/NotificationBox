@@ -206,17 +206,26 @@ void NBSharedLog(NSString *fmt, ...) {
 }
 
 + (NSSet<NSString *> *)bundlesWithUnread {
+    return [self bundlesWithUnreadSince:0];   // 全库口径（空列表提示要用它做对照）
+}
+
++ (NSSet<NSString *> *)bundlesWithUnreadSince:(NSTimeInterval)since {
     // v0.0.36：图标栏红点用。只回"这个 App 有没有未读"，不回条数。
     // 🔴 为什么不复用 `bundleCounts`：它 `SELECT bundle, COUNT(*)` 数的是**全部**记录
     //    （v0.0.13 给 App 选择器排序用），拿它判未读 ⇒ 所有 App 永远都有红点，
     //    红点变成装饰，等于没有。
+    // v0.0.37：加时间窗。红点必须和列表同一口径 —— 否则会出现"有红点、点进去没记录、
+    //    红点永远消不掉"（v0.0.36 真机实测）。`since <= 0` 就当全库。
     NSMutableSet *s = [NSMutableSet set];
     sqlite3 *db = [self openDB];
     if (!db) return s;
     sqlite3_stmt *st;
-    const char *sql = "SELECT DISTINCT bundle FROM notifications "
-                      "WHERE read=0 AND bundle IS NOT NULL AND bundle <> ''";
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+    NSMutableString *sql = [NSMutableString stringWithString:
+        @"SELECT DISTINCT bundle FROM notifications "
+        @"WHERE read=0 AND bundle IS NOT NULL AND bundle <> ''"];
+    if (since > 0) [sql appendString:@" AND ts>=?"];
+    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) == SQLITE_OK) {
+        if (since > 0) sqlite3_bind_double(st, 1, (double)since);
         while (sqlite3_step(st) == SQLITE_ROW) {
             const char *t = (const char *)sqlite3_column_text(st, 0);
             if (!t) continue;
