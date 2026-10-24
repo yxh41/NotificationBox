@@ -847,6 +847,72 @@ static sqlite3_stmt *NBPrepareDelete(sqlite3 *db, NSString *bundle, NSTimeInterv
     return n;
 }
 
+#pragma mark - v0.0.48 关键词自动规则（展示时生效）
+
+// 大小写不敏感子串包含，nil/空安全。
+// 🔴 中文无大小写，但英文关键词（如 "verify" / "code"）必须忽略大小写，
+//    否则用户填小写规则命中不到大写的 "VERIFY"。
+static BOOL NBContainsText(NSString *hay, NSString *needle) {
+    if (!hay.length || !needle.length) return NO;
+    return [hay rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
++ (NSArray<NSDictionary *> *)keywordRules {
+    NSDictionary *p = NBLoadSettings();
+    NSArray *raw = p[@"keywordRules"];
+    if (![raw isKindOfClass:[NSArray class]]) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (id item in raw) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        NSString *kw = item[@"keyword"];
+        if (![kw isKindOfClass:[NSString class]] || !kw.length) continue;
+        [out addObject:@{ @"keyword": kw,
+                          @"star": @([item[@"star"] boolValue]),
+                          @"fold": @([item[@"fold"] boolValue]) }];
+        if (out.count >= 20) break;   // 🔴 上限 20 条（和设置页的闸门同一数字）
+    }
+    return out;
+}
+
++ (BOOL)saveKeywordRules:(NSArray<NSDictionary *> *)rules {
+    NSMutableArray *clean = [NSMutableArray array];
+    for (id item in rules ?: @[]) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        NSString *kw = item[@"keyword"];
+        if (![kw isKindOfClass:[NSString class]] || !kw.length) continue;
+        BOOL star = [item[@"star"] boolValue];
+        BOOL fold = [item[@"fold"] boolValue];
+        // 🔴 两个动作都没选的规则是死的（命中什么也不做）⇒ 存进去只会让用户以为设了。
+        if (!star && !fold) continue;
+        [clean addObject:@{ @"keyword": kw, @"star": @(star), @"fold": @(fold) }];
+        if (clean.count >= 20) break;
+    }
+    NSMutableDictionary *d = [[self settings] mutableCopy] ?: [NSMutableDictionary dictionary];
+    if (clean.count) d[@"keywordRules"] = clean;
+    else [d removeObjectForKey:@"keywordRules"];   // 全删干净 ⇒ 键也消失，不留空数组
+    return [self saveSettings:d];
+}
+
++ (NBKeywordAction)keywordActionForTitle:(NSString *)title
+                                 message:(NSString *)message
+                                subtitle:(NSString *)subtitle
+                                 appName:(NSString *)appName {
+    NSArray *rules = [self keywordRules];
+    if (!rules.count) return NBKeywordActionNone;
+    NSUInteger action = NBKeywordActionNone;
+    for (NSDictionary *r in rules) {
+        NSString *kw = r[@"keyword"];
+        if (!kw.length) continue;
+        BOOL hit = NBContainsText(title, kw) || NBContainsText(message, kw)
+                || NBContainsText(subtitle, kw) || NBContainsText(appName, kw);
+        if (!hit) continue;
+        // 🔴 一条规则可同时标星+折叠；多条规则可叠加（星来自 A、折叠来自 B）。
+        if ([r[@"star"] boolValue])  action |= NBKeywordActionStar;
+        if ([r[@"fold"] boolValue])  action |= NBKeywordActionFold;
+    }
+    return action;
+}
+
 + (NSInteger)count {
     sqlite3 *db = [self openDB];
     if (!db) return -1;

@@ -92,6 +92,15 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    不放导航栏标题、也不放分段控件里：那两处都要**赌系统怎么排**（标题会被压缩/截断，
 //    分段控件段宽是系统算的）。v0.0.37 已经被系统 scope bar 教过一次。
 @property (nonatomic, strong) UIButton *hiddenHint;
+// v0.0.48：关键词"折叠"动作 —— 被规则收起的条数 + 常驻提示条（点一下在"收起/显示"间切换）。
+// 🔴 和 hiddenHint 是**两条独立的提示**：hiddenHint 管「未读被筛选挡掉了」，
+//    这条管「记录被关键词规则收起了」。两个数不会互相吵（一个是未读口径、一个是全量口径）。
+@property (nonatomic, strong) UIButton *foldedHint;
+@property (nonatomic, assign) NSInteger foldedCount;   // 被 fold 规则命中的条数（与 showFolded 无关）
+@property (nonatomic, assign) BOOL showFolded;          // YES = 把收起的记录也显示出来
+// 🔴 折叠**前**的查询条数，专给 `updateMoreFooter` 用（第三禁忌：不能拿折叠后的
+//    items.count 去算"还有几条更早"，否则折叠掉的会被误算成"被列表上限截断的"）。
+@property (nonatomic, assign) NSInteger queriedCount;
 // v0.0.42：bundle -> App 显示名。**同时给两件事用**：
 //   ① 列表每一行显示「这条是哪个 App 的」—— 以前只有图标，图标加载失败就只剩一个字母；
 //   ② 搜索时把「微信」「招商银行」这种词匹配成 bundle 列表，再传给 NotifyStore。
@@ -147,6 +156,11 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)refreshUnreadDerived;
 // v0.0.41：点顶部提示条 ⇒ 三个筛选一次清干净
 - (void)onHiddenHintTap;
+// v0.0.48：关键词折叠提示条的点击 / 刷新 / 文案，以及"给查询结果套关键词规则"的唯一出口。
+- (void)onFoldedHintTap;
+- (void)updateFoldedHint;
+- (NSString *)foldedHintText;
+- (NSArray<NSDictionary *> *)applyKeywordRulesToRows:(NSArray<NSDictionary *> *)rows;
 // v0.0.42：重建 bundle -> App 显示名 映射（`reloadIconBar` 尾部调一次）
 - (void)rebuildAppNames;
 // v0.0.42：单条查 App 名（查不到退回 bundle 末段，不要显示成空白）
@@ -778,6 +792,20 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
               forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.hiddenHint];
 
+    // v0.0.48：被关键词规则收起的条数提示（foldedCount>0 才显示，见 viewDidLayoutSubviews）。
+    // 🔴 创建方式对齐 hiddenHint：同一套 UIButtonTypeSystem + 手动设字体/颜色 + 左对齐，
+    //    不引第二套写法（本项目"同一个东西只留一份实现"的纪律）。
+    self.foldedHint = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.foldedHint.titleLabel.font = [UIFont systemFontOfSize:12];
+    self.foldedHint.titleLabel.adjustsFontSizeToFitWidth = YES;
+    self.foldedHint.titleLabel.minimumScaleFactor = 0.85;
+    self.foldedHint.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    [self.foldedHint setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
+    self.foldedHint.hidden = YES;
+    [self.foldedHint addTarget:self action:@selector(onFoldedHintTap)
+              forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.foldedHint];
+
     // 顶部 App 图标栏（横向滚动）
     self.iconBar = [[UIScrollView alloc] init];
     self.iconBar.showsHorizontalScrollIndicator = NO;
@@ -841,6 +869,19 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         y += 20 + 4;
     } else {
         self.hiddenHint.frame = CGRectZero;
+    }
+
+    // v0.0.48：被关键词规则收起的条数提示。紧贴 hiddenHint 之后、图标栏之前，
+    // 共用同一个 `y` 累加器（不显示时高度 0、frame 清零 —— 和 hiddenHint 同一套教训）。
+    // 🔴 可见性判据**故意不串 `items.count`**（和 hiddenHint 相反）：列表被折叠空时
+    //    **更要显示**，否则用户看到"暂无记录"以为没数据，其实有 N 条被规则收着。
+    BOOL showFoldedHint = (self.foldedCount > 0);
+    self.foldedHint.hidden = !showFoldedHint;
+    if (showFoldedHint) {
+        self.foldedHint.frame = CGRectMake(12, y, w - 24, 20);
+        y += 20 + 4;
+    } else {
+        self.foldedHint.frame = CGRectZero;
     }
 
     self.iconBar.frame = CGRectMake(0, y, w, 56);
@@ -1033,11 +1074,13 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 算好的 bundle 列表作为参数传下去。`searchBundles` 只在 `search` 非空时才有意义。
     NSArray<NSString *> *searchBundles = [self bundlesMatchingSearch:self.searchText];
 
-    self.items = [NotifyStore queryWithBundle:self.filterBundle
+    NSArray<NSDictionary *> *queried = [NotifyStore queryWithBundle:self.filterBundle
                                         since:[self sinceFromSeg]
                                        search:self.searchText
                                searchBundles:searchBundles
                                    unreadOnly:self.unreadOnly];
+    // v0.0.48：给查询结果套关键词规则（标星 + 折叠）。**无规则时原样返回 ⇒ 行为零变化。**
+    self.items = [self applyKeywordRulesToRows:queried];
     [self.table reloadData];
     [self updateEmptyView];
 
@@ -1062,6 +1105,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    而那个 y 只在 `viewDidLayoutSubviews` 里算。不触发重布局的话，
     //    切完时间段、`hiddenUnread` 从 12 变成 0，提示条会**继续留在屏幕上**。
     [self updateHiddenUnread];
+    // v0.0.48：折叠提示条紧随其后刷新（它出现/消失同样改变起始 y，靠下面那句 setNeedsLayout）。
+    [self updateFoldedHint];
     [self.view setNeedsLayout];
 }
 
@@ -1093,7 +1138,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                                                  search:self.searchText
                                           searchBundles:[self bundlesMatchingSearch:self.searchText]
                                              unreadOnly:self.unreadOnly];
-    NSInteger shown = (NSInteger)self.items.count;
+    // v0.0.48：用**折叠前**的 queriedCount，不用 self.items.count —— 后者已被关键词
+    //   折叠/过滤改小，会把"被规则收起的"误算成"被列表上限截断的"（第三禁忌）。
+    NSInteger shown = self.queriedCount;
     // scopeCount < 0 ⇒ DB 打不开，宁可不提示（跟 `updateHiddenUnread` 的处理一致）
     NSInteger more = (scopeCount >= 0) ? (scopeCount - shown) : 0;
 
@@ -1214,7 +1261,57 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self loadData];
 }
 
-// v0.0.40：提示文案的唯一来源 —— 顶部提示条和空列表正中那句都从这里拿。
+#pragma mark - v0.0.48 关键词规则（标星 + 折叠）
+
+// 给查询结果套关键词规则的**唯一出口**。
+// 🔴 无规则时原样返回 rows ⇒ 行为/性能零变化（keywordActionForTitle: 里也早退，
+//    这里再挡一道是双保险，也保证 items 保持 queryWithBundle: 原样返回的类型）。
+// 🔴 foldedCount 在这里算（**与 showFolded 无关**）：它是"被 fold 规则命中的总条数"，
+//    提示条据此决定显隐和文案；showFolded 只决定这些行"显不显示"，不改变这个数。
+// 🔴 queriedCount 存**折叠前**的条数，专给 updateMoreFooter（第三禁忌，见属性注释）。
+- (NSArray<NSDictionary *> *)applyKeywordRulesToRows:(NSArray<NSDictionary *> *)rows {
+    self.queriedCount = (NSInteger)rows.count;
+    self.foldedCount = 0;
+    if (![NotifyStore keywordRules].count) return rows;
+
+    NSMutableArray *visible = [NSMutableArray array];
+    for (NSDictionary *row in rows) {
+        NBKeywordAction act = [NotifyStore keywordActionForTitle:row[@"title"]
+                                                         message:row[@"message"]
+                                                        subtitle:row[@"subtitle"]
+                                                         appName:[self appNameForBundle:row[@"bundle"]]];
+        BOOL star = (act & NBKeywordActionStar) != 0;
+        BOOL fold = (act & NBKeywordActionFold) != 0;
+        if (fold) self.foldedCount += 1;
+        // 被折叠、且当前不在"显示收起的"模式 ⇒ 不进列表（但仍计入 foldedCount）
+        if (fold && !self.showFolded) continue;
+        // 🔴 mutableCopy：didSelect 的"只刷一行"那条路要求 items 是可变字典（就地改 read）。
+        NSMutableDictionary *m = [row mutableCopy];
+        m[@"nbStar"] = @(star);
+        [visible addObject:m];
+    }
+    return visible;
+}
+
+// 点折叠提示条 ⇒ 在"收起/显示"之间切换，然后整表重查（数量会变 ⇒ 必须重查，见 v0.0.33 纪律）。
+- (void)onFoldedHintTap {
+    self.showFolded = !self.showFolded;
+    [self loadData];
+}
+
+// 刷新折叠提示条（loadData 里调一次）。foldedCount<=0 时 title 置空 ⇒ viewDidLayoutSubviews 藏掉。
+- (void)updateFoldedHint {
+    NSString *t = (self.foldedCount > 0) ? [[self foldedHintText] stringByAppendingString:@" ›"] : nil;
+    [self.foldedHint setTitle:t forState:UIControlStateNormal];
+}
+
+// 折叠提示文案的唯一来源（和 hiddenHintText 同规矩：只产纯文案，`›` 由 updateFoldedHint 加）。
+- (NSString *)foldedHintText {
+    if (self.showFolded) {
+        return [NSString stringWithFormat:@"%ld 条被规则收起（显示中，点此隐藏）", (long)self.foldedCount];
+    }
+    return [NSString stringWithFormat:@"%ld 条被关键词规则收起", (long)self.foldedCount];
+}
 // 🔴 文案必须说清「被什么挡住了」，否则用户不知道往哪一步退。
 //    **但只在能确定唯一出口时才点名**：三种筛选叠加时点名其中一个（比如
 //    "点「全部」图标看全"）会把人带进死路 —— 他照做了还是看不到，就会认定
@@ -1313,6 +1410,12 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     }
     if (self.unreadOnly) {
         [t appendString:@"\n\n（当前是「只看未读」，切上面「全部」可以看所有记录）"];
+    }
+    // v0.0.48：列表被关键词规则折叠空时，**必须说清"其实有 N 条、被规则收着"** ——
+    //    否则屏幕只剩"暂无记录"，用户会以为记录丢了（而它们是被自己设的规则收起的）。
+    //    上面那条可点的 foldedHint 提示条是同一个事实的"可操作版"，这里补一句解释，不矛盾。
+    if (self.foldedCount > 0) {
+        [t appendFormat:@"\n\n%ld 条被关键词规则收起，点上面的提示可以显示", (long)self.foldedCount];
     }
     [t appendFormat:@"\n\n%@", [NotifyStore debugSummary]];
     l.text = t;
@@ -1449,6 +1552,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 只是 cell 从来没用过 ⇒ `markRead:` 写了等于没写，用户看不出哪条看过。
     // 0 = 未读（建表默认值），非 0 = 已读。
     [c setUnread:([d[@"read"] integerValue] == 0)];
+    // v0.0.48：关键词"标星"动作（★ 展示时派生，nil ⇒ NO ⇒ 不显示，无规则时走这条）。
+    [c setStarred:[d[@"nbStar"] boolValue]];
     return c;
 }
 
