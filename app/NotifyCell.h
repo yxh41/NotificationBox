@@ -43,6 +43,10 @@ NS_ASSUME_NONNULL_BEGIN
 // 🔴 传 NO 时点必须**真的消失**（hidden），不能只改颜色 —— 未读和已读要能"数出来"。
 - (void)setUnread:(BOOL)unread;
 
+// v0.0.48：关键词"标星"动作（右上角 ★，展示时派生、不落库）。
+// 🔴 传 NO 时 ★ 必须真的消失（hidden）—— 和未读点同一条纪律。
+- (void)setStarred:(BOOL)starred;
+
 + (CGFloat)height;
 
 @end

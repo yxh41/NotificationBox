@@ -14,6 +14,7 @@
 #import "SoundAppsViewController.h"
 #import "InstalledApps.h"
 #import "NotifyStatsViewController.h"
+#import "KeywordRulesViewController.h"
 #import <errno.h>
 #import <string.h>
 
@@ -245,6 +246,8 @@ static const NSInteger kSubHit = 105;
     [self addActionRow:@"内容替换规则" key:@"replace" action:@selector(onReplace:)];
     // v0.0.46：统计。**排在"诊断"之前** —— 诊断是排查用的，统计是天天想看的。
     [self addActionRow:@"统计（哪个 App 最烦人）" key:@"stats" action:@selector(onStats:)];
+    // v0.0.48：关键词规则（标星 / 自动折叠）。排在统计下面、诊断上面 —— 和统计一样是"天天用"的。
+    [self addActionRow:@"关键词规则" key:@"kwrule" action:@selector(onKeywordRules:)];
     [self addActionRow:@"App 枚举诊断" key:@"appdiag" action:@selector(onAppDiag:)];
     // v0.0.45：批量清理。**放在「清空全部记录」上面** ——
     // 用户想清的是"某一批"，而"全清"是那个操作的极端形式；
@@ -913,6 +916,13 @@ static const NSInteger kSubHit = 105;
 - (void)onStats:(id)sender {
     [self.view endEditing:YES];
     NotifyStatsViewController *v = [[NotifyStatsViewController alloc] init];
+    [self.navigationController pushViewController:v animated:YES];
+}
+
+// v0.0.48：关键词规则编辑页。
+- (void)onKeywordRules:(id)sender {
+    [self.view endEditing:YES];
+    KeywordRulesViewController *v = [[KeywordRulesViewController alloc] init];
     [self.navigationController pushViewController:v animated:YES];
 }
 

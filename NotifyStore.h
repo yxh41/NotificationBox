@@ -2,6 +2,16 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// v0.0.48：关键词规则命中后要做的动作（位掩码，一次匹配同时出两个）。
+// 🔴 为什么用位掩码而不是两个 BOOL 出参 / 两个方法：
+//    "总数与未读同一条 SQL 出"是同一条纪律 —— 一遍匹配、一个来源，
+//    避免"标星用一套条件、折叠用另一套"两个口径互相矛盾。
+typedef NS_OPTIONS(NSUInteger, NBKeywordAction) {
+    NBKeywordActionNone = 0,
+    NBKeywordActionStar = 1 << 0,   // 命中 ⇒ 该行显示 ★
+    NBKeywordActionFold = 1 << 1,   // 命中 ⇒ 该行默认被主列表收起
+};
+
 @interface NotifyStore : NSObject
 
 // 录制（tweak 调用）。date 传 nil 时自动用当前时间。
@@ -186,6 +196,19 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSInteger)autoCleanDays;
 + (void)setAutoCleanDays:(NSInteger)days;
 + (NSInteger)runAutoClean;
+
+// v0.0.48：关键词自动规则（**展示时生效、纯盒子 App 端**，tweak 侧零改动）。
+// 🔴 为什么"展示时"而不是"写入时"：规则改动要**即时生效**、老记录不用重录、
+//    也就不用把规则同步给 tweak（tweak 零改动是本项目一贯的低风险偏好）。
+// 存储键：settings.plist 的 keywordRules = @[@{@"keyword":…, @"star":@BOOL, @"fold":@BOOL}]。
+// 🔴 上限 20 条：每条规则要对 4 个字段做大小写不敏感子串匹配，条数不设限会拖慢每次刷新。
+// 🔴 `keywordActionForTitle:…` 一次遍历同时出 star/fold 两个动作（见 NBKeywordAction）。
++ (NSArray<NSDictionary *> *)keywordRules;
++ (BOOL)saveKeywordRules:(NSArray<NSDictionary *> *)rules;
++ (NBKeywordAction)keywordActionForTitle:(nullable NSString *)title
+                                 message:(nullable NSString *)message
+                                subtitle:(nullable NSString *)subtitle
+                                 appName:(nullable NSString *)appName;
 
 // 自检（盒子 App 空列表时直接显示，用来判断沙盒可达性）
 + (NSInteger)count;

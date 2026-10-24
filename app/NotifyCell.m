@@ -12,6 +12,11 @@
 @property (nonatomic, strong) UILabel *msgLabel;
 @property (nonatomic, strong) UILabel *timeLabel;
 @property (nonatomic, strong) UIView *dotView;      // v0.0.35 未读点
+// v0.0.48：关键词规则标星（右上角 ★）。**展示时派生、不落库** —— 规则一改即时生效。
+@property (nonatomic, strong) UILabel *starLabel;
+// 🔴 布局判据用这个原始 BOOL，**不拿 starLabel.hidden 反推**：
+//    "拿视图状态反推数据状态"本项目栽过（attributedText 时序），星也必须存一份原始量。
+@property (nonatomic, assign) BOOL starred;
 // v0.0.44：高亮要"先存原始串、最后统一渲染" —— 两个 setter 的调用顺序不固定，
 // 谁先到都只是记下来，真正写字在 `nbRender` 里一次做完。
 @property (nonatomic, copy) NSString *rawAppName;
@@ -147,6 +152,17 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     self.msgLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     [self.contentView addSubview:self.msgLabel];
 
+    // v0.0.48：右上角 ★（关键词"标星"动作）。默认藏 —— 和未读点一样，
+    // 万一某处忘了调 setStarred:，宁可少一颗星，也不要给所有行都点上。
+    // 🔴 systemOrange：金/橙在浅色底上醒目，又不是"行情红绿"那种会误读成涨跌的颜色。
+    self.starLabel = [[UILabel alloc] init];
+    self.starLabel.text = @"★";
+    self.starLabel.font = [UIFont systemFontOfSize:13];
+    self.starLabel.textColor = [UIColor systemOrangeColor];
+    self.starLabel.textAlignment = NSTextAlignmentRight;
+    self.starLabel.hidden = YES;
+    [self.contentView addSubview:self.starLabel];
+
     return self;
 }
 
@@ -178,7 +194,11 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     //   标题    y=25~45    （时间跟标题同一水平线）
     //   正文    y=47~87    （两行 13pt）
     // 🔴 标题和时间的 y 差 1pt 是**故意的**：时间 11pt、标题 15pt，基线对齐靠这一格补。
-    self.appLabel.frame     = CGRectMake(textX, 10, w - textX - pad, 14);
+    // v0.0.48：右上角 ★。标星时给 App 名那一行**收宽**，避免 ★ 和 App 名尾字重叠。
+    // 🔴 判据用原始 `self.starred`，不用 starLabel.hidden（见属性注释）。
+    CGFloat starW = self.starred ? 20 : 0;
+    self.starLabel.frame = CGRectMake(w - pad - 18, 8, 18, 18);
+    self.appLabel.frame     = CGRectMake(textX, 10, w - textX - pad - starW, 14);
     self.titleLabel2.frame  = CGRectMake(textX, 25, w - textX - timeW - pad, 20);
     self.timeLabel.frame    = CGRectMake(w - pad - timeW, 26, timeW, 16);
     // v0.0.45：有副标题时正文下移一行；没有就完全回到原来的 47/40。
@@ -275,6 +295,13 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     self.dotView.hidden = !unread;
 }
 
+// v0.0.48：关键词"标星"动作。和未读点一样只切 hidden（★ 不改变其它元素布局，
+// 只有 App 名那一行在标星时收宽，见 layoutSubviews）。
+- (void)setStarred:(BOOL)starred {
+    self.starred = starred;
+    self.starLabel.hidden = !starred;
+}
+
 - (void)prepareForReuse {
     [super prepareForReuse];
     self.iconView.image = nil;
@@ -306,6 +333,9 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     //    这是 cell 复用最经典的串行 bug，而且单元测试抓不到、代码看着也没错：
     //    cellForRow 里明明调了 setUnread:NO，显示的却还是上一个 cell 的点。
     self.dotView.hidden = YES;
+    // 🔴 v0.0.48：★ 同理必须复位（否则上一行标了星、这一行规则没命中，星会串过来）。
+    self.starred = NO;
+    self.starLabel.hidden = YES;
 }
 
 @end
