@@ -229,6 +229,16 @@ static inline double NBSoundMaxSecFromValue(id v) {
 #define NB_KEY_SOUND_MAP        @"soundMap"
 #define NB_KEY_SOUND_ENTRY_FILE @"file"
 #define NB_KEY_SOUND_ENTRY_ID   @"id"
+// v0.0.31：entry 里**可选**的「这个 App 最长播多少秒」。
+//
+// 🔴 三条语义，写错任何一条都会静默改变行为：
+//   ① **键不存在 = 跟随全局 soundMaxSec**（不是 0）。所以老 entry 天然兼容，不需要迁移。
+//   ② **0 是合法值 = 不限**。⇒ 判「有没有设」只能看「键在不在」，绝不能看「值是否为 0」。
+//   ③ 值非法（负数 / 非数字 / 超 NB_SOUND_MAX_SEC_CEIL）⇒ 退化方向是**跟随全局**，
+//      不是夹到默认 8 秒 —— 因为 entry 的父级（全局）已经有值了，
+//      夹成 8 会把"我明明全局配了 30 秒"改成 8，属于**静默改语义**。
+//      （对比：全局那个 NBSoundMaxSecFromValue 是"夹取"，因为它没有父级可退化。）
+#define NB_KEY_SOUND_ENTRY_MAXSEC @"maxSec"
 
 // ---------- v0.0.29：连续通知不叠加 ----------
 // 「这一声归谁」的标识：通知用 bundleId，试听用这个常量。

@@ -122,6 +122,19 @@ NS_ASSUME_NONNULL_BEGIN
 //   两份一旦走岔，症状是"界面说会截断、实际没截断"，几乎没法自证。
 + (NSString *)playbackPlanForFileNamed:(nullable NSString *)name;
 
+// ---------- v0.0.31：按 App 配「最长播放秒数」 ----------
+//
+// 存储口径见 NotifyCommon.h 的 NB_KEY_SOUND_ENTRY_MAXSEC（三句话：键不存在 = 跟随全局 /
+// 0 = 不限 / 非法值 ⇒ 跟随全局而不是夹成默认值）。
+//
+// 同一个文件在不同 App 下可以有不同上限，所以"界面显示的计划"必须按 App 问一次 ——
+// 否则会出现「给微信配了 30 秒，界面却写着 8 秒后停」这种界面与行为走岔。
++ (NSString *)playbackPlanForFileNamed:(nullable NSString *)name
+                             forBundle:(nullable NSString *)bundle;
+
+// entry 的时长一行人话：`跟随全局` / `不限时长` / `30 秒后停`。只用于显示。
++ (NSString *)soundEntryLimitSummary:(nullable NSDictionary *)entry;
+
 // ---------- v0.0.28：按 App 分配提示音 ----------
 //
 // 存储口径（唯一权威）见 NotifyCommon.h 的 NB_KEY_SOUND_MAP。

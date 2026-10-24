@@ -132,7 +132,14 @@
     c.textLabel.text = self.nameOf[b] ?: b;
     // 副标题给"用的是哪个音"：这一行就是这一版存在的全部理由 ——
     // 用户要能一眼看出"微信现在是 a.mp3、QQ 是系统音 1007"。
-    c.detailTextLabel.text = [NotifyFilter soundEntrySummary:self.map[b]];
+    // v0.0.31：如果这个 App 单独设过时长，也一并显示 —— 否则"同一份 a.mp3、
+    // 微信响 30 秒、QQ 响 8 秒"这件事在总览页完全看不出来，用户只会觉得"时长设置没生效"。
+    NSString *limit = [NotifyFilter soundEntryLimitSummary:self.map[b]];
+    BOOL custom = ![limit isEqualToString:@"跟随全局"];
+    c.detailTextLabel.text = custom
+                           ? [NSString stringWithFormat:@"%@ · %@",
+                              [NotifyFilter soundEntrySummary:self.map[b]], limit]
+                           : [NotifyFilter soundEntrySummary:self.map[b]];
     c.textLabel.textColor = [UIColor labelColor];
     c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     return c;

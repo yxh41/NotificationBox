@@ -55,12 +55,20 @@ typedef NS_ENUM(NSInteger, NBSoundVerdict) {
 @end
 
 @interface NotifyFilter ()
-// outSID / outFile 都可为 NULL。任何异常都返回 NBSoundVerdictOff ——
+// outSID / outFile / outMaxSec 都可为 NULL。任何异常都返回 NBSoundVerdictOff ——
 // 这个功能的失效方式必须是"什么都不做"，绝不能影响通知本身。
 //
 // 🔴 v0.0.26：多了一个 outFile。**判定口径仍然只有这一个函数** ——
 //    两个输出的关系是「outFile 非空 ⇒ 播文件（优先）；否则看 outSID」。
 //    旧的两参版本留作包装（诊断在用），内部转调这一个。
+// 🔴 v0.0.31：多了 outMaxSec —— **算出的是最终生效的秒数**（entry 有就用 entry 的，
+//    否则用全局），不是一个"可能还要兜底"的半成品。理由同上面那条：
+//    如果让调用方自己再兜一次底，就等于"兜底逻辑两份"，迟早走岔
+//    （症状是"界面说 30 秒停、实际 8 秒就停"，这种几乎没法自证）。
++ (NBSoundVerdict)soundVerdictForBundle:(nullable NSString *)bundle
+                                soundID:(NSInteger *)outSID
+                              soundFile:(NSString * _Nullable * _Nullable)outFile
+                                 maxSec:(double *)outMaxSec;
 + (NBSoundVerdict)soundVerdictForBundle:(nullable NSString *)bundle
                                 soundID:(NSInteger *)outSID
                               soundFile:(NSString * _Nullable * _Nullable)outFile;
@@ -77,13 +85,21 @@ typedef NS_ENUM(NSInteger, NBSoundVerdict) {
                       why:(NSString **)why;
 
 // v0.0.29：内部真正干活的播放入口（公开的 playSoundFileNamed: 转调它，owner 传 @preview）
+// v0.0.31：多了 cap —— 这个 App 自己的「最长播放秒数」。
+//          🔴 **负数 = 调用方没指定，用全局**。为什么不用 0 当哨兵：0 在这套语义里是合法值（不限），
+//          让它兼职"没指定"就分不开"不限"和"忘了传"（而这两者行为差得远）。
 + (BOOL)nbPlaySoundFile:(NSString *)name
                forOwner:(NSString *)owner
+                    cap:(double)cap
                  result:(NSString **)result;
 
 // v0.0.27：时长上限相关（都只在内部用）
 + (NSTimeInterval)nbDurationOfFile:(NSString *)path;   // -1 = 量不出来
 + (NSTimeInterval)nbSoundMaxSec;                       // 0 = 不限
+// v0.0.31：选路 + 文案的唯一实现（cap < 0 = 跟随全局）。
+// 🔴 必须在这里声明：C 类方法不声明就调用，clang 报 "no known class method for selector"
+//    ⇒ 本工程开着 -Werror ⇒ 编译直接挂。（同类坑：tweak 侧 %new 方法也必须在顶部声明。）
++ (NSString *)nbPlaybackPlanForFile:(NSString *)name cap:(double)cap;
 // 通道优先级：YES = 先试 A（已验证通道），NO = 先走 B。**选路逻辑只写在这一处。**
 + (BOOL)nbPrefersAudioServicesForDuration:(NSTimeInterval)dur cap:(NSTimeInterval)cap;
 @end
@@ -395,6 +411,38 @@ static inline NSString *NBTrimText(NSString *s) {
 //     ⇒ `playCustomSoundForBundle` 返回 YES 却没出声 ⇒ **把系统原声掐掉 = 哑巴**。
 //     （这是本项目最贵的一类错：宁可不换音，也绝不哑巴。）
 // 🔴 这里**故意不 stat 文件**：那是判定阶段的事，而且必须排在这个 App 到底要不要换音之后。
+
+// v0.0.31：entry 里的 maxSec。**返回 NO = "没有可用值，请跟随全局"**。
+//
+// 与全局那个 `NBSoundMaxSecFromValue` 的**关键区别**（不是笔误，是刻意的）：
+//   · 全局版：非法值 **夹取**成默认值（8 秒）—— 它没有父级可退化，必须给个能用的数；
+//   · 本函数：非法值 **拒绝**（返回 NO，调用方退回全局）——
+//     它上面已经有全局值了，夹成 8 会把"我全局配了 30 秒"悄悄改成 8，属于静默改语义。
+//
+// 🔴 严格解析的理由：`[@"abc" doubleValue]` 返回 0，而 0 的语义是「不限」⇒
+//    手改文件写错一个字母就变成"长音响到底"，且界面上看不出任何异常。
+//    （这个坑全局那个函数里已经踩过一次，注释在 NotifyCommon.h 的 NBSoundMaxSecFromValue。）
+static BOOL NBMaxSecFromEntry(NSDictionary *entry, double *out) {
+    if (![entry isKindOfClass:[NSDictionary class]]) return NO;
+    id v = entry[NB_KEY_SOUND_ENTRY_MAXSEC];
+    if (!v) return NO;                       // 键不存在 ⇒ 跟随全局（①）
+    double n = 0;
+    if ([v isKindOfClass:[NSNumber class]]) {
+        n = [(NSNumber *)v doubleValue];
+    } else if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!s.length) return NO;
+        NSScanner *sc = [NSScanner scannerWithString:s];
+        if (![sc scanDouble:&n] || !sc.isAtEnd) return NO;      // "abc" ⇒ 跟随全局，不是"不限"
+    } else {
+        return NO;
+    }
+    if (n < 0 || n > NB_SOUND_MAX_SEC_CEIL) return NO;          // 乱填 ⇒ 跟随全局
+    if (out) *out = n;                                          // 0 是合法值 = 不限（②）
+    return YES;
+}
+
 static NSDictionary<NSString *, NSDictionary *> *NBSanitizedSoundMap(id raw) {
     if (![raw isKindOfClass:[NSDictionary class]]) return @{};
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
@@ -407,6 +455,20 @@ static NSDictionary<NSString *, NSDictionary *> *NBSanitizedSoundMap(id raw) {
         BOOL hasI = [iv isKindOfClass:[NSNumber class]] ||
                     ([iv isKindOfClass:[NSString class]] && [(NSString *)iv length] > 0);
         if (!f.length && !hasI) continue;
+        // v0.0.31：maxSec 非法 ⇒ **只剔掉这个键**，绝不丢整条 entry。
+        //   丢整条 ⇒ 用户会觉得"我这个 App 的提示音突然没了"；
+        //   剔键   ⇒ 只是"时长回到跟随全局"，退化方向是安全的（音还在）。
+        //   而且必须在这里剔：判定之后的 `nbPrefersAudioServicesForDuration:cap:` 会拿它去选通道，
+        //   一个乱填的 1e9 会变成 `dispatch_after(1e9 秒)` ⇒ player 永不释放 ⇒
+        //   live 攒满 6 ⇒ 后面的音全被挤掉（真机表现为"响几声之后就不响了"）。
+        if (((NSDictionary *)v)[NB_KEY_SOUND_ENTRY_MAXSEC] != nil) {
+            double probe = 0;
+            if (!NBMaxSecFromEntry(v, &probe)) {
+                NSMutableDictionary *vv = [NSMutableDictionary dictionaryWithDictionary:v];
+                [vv removeObjectForKey:NB_KEY_SOUND_ENTRY_MAXSEC];
+                v = vv;
+            }
+        }
         out[k] = v;
     }
     return out;
@@ -513,11 +575,15 @@ static NSDictionary<NSString *, NSDictionary *> *NBSanitizedSoundMap(id raw) {
 //    这样"新格式有校验、旧格式没校验"这种分叉从结构上就不存在。
 + (NBSoundVerdict)soundVerdictForBundle:(NSString *)bundle
                                 soundID:(NSInteger *)outSID
-                              soundFile:(NSString * _Nullable * _Nullable)outFile {
+                              soundFile:(NSString * _Nullable * _Nullable)outFile
+                                 maxSec:(double *)outMaxSec {
     if (outSID) *outSID = 0;
     if (outFile) *outFile = nil;
     @try {
         NSDictionary *p = [self prefs];
+        // v0.0.31：先给"跟随全局"的值 —— 后续任何一条路不覆盖它，就等于跟随全局。
+        // 🔴 用 p 里已读到的字典算，不再调 nbSoundMaxSec 二次读盘：判定在每条通知上都会跑。
+        if (outMaxSec) *outMaxSec = NBSoundMaxSecFromValue(p[NB_KEY_SOUND_MAX_SEC]);
         if (!p.count) return NBSoundVerdictOff;
         if (!NBBoolValue(p[NB_KEY_SOUND_ENABLED])) return NBSoundVerdictOff;
 
@@ -537,6 +603,9 @@ static NSDictionary<NSString *, NSDictionary *> *NBSanitizedSoundMap(id raw) {
             if ([iv isKindOfClass:[NSNumber class]])      sid = [(NSNumber *)iv integerValue];
             else if ([iv isKindOfClass:[NSString class]]) sid = [(NSString *)iv integerValue];
             if (outSID) *outSID = sid;
+            // v0.0.31：这个 App 自己的时长（键不存在 / 值非法 ⇒ 保持上面的全局值）
+            double entryCap = 0;
+            if (outMaxSec && NBMaxSecFromEntry(entry, &entryCap)) *outMaxSec = entryCap;
         } else {
             // ---- ② 旧格式回退：名单 + 全局音 ----
             // 🔴 保留它只为**升级不炸**：用户刚装上这版的那一刻，设置文件还是旧格式，
@@ -585,10 +654,18 @@ static NSDictionary<NSString *, NSDictionary *> *NBSanitizedSoundMap(id raw) {
     }
 }
 
+// 旧三参版本：诊断（NotifySoundDiag）与 isSoundTargetBundle 还在用。
+// 🔴 必须是**转调**而不是复制一份实现 —— 否则口径又变成两份。
++ (NBSoundVerdict)soundVerdictForBundle:(NSString *)bundle
+                                soundID:(NSInteger *)outSID
+                              soundFile:(NSString * _Nullable * _Nullable)outFile {
+    return [self soundVerdictForBundle:bundle soundID:outSID soundFile:outFile maxSec:NULL];
+}
+
 // 旧两参版本：诊断（NotifySoundDiag）还在用，保持签名不变。
 // 🔴 必须是**转调**而不是复制一份实现 —— 否则口径又变成两份。
 + (NBSoundVerdict)soundVerdictForBundle:(NSString *)bundle soundID:(NSInteger *)outSID {
-    return [self soundVerdictForBundle:bundle soundID:outSID soundFile:NULL];
+    return [self soundVerdictForBundle:bundle soundID:outSID soundFile:NULL maxSec:NULL];
 }
 
 // 给诊断（NotifySoundDiag）用：这个 App 是不是该换音。
@@ -902,12 +979,15 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
     //    （设置页试听 / 选音页试听 / 选音页选完试播），改签名等于三处一起动，
     //    而它们本来就都该是"试听"这个语义 ⇒ 默认值就写在转调这一行，一处都说清。
     //    ⚠️ 通知路径**不许**调这个函数（那会让所有 App 共用一个 owner，又变回全局只留一个音）。
-    return [self nbPlaySoundFile:name forOwner:NB_SOUND_OWNER_PREVIEW result:result];
+    // 🔴 v0.0.31：cap 传 -1 = 跟随全局。试听是"预览这一份文件"，用全局的上限最符合直觉；
+    //    真要按某个 App 的时长试听，那是选音页的事（它有自己的预览文案）。
+    return [self nbPlaySoundFile:name forOwner:NB_SOUND_OWNER_PREVIEW cap:-1 result:result];
 }
 
 // 内部真正干活的入口。owner 决定"跟谁互斥"，其余逻辑与 v0.0.27 完全一致。
 + (BOOL)nbPlaySoundFile:(NSString *)name
                forOwner:(NSString *)owner
+                    cap:(double)cap
                  result:(NSString **)result {
     if (result) *result = nil;
     @try {
@@ -928,9 +1008,11 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
 
         // ---- v0.0.27：按"能不能在时限内播完"选通道 ----
         // 上限 0 = 不限 ⇒ 仍然走 A（已验证通道，零 session 副作用）。
-        NSTimeInterval cap = [self nbSoundMaxSec];
+        // v0.0.31：cap 负数 = 调用方没指定 ⇒ 用全局。**必须在这里兜底而不是在调用方**，
+        //          否则"哪些调用点兜了、哪些没兜"会散在几个文件里。
+        NSTimeInterval useCap = (cap < 0) ? [self nbSoundMaxSec] : (NSTimeInterval)cap;
         NSTimeInterval dur = [self nbDurationOfFile:path];          // 负数 = 量不出来
-        BOOL aFirst = [self nbPrefersAudioServicesForDuration:dur cap:cap];
+        BOOL aFirst = [self nbPrefersAudioServicesForDuration:dur cap:useCap];
 
         NSString *whyA = nil;
         NSString *whyB = nil;
@@ -941,16 +1023,16 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
         //    那时响得久一点，远好过哑巴。这个取舍要写进 README，不能只在代码里。
         if (aFirst) {
             okA = [self nbPlayViaAudioServices:path why:&whyA];
-            if (!okA) okB = [self nbPlayViaAVPlayer:path maxSec:cap owner:owner why:&whyB];
+            if (!okA) okB = [self nbPlayViaAVPlayer:path maxSec:useCap owner:owner why:&whyB];
         } else {
-            okB = [self nbPlayViaAVPlayer:path maxSec:cap owner:owner why:&whyB];
+            okB = [self nbPlayViaAVPlayer:path maxSec:useCap owner:owner why:&whyB];
             if (!okB) okA = [self nbPlayViaAudioServices:path why:&whyA];
         }
         if (okA || okB) {
             if (result) {
                 // dur=-1.0 表示"时长没量出来"（不是播了 -1 秒）；cap=0.0 表示不限。
                 *result = [NSString stringWithFormat:@"自播 file=%@ ch=%@ dur=%.1f cap=%.1f",
-                           name, okA ? @"A" : @"B", dur, cap];
+                           name, okA ? @"A" : @"B", dur, useCap];
             }
             return YES;
         }
@@ -968,21 +1050,26 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
 // **只用于显示，不做判定** —— 判定仍然只在 soundVerdictForBundle 里。
 // 🔴 放在引擎里而不是界面里：这样"界面写的"和"实际做的"用**同一份选路逻辑**。
 //    两份必走岔，而走岔的症状（界面说会截断、实际没截断）几乎没法自证。
-+ (NSString *)playbackPlanForFileNamed:(NSString *)name {
+//
+// v0.0.31：拆成两层。cap < 0 = 跟随全局。
+// 🔴 为什么必须拆：v0.0.31 之后"同一个文件"在不同 App 下会有**不同上限**，
+//    界面若还只读全局，就会在"给微信配了 30 秒"时显示「8 秒后停」——
+//    正是上面那条注释警告的走岔。所以多一个 forBundle: 版本去问判定要最终 cap。
++ (NSString *)nbPlaybackPlanForFile:(NSString *)name cap:(double)cap {
     @try {
         NSString *path = NBSoundFilePath(name);
         if (!path) return @"文件名不合法";
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return @"文件不在";
 
         NSTimeInterval dur = [self nbDurationOfFile:path];
-        NSTimeInterval cap = [self nbSoundMaxSec];
-        BOOL aFirst = [self nbPrefersAudioServicesForDuration:dur cap:cap];
+        NSTimeInterval useCap = (cap < 0) ? [self nbSoundMaxSec] : (NSTimeInterval)cap;
+        BOOL aFirst = [self nbPrefersAudioServicesForDuration:dur cap:useCap];
         NSString *durText = (dur < 0) ? @"时长未知" : [NSString stringWithFormat:@"%.1f 秒", dur];
 
         NSString *how = @"走 A";
         if (!aFirst) {
-            if (cap > 0 && (dur < 0 || dur > cap)) {
-                how = [NSString stringWithFormat:@"走 B，%.0f 秒后停", cap];
+            if (useCap > 0 && (dur < 0 || dur > useCap)) {
+                how = [NSString stringWithFormat:@"走 B，%.0f 秒后停", useCap];
             } else {
                 how = [NSString stringWithFormat:@"走 B（超 %.0f 秒，A 放不全）", NB_A_CHANNEL_MAX_SEC];
             }
@@ -991,6 +1078,28 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
     } @catch (NSException *e) {
         return @"?";
     }
+}
+
++ (NSString *)playbackPlanForFileNamed:(NSString *)name {
+    return [self nbPlaybackPlanForFile:name cap:-1];      // -1 = 跟随全局
+}
+
+// v0.0.31：给某个 App 配的这个文件会怎么播（用这个 App 自己的时长）。
++ (NSString *)playbackPlanForFileNamed:(NSString *)name forBundle:(NSString *)bundle {
+    // 🔴 cap 从判定里取，不自己读设置 —— "界面"和"刀"必须是同一份计算。
+    //    判定在"功能没开 / 不在名单"时会提前 return，但 outMaxSec 在最前面就填好了全局值，
+    //    所以这里永远拿到一个可用值（-1 只在判定抛异常时出现）。
+    double cap = -1;
+    [self soundVerdictForBundle:bundle soundID:NULL soundFile:NULL maxSec:&cap];
+    return [self nbPlaybackPlanForFile:name cap:(cap < 0 ? -1 : cap)];
+}
+
+// v0.0.31：entry 的「最长播放秒数」一行人话（界面显示用，**不做判定**）。
++ (NSString *)soundEntryLimitSummary:(NSDictionary *)entry {
+    double v = 0;
+    if (!NBMaxSecFromEntry(entry, &v)) return @"跟随全局";
+    if (v <= 0) return @"不限时长";
+    return [NSString stringWithFormat:@"%.0f 秒后停", v];
 }
 
 // ---------- v0.0.25：换提示音的**新刀** ----------
@@ -1021,7 +1130,12 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
     @try {
         NSInteger sid = 0;
         NSString *srcFile = nil;
-        NBSoundVerdict verdict = [self soundVerdictForBundle:bundle soundID:&sid soundFile:&srcFile];
+        // v0.0.31：cap 由判定一起给出（entry 有就用 entry 的，否则全局），
+        // 🔴 这里**不许**再自己读一次 nbSoundMaxSec：兜底逻辑两份迟早走岔，
+        //    症状是"界面说 30 秒停、实际 8 秒就停"，而两边看着都对。
+        double cap = -1;
+        NBSoundVerdict verdict = [self soundVerdictForBundle:bundle soundID:&sid
+                                                    soundFile:&srcFile maxSec:&cap];
 
         // 两种「不适用」静默返回：开关没开 / 这个 App 不在名单。
         // 这是绝大多数通知的结局 —— 每条都留痕会把约 50 行的日志窗口冲干净（v0.0.22 白跑一轮的同一个病）。
@@ -1063,7 +1177,7 @@ static NSMutableDictionary<NSString *, NSNumber *> *NBDurCache(void) {
         //    而症状（"QQ 把我微信的提示音停了"）几乎没法从日志看出来。
         if (srcFile.length) {
             NSString *d = nil;
-            BOOL ok = [self nbPlaySoundFile:srcFile forOwner:bundle result:&d];
+            BOOL ok = [self nbPlaySoundFile:srcFile forOwner:bundle cap:cap result:&d];
             if (result) *result = d;
             return ok;              // 播不出去 ⇒ NO ⇒ 调用方放原声（绝不哑巴）
         }
