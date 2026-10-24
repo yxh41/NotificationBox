@@ -150,6 +150,24 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSDictionary<NSString *, NSString *> *)appNames;
 + (nullable NSString *)appNameForBundle:(NSString *)bundle;
 
+#pragma mark - v0.0.46 统计
+
+// 按 App 分组。返回 @[@{@"bundle":…, @"total":@N, @"unread":@N}]，按 total 降序。
+// 🔴 总数和未读**一条 SQL 同时出**（`SUM(CASE WHEN read=0 …)`），
+//    不分成两条查 —— 两条就有可能出现"A 口径的总数 + B 口径的未读"，
+//    而本项目最贵的那次事故（v0.0.37 红点永远消不掉）正是两个指标不同口径。
+// 🔴 `since` 与列表同一口径（`ts >= since`），0 = 全库。
+// 🔴 `limit` <= 0 表示不限制。
++ (NSArray<NSDictionary *> *)statsBundlesSince:(NSTimeInterval)since limit:(NSInteger)limit;
+// 按时间桶分组。`byHour` = YES 时返回 **24 个桶（含 0 条的）**，key 是 @"hour"（0~23）；
+// NO 时按天，key 是 @"day"（yyyy-MM-dd），只回有记录的天。
+// 🔴 用 `localtime`：库里存的是 unix 时间戳，**不转换会得到 UTC 的小时**
+//    ⇒ 用户看到"我明明晚上收到的，却算在凌晨"。
++ (NSArray<NSDictionary *> *)statsBucketsSince:(NSTimeInterval)since byHour:(BOOL)byHour;
+// 统计页顶部那一行：总条数、未读、覆盖多少个 App、最早一条的时间。
+// 🔴 返回的字典里 key 固定为 total / unread / apps / earliest（earliest 是 NSDate 或 nil）。
++ (NSDictionary *)statsSummarySince:(NSTimeInterval)since;
+
 // 设置（App 侧的**唯一**读写入口；tweak 侧读走 NotifyCommon.h 的 NBLoadSettings）
 // 🔴 统一在这里写，别让每个 VC 各写一遍 writeToFile: —— 写入点一多，
 //    "某个页面写了、另一个页面没写" 这类 bug 就必然出现。

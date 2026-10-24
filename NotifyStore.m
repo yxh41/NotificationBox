@@ -223,6 +223,109 @@ static NSObject *gAppNameLock = nil;
     return [self appNames][bundle];
 }
 
+#pragma mark - v0.0.46 统计
+
+// 🔴 三个统计方法共用：开库 + 准备 + 逐行取。
+//    分开写三份的话，"某个方法忘了 sqlite3_finalize" 是迟早的事，
+//    而这种泄漏在真机上的表现是"用久了盒子打不开"，很难往这边想。
+// `build` 由调用方给：它决定"这一行的列分别是什么 key、什么类型"。
+// 一开始我试过传 key 数组 + 两个 BOOL（"第一列是 int 还是 text"），
+// 结果读起来像谜语 ⇒ 直接传构造 block，列号由调用方自己写清楚。
+static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterval since,
+                                       NSDictionary *(^build)(sqlite3_stmt *st)) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) return @[];
+    if (since > 0) sqlite3_bind_double(st, 1, (double)since);
+    NSMutableArray *out = [NSMutableArray array];
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        NSDictionary *d = build(st);
+        if (d) [out addObject:d];
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
++ (NSArray<NSDictionary *> *)statsBundlesSince:(NSTimeInterval)since limit:(NSInteger)limit {
+    sqlite3 *db = [self openDB];
+    if (!db) return @[];
+    NSMutableString *sql = [NSMutableString stringWithString:
+        @"SELECT bundle, COUNT(*), SUM(CASE WHEN read=0 THEN 1 ELSE 0 END) "
+        @"FROM notifications WHERE 1=1"];
+    if (since > 0) [sql appendString:@" AND ts>=?"];
+    [sql appendString:@" GROUP BY bundle ORDER BY COUNT(*) DESC"];
+    // 🔴 LIMIT 只能拼字面量（SQLite 不支持 `LIMIT ?` 之外的写法其实支持，
+    //    但这里 limit 来自我们自己的常量，且是 long ⇒ 用 %ld 拼，不走用户输入）
+    if (limit > 0) [sql appendFormat:@" LIMIT %ld", (long)limit];
+    NSArray *rows = NBRows(db, sql, since, ^NSDictionary *(sqlite3_stmt *st) {
+        const char *b = (const char *)sqlite3_column_text(st, 0);
+        return @{
+            @"bundle": (b ? [NSString stringWithUTF8String:b] : @""),
+            @"total":  @(sqlite3_column_int(st, 1)),
+            @"unread": @(sqlite3_column_int(st, 2)),
+        };
+    });
+    sqlite3_close(db);
+    return rows;
+}
+
++ (NSArray<NSDictionary *> *)statsBucketsSince:(NSTimeInterval)since byHour:(BOOL)byHour {
+    sqlite3 *db = [self openDB];
+    if (!db) return @[];
+    NSString *expr = byHour
+        ? @"CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS INTEGER)"
+        : @"strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime')";
+    NSMutableString *sql = [NSMutableString stringWithFormat:
+        @"SELECT %@ AS k, COUNT(*) FROM notifications WHERE 1=1", expr];
+    if (since > 0) [sql appendString:@" AND ts>=?"];
+    [sql appendString:@" GROUP BY k ORDER BY k"];
+    NSArray *rows = NBRows(db, sql, since, ^NSDictionary *(sqlite3_stmt *st) {
+        if (byHour) return @{ @"hour": @(sqlite3_column_int(st, 0)),
+                              @"total": @(sqlite3_column_int(st, 1)) };
+        const char *s = (const char *)sqlite3_column_text(st, 0);
+        return @{ @"day": (s ? [NSString stringWithUTF8String:s] : @""),
+                  @"total": @(sqlite3_column_int(st, 1)) };
+    });
+    sqlite3_close(db);
+    if (byHour) {
+        // 🔴 24 个桶**补齐**：SQL 的 GROUP BY 只回有记录的小时。
+        //    不补的话，"凌晨 3 点一条都没有"这个信息在界面上就变成了"那一格不存在"，
+        //    而"没有"和"没查到"在用户眼里是两回事。
+        NSMutableDictionary *map = [NSMutableDictionary dictionary];
+        for (NSDictionary *d in rows) map[d[@"hour"]] = d[@"total"];
+        NSMutableArray *out = [NSMutableArray array];
+        for (NSInteger h = 0; h < 24; h++) {
+            [out addObject:@{@"hour": @(h), @"total": map[@(h)] ?: @0}];
+        }
+        return out;
+    }
+    return rows;
+}
+
++ (NSDictionary *)statsSummarySince:(NSTimeInterval)since {
+    sqlite3 *db = [self openDB];
+    if (!db) return @{};
+    NSMutableString *sql = [NSMutableString stringWithString:
+        @"SELECT COUNT(*), SUM(CASE WHEN read=0 THEN 1 ELSE 0 END), "
+        @"COUNT(DISTINCT bundle), MIN(ts) FROM notifications WHERE 1=1"];
+    if (since > 0) [sql appendString:@" AND ts>=?"];
+    sqlite3_stmt *st = NULL;
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) == SQLITE_OK) {
+        if (since > 0) sqlite3_bind_double(st, 1, (double)since);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            out[@"total"] = @(sqlite3_column_int(st, 0));
+            out[@"unread"] = @(sqlite3_column_int(st, 1));
+            out[@"apps"] = @(sqlite3_column_int(st, 2));
+            double ts = sqlite3_column_double(st, 3);
+            // 🔴 空表时 MIN(ts) 是 NULL ⇒ sqlite3_column_double 给 0 ⇒ 不能当"1970 年"显示
+            if (ts > 0) out[@"earliest"] = [NSDate dateWithTimeIntervalSince1970:ts];
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return out;
+}
+
 + (void)recordWithBundle:(NSString *)bundle
                    title:(NSString *)title
                  message:(NSString *)message
