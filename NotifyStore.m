@@ -230,6 +230,25 @@ void NBSharedLog(NSString *fmt, ...) {
     sqlite3_close(db);
 }
 
+// v0.0.33：删单条。返回 YES = 真的删掉了（id 不存在 ⇒ NO，界面据此提示"这条已经没了"）。
+// 🔴 用参数绑定而不是拼 SQL：rowId 虽然来自数据库（整数、无注入面），
+//    但这里保持和 queryWithBundle 同一口径 —— 一处拼串、一处绑参，
+//    以后有人把某个参数换成字符串时就会在拼串那处出事。
++ (BOOL)deleteRow:(NSInteger)rowId {
+    sqlite3 *db = [self openDB];
+    if (!db) return NO;
+    BOOL ok = NO;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM notifications WHERE id=?", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)rowId);
+        ok = (sqlite3_step(st) == SQLITE_DONE) && (sqlite3_changes(db) > 0);
+        sqlite3_finalize(st);
+    }
+    if (!ok) NBStoreLog(@"DELETE 未删到 id=%ld err=%s", (long)rowId, sqlite3_errmsg(db));
+    sqlite3_close(db);
+    return ok;
+}
+
 + (void)clearAll {
     sqlite3 *db = [self openDB];
     if (!db) return;

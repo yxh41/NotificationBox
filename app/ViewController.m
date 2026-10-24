@@ -4,6 +4,8 @@
 #import "SettingsViewController.h"
 #import "NotifyCell.h"
 #import "AppIconLoader.h"
+// v0.0.33：点开看全文 + 复制 + 删单条
+#import "NotifyDetailViewController.h"
 
 // 🔴 盒子 App：读 NotifyStore 的 SQLite，展示通知列表
 //    - 顶部横向 App 图标栏（抖音聊天页那种）：点击筛选对应 bundle
@@ -28,6 +30,9 @@
 - (void)onDiag:(id)sender;
 - (void)onSettings:(id)sender;
 - (void)showText:(NSString *)text title:(NSString *)title;
+// v0.0.33：轻量一行提示（左滑删除失败时用）。
+// 不走 showText: —— 那个是"长文本可滚动页"，弹一句"这条已经没了"太重。
+- (void)alertTitle:(NSString *)title text:(NSString *)text;
 - (NSString *)keyLinesFrom:(NSString *)text;
 - (NSString *)selLinesFrom:(NSString *)text;
 - (NSString *)probeLinesFrom:(NSString *)text;
@@ -317,6 +322,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self.navigationController pushViewController:vc animated:YES];
 }
 
+// v0.0.33：轻量提示（左滑删除"删不到"时用）。不用 showText: —— 那是长文本页，太重。
+- (void)alertTitle:(NSString *)title text:(NSString *)text {
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:title
+                                                               message:text
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [al addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:al animated:YES completion:nil];
+}
+
 - (void)buildUI {
     // 时间分段
     self.timeSeg = [[UISegmentedControl alloc] initWithItems:@[@"今天", @"近7天", @"全部"]];
@@ -514,6 +528,47 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     NSDictionary *d = self.items[indexPath.row];
     [NotifyStore markRead:[d[@"id"] integerValue]];
+
+    // v0.0.33：点开看**全文**。列表 cell 的正文 `numberOfLines = 2`、超了截断，
+    // 而在这之前点一行只做 markRead ⇒ 长通知永远看不全、也复制不了。
+    // 对「消息盒子」来说这是核心缺口：验证码、链接、长消息都看不全，等于记录没记全。
+    NotifyDetailViewController *vc = [[NotifyDetailViewController alloc] init];
+    vc.item = d;
+    __weak typeof(self) weakSelf = self;
+    // 🔴 删除后由**列表**重查数据库。详情页绝不直接改 self.items ——
+    //    在「搜索 / App 筛选 / 时间段」状态下，内存下标和数据库 id 完全是两回事。
+    vc.onDeleted = ^{ [weakSelf loadData]; };
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
+// v0.0.33：左滑删除。
+// 🔴 刻意**不用** `deleteRowsAtIndexPaths:` —— 它要求"内存数组与即将删的行严格同步"，
+//    而我们删的是数据库。正确顺序是「先删库 → 整表重查」，让两边从同一个来源重建。
+//    只改内存 = 只改账本的读数（数量契约第 2 问）：症状是删完那一行还在，
+//    或者删了 A 却少了一条 B（搜索/筛选态下标错位）。
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
+        trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.row >= (NSInteger)self.items.count) return nil;
+    NSDictionary *d = self.items[indexPath.row];
+    __weak typeof(self) weakSelf = self;
+    UIContextualAction *del = [UIContextualAction
+        contextualActionWithStyle:UIContextualActionStyleDestructive
+                            title:@"删除"
+                          handler:^(UIContextualAction *action, UIView *src, void (^done)(BOOL)) {
+        NSInteger rowId = [d[@"id"] integerValue];
+        BOOL ok = (rowId > 0) && [NotifyStore deleteRow:rowId];
+        // 先重查（数据源变了），再告诉系统动作完成 —— 顺序反了会"删完还留着"。
+        [weakSelf loadData];
+        done(YES);
+        if (!ok) {
+            // 删不到也要说：最常见的原因是 tweak 按「记录上限」把它裁掉了，
+            // 而列表还显示着。静默失败会让人以为删除按钮坏了。
+            [weakSelf alertTitle:@"没删掉"
+                            text:@"这条记录已经不在了（可能被「记录上限」自动清掉了）。列表已刷新。"];
+        }
+    }];
+    del.backgroundColor = [UIColor systemRedColor];
+    return [UISwipeActionsConfiguration configurationWithActions:@[del]];
 }
 
 @end
