@@ -397,7 +397,10 @@ static NSMutableArray<NSNumber *> *NBZeroArray(NSUInteger n) {
     if (!n) return;
 
     // 与引擎一致：只看盒子里存的**原文**（记录发生在替换之前，所以原文是真的原文）
-    NSArray<NSDictionary *> *notes = [NotifyStore queryWithBundle:nil since:0 search:nil];
+    // v0.0.36：`queryWithBundle:` 多了 `unreadOnly` 参数。这里恒传 NO ——
+    // 替换规则的「试运行」是要匹配**全部**记录，不受界面那个"只看未读"开关影响。
+    NSArray<NSDictionary *> *notes = [NotifyStore queryWithBundle:nil since:0 search:nil
+                                                        unreadOnly:NO];
 
     NSMutableArray<NSNumber *> *hit = NBZeroArray(n);
     NSMutableArray<NSNumber *> *eaten = NBZeroArray(n);
