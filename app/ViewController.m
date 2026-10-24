@@ -57,21 +57,23 @@ static const CGFloat kNBMarkAllWidth = 88;
 //    两个数一起看，新增和删除都盖得住。
 @property (nonatomic, assign) NSInteger lastTotal;
 @property (nonatomic, assign) NSInteger lastMaxId;
-// v0.0.39：**更早还有多少条未读**（当前筛选范围、不限时间）。
-// 🔴 为什么非要有这个数：红点从 v0.0.37 起是**时间窗口径**（和列表同口径，才清得掉）。
-//    于是出现一个信息缺口 —— 时间选「近24小时」、窗口内一条未读都没有、而更早还有 12 条
-//    未读时：**红点全灭 + 列表不空（可能有已读记录）⇒ 界面上一个字都不提示**，
+// v0.0.40：**当前筛选之外还有多少条未读**（= 全库未读 − 当前筛选下的未读）。
+// 🔴 为什么非要有这个数：红点从 v0.0.37 起是「App + 时间窗」口径（和列表同口径，才清得掉）。
+//    于是出现一个信息缺口 —— 当前筛选下一条未读都没有、而筛选之外还有 12 条未读时：
+//    **红点全灭 + 列表可能不空（有已读记录）⇒ 界面上一个字都不提示**，
 //    用户会断定"全都读完了"，然后那 12 条永远不会被看到。
-//    v0.0.37 只在**空列表**里补了这句提示，列表非空时照样是哑的。
-// 🔴 语义收紧：只有「窗口内**一条未读都没有**」时它才 > 0。
-//    窗口内本来就有未读时红点亮着，再喊"更早还有"只是噪音；而且那时用户的注意力
-//    应该在红点上。`since` 为 0（不限时间）时它恒为 0 —— 不需要额外判段号。
-@property (nonatomic, assign) NSInteger olderUnread;
-// v0.0.39：上面那个数的常驻出口（一行小字，`olderUnread > 0` 才占位）。
+// 🔴🔴 v0.0.39 的第一版把范围写成"比时间窗更早"，真机上一装就发现**永远看不到**：
+//    默认时间窗就是 24 小时，库里记录都在 24 小时内时"更早"恒为 0。
+//    ⇒ 改成算**三个筛选维度一起**（App 图标 + 时间 + 搜索），因为这三个任何一项
+//    都会让一部分未读看不见，而用户只关心"还有没有我没看到的"。
+// ⇒ 所以名字从 `olderUnread` 改成 `hiddenUnread`：「更早」是错的名字，
+//    名不符实在这个项目里栽过（第 0 段时间曾叫「今天」而实际是 now-86400）。
+@property (nonatomic, assign) NSInteger hiddenUnread;
+// v0.0.40：上面那个数的常驻出口（一行小字，`hiddenUnread > 0` 才占位）。
 // 🔴 不放导航栏标题、也不放分段控件里：那两处都要**赌系统怎么排**（标题会被压缩/截断，
 //    分段控件段宽是系统算的）。v0.0.37 已经被系统 scope bar 教过一次 ——
 //    凡是"只能靠系统内部布局才出现"的东西，都不赌，自己画、自己算高度。
-@property (nonatomic, strong) UILabel *olderHint;
+@property (nonatomic, strong) UILabel *hiddenHint;
 
 - (void)onDiag:(id)sender;
 - (void)onSettings:(id)sender;
@@ -92,8 +94,10 @@ static const CGFloat kNBMarkAllWidth = 88;
 - (void)refreshIfChanged;
 - (void)reloadKeepingOffset;
 - (void)onForeground:(NSNotification *)note;
-// v0.0.39：更早未读的条数（`loadData` 里算，`viewDidLayoutSubviews` 用它决定提示条占不占位）
-- (void)updateOlderUnread;
+// v0.0.40：筛选之外未读的条数（`loadData` 里算，`viewDidLayoutSubviews` 用它决定占不占位）
+- (void)updateHiddenUnread;
+// v0.0.40：提示文案的**唯一来源**（顶部提示条 + 空列表正中那句都用它产出）
+- (NSString *)hiddenHintText;
 // v0.0.38：时间段的显示名 / 「App + 时间」两维的范围描述
 // 🔴 抽出来是因为确认框文案和空列表文案都用到它，字面量写两处就会不一致
 - (NSArray<NSString *> *)timeNames;
@@ -240,7 +244,7 @@ static const CGFloat kNBMarkAllWidth = 88;
     // 🔴 先算一遍再问 —— 和 `onClear:` 同一条纪律：确认框里的数字必须是**这次真正会改的
     //    行数**，不能拿 `self.items.count`（那是列表显示了几条，受搜索和单次上限影响）。
     //    这个数由 `unreadCountWithBundle:since:` 算，和后面 `markAllReadWithBundle:since:`
-    //    共用同一套 WHERE 条件（见 NotifyStore.m 里 `NBPrepareUnreadScope`）。
+    //    共用同一套 WHERE 条件（见 NotifyStore.m 里 `NBPrepareScope`）。
     NSInteger n = [NotifyStore unreadCountWithBundle:self.filterBundle since:since];
     if (n == 0) {
         [self alertTitle:@"没有未读" text:@"这个范围里已经没有未读记录了。"];
@@ -598,17 +602,17 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.markAllBtn.hidden = YES;
     [self.view addSubview:self.markAllBtn];
 
-    // v0.0.39：更早未读的常驻提示（`olderUnread > 0` 才显示，见属性注释）。
+    // v0.0.40：筛选之外还有未读的常驻提示（`hiddenUnread > 0` 才显示，见属性注释）。
     // 🔴 用 `secondaryLabelColor` + 12pt：它是"补充说明"，不该比列表本身更抢眼。
     //    但前面带 ⚠️，因为不说的话用户会当成"全都读完了"。
-    self.olderHint = [[UILabel alloc] init];
-    self.olderHint.font = [UIFont systemFontOfSize:12];
-    self.olderHint.textColor = [UIColor secondaryLabelColor];
-    self.olderHint.numberOfLines = 1;
-    self.olderHint.adjustsFontSizeToFitWidth = YES;
-    self.olderHint.minimumScaleFactor = 0.85;
-    self.olderHint.hidden = YES;
-    [self.view addSubview:self.olderHint];
+    self.hiddenHint = [[UILabel alloc] init];
+    self.hiddenHint.font = [UIFont systemFontOfSize:12];
+    self.hiddenHint.textColor = [UIColor secondaryLabelColor];
+    self.hiddenHint.numberOfLines = 1;
+    self.hiddenHint.adjustsFontSizeToFitWidth = YES;
+    self.hiddenHint.minimumScaleFactor = 0.85;
+    self.hiddenHint.hidden = YES;
+    [self.view addSubview:self.hiddenHint];
 
     // 顶部 App 图标栏（横向滚动）
     self.iconBar = [[UIScrollView alloc] init];
@@ -656,23 +660,23 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.markAllBtn.frame = CGRectMake(12 + MAX(120, unreadW) + 6, y, kNBMarkAllWidth, 30);
     y += 30 + 6;
 
-    // v0.0.39：更早未读的常驻提示。
+    // v0.0.40：筛选之外还有未读的常驻提示。
     // 🔴 不显示时高度必须是 **0**，而且要把 frame 也清零 ——
     //    只 `hidden = YES` 而保留 frame 的话，`y` 已经加过了 ⇒ 下面凭空多 24pt 空白，
     //    症状是"图标栏和列表整体下移一点点"，肉眼很难归因。
     // 🔴 可见性判据和 `y` 累加必须用**同一个** `showHint` 变量，
-    //    不能一处写 `self.olderUnread > 0`、另一处写 `!= 0`（这类不一致不会报错）。
+    //    不能一处写 `self.hiddenUnread > 0`、另一处写 `!= 0`（这类不一致不会报错）。
     // 🔴🔴 为什么要串上 `self.items.count > 0`：**列表为空时 `updateEmptyView`
-    //    已经在屏幕正中说了同一件事**（v0.0.37 的提示，还带「当前筛选」）。
+    //    已经在屏幕正中说了同一件事**（还带「当前筛选」）。
     //    这边再飘一条，同一句话就占了两处屏幕。
-    //    本版要补的缺口精确地是「**列表非空时一个字都没有**」，所以提示条只管这个场景。
-    BOOL showHint = (self.olderUnread > 0 && self.items.count > 0);
-    self.olderHint.hidden = !showHint;
+    //    提示条只管「**列表非空时一个字都没有**」这个场景。
+    BOOL showHint = (self.hiddenUnread > 0 && self.items.count > 0);
+    self.hiddenHint.hidden = !showHint;
     if (showHint) {
-        self.olderHint.frame = CGRectMake(12, y, w - 24, 20);
+        self.hiddenHint.frame = CGRectMake(12, y, w - 24, 20);
         y += 20 + 4;
     } else {
-        self.olderHint.frame = CGRectZero;
+        self.hiddenHint.frame = CGRectZero;
     }
 
     self.iconBar.frame = CGRectMake(0, y, w, 56);
@@ -838,37 +842,69 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.lastTotal = total;
     self.lastMaxId = [NotifyStore maxRowId];
 
-    // v0.0.39：更早未读的条数在这里算（`loadData` 是唯一的刷新入口 ⇒ 不会被漏）。
+    // v0.0.40：筛选之外未读的条数在这里算（`loadData` 是唯一的刷新入口 ⇒ 不会被漏）。
     // 🔴 后面那句 `setNeedsLayout` 不能省：提示条出现/消失会改变图标栏和列表的**起始 y**，
     //    而那个 y 只在 `viewDidLayoutSubviews` 里算。不触发重布局的话，
-    //    切完时间段、`olderUnread` 从 12 变成 0，提示条会**继续留在屏幕上**。
-    [self updateOlderUnread];
+    //    切完时间段、`hiddenUnread` 从 12 变成 0，提示条会**继续留在屏幕上**。
+    [self updateHiddenUnread];
     [self.view setNeedsLayout];
 }
 
-// v0.0.39：算「更早还有多少条未读」，顺手把提示文案写好。
-// 🔴 最多查两次，而且第二次只在需要时才查：先看**当前时间窗内**有没有未读，
-//    有就说明红点亮着、根本不用提示（那是最常见的情况）。
-// 🔴 语义收紧的关键判据是 `inWin == 0`：
-//    窗口内本来就有未读时再喊"更早还有"是噪音；窗口内一条都没有、而更早还有，
-//    才是"用户以为全读完了"的那个假象。
-// 🔴 `since` 为 0（不限时间）时直接跳过 ⇒ `olderUnread` 恒为 0，
-//    不需要另判 `selectedSegmentIndex != 2`（那种写法容易和 `sinceFromSeg` 走岔）。
-- (void)updateOlderUnread {
-    NSTimeInterval since = [self sinceFromSeg];
-    NSInteger inWin = [NotifyStore unreadCountWithBundle:self.filterBundle since:since];
-    self.olderUnread = 0;
-    // `inWin < 0`（DB 打不开）不满足 `== 0` ⇒ 不提示，比显示"更早还有 -1 条"强。
-    if (inWin == 0 && since > 0) {
-        NSInteger all = [NotifyStore unreadCountWithBundle:self.filterBundle since:0];
-        if (all > 0) self.olderUnread = all;
+// v0.0.40：算「当前筛选之外还有多少条未读」，顺手把提示文案写好。
+// 🔴 为什么是"全库未读 − 当前筛选下的未读"，而不是只算时间窗：
+//    会让未读看不见的筛选有**三个**（App 图标 / 时间 / 搜索），任何一个生效都算。
+//    只算时间窗的写法（v0.0.39）在真机上永远看不到 —— 默认窗口就是 24 小时。
+// 🔴🔴 两个数必须走**同一条 SQL 条件**（`NBPrepareScope`）：如果这里用内存遍历
+//    `items` 里 `d[@"read"]` 去数"可见未读"，和 SQL 的 `read=0` 口径就会差在
+//    `read IS NULL` 的老行上（`sqlite3_column_int` 把 NULL 读成 0、SQL 里 `read=0` 不成立）
+//    ⇒ 差值被算小 ⇒ 提示条该出现时不出现。这类错**不报错、只静默少一条**。
+// 🔴 两次查询：第一次全库（不限任何条件），第二次带当前筛选。
+//    第一次的结果是 0 就不用查第二次了（回到最常见的"全读完了"状态，省一次查询）。
+- (void)updateHiddenUnread {
+    self.hiddenUnread = 0;
+    NSInteger all = [NotifyStore unreadCountWithBundle:nil since:0 search:nil];
+    if (all > 0) {
+        NSInteger inScope = [NotifyStore unreadCountWithBundle:self.filterBundle
+                                                        since:[self sinceFromSeg]
+                                                       search:self.searchText];
+        // 🔴 `inScope < 0`（DB 打不开）时宁可不提示，也不显示一个可能是瞎猜的数。
+        if (inScope >= 0) self.hiddenUnread = MAX(0, all - inScope);
     }
-    // 文案里带条数：只说"还有更早的未读"用户不知道值不值得去切；
-    // 说"还有 12 条"他才会去切。
-    self.olderHint.text = (self.olderUnread > 0)
-        ? [NSString stringWithFormat:@"⚠️ 更早还有 %ld 条未读 · 切「不限时间」看",
-                                     (long)self.olderUnread]
-        : nil;
+    self.hiddenHint.text = [self hiddenHintText];
+}
+
+// v0.0.40：提示文案的唯一来源 —— 顶部提示条和空列表正中那句都从这里拿。
+// 🔴 文案必须说清「被什么挡住了」，否则用户不知道往哪一步退。
+//    **但只在能确定唯一出口时才点名**：三种筛选叠加时点名其中一个（比如
+//    "点「全部」图标看全"）会把人带进死路 —— 他照做了还是看不到，就会认定
+//    整个提示在说谎，比不提示更糟。
+- (NSString *)hiddenHintText {
+    if (self.hiddenUnread <= 0) return nil;
+    NSInteger n = self.hiddenUnread;
+    BOOL byApp = (self.filterBundle.length > 0);   // 顶部点了某个 App 图标
+    BOOL bySearch = (self.searchText.length > 0);
+    BOOL byTime = ([self sinceFromSeg] > 0);       // 第 2 段「不限时间」时是 0
+    NSInteger dims = (byApp ? 1 : 0) + (bySearch ? 1 : 0) + (byTime ? 1 : 0);
+    if (dims == 1) {
+        if (byApp) {
+            return [NSString stringWithFormat:@"⚠️ 还有 %ld 条未读 · 点顶部「全部」图标看全",
+                                             (long)n];
+        }
+        if (bySearch) {
+            return [NSString stringWithFormat:@"⚠️ 还有 %ld 条未读 · 清空搜索就能看到",
+                                             (long)n];
+        }
+        // 只有时间窗在挡：和 v0.0.39 一字不差（这一种情况语义没变、出口唯一）
+        return [NSString stringWithFormat:@"⚠️ 更早还有 %ld 条未读 · 切「不限时间」看",
+                                         (long)n];
+    }
+    if (dims == 0) {
+        // 三个筛选都没生效却还有没显示的 —— 只可能是 `queryWithBundle` 的 LIMIT 2000
+        // 截断了。这时点不出任何"出口"，如实说"没显示出来"。
+        return [NSString stringWithFormat:@"⚠️ 还有 %ld 条未读没显示出来", (long)n];
+    }
+    // 两种以上筛选叠加：出口不止一个，笼统说，不点名。
+    return [NSString stringWithFormat:@"⚠️ 还有 %ld 条未读在当前筛选之外", (long)n];
 }
 
 // v0.0.38：库里变了才重查一次。给「从详情页/设置页返回」和「App 回前台」用。
@@ -923,16 +959,16 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     NSMutableString *t = [NSMutableString stringWithFormat:@"暂无记录\n\n当前筛选：%@",
                           [self filterDesc]];
     // 🔴 v0.0.37：真机上用户卡在这里过 —— 红点（当时是全库口径）亮着，点进某个 App
-    //    却是空的，于是"红点永远消不掉"。现在红点已经改成同口径了，但**更早的未读
-    //    仍然存在**，只是被时间窗挡住。不说清楚的话，用户会以为记录丢了。
+    //    却是空的，于是"红点永远消不掉"。现在红点已经改成同口径了，但筛选之外的未读
+    //    仍然存在。不说清楚的话，用户会以为记录丢了。
     // v0.0.39：这里原来自己再查一遍 `bundlesWithUnread`（全库 App 集合），
-    //    现在直接用 `loadData` 算好的 `self.olderUnread` —— **同一个量只算一次**。
-    //    同时语义收紧：只有"窗口内一条未读都没有、更早还有"时它才 > 0，
-    //    所以原来那个 `selectedSegmentIndex != 2` 的判断也不需要了
-    //    （`since == 0` 时 `olderUnread` 恒为 0，由 `updateOlderUnread` 保证）。
-    if (self.olderUnread > 0) {
-        [t appendFormat:@"\n\n⚠️ 还有 %ld 条更早的未读记录，被时间筛选挡住了 —— "
-                         @"把时间切到「不限时间」就能看到。", (long)self.olderUnread];
+    //    现在直接用 `loadData` 算好的那个数 —— **同一个量只算一次**。
+    // v0.0.40：文案改成和顶部提示条**同源**（`hiddenHintText`）。
+    //    以前这里自己写一句"被时间筛选挡住了 —— 把时间切到「不限时间」"，
+    //    而 v0.0.40 起那个数还包含"被 App 图标挡住"和"被搜索挡住"的情况 ⇒
+    //    那句话在搜索态下就是错的（照它切时间什么也不会变）。
+    if (self.hiddenUnread > 0) {
+        [t appendFormat:@"\n\n%@", [self hiddenHintText]];
     }
     if (self.unreadOnly) {
         [t appendString:@"\n\n（当前是「只看未读」，切上面「全部」可以看所有记录）"];
