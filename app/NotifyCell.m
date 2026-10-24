@@ -7,6 +7,7 @@
 @property (nonatomic, strong) UILabel *titleLabel2;
 @property (nonatomic, strong) UILabel *msgLabel;
 @property (nonatomic, strong) UILabel *timeLabel;
+@property (nonatomic, strong) UIView *dotView;      // v0.0.35 未读点
 @end
 
 @implementation NotifyCell
@@ -23,6 +24,14 @@
     self.iconBox.layer.cornerRadius = 9;
     self.iconBox.clipsToBounds = YES;
     [self.contentView addSubview:self.iconBox];
+
+    // v0.0.35：未读点。放在图标左边（见 layoutSubviews 里的 DOT_X/ICON_X）。
+    // 默认 hidden —— 万一某处忘了调 setUnread:，宁可少一个点，也不要给所有行都点上。
+    self.dotView = [[UIView alloc] init];
+    self.dotView.backgroundColor = [UIColor systemBlueColor];
+    // 圆的半径在 layoutSubviews 里按 dotD / 2 算（改尺寸不会忘同步）
+    self.dotView.hidden = YES;
+    [self.contentView addSubview:self.dotView];
 
     self.iconView = [[UIImageView alloc] init];
     self.iconView.contentMode = UIViewContentModeScaleAspectFit;
@@ -59,14 +68,25 @@
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat w = self.contentView.bounds.size.width;
+    CGFloat h = self.contentView.bounds.size.height;
     CGFloat pad = 14;
     CGFloat side = 46;
 
-    self.iconBox.frame = CGRectMake(pad, (self.contentView.bounds.size.height - side) / 2, side, side);
+    // v0.0.35：左侧让出 8pt 给未读点。
+    // 🔴 未读/已读两态**共用同一个 iconX**（不是"只有未读才右移"）：
+    //    否则同一屏里图标左缘会参差不齐，比没有点更乱。
+    CGFloat dotD = 8;
+    CGFloat dotX = 12;
+    CGFloat iconX = dotX + dotD + 2;
+    self.dotView.frame = CGRectMake(dotX, (h - dotD) / 2, dotD, dotD);
+    // 半径按 dotD 算，改尺寸时不用记得同步 cornerRadius
+    self.dotView.layer.cornerRadius = dotD / 2;
+
+    self.iconBox.frame = CGRectMake(iconX, (h - side) / 2, side, side);
     self.iconView.frame = self.iconBox.bounds;
     self.letterLabel.frame = self.iconBox.bounds;
 
-    CGFloat textX = pad + side + 12;
+    CGFloat textX = iconX + side + 12;
     CGFloat timeW = 78;
     self.titleLabel2.frame = CGRectMake(textX, 12, w - textX - timeW - pad, 20);
     self.timeLabel.frame = CGRectMake(w - pad - timeW, 13, timeW, 16);
@@ -108,6 +128,12 @@
     self.timeLabel.text = text;
 }
 
+- (void)setUnread:(BOOL)unread {
+    // 只切 hidden、不改颜色：`hidden` 不参与布局计算，也就不会因为
+    // 未读/已读切换而触发多余的 layout 抖动。
+    self.dotView.hidden = !unread;
+}
+
 - (void)prepareForReuse {
     [super prepareForReuse];
     self.iconView.image = nil;
@@ -117,6 +143,11 @@
     self.titleLabel2.text = nil;
     self.msgLabel.text = nil;
     self.timeLabel.text = nil;
+    // 🔴 v0.0.35：未读点**必须**在这里复位。
+    //    不复位的话，第 3 行（未读）被复用到第 30 行（已读）时会把蓝点一起带过去 ——
+    //    这是 cell 复用最经典的串行 bug，而且单元测试抓不到、代码看着也没错：
+    //    cellForRow 里明明调了 setUnread:NO，显示的却还是上一个 cell 的点。
+    self.dotView.hidden = YES;
 }
 
 @end

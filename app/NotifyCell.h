@@ -20,6 +20,13 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)setTimeText:(nullable NSString *)text;
 
+// v0.0.35：未读标记（左侧 8pt 蓝点）。
+// 🔴 为什么用"点"而不是"标题加粗/变灰"：
+//    15pt semibold 到 bold 在小屏上几乎看不出差别；而"已读标题变灰"会让整屏发灰，
+//    用户第一眼会以为列表坏了。侧面一个点是最不打扰、又一眼能数的做法。
+// 🔴 传 NO 时点必须**真的消失**（hidden），不能只改颜色 —— 未读和已读要能"数出来"。
+- (void)setUnread:(BOOL)unread;
+
 + (CGFloat)height;
 
 @end
