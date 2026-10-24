@@ -23,13 +23,16 @@ NS_ASSUME_NONNULL_BEGIN
 // 🔴 只回"有没有"，不回条数 —— 红点不显示数字，查询越轻越好。
 // 🔴 别拿 `bundleCounts` 兼职：它数的是**全部**条数（v0.0.13 给 App 选择器排序用的），
 //    拿它判未读会"所有 App 永远都有红点"。
-+ (NSSet<NSString *> *)bundlesWithUnread;
 // v0.0.37：带时间窗的版本 —— 红点必须和列表**看同一个范围**。
 // 🔴 v0.0.36 的真机 bug：红点用的是全库口径，列表却只查 `now-86400` 之后，
 //    结果「有红点 → 点进去暂无记录 → 红点永远消不掉」。用户看到的是一个
 //    自己清不掉的提示，比不打红点更糟。
 //    ⇒ 红点语义改成「**当前时间窗内**有未读」，永远点得进去、清得掉。
-//    `since <= 0` 等价于全库（= 上面那个不带参的版本）。
+//    `since <= 0` 等价于全库。
+// 🔴 v0.0.39：**不带参的 `bundlesWithUnread` 已删除**（死的公开 API）。
+//    它唯一的调用者是空列表提示，而那个提示现在改问「更早还有**多少条**」——
+//    要条数就得用 `unreadCountWithBundle:since:`（它连"某个 App + 某段时间"都能算，
+//    是这套查询的超集）。留着它就是留一条谁都可能误用的老路。
 + (NSSet<NSString *> *)bundlesWithUnreadSince:(NSTimeInterval)since;
 // v0.0.13：bundle -> 通知条数。App 选择器用它把「经常来通知的」排前面。
 + (NSDictionary<NSString *, NSNumber *> *)bundleCounts;
