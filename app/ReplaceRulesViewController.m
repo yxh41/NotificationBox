@@ -399,7 +399,10 @@ static NSMutableArray<NSNumber *> *NBZeroArray(NSUInteger n) {
     // 与引擎一致：只看盒子里存的**原文**（记录发生在替换之前，所以原文是真的原文）
     // v0.0.36：`queryWithBundle:` 多了 `unreadOnly` 参数。这里恒传 NO ——
     // 替换规则的「试运行」是要匹配**全部**记录，不受界面那个"只看未读"开关影响。
+    // v0.0.42：又多了一个 `searchBundles`。这里恒传 nil —— 试运行和主列表的搜索框无关，
+    // 它要的是"库里所有记录"（search 也是 nil ⇒ searchBundles 本来就该 nil）。
     NSArray<NSDictionary *> *notes = [NotifyStore queryWithBundle:nil since:0 search:nil
+                                                    searchBundles:nil
                                                         unreadOnly:NO];
 
     NSMutableArray<NSNumber *> *hit = NBZeroArray(n);

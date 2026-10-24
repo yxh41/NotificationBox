@@ -6,11 +6,18 @@
 #import "AppIconLoader.h"
 // v0.0.33：点开看全文 + 复制 + 删单条
 #import "NotifyDetailViewController.h"
+// v0.0.42：App 显示名（bundle -> 名字）。列表要显示它，搜索也要用它匹配。
+#import "InstalledApps.h"
 
 // v0.0.38：「全标已读」按钮的固定宽度。「全标已读」4 个汉字 @14pt ≈ 56pt，
 // 加左右各 16pt 内边距 ⇒ 88 够宽裕。写常量是因为布局里要拿它算分段控件的宽度，
 // 两处各写一个数字的话，改了其中一个就会出现"按钮压住分段控件"。
 static const CGFloat kNBMarkAllWidth = 88;
+
+// v0.0.42：搜索防抖窗口。
+// 250ms 的依据：真人连续打字的间隔通常在 100~200ms，250ms 能吃掉整串输入；
+// 再长（比如 500ms）用户会觉得"我打完了它还没反应"。
+static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 
 // 🔴 盒子 App：读 NotifyStore 的 SQLite，展示通知列表
 //    - 顶部横向 App 图标栏（抖音聊天页那种）：点击筛选对应 bundle
@@ -84,6 +91,26 @@ static const CGFloat kNBMarkAllWidth = 88;
 //    不放导航栏标题、也不放分段控件里：那两处都要**赌系统怎么排**（标题会被压缩/截断，
 //    分段控件段宽是系统算的）。v0.0.37 已经被系统 scope bar 教过一次。
 @property (nonatomic, strong) UIButton *hiddenHint;
+// v0.0.42：bundle -> App 显示名。**同时给两件事用**：
+//   ① 列表每一行显示「这条是哪个 App 的」—— 以前只有图标，图标加载失败就只剩一个字母；
+//   ② 搜索时把「微信」「招商银行」这种词匹配成 bundle 列表，再传给 NotifyStore。
+// 🔴 为什么放在界面层算、不放进 NotifyStore：库里只有 bundle id，App 显示名属于
+//    界面知识（要 LSApplicationProxy / Info.plist 扫描）。把它写进库就得改 schema +
+//    迁移老记录；而**查询时现算**对库里已有的记录**立即生效**，不用重装、不用重记。
+// 🔴 `reloadIconBar` 尾部重建 —— `InstalledApps +all` 自己有缓存（`gCache`），
+//    所以每次 `loadData` 只是"遍历一个数组塞进字典"，没有 I/O。
+@property (nonatomic, strong) NSDictionary<NSString *, NSString *> *appNameMap;
+// v0.0.42：搜索防抖的**代次**。每敲一个字 +1，挂起的 block 只有代次没变才执行。
+// 🔴 为什么必须有这个数：只用一个 BOOL 标记的话，"敲 a、敲 ab、敲 abc" 会排三个
+//    250ms 后执行的 block，三个都会跑 ⇒ 一次输入跑三次 `loadData`，比不防抖更慢。
+@property (nonatomic, assign) NSUInteger searchGen;
+// v0.0.42：列表底部「下面还有 N 条更早记录」。
+// 🔴 用 `table.tableFooterView`，**绝不做"假行"** —— 行号必须和 `self.items` 严格一一对应，
+//    否则 `reloadRowsAtIndexPaths:` / `deleteRowsAtIndexPaths:` 会错位
+//    （v0.0.33 删除场景已经栽过一次）。
+// 🔴 和顶部提示条的分工：顶部管「**未读**被筛选掉了」，底部管「**已读**被列表上限截断了」。
+//    两个场景互斥，不会同时喊同一件事。
+@property (nonatomic, strong) UILabel *moreFooter;
 
 - (void)onDiag:(id)sender;
 - (void)onSettings:(id)sender;
@@ -116,6 +143,18 @@ static const CGFloat kNBMarkAllWidth = 88;
 - (void)refreshUnreadDerived;
 // v0.0.41：点顶部提示条 ⇒ 三个筛选一次清干净
 - (void)onHiddenHintTap;
+// v0.0.42：重建 bundle -> App 显示名 映射（`reloadIconBar` 尾部调一次）
+- (void)rebuildAppNames;
+// v0.0.42：单条查 App 名（查不到退回 bundle 末段，不要显示成空白）
+- (NSString *)appNameForBundle:(NSString *)bid;
+// v0.0.42：把搜索词匹配成 bundle 列表（匹配 App 显示名**或** bundle id 本身）
+- (NSArray<NSString *> *)bundlesMatchingSearch:(NSString *)q;
+// v0.0.42：搜索防抖。250ms 内连续输入只跑最后一次
+- (void)scheduleLoadData;
+// v0.0.42：作废挂起的防抖（"清空筛选"这类动作要立刻执行，不能让挂起的再补一刀）
+- (void)cancelPendingLoadData;
+// v0.0.42：底部「还有 N 条更早记录」的显隐与文案
+- (void)updateMoreFooter;
 // v0.0.38：时间段的显示名 / 「App + 时间」两维的范围描述
 // 🔴 抽出来是因为确认框文案和空列表文案都用到它，字面量写两处就会不一致
 - (NSArray<NSString *> *)timeNames;
@@ -791,6 +830,49 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 夹回滚动位置（内容变短时也安全）
     CGFloat maxX = MAX(0, x - self.iconBar.bounds.size.width);
     self.iconBar.contentOffset = CGPointMake(MIN(barOff.x, maxX), barOff.y);
+
+    // v0.0.42：App 名映射跟着图标栏一起重建。
+    // 🔴 为什么挂在这里：新 App 第一次来通知时 `self.bundles` 会变长，
+    //    这时列表里马上就会出现它的记录。映射若只建一次，那一行就没名字。
+    // 🔴 成本可忽略：`InstalledApps +all` 自己有 `gCache`，这里只是把数组塞进字典。
+    [self rebuildAppNames];
+}
+
+#pragma mark - v0.0.42 App 名（列表显示 + 搜索匹配）
+
+- (void)rebuildAppNames {
+    NSMutableDictionary<NSString *, NSString *> *m = [NSMutableDictionary dictionary];
+    for (InstalledApp *a in [InstalledApps all]) {
+        if (!a.bundleId.length) continue;
+        m[a.bundleId] = a.name.length ? a.name : a.bundleId;
+    }
+    self.appNameMap = m;
+}
+
+- (NSString *)appNameForBundle:(NSString *)bid {
+    if (!bid.length) return nil;
+    NSString *n = self.appNameMap[bid];
+    if (n.length) return n;
+    // 兜底：菜单里还没出现过这个 App（比如刚装上、还没重建过映射）。
+    // 🔴 不要返回 nil / 空串 —— 列表里那一行就没有名字，看起来像"这个 App 叫空"。
+    return [self shortName:bid];
+}
+
+- (NSArray<NSString *> *)bundlesMatchingSearch:(NSString *)q {
+    if (!q.length) return nil;
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (NSString *bid in self.appNameMap) {
+        NSString *name = self.appNameMap[bid];
+        // ① 匹配 App 显示名（用户想的是「微信」，不是 com.tencent.xin）
+        NSRange r1 = [name rangeOfString:q
+                                 options:NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch];
+        // ② 也匹配 bundle id 本身（懂行的人会直接搜 `tencent`）
+        NSRange r2 = [bid rangeOfString:q options:NSCaseInsensitiveSearch];
+        if (r1.location != NSNotFound || r2.location != NSNotFound) {
+            [out addObject:bid];
+        }
+    }
+    return out.count ? out : nil;
 }
 
 // v0.0.36：只刷新红点，**不重建按钮**。
@@ -846,9 +928,14 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         self.filterBundle = nil;
     }
 
+    // v0.0.42：搜索也要匹配 App 名。**匹配在界面层做**（库里没有 App 显示名），
+    // 算好的 bundle 列表作为参数传下去。`searchBundles` 只在 `search` 非空时才有意义。
+    NSArray<NSString *> *searchBundles = [self bundlesMatchingSearch:self.searchText];
+
     self.items = [NotifyStore queryWithBundle:self.filterBundle
                                         since:[self sinceFromSeg]
                                        search:self.searchText
+                               searchBundles:searchBundles
                                    unreadOnly:self.unreadOnly];
     [self.table reloadData];
     [self updateEmptyView];
@@ -866,12 +953,60 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.lastTotal = total;
     self.lastMaxId = [NotifyStore maxRowId];
 
+    // v0.0.42：底部「还有 N 条更早记录」。必须排在 `reloadData` 之后（那时 items 才定）。
+    [self updateMoreFooter];
+
     // v0.0.40：筛选之外未读的条数在这里算（`loadData` 是唯一的刷新入口 ⇒ 不会被漏）。
     // 🔴 后面那句 `setNeedsLayout` 不能省：提示条出现/消失会改变图标栏和列表的**起始 y**，
     //    而那个 y 只在 `viewDidLayoutSubviews` 里算。不触发重布局的话，
     //    切完时间段、`hiddenUnread` 从 12 变成 0，提示条会**继续留在屏幕上**。
     [self updateHiddenUnread];
     [self.view setNeedsLayout];
+}
+
+// v0.0.42：底部「下面还有 N 条更早记录」。
+// 🔴 为什么会有这个差：列表是 `LIMIT listLimit`（2000），而 `maxRecords` 允许用户填到 99999。
+//    用户把上限调到 5000 时，库里 5000 条、列表只显示最新 2000 —— 剩下 3000 条
+//    **既看不到、也左滑删不掉**（只能"清空"）。以前界面对此一个字都不说。
+// 🔴 数从哪来：`countWithBundle:…`（当前筛选下的总条数）− `self.items.count`。
+//    两者必须走同一个 `NBPrepareScope`，否则会出现"列表已经到底了、底部还在说还有 3 条"。
+// 🔴 为什么用 `tableFooterView` 而不是"最后多加一行"：行号必须和 `self.items` 严格对应，
+//    加假行会让 `reloadRowsAtIndexPaths:` / `deleteRowsAtIndexPaths:` 全部错位
+//    （v0.0.33 删除场景栽过一次）。
+// 🔴 和顶部提示条的分工：顶部管「**未读**被筛选挡掉了」，这里管「**记录**被列表上限截断了」。
+//    两个场景不会同时成立（顶部说的是未读、这里说的是条数），不会互相吵。
+- (void)updateMoreFooter {
+    NSInteger scopeCount = [NotifyStore countWithBundle:self.filterBundle
+                                                  since:[self sinceFromSeg]
+                                                 search:self.searchText
+                                          searchBundles:[self bundlesMatchingSearch:self.searchText]];
+    NSInteger shown = (NSInteger)self.items.count;
+    // scopeCount < 0 ⇒ DB 打不开，宁可不提示（跟 `updateHiddenUnread` 的处理一致）
+    NSInteger more = (scopeCount >= 0) ? (scopeCount - shown) : 0;
+
+    if (more <= 0) {
+        self.table.tableFooterView = nil;
+        return;
+    }
+
+    if (!self.moreFooter) {
+        UILabel *l = [[UILabel alloc] init];
+        l.font = [UIFont systemFontOfSize:12];
+        l.textColor = [UIColor secondaryLabelColor];
+        l.textAlignment = NSTextAlignmentCenter;
+        l.numberOfLines = 2;
+        self.moreFooter = l;
+    }
+    // 🔴 「列表上限」这个数字从 `NotifyStore` 取，**不要**在界面里另写一个 2000
+    self.moreFooter.text = [NSString stringWithFormat:
+        @"下面还有 %ld 条更早的记录\n列表一次最多显示 %ld 条，更早的在库里、这里翻不到",
+        (long)more, (long)[NotifyStore listLimit]];
+
+    CGFloat w = self.table.bounds.size.width;
+    if (w <= 0) w = [UIScreen mainScreen].bounds.size.width;
+    CGSize fit = [self.moreFooter sizeThatFits:CGSizeMake(w - 24, CGFLOAT_MAX)];
+    self.moreFooter.frame = CGRectMake(12, 0, w - 24, MAX(48, fit.height + 20));
+    self.table.tableFooterView = self.moreFooter;
 }
 
 // v0.0.40：算「当前筛选之外还有多少条未读」，顺手把提示文案写好。
@@ -888,9 +1023,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.hiddenUnread = 0;
     NSInteger all = [NotifyStore unreadCountWithBundle:nil since:0 search:nil];
     if (all > 0) {
+        // v0.0.42：**必须带 `searchBundles`**。搜索现在能命中 App 名，
+        // 列表因此多显示了若干条 ⇒ 如果这里还按"只匹配标题正文"算筛选内未读，
+        // 那个数就偏小、`hiddenUnread` 偏大 ⇒ 顶部又变成"列表里都读完了还在喊还有 N 条"。
+        // 这条坑 v0.0.40 花整版买过一次，所以把 `bundlesMatchingSearch:` 这里也调一遍
+        // （返回 nil 时传 nil，和 `loadData` 完全同一条路）。
         NSInteger inScope = [NotifyStore unreadCountWithBundle:self.filterBundle
                                                         since:[self sinceFromSeg]
-                                                       search:self.searchText];
+                                                       search:self.searchText
+                                                searchBundles:[self bundlesMatchingSearch:self.searchText]];
         // 🔴 `inScope < 0`（DB 打不开）时宁可不提示，也不显示一个可能是瞎猜的数。
         if (inScope >= 0) self.hiddenUnread = MAX(0, all - inScope);
     }
@@ -949,6 +1090,12 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                          @"可以到「设置 → 记录上限」把它调小一些，让列表能一次装下。"];
         return;
     }
+    // v0.0.42：作废挂起的搜索防抖。
+    // 🔴 不清的话，"刚敲完字、防抖还没到点就点了提示条"会这样：
+    //    提示条把筛选全清干净 → 立刻 `loadData`（列表变全）→ 250ms 后挂起的那个
+    //    再跑一次 `loadData`。结果虽然一样、用户看不出来，但白跑一次全量查询
+    //    （6~8 条 SQL + 重建图标栏 + 重载 2000 行）—— 正是这版要省掉的那笔开销。
+    [self cancelPendingLoadData];
     [self loadData];
 }
 
@@ -1097,6 +1244,41 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 #pragma mark - UISearchBarDelegate
 - (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
     self.searchText = searchText.length ? searchText : nil;
+    // v0.0.42：**防抖**，不再每敲一个字就全量重查。
+    // 🔴 以前这里是直接 `[self loadData]`，而一次 `loadData` 要跑 6~8 条 SQL：
+    //    `reloadIconBar`（DISTINCT bundle + 未读集合 + 重建图标按钮）、列表查询（最多 2000 行）、
+    //    `count`、`maxRowId`、`updateHiddenUnread` 的两条 COUNT，外加 v0.0.42 新增的
+    //    `countWithBundle:…`。打一个 4 字词 = 5 次全量刷新，量级到 500 条以上就能感觉到卡。
+    // 🔴 为什么用 `searchGen` 代次而不是一个 BOOL 标记：BOOLean 标记挡不住"排了三个 block"
+    //    （敲 a、ab、abc 各排一个）⇒ 三个都会跑，比不防抖更慢。
+    [self scheduleLoadData];
+}
+
+- (void)scheduleLoadData {
+    NSUInteger gen = ++self.searchGen;   // 先自增，让之前挂起的那些全部作废
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kNBAutoSearchDelay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(ws) ss = ws;
+        if (!ss) return;
+        // 代次变了 ⇒ 后面还有更新的输入在排队，这一枪让给它
+        if (ss.searchGen != gen) return;
+        [ss loadData];
+    });
+}
+
+- (void)cancelPendingLoadData {
+    // 只把代次推进一格：所有挂起的 block 跑起来都会发现自己过期了，直接返回。
+    // 🔴 比"再维护一个 dispatch_block_cancel"简单，也不会漏掉已经进队列的那些。
+    self.searchGen++;
+}
+
+// v0.0.42：按键盘上的「搜索」键 ⇒ **立刻**出结果，不等防抖。
+// 🔴 防抖是为了省掉"打字中的中间态"，但用户主动按了搜索键就是在说"我现在要结果"。
+//    让他再等 250ms 是没道理的，而且他会以为按了没反应、再按一次。
+- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
+    [searchBar resignFirstResponder];
+    [self cancelPendingLoadData];
     [self loadData];
 }
 
@@ -1138,6 +1320,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 
     UIImage *ic = [AppIconLoader iconForBundle:bid];
     [c setIcon:ic letter:[self shortName:bid]];
+    // v0.0.42：一行小字报出「这条是哪个 App 的」。
+    // 🔴 以前只有图标 —— 图标加载失败就只剩一个首字母，而「b」「m」这种字母
+    //    在十几个 App 的列表里分辨不出来。而"这条到底是哪个 App 弹的"
+    //    恰恰是这个盒子最需要回答的问题（用户来查的就是"谁在打扰我"）。
+    [c setAppName:[self appNameForBundle:bid]];
     [c setTitleText:title message:msg subtitle:sub];
     [c setTimeText:[fmt stringFromDate:date]];
     // v0.0.35：`read` 字段数据层早就有了（`queryWithBundle:` 的 SELECT 里一直带着），
