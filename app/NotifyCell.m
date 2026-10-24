@@ -297,8 +297,11 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
 
 // v0.0.48：关键词"标星"动作。和未读点一样只切 hidden（★ 不改变其它元素布局，
 // 只有 App 名那一行在标星时收宽，见 layoutSubviews）。
+// 🔴🔴 必须直接写 `_starred`，⛔ 不许写 `self.starred = starred;` —— 那就是
+//    在 setter 里调自己 ⇒ 无限递归 ⇒ 一标星就爆栈（CI #98 的 clang
+//    -Wunused-property-ivar 逮到的正是这个：ivar 没在 accessor 里被引用）。
 - (void)setStarred:(BOOL)starred {
-    self.starred = starred;
+    _starred = starred;
     self.starLabel.hidden = !starred;
 }
 
