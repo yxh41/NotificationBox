@@ -261,11 +261,77 @@ void NBSharedLog(NSString *fmt, ...) {
     return m;
 }
 
+// v0.0.38：改成参数绑定。
+// 🔴 不是因为 rowId 有注入面（它是整数，没有），而是因为 v0.0.33 在下面 `deleteRow:`
+//    的注释里写着「一处拼串、一处绑参，以后有人把某个参数换成字符串时就会在拼串那处出事」
+//    —— 同文件里注释和代码自相矛盾了五版。删除和标记都是「按 id 改一行」，
+//    写法应该只有一种。
 + (void)markRead:(NSInteger)rowId {
     sqlite3 *db = [self openDB];
     if (!db) return;
-    sqlite3_exec(db, [[NSString stringWithFormat:@"UPDATE notifications SET read=1 WHERE id=%ld", (long)rowId] UTF8String], NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE notifications SET read=1 WHERE id=?", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)rowId);
+        if (sqlite3_step(st) != SQLITE_DONE) {
+            NBStoreLog(@"markRead 失败 id=%ld err=%s", (long)rowId, sqlite3_errmsg(db));
+        }
+        sqlite3_finalize(st);
+    }
     sqlite3_close(db);
+}
+
+// v0.0.38：批量标记 / 批量计数的**共用条件**。
+// 🔴 拼 WHERE 和绑参必须在同一个函数里，不能拆成「拼一个函数、绑一个函数」——
+//    拆开就有"两边顺序不一致"的可能，而这类错不会报错，只会静默少筛一个条件。
+// 🔴 两个调用方必须用同一套条件：界面上的确认文案报的是「将要改多少条」，
+//    计数和实际改动只要有一点点不一样，就会出现"说改 5 条、实际改了 200 条"
+//    （v0.0.35 的 `onClear:` 已经栽过一次：报列表 3 条、实际清整张表）。
+// 🔴 值一律绑参：bundle 是字符串，来自 App 侧调用，是这里唯一真正的注入面。
+static sqlite3_stmt *NBPrepareUnreadScope(sqlite3 *db,
+                                          NSString *sqlHead,
+                                          NSString * _Nullable bundle,
+                                          NSTimeInterval since) {
+    NSMutableString *sql = [NSMutableString stringWithString:sqlHead];
+    if (bundle.length) [sql appendString:@" AND bundle=?"];
+    if (since > 0) [sql appendString:@" AND ts>=?"];
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) return NULL;
+    int i = 1;
+    if (bundle.length) sqlite3_bind_text(st, i++, [bundle UTF8String], -1, SQLITE_TRANSIENT);
+    if (since > 0) sqlite3_bind_double(st, i++, (double)since);
+    return st;
+}
+
++ (NSInteger)markAllReadWithBundle:(NSString * _Nullable)bundle since:(NSTimeInterval)since {
+    sqlite3 *db = [self openDB];
+    if (!db) return -1;
+    NSInteger n = -1;
+    // `WHERE read=0` 不只是优化：`sqlite3_changes` 数的是"真的被改写的行"，
+    // 已经 read=1 的行不会重复计数 ⇒ 返回值正好是"这次标掉了多少条未读"。
+    sqlite3_stmt *st = NBPrepareUnreadScope(db, @"UPDATE notifications SET read=1 WHERE read=0",
+                                            bundle, since);
+    if (st) {
+        if (sqlite3_step(st) == SQLITE_DONE) n = (NSInteger)sqlite3_changes(db);
+        sqlite3_finalize(st);
+    } else {
+        NBStoreLog(@"markAllRead 失败 err=%s", sqlite3_errmsg(db));
+    }
+    sqlite3_close(db);
+    return n;
+}
+
++ (NSInteger)unreadCountWithBundle:(NSString * _Nullable)bundle since:(NSTimeInterval)since {
+    sqlite3 *db = [self openDB];
+    if (!db) return -1;
+    NSInteger n = -1;
+    sqlite3_stmt *st = NBPrepareUnreadScope(db, @"SELECT COUNT(*) FROM notifications WHERE read=0",
+                                            bundle, since);
+    if (st) {
+        if (sqlite3_step(st) == SQLITE_ROW) n = (NSInteger)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return n;
 }
 
 // v0.0.33：删单条。返回 YES = 真的删掉了（id 不存在 ⇒ NO，界面据此提示"这条已经没了"）。
@@ -319,6 +385,23 @@ void NBSharedLog(NSString *fmt, ...) {
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM notifications", -1, &st, NULL) == SQLITE_OK) {
         if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return n;
+}
+
+// v0.0.38：给「列表要不要重查」当探针。空表返回 0，DB 打不开返回 -1。
+// 🔴 `IFNULL(MAX(id),0)`：空表时 `MAX(id)` 是 NULL，`sqlite3_column_int64` 读 NULL 也回 0，
+//    但显式写 IFNULL 是为了让"0 = 空表"这件事在 SQL 里就说清楚，而不是靠 C 层的巧合。
++ (NSInteger)maxRowId {
+    sqlite3 *db = [self openDB];
+    if (!db) return -1;
+    NSInteger n = 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, "SELECT IFNULL(MAX(id),0) FROM notifications",
+                           -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) n = (NSInteger)sqlite3_column_int64(st, 0);
         sqlite3_finalize(st);
     }
     sqlite3_close(db);
