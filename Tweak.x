@@ -1,4 +1,14 @@
-// Tweak.x —— v0.0.52（当前）：**tweak 侧有逻辑改动** ——
+// Tweak.x —— v0.0.53（当前）：**诊断版** ——
+//   真机反馈：v0.0.52 的 `[NC-CLEAR] 已清` 日志能打出来（说明 `_clearBulletinIDs:…` 存在、
+//   调用不抛异常），但通知中心那条**没消失**。这正是本项目最贵的一条教训：
+//   「自证里的数对了 ≠ 界面上发生了」—— 日志只证明"我们调了"，不证明"它删了"。
+//   ⇒ v0.0.53 不改逻辑，只加两处**零风险只读诊断**：
+//   ① %ctor 把 BBServer 上 clear/remove/dismiss/withdraw/bulletinID 相关方法名全打出来
+//      （只打名字、不调用未知方法），据此选下一步正确的 API；
+//   ② 清除回调里 shouldSync 的 YES/NO 都试一遍，并在清除**前后各量一次**
+//      `_bulletinIDsForSectionID:` 的真实 live ID —— 用"清单有没有变"来区分三种病因：
+//      sysId 本来就不在名单里 = ID 不对；调完还在 = 方法对本机无效；消失但界面还在 = UI 没刷新。
+//   以下为 v0.0.52 功能主体（保留）：
 //   「删除盒子记录时同步清系统通知中心」（精确 1:1）：
 //   ① NBRecordItem 记录时读系统 bulletin ID（bulletinID / notificationIdentifier）存进库；
 //   ② %ctor 在 SpringBoard 注册 Darwin 通知观察者；盒子 App 删单条记录时写请求文件 + post；
@@ -303,6 +313,42 @@ static void NBCaptureServerIfNeeded(id server) {
     });
 }
 
+// v0.0.53 诊断：把通知中心里**当前真实存在**的 bulletin ID 打出来，跟库里存的 sys_id 对一下。
+// 🔴 只调用确实存在的选择器（respondsToSelector 守卫），逐个 @try；
+//    返回不是 NSArray 就当没读到；**不读元素内部的 KVC 键**（缺键会抛，违反本项目铁律）。
+static void NBDiagLogLiveIDs(id server, NSString *bundle) {
+    @try {
+        NSArray *sels = @[@"_bulletinIDsForSectionID:", @"bulletinIDsForSectionID:"];
+        for (NSString *nm in sels) {
+            SEL s = NSSelectorFromString(nm);
+            if (![server respondsToSelector:s]) continue;
+            @try {
+                // 🔴 用 performSelector 而不是 objc_msgSend 强转：后者在 -Werror 下可能触发
+                //    -Wcast-function-type；这里只压 ARC 的 performSelector 泄漏警告。
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id r = [server performSelector:s withObject:bundle];
+                #pragma clang diagnostic pop
+                if ([r isKindOfClass:[NSArray class]]) {
+                    NSArray *a = (NSArray *)r;
+                    NSMutableArray *strs = [NSMutableArray array];
+                    for (id x in a) {
+                        if ([x isKindOfClass:[NSString class]]) [strs addObject:(NSString *)x];
+                        else [strs addObject:[NSString stringWithFormat:@"<%@>", NBClassName(x)]];
+                    }
+                    NSString *d = [strs componentsJoinedByString:@","];
+                    if (d.length > 500) d = [[d substringToIndex:500] stringByAppendingString:@"…"];
+                    NBLog(@"[NC-DIAG] %@ => %lu 个: %@", nm, (unsigned long)a.count, d);
+                } else {
+                    NBLog(@"[NC-DIAG] %@ => 非数组(%@)", nm, NBClassName(r));
+                }
+            } @catch (NSException *e) {
+                NBLog(@"[NC-DIAG] %@ 抛异常:%@", nm, e);
+            }
+        }
+    } @catch (__unused NSException *e) { }
+}
+
 // 🔴 盒子 App 删记录后唤醒我们，在 BBServer 队列上精确清掉那一条通知。
 //   放在正确队列上是关键：_clearBulletinIDs:… 必须在 BBServer 内部队列上调，否则会报错。
 static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
@@ -327,12 +373,25 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         dispatch_sync(gBBServerQueue, ^{
         #pragma clang diagnostic pop
+            NBLog(@"=== [NC-CLEAR] 请求 sysId=%@ bundle=%@（先量 live ID）", sysId, bundle);
+            // 诊断 ①：清除**前**看通知中心里真实有哪些 ID —— 判断我们存的 sysId 到底在不在里面。
+            NBDiagLogLiveIDs(gBBServer, bundle);
+            // shouldSync 两个取值都试：YES 无效时 NO 可能有效（都只影响"是否同步到配对设备"）。
             @try {
                 [gBBServer _clearBulletinIDs:@[sysId] forSectionID:bundle shouldSync:YES];
-                NBLog(@"=== [NC-CLEAR] 已清 sysId=%@ bundle=%@", sysId, bundle);
+                NBLog(@"=== [NC-CLEAR] YES 已调 sysId=%@", sysId);
             } @catch (NSException *e) {
-                NBLog(@"!!! [NC-CLEAR] 调用抛异常：%@", e);
+                NBLog(@"!!! [NC-CLEAR] YES 抛异常：%@", e);
             }
+            @try {
+                [gBBServer _clearBulletinIDs:@[sysId] forSectionID:bundle shouldSync:NO];
+                NBLog(@"=== [NC-CLEAR] NO 已调 sysId=%@", sysId);
+            } @catch (NSException *e) {
+                NBLog(@"!!! [NC-CLEAR] NO 抛异常：%@", e);
+            }
+            // 诊断 ②：清除**后**再量一次 —— sysId 还在名单里 = BB 根本没清掉（ID 不对/方法无效）；
+            //   已消失但界面还在 = UI 刷新问题。两种病因必须能分开。
+            NBDiagLogLiveIDs(gBBServer, bundle);
         });
     } @catch (NSException *e) {
         NBLog(@"!!! [NC-CLEAR] 回调异常：%@", e);
@@ -806,7 +865,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.52 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.53 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -845,8 +904,27 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.52 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.53 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
+
+    // v0.0.53 诊断：把 BBServer 上跟「清除 / 移除 / 通知项 ID」相关的方法名全打出来。
+    // 🔴 目的：`_clearBulletinIDs:` 存在、调用也不抛异常，但通知中心那条没消失 ——
+    //    需要知道 iOS 16 到底还有哪些可用的枚举/清除方法，下一步按清单选正确的那个（不靠猜）。
+    // 🔴 只打名字，**不调用任何未知方法**（零风险）。
+    {
+        NSMutableArray *rel = [NSMutableArray array];
+        for (NSString *n in names) {
+            NSString *low = [n lowercaseString];
+            if ([low containsString:@"clear"] || [low containsString:@"remove"]
+                || [low containsString:@"dismiss"] || [low containsString:@"withdraw"]
+                || [low containsString:@"bulletinid"] || [low containsString:@"allbulletin"]) {
+                [rel addObject:n];
+            }
+        }
+        NBLog(@"=== [v0.0.53 诊断] 清除/枚举相关方法 %lu 条：%@ ===",
+              (unsigned long)rel.count,
+              [[rel sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" | "]);
+    }
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
     if (h2) { NBLog(@"--> 挂 GPBR (publishBulletinRequest:destinations:)"); %init(GPBR); }
@@ -910,7 +988,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.52 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.53 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
