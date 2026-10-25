@@ -1,7 +1,10 @@
-// Tweak.x —— v0.0.50（当前）：**tweak 侧无逻辑改动**，只升版本号；本版改的是盒子 App
-//   （桌面图标接入：Resources/AppIcon.png + Info.plist CFBundleIcons，用户四选一选了 D 毛玻璃闭合盒）。
-//   🔴 最近一次 tweak 侧真的动是 v0.0.45：在 SpringBoard 后台代读 App 显示名、
-//      写进 `app_names` 表（病根与做法见 NBAppName.h）；v0.0.46 / v0.0.47 / v0.0.48 / v0.0.49 / v0.0.50 都只升版本号。
+// Tweak.x —— v0.0.51（当前）：**tweak 侧有逻辑改动**（本版起）——
+//   「连记录都不要」per-App 名单：NBRecordItem 在 recordWithBundle: 之前加闸门
+//   （NotifyFilter shouldSkipRecordForBundle:，读 settings.plist 的 noRecordApps）。
+//   只掐"记"这一路，过滤/替换/换声/朗读照跑。
+//   🔴 上一次 tweak 侧真的动是 v0.0.45：在 SpringBoard 后台代读 App 显示名、
+//      写进 `app_names` 表（病根与做法见 NBAppName.h）；
+//      v0.0.46 / v0.0.47 / v0.0.48 / v0.0.49 / v0.0.50 都只升版本号。
 //   🔴 为什么要由 tweak 来做（这是 v0.0.42/43/44 连着三版没修好的直接原因）：
 //     盒子 App 有沙盒，读不到 /var/containers/Bundle/Application/<UUID>/Xxx.app，
 //     而 App 自己 bundle 里本地化的 CFBundleDisplayName **才是桌面那个字的权威来源**。
@@ -296,6 +299,15 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
         }
         return nil;
     }
+
+    // v0.0.51：连记录都不要（per-App 名单）—— 命中的 App 不落库，但**不影响呈现**
+    //    （过滤/替换/换声/朗读照跑，通知照弹；这个开关只掐"记"这一路）。
+    // 🔴 摆在 NBClaimKey **之前**：没记的东西不该占去重表的名额；另两个入口还会
+    //    走到这儿，让它们也过同一条闸门，三个入口行为一致。
+    // 🔴 返回 bid 而不是 nil：调用方拿它做下游过滤判定，呈现层必须照常工作。
+    // 🔴 与黑名单的分工：黑名单拦"呈现"（记录已落库、盒子里仍看得到，v0.0.8 口径），
+    //    这里拦"记录"本身——用户要的是"这个 App 别在我盒子里留任何痕迹"。
+    if ([NotifyFilter shouldSkipRecordForBundle:bid]) return bid;
 
     NSString *key = [NSString stringWithFormat:@"%@|%@|%@", bid, title ?: @"", msg ?: @""];
     if (!NBClaimKey(key)) return bid;      // 已被另一个入口记过；bundle 仍有效
@@ -699,7 +711,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.50 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.51 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -737,7 +749,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.50 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.51 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -802,7 +814,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.50 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.51 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

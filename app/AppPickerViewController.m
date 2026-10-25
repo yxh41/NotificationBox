@@ -70,6 +70,8 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
         //    而且界面上看不出异常（值还在、只是变成读不出来的形状）⇒ 所有 App 一起哑。
         //    写盘一律走 persistSoundMap（内部只调 NotifyFilter 的 setSoundEntry:）。
         case NBAppPickModeSoundMap:  return NB_KEY_SOUND_MAP;
+        // v0.0.51：连记录都不要。普通数组键，和 speak/dnd 同族。
+        case NBAppPickModeNoRecord:  return NB_KEY_NO_RECORD_APPS;
     }
     return @"whitelist";
 }
@@ -81,6 +83,8 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
         case NBAppPickModeSpeak:     return @"朗读限定 App";
         case NBAppPickModeDnd:       return @"免打扰生效的 App";
         case NBAppPickModeSoundMap:  return @"给哪些 App 换提示音";
+        // v0.0.51：标题说清"不记录"和黑名单（不推送）不是一回事
+        case NBAppPickModeNoRecord:  return @"不记录的 App";
     }
     return @"选择 App";
 }
@@ -436,6 +440,14 @@ static UIImage *NBScaledIcon(UIImage *img, CGFloat side) {
             return @"这个列表为空 = 全部放行。一旦选了，就等于「只保留这些 App」，其它全部不弹（有杀伤力，慎重）。";
         case NBAppPickModeBlacklist:
             return @"选上的 App 通知不会被弹出，但仍然会记进盒子里。";
+        // v0.0.51：必须说清两件事——空列表 = 全部记录；勾了**照弹**（只不记）。
+        //     不说第二件，用户会以为这是"第二个黑名单"（又拦呈现又拦记录），
+        //     而两者的分工（v0.0.8 立的口径）是这个插件记录层的基本假设。
+        case NBAppPickModeNoRecord:
+            return @"这个列表为空 = 全部 App 都正常记录。\n"
+                    "选上的 App 连记录都不落库（盒子里不会留下任何痕迹），"
+                    "但通知照常弹出、朗读/换音/替换都照跑 —— 这和「黑名单」不一样："
+                    "黑名单只是不弹，记录仍然在盒子里看得到。";
     }
     return nil;
 }

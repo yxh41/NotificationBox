@@ -307,6 +307,17 @@ static inline NSArray<NSString *> *NBStringArray(id v) {
 //    ⇒ 直接把 speakEnabled 写成 NO 并留日志。崩溃自愈，不依赖用户操作。
 #define NOTIFYBOX_SPEAK_GUARD_PATH @"/var/mobile/Library/NotifyBox/.speak_guard"
 
+// ---------- v0.0.51：连记录都不要（per-App 名单） ----------
+// 语义：命中的 App **连记录都不落库**（闸门加在 Tweak.x 的 recordWithBundle: 之前），
+//   但**不影响呈现** —— 过滤/替换/换声/朗读照跑，通知照弹。
+// 🔴 它和黑名单（blacklist）是两件事，**不要合并**：
+//    黑名单拦的是"呈现"——记录早已落库，盒子里仍看得到（v0.0.8 立的口径：
+//    「记录永远存原始通知，过滤只改屏幕呈现，不污染记录」）；
+//    这个名单拦的是"记录"本身，用户要的是"这个 App 别在我盒子里留任何痕迹"。
+// 🔴 空/缺失 = 全部记录（与 speakApps/dndApps 同族：不填就不生效）。
+// 🔴 只有 App 侧写（设置页选择器）、tweak 侧读——和所有名单一样，别让 SpringBoard 写。
+#define NB_KEY_NO_RECORD_APPS @"noRecordApps"   // 数组或 "a,b"，空/缺失 = 全部记录
+
 // ---------- 统一日志 ----------
 // 🔴 v0.0.12：原来 Tweak.x 里有份 static NBLog，新加的 NotifySpeaker/NotifyProbe 够不着。
 //    **复制一份日志函数**是最差解（两份轮转逻辑迟早走岔），所以把实现沉到 NotifyStore.m

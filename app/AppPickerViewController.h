@@ -20,6 +20,12 @@ typedef NS_ENUM(NSInteger, NBAppPickMode) {
     //    界面上有一个「勾了 App 却不出声」的按钮 —— 它写进去的东西没人读。
     //    ⇒ 旧写法只保留"被读"的部分（迁移 + 回退），**不再保留任何写入通道**。
     NBAppPickModeSoundMap  = 4,   // soundMap：点一下 = 给这个 App 建/删一条独立分配
+
+    // 🔴 v0.0.51：连记录都不要（per-App 名单，NB_KEY_NO_RECORD_APPS）。
+    //    ⚠️ 加这个模式时**两个 switch 都必须加 case**（keyForMode / titleForMode）——
+    //    漏一个的后果不是编译错，而是静默回落到默认分支（whitelist / "选择 App"），
+    //    表现是"勾了 App 却没写进该写的键"，正是这个文件顶部记过两次的那类后门。
+    NBAppPickModeNoRecord  = 5,   // noRecordApps：这些 App 连记录都不落库（不影响呈现）
 };
 
 // 可搜索、可多选的 App 选择器（v0.0.13）

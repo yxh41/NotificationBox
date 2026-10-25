@@ -93,6 +93,8 @@ static const NSInteger kSubHit = 105;
 - (void)pickAppToClean;
 - (void)onWhite:(id)sender;
 - (void)onBlack:(id)sender;
+// v0.0.51：连记录都不要（per-App 名单）
+- (void)onNoRecordApps:(id)sender;
 - (void)onSpeakApps:(id)sender;
 - (void)onDndApps:(id)sender;
 - (void)onSoundApps:(id)sender;
@@ -233,6 +235,13 @@ static const NSInteger kSubHit = 105;
            keyboard:UIKeyboardTypeNumberPad
                 key:@"autoCleanDays"];
 
+    // ---------- 连记录都不要（v0.0.51） ----------
+    // 🔴 单独一区、排在「推送拦截」**之前**：流水线上先记录后过滤——
+    //    这个名单管"记不记"，下面那组管"弹不弹"。放一起才看得出两段的分工，
+    //    用户也不会把"不记录"误当成"第二个黑名单"。
+    [self addActionRow:@"不记录的 App（连记录都不留）" key:@"norecord"
+               action:@selector(onNoRecordApps:)];
+
     // ---------- 推送拦截 ----------
     [self addActionRow:@"白名单（只推送这些）" key:@"white" action:@selector(onWhite:)];
     [self addActionRow:@"黑名单（不推送这些）" key:@"black" action:@selector(onBlack:)];
@@ -265,6 +274,9 @@ static const NSInteger kSubHit = 105;
         @"• 白名单一旦填了，就等于「只保留这些 App」，其它全部不弹（有杀伤力）。\n"
         @"• 白名单/黑名单/朗读限定都点进去选，可以搜索；点一下立即生效，没有保存按钮。\n"
         @"• 被拦下的通知仍然会记进盒子里，方便回头查本来要推什么。\n"
+        @"• 「不记录的 App」是另一回事：选上的 App **连记录都不落库**（盒子里不留痕迹），\n"
+        @"  但通知照常弹出、朗读/换音/替换都照跑 —— 它管「记不记」，黑白名单管「弹不弹」。\n"
+        @"  已有的记录不受影响；想清掉已有的，用下面的「批量清理记录 / 清空全部记录」。\n"
         @"• 内容替换只改通知上显示的文字；盒子里存的仍是原文。\n"
         @"• 记录上限默认 500；超出后自动淘汰最旧的。\n"
         @"• 「自动清理：保留最近 N 天」= 每次打开盒子自动删掉 N 天前的记录（连未读一起，\n"
@@ -450,6 +462,14 @@ static const NSInteger kSubHit = 105;
     [self setActionValue:(dn ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)dn]
                              : @"全部 App ›")
                   forKey:@"dndapps"];
+
+    // v0.0.51：不记录的 App。空 = 全部记录（与 speak/dnd 的"全部 App"同族语义）。
+    // 🔴 文案不能说成"未设置"就完事 —— 空名单是**功能关闭**的正常状态，
+    //    和"配了但没生效"要能区分开（后者在这个插件里从不存在，因为读失败=照常记）。
+    NSUInteger nr = [NBStringArray(d[NB_KEY_NO_RECORD_APPS]) count];
+    [self setActionValue:(nr ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)nr]
+                            : @"全部记录 ›")
+                  forKey:@"norecord"];
 
     // 🔴🔴 v0.0.28：这一行的数据源从 `soundApps`（数组）换成了 `soundMap`（映射）。
     //    三态必须分开显示，因为后果完全不同：
@@ -786,6 +806,15 @@ static const NSInteger kSubHit = 105;
 - (void)onBlack:(id)sender {
     [self.view endEditing:YES];
     [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeBlacklist]];
+}
+
+// v0.0.51：连记录都不要（per-App）。走 AppPicker 的 NoRecord 模式——
+// 和黑白名单同一个页面、同一套"点一下立即生效、没有保存按钮"，只是写的是 noRecordApps 键。
+// 🔴 这个入口**不弹确认框**：勾选只是让以后的记录不落库，不动任何已有数据
+//    （想清已有的走下面的"批量清理/清空全部"）。可逆、无破坏，不需要二次确认。
+- (void)onNoRecordApps:(id)sender {
+    [self.view endEditing:YES];
+    [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeNoRecord]];
 }
 
 - (void)onSpeakApps:(id)sender {

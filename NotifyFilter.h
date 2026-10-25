@@ -25,6 +25,14 @@ NS_ASSUME_NONNULL_BEGIN
                  message:(nullable NSString *)message
                 subtitle:(nullable NSString *)subtitle;
 
+// v0.0.51：连记录都不要（per-App 名单 NB_KEY_NO_RECORD_APPS）。
+// 判定口径：命中的 App **不落库**（闸门在 Tweak.x 的 recordWithBundle: 之前），
+//   但**不碰呈现**——通知照弹、过滤/替换/换声/朗读照跑。
+// 🔴 与 shouldDropBundle: 的分工：那个拦"呈现"（记录已落库、盒子里仍看得到），
+//    这个拦"记录"本身。两个名单独立、互不影响，别试图合并成一个。
+// 任何异常都返回 NO —— **宁可多记一条，不可因为读设置出错把记录全吞了**。
++ (BOOL)shouldSkipRecordForBundle:(nullable NSString *)bundle;
+
 // 内容替换（预设规则）：只对**真正响应 getter+setter** 的对象动手，逐个探。
 // 返回 YES 表示真的改过。默认无规则 ⇒ 直接返回 NO，行为与不装插件一致。
 + (BOOL)applyReplaceRulesTo:(nullable id)bulletin;

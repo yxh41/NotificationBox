@@ -171,6 +171,21 @@ typedef NS_ENUM(NSInteger, NBSoundVerdict) {
     return NO;
 }
 
+// v0.0.51：连记录都不要（per-App）。判定只认 NB_KEY_NO_RECORD_APPS 一个键，
+// 读法走 arrayFromPref:（数组或 "a,b" 两种历史格式都认，和黑白名单同一套）。
+// 🔴 位置摆在 shouldDropBundle: 旁边是故意的：两个名单语义相反（一个拦呈现、
+//    一个拦记录），放一起才看得清"谁管哪一段"，改一个的时候会看见另一个。
++ (BOOL)shouldSkipRecordForBundle:(nullable NSString *)bundle {
+    @try {
+        NSDictionary *p = [self prefs];
+        if (!p.count) return NO;                 // 没有任何设置 ⇒ 全部照常记录
+        NSString *bid = bundle.length ? bundle : @"";
+        return [[self arrayFromPref:p[NB_KEY_NO_RECORD_APPS]] containsObject:bid];
+    } @catch (__unused NSException *e) {
+        return NO;      // 判错就照常记：宁可多记一条，也不要把用户的记录吞掉
+    }
+}
+
 + (NSArray<NSDictionary *> *)normalizedRules:(id)raw {
     NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
     if (![raw isKindOfClass:[NSArray class]]) return out;      // 缺失 / 脏数据 ⇒ 空表，不是崩溃
