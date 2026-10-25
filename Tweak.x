@@ -1,4 +1,12 @@
-// Tweak.x —— v0.0.57（当前）：**真机清单已取回，改用 iOS 16 的 withdraw 系 API** ——
+// Tweak.x —— v0.0.59（当前）：**功能已打通（真机 3/3），本版只修结论措辞** ——
+//   ✅ v0.0.58 真机结果：`_removeBulletin:shouldSync:NO`（用真 BBBulletin 对象）**第 1 步就中**：
+//        workbuddy live 50→49 含本条 是→否；TIM 2→1；微信 17→16。后五步一次都没轮到。
+//      ⇒ iOS 16 上正确的删除姿势 = `_bulletinsForIDs:` 取真对象（🔴 返回 **NSSet**，不能下标）
+//        再 `_removeBulletin:shouldSync:NO`。`_clearBulletinIDs:` 那条老路确认空转。
+//   🔴 v0.0.59 只修一件事：结论行改成三态。v0.0.58 日志里 13 条有 10 条是「本来就不在段内」
+//      （App 被点开过 ⇒ 系统早把通知清了），却统一打印「已从段内消失」——
+//      看着像 100% 成功，其实只动了 3 条。**措辞必须等于它真正证明的那件事**。
+//   v0.0.57 的历史（当年的尝试方向，保留作背景）：
 //   v0.0.56 探针取回的 `nc_diag.txt` 里，BBServer 有 253 个实例方法，关键几条：
 //     - withdrawBulletinRequestsWithRecordID:forSectionID:        v@:@@   ← iOS16 正规撤回
 //     - withdrawBulletinRequestsWithPublisherBulletinID:forSectionID: v@:@@
@@ -552,7 +560,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         #pragma clang diagnostic pop
             NSMutableString *rec = [NSMutableString string];
             [rec appendFormat:@"\n=== [尝试 %@] sysId=%@ bundle=%@\n", [NSDate date], sysId, bundle];
-            NBLog(@"=== [NC-CLEAR] v0.0.58 请求 sysId=%@ bundle=%@", sysId, bundle);
+            NBLog(@"=== [NC-CLEAR] v0.0.59 请求 sysId=%@ bundle=%@", sysId, bundle);
             NBLog(@"[NC-DIAG] 捕获对象类=%@", NSStringFromClass([gBBServer class]));
             // 方法表是静态信息，只在文件不存在时写一次；之后只追加「本次尝试记录」
             if (![[NSFileManager defaultManager] fileExistsAtPath:NOTIFYBOX_NC_DIAG_PATH]) {
@@ -571,6 +579,13 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 NSInteger n0 = NBLiveScan(gBBServer, bundle, cid, &still);
                 [rec appendFormat:@"  删前 live=%ld 含本条=%@\n", (long)n0, still ? @"是" : @"否"];
                 NBLog(@"=== [NC-CLEAR] 删前 live=%ld 含本条=%@", (long)n0, still ? @"是" : @"否");
+                // v0.0.59：三态结论需要两个量 ——
+                //   was     = 动手之前它到底在不在（不在就没得删，不能报"已删除"）
+                //   winStep = 第几步让它消失的（0=没有任何一步成功）
+                // 🔴 这两条是 v0.0.58 的教训：那份日志里 10 条记录「删前 含本条=否」，
+                //    我什么都没做，结论行却写着「已从段内消失」—— 原因与结论对不上，就是假绿。
+                BOOL was = still;
+                NSInteger winStep = 0;
 
                 // ---- ② 按 ID 取真实对象（NSSet 也要能取出来，见 NBFirstObject 的注释）----
                 id bullet = nil;
@@ -600,6 +615,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         [gBBServer _removeBulletin:bullet shouldSync:NO];
                         BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
                         still = f;
+                        if (!f) winStep = 1;
                         [rec appendFormat:@"  ① _removeBulletin:shouldSync:NO ⇒ live=%ld 含本条=%@%@\n",
                          (long)n, f ? @"是" : @"否", f ? @"（没删掉）" : @" ★本条已消失"];
                         NBLog(@"=== [NC-CLEAR] ① _removeBulletin ⇒ live=%ld 含本条=%@",
@@ -617,6 +633,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         [gBBServer _removeBulletins:@[bullet] forSectionID:bundle shouldSync:NO];
                         BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
                         still = f;
+                        if (!f) winStep = 2;
                         [rec appendFormat:@"  ② _removeBulletins:forSectionID: ⇒ live=%ld 含本条=%@%@\n",
                          (long)n, f ? @"是" : @"否", f ? @"（没删掉）" : @" ★本条已消失"];
                         NBLog(@"=== [NC-CLEAR] ② _removeBulletins ⇒ live=%ld 含本条=%@",
@@ -634,6 +651,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         [gBBServer withdrawBulletinRequestsWithRecordID:useRID forSectionID:bundle];
                         BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
                         still = f;
+                        if (!f) winStep = 3;
                         [rec appendFormat:@"  ③ withdraw…WithRecordID=%@ ⇒ live=%ld 含本条=%@%@\n",
                          useRID, (long)n, f ? @"是" : @"否", f ? @"（没删掉）" : @" ★本条已消失"];
                         NBLog(@"=== [NC-CLEAR] ③ withdraw…WithRecordID ⇒ live=%ld 含本条=%@",
@@ -650,6 +668,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         [gBBServer withdrawBulletinRequestsWithPublisherBulletinID:pID forSectionID:bundle];
                         BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
                         still = f;
+                        if (!f) winStep = 4;
                         [rec appendFormat:@"  ④ withdraw…WithPublisherID=%@ ⇒ live=%ld 含本条=%@%@\n",
                          pID, (long)n, f ? @"是" : @"否", f ? @"（没删掉）" : @" ★本条已消失"];
                         NBLog(@"=== [NC-CLEAR] ④ withdraw…WithPublisherID ⇒ live=%ld 含本条=%@",
@@ -665,6 +684,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         [gBBServer withdrawBulletinID:cid];
                         BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
                         still = f;
+                        if (!f) winStep = 5;
                         [rec appendFormat:@"  ⑤ withdrawBulletinID: ⇒ live=%ld 含本条=%@%@\n",
                          (long)n, f ? @"是" : @"否", f ? @"（没删掉）" : @" ★本条已消失"];
                         NBLog(@"=== [NC-CLEAR] ⑤ withdrawBulletinID ⇒ live=%ld 含本条=%@",
@@ -698,7 +718,8 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                             [gNCDispatcher withdrawNotificationWithRequest:ncReq];
                             BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
                             still = f;
-                            [rec appendFormat:@"  ⑥ NC withdraw(%@) ⇒ live=%ld 含本条=%@\n",
+                            if (!f) winStep = 6;
+                        [rec appendFormat:@"  ⑥ NC withdraw(%@) ⇒ live=%ld 含本条=%@\n",
                              how, (long)n, f ? @"是" : @"否"];
                             NBLog(@"=== [NC-CLEAR] ⑥ NC withdraw(%@) ⇒ live=%ld 含本条=%@",
                                   how, (long)n, f ? @"是" : @"否");
@@ -711,9 +732,22 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     }
                 }
 
-                // 结论行：一眼能看出"到底删掉没有"
-                [rec appendFormat:@"  ⇒ 这条 %@\n", still ? @"仍在段内（本次全部失败）" : @"已从段内消失"];
-                NBLog(@"=== [NC-CLEAR] 结论：%@ cid=%@", still ? @"仍在（全部失败）" : @"已消失", cid);
+                // 结论行（v0.0.59 三态）：**"本来就不在" 不许写成 "已删除"**
+                //   🔴 v0.0.58 的真机日志里 13 条有 10 条属于「本来就不在」，
+                //      却统一打印「已从段内消失」⇒ 看着像 100% 成功，其实只动了 3 条。
+                //      判据的措辞必须等于它真正证明的那件事。
+                NSString *verdict;
+                if (!was) {
+                    verdict = @"本来就不在段内（可能已被 App 或用户清掉，无需处理）";
+                } else if (!still && winStep > 0) {
+                    verdict = [NSString stringWithFormat:@"本次已删掉（第 %ld 步生效）", (long)winStep];
+                } else if (!still) {
+                    verdict = @"已消失，但没记到是哪一步（异常）";
+                } else {
+                    verdict = @"仍在段内（六步全部失败）";
+                }
+                [rec appendFormat:@"  ⇒ %@\n", verdict];
+                NBLog(@"=== [NC-CLEAR] 结论：%@ cid=%@", verdict, cid);
 
             }
             NBDiagAppend(rec);
@@ -1251,7 +1285,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.58 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.59 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -1290,7 +1324,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.58 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.59 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     // v0.0.55：删掉 v0.0.53 在这里（%ctor）打的那行方法清单。
@@ -1359,7 +1393,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.58 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.59 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
