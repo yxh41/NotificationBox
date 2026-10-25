@@ -422,8 +422,6 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 
     // App 显示名只有界面层有（库里存的是 bundle id）⇒ 把映射传进去
     NSString *csv = [NotifyExport csvFromRows:rows appNames:self.appNameMap];
-    NSString *base = self.filterBundle.length ? [self appNameForBundle:self.filterBundle]
-                                              : @"消息盒子";
     NSURL *url = [NotifyExport writeTempCSV:csv baseName:base];
     if (!url) {
         [self alertTitle:@"导出失败" text:@"写临时文件失败。可以重启 App 再试。"];
