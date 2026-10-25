@@ -333,6 +333,14 @@ static inline NSArray<NSString *> *NBStringArray(id v) {
 //   单条删除用单文件足够（手动逐条删几乎不会竞态）；批量清理 / 清空全部不触发本通道。
 #define NOTIFYBOX_NC_CLEAR_REQ @"/var/mobile/Library/NotifyBox/nc_clear_req.plist"
 
+// ---------- v0.0.56 诊断产物（独立文件，不写日志） ----------
+// 🔴 为什么要单开一个文件：iOS 16 上到底有哪些「能删通知」的方法，必须一次性看全。
+//    tweak.log 只能看最后几十行（用户还得在几百 KB 里翻），长行会被折成好几行、极易漏读；
+//    而文件没有人眼窗口限制 ⇒ 这里把**整个类的方法表（实例 + 类方法，带类型签名）**全写进去，
+//    一条一行、按名字排序，可以直接 grep，也可以整份发出来。
+// 🔴 只读类结构，**不调用任何未知方法**（零崩溃风险）。
+#define NOTIFYBOX_NC_DIAG_PATH @"/var/mobile/Library/NotifyBox/nc_diag.txt"
+
 // ---------- 统一日志 ----------
 // 🔴 v0.0.12：原来 Tweak.x 里有份 static NBLog，新加的 NotifySpeaker/NotifyProbe 够不着。
 //    **复制一份日志函数**是最差解（两份轮转逻辑迟早走岔），所以把实现沉到 NotifyStore.m
