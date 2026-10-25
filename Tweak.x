@@ -1,13 +1,15 @@
-// Tweak.x —— v0.0.53（当前）：**诊断版** ——
-//   真机反馈：v0.0.52 的 `[NC-CLEAR] 已清` 日志能打出来（说明 `_clearBulletinIDs:…` 存在、
-//   调用不抛异常），但通知中心那条**没消失**。这正是本项目最贵的一条教训：
-//   「自证里的数对了 ≠ 界面上发生了」—— 日志只证明"我们调了"，不证明"它删了"。
-//   ⇒ v0.0.53 不改逻辑，只加两处**零风险只读诊断**：
-//   ① %ctor 把 BBServer 上 clear/remove/dismiss/withdraw/bulletinID 相关方法名全打出来
-//      （只打名字、不调用未知方法），据此选下一步正确的 API；
-//   ② 清除回调里 shouldSync 的 YES/NO 都试一遍，并在清除**前后各量一次**
-//      `_bulletinIDsForSectionID:` 的真实 live ID —— 用"清单有没有变"来区分三种病因：
-//      sysId 本来就不在名单里 = ID 不对；调完还在 = 方法对本机无效；消失但界面还在 = UI 没刷新。
+// Tweak.x —— v0.0.54（当前）：**诊断版（第二轮）** ——
+//   v0.0.53 真机结论（两条硬事实）：
+//   ① `_clearBulletinIDs:forSectionID:shouldSync:` **存在**且能调（YES/NO 都不抛异常），
+//      但通知中心那条**不消失** ⇒ 「自证里的数对了 ≠ 界面上发生了」；
+//   ② `_bulletinIDsForSectionID:` / `bulletinIDsForSectionID:` 在 iOS 16 **都不存在**
+//      ⇒ 枚举反查 live ID 这条路断了（v0.0.53 的 [NC-DIAG] 一行都没打出来）。
+//   ⇒ v0.0.54 只做两件能真正推进的事（仍是只读诊断 + 两个候选都试，不改算法）：
+//   ① 把方法名清单从 %ctor **搬进清除回调**（开机那次早被日志窗口挤掉，这里一定在用户眼前），
+//      并且不只 BBServer，连 BBObserver / NCNotificationDispatcher / NCNotificationCenter /
+//      SBNotificationCenterController 一起打 ⇒ 拿到 ios16 真正可用的清除 API 清单；
+//   ② `bulletinID` 与 `notificationIdentifier` **两个候选都存**（"bID|nID"），清除时逐个试
+//      ⇒ 若病因是"存错 ID"，这一版当场就修好了；同时 [NC-ID] 日志给出 ID 来源证据。
 //   以下为 v0.0.52 功能主体（保留）：
 //   「删除盒子记录时同步清系统通知中心」（精确 1:1）：
 //   ① NBRecordItem 记录时读系统 bulletin ID（bulletinID / notificationIdentifier）存进库；
@@ -313,39 +315,31 @@ static void NBCaptureServerIfNeeded(id server) {
     });
 }
 
-// v0.0.53 诊断：把通知中心里**当前真实存在**的 bulletin ID 打出来，跟库里存的 sys_id 对一下。
-// 🔴 只调用确实存在的选择器（respondsToSelector 守卫），逐个 @try；
-//    返回不是 NSArray 就当没读到；**不读元素内部的 KVC 键**（缺键会抛，违反本项目铁律）。
-static void NBDiagLogLiveIDs(id server, NSString *bundle) {
+// v0.0.54 诊断：把某个类上「清除 / 移除 / 投递 / bulletin」相关的方法名打出来。
+// 🔴 只读类结构、**不调用任何未知方法**（零风险）；这是"下一步该用哪个 API"的唯一依据。
+static void NBDiagDumpMethods(const char *clsName, NSString *label) {
     @try {
-        NSArray *sels = @[@"_bulletinIDsForSectionID:", @"bulletinIDsForSectionID:"];
-        for (NSString *nm in sels) {
-            SEL s = NSSelectorFromString(nm);
-            if (![server respondsToSelector:s]) continue;
-            @try {
-                // 🔴 用 performSelector 而不是 objc_msgSend 强转：后者在 -Werror 下可能触发
-                //    -Wcast-function-type；这里只压 ARC 的 performSelector 泄漏警告。
-                #pragma clang diagnostic push
-                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                id r = [server performSelector:s withObject:bundle];
-                #pragma clang diagnostic pop
-                if ([r isKindOfClass:[NSArray class]]) {
-                    NSArray *a = (NSArray *)r;
-                    NSMutableArray *strs = [NSMutableArray array];
-                    for (id x in a) {
-                        if ([x isKindOfClass:[NSString class]]) [strs addObject:(NSString *)x];
-                        else [strs addObject:[NSString stringWithFormat:@"<%@>", NBClassName(x)]];
-                    }
-                    NSString *d = [strs componentsJoinedByString:@","];
-                    if (d.length > 500) d = [[d substringToIndex:500] stringByAppendingString:@"…"];
-                    NBLog(@"[NC-DIAG] %@ => %lu 个: %@", nm, (unsigned long)a.count, d);
-                } else {
-                    NBLog(@"[NC-DIAG] %@ => 非数组(%@)", nm, NBClassName(r));
-                }
-            } @catch (NSException *e) {
-                NBLog(@"[NC-DIAG] %@ 抛异常:%@", nm, e);
+        Class c = objc_getClass(clsName);
+        if (!c) { NBLog(@"[NC-DIAG] %@: 类不存在", label); return; }
+        unsigned int cnt = 0;
+        Method *ms = class_copyMethodList(c, &cnt);
+        if (!ms) { NBLog(@"[NC-DIAG] %@: 无方法(共%u)", label, cnt); return; }
+        NSMutableArray *rel = [NSMutableArray array];
+        for (unsigned i = 0; i < cnt; i++) {
+            NSString *n = NSStringFromSelector(method_getName(ms[i]));
+            NSString *low = [n lowercaseString];
+            if ([low containsString:@"clear"] || [low containsString:@"remove"]
+                || [low containsString:@"dismiss"] || [low containsString:@"withdraw"]
+                || [low containsString:@"bulletin"] || [low containsString:@"deliver"]) {
+                [rel addObject:n];
             }
         }
+        free(ms);
+        NSArray *sorted = [rel sortedArrayUsingSelector:@selector(compare:)];
+        // 上限 120 条，避免单行过长被日志窗口吃掉
+        if (sorted.count > 120) sorted = [sorted subarrayWithRange:NSMakeRange(0, 120)];
+        NBLog(@"[NC-DIAG] %@ 共%u方法·相关%lu: %@", label, cnt,
+              (unsigned long)rel.count, [sorted componentsJoinedByString:@","]);
     } @catch (__unused NSException *e) { }
 }
 
@@ -373,25 +367,32 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         dispatch_sync(gBBServerQueue, ^{
         #pragma clang diagnostic pop
-            NBLog(@"=== [NC-CLEAR] 请求 sysId=%@ bundle=%@（先量 live ID）", sysId, bundle);
-            // 诊断 ①：清除**前**看通知中心里真实有哪些 ID —— 判断我们存的 sysId 到底在不在里面。
-            NBDiagLogLiveIDs(gBBServer, bundle);
-            // shouldSync 两个取值都试：YES 无效时 NO 可能有效（都只影响"是否同步到配对设备"）。
-            @try {
-                [gBBServer _clearBulletinIDs:@[sysId] forSectionID:bundle shouldSync:YES];
-                NBLog(@"=== [NC-CLEAR] YES 已调 sysId=%@", sysId);
-            } @catch (NSException *e) {
-                NBLog(@"!!! [NC-CLEAR] YES 抛异常：%@", e);
+            NBLog(@"=== [NC-CLEAR] 请求 sysId=%@ bundle=%@", sysId, bundle);
+            // 诊断 ①：把候选类上「清除/移除/投递/bulletin」相关方法名全打出来（只读，零风险）。
+            //   🔴 放在**这里**而不是 %ctor：%ctor 那次输出在开机时，早被日志窗口挤掉了；
+            //      这里正好在"用户删记录"这一刻，一定在他的日志里。
+            NBDiagDumpMethods("BBServer", @"BBServer");
+            NBDiagDumpMethods("BBObserver", @"BBObserver");
+            NBDiagDumpMethods("NCNotificationDispatcher", @"NCNotificationDispatcher");
+            NBDiagDumpMethods("NCNotificationCenter", @"NCNotificationCenter");
+            NBDiagDumpMethods("SBNotificationCenterController", @"SBNotificationCenterController");
+            // 诊断 ②：sysId 可能是 "bID|nID"（两个候选都存了）⇒ 逐个试，YES/NO 各一次。
+            NSArray *cands = [sysId componentsSeparatedByString:@"|"];
+            for (NSString *cid in cands) {
+                if (!cid.length) continue;
+                @try {
+                    [gBBServer _clearBulletinIDs:@[cid] forSectionID:bundle shouldSync:YES];
+                    NBLog(@"=== [NC-CLEAR] YES 已调 id=%@", cid);
+                } @catch (NSException *e) {
+                    NBLog(@"!!! [NC-CLEAR] YES 抛 id=%@: %@", cid, e);
+                }
+                @try {
+                    [gBBServer _clearBulletinIDs:@[cid] forSectionID:bundle shouldSync:NO];
+                    NBLog(@"=== [NC-CLEAR] NO 已调 id=%@", cid);
+                } @catch (NSException *e) {
+                    NBLog(@"!!! [NC-CLEAR] NO 抛 id=%@: %@", cid, e);
+                }
             }
-            @try {
-                [gBBServer _clearBulletinIDs:@[sysId] forSectionID:bundle shouldSync:NO];
-                NBLog(@"=== [NC-CLEAR] NO 已调 sysId=%@", sysId);
-            } @catch (NSException *e) {
-                NBLog(@"!!! [NC-CLEAR] NO 抛异常：%@", e);
-            }
-            // 诊断 ②：清除**后**再量一次 —— sysId 还在名单里 = BB 根本没清掉（ID 不对/方法无效）；
-            //   已消失但界面还在 = UI 刷新问题。两种病因必须能分开。
-            NBDiagLogLiveIDs(gBBServer, bundle);
         });
     } @catch (NSException *e) {
         NBLog(@"!!! [NC-CLEAR] 回调异常：%@", e);
@@ -420,16 +421,38 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
             if (!date)         date  = NBSafeDate(inner, @"date");
         }
     }
-    // v0.0.52：读系统 bulletin ID（精确同步清通知中心用）。
-    // 🔴 先 bulletinID，再 notificationIdentifier（两代 API 名字不同，真机以哪个为准未知）；
-    //    嵌套包装的还要从 .bulletin 里再读一遍。读不到就留空（feature 自动失效，不影响记录）。
-    NSString *sysId = NBSafeStr(obj, @"bulletinID");
-    if (!sysId.length) sysId = NBSafeStr(obj, @"notificationIdentifier");
-    if (!sysId.length) {
+    // v0.0.54：**两个候选 ID 都读、都存**（清除时都试）。
+    // 🔴 v0.0.53 真机结论：`_clearBulletinIDs:` 能调、不抛，但通知没消失；且
+    //    `_bulletinIDsForSectionID:` / `bulletinIDsForSectionID:` 在 iOS 16 **都不存在**
+    //    ⇒ 无法靠枚举反查。所以改成"两个候选都留一手"：
+    //    - bulletinID           = BB 自己的 bulletin 标识（清除 API 最可能要这个）
+    //    - notificationIdentifier = UNNotificationRequest 的标识
+    //    两个都非空且不同 ⇒ 存成 "bID|nID"，清除时逐个试（见 NBClearNCCallback）。
+    NSString *bID = NBSafeStr(obj, @"bulletinID");
+    NSString *nID = NBSafeStr(obj, @"notificationIdentifier");
+    {
         id inner2 = NBSafeValue(obj, @"bulletin");
         if (inner2 && inner2 != obj) {
-            if (!sysId.length) sysId = NBSafeStr(inner2, @"bulletinID");
-            if (!sysId.length) sysId = NBSafeStr(inner2, @"notificationIdentifier");
+            if (!bID.length) bID = NBSafeStr(inner2, @"bulletinID");
+            if (!nID.length) nID = NBSafeStr(inner2, @"notificationIdentifier");
+        }
+    }
+    NSString *sysId = nil;
+    if (bID.length && nID.length && ![bID isEqualToString:nID]) {
+        sysId = [NSString stringWithFormat:@"%@|%@", bID, nID];
+    } else if (bID.length) {
+        sysId = bID;
+    } else {
+        sysId = nID;
+    }
+    // v0.0.54 诊断：只前 5 条打一次 ID 来源（不刷屏）。看清 bulletinID / notificationIdentifier
+    //   到底哪个有值、是否相同 —— 这是判断"存的 ID 对不对"的唯一直接证据。
+    {
+        static int gIdLog = 0;
+        if (gIdLog < 5) {
+            gIdLog++;
+            NBLog(@"[NC-ID#%d] cls=%@ bID=%@ nID=%@ 存=%@", gIdLog, NBClassName(obj),
+                  bID.length ? bID : @"(nil)", nID.length ? nID : @"(nil)", sysId ?: @"(nil)");
         }
     }
 
@@ -865,7 +888,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.53 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.54 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -904,7 +927,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.53 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.54 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     // v0.0.53 诊断：把 BBServer 上跟「清除 / 移除 / 通知项 ID」相关的方法名全打出来。
@@ -988,7 +1011,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.53 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.54 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
