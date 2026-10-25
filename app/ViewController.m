@@ -101,6 +101,19 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // 🔴 折叠**前**的查询条数，专给 `updateMoreFooter` 用（第三禁忌：不能拿折叠后的
 //    items.count 去算"还有几条更早"，否则折叠掉的会被误算成"被列表上限截断的"）。
 @property (nonatomic, assign) NSInteger queriedCount;
+// v0.0.49：★ 只看标星（第五个筛选维度）。和折叠同源：**纯派生、不落库** ——
+//    nbStar 由关键词规则现算，SQL 里没有这一列 ⇒ 筛选只能在内存里做
+//    （见 applyKeywordRulesToRows:，star 必须先于 fold）。
+// 🔴 它和 unreadOnly **正交**：★ 只看标星 + 只看未读 = 标星且未读，两者可叠加。
+@property (nonatomic, assign) BOOL starOnly;
+// v0.0.49：★ 筛选**之后、折叠之前**的条数。专给 updateMoreFooter 当"当前视图的条数" ——
+//    queriedCount 在 ★ 视图下混着非标星的行，直接拿去算差就是"底部说的数和列表
+//    装的不是同一个集合"（第三禁忌同款，v0.0.48 为折叠立过同一条）。
+@property (nonatomic, assign) NSInteger queriedStarCount;
+// v0.0.49：★ 开关按钮（常驻，不随 unreadOnly 进出）。
+@property (nonatomic, strong) UIButton *starBtn;
+// v0.0.49：关键词规则指纹（settings.plist 派生，不进数据库）—— 见 refreshIfChanged。
+@property (nonatomic, copy)   NSArray<NSDictionary *> *lastRules;
 // v0.0.42：bundle -> App 显示名。**同时给两件事用**：
 //   ① 列表每一行显示「这条是哪个 App 的」—— 以前只有图标，图标加载失败就只剩一个字母；
 //   ② 搜索时把「微信」「招商银行」这种词匹配成 bundle 列表，再传给 NotifyStore。
@@ -137,6 +150,10 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)refreshUnreadDots;
 // v0.0.37：全部 / 只看未读（自己的分段控件，替掉没渲染出来的系统 scope bar）
 - (void)onUnread:(UISegmentedControl *)seg;
+// v0.0.49：★ 只看标星开关；以及"有没有任何规则带 ★ 动作"（★ 视图为空时区分
+//    "这个范围没有标星的" 和 "根本没有任何规则会标星"，后者必须点醒用户去建规则）。
+- (void)onStar:(id)sender;
+- (BOOL)anyStarRule;
 // v0.0.38：批量把当前筛选范围内的未读标成已读
 - (void)onMarkAllRead:(id)sender;
 - (void)doMarkAllRead;
@@ -324,13 +341,22 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    为什么：用户要备份的通常是"我正在看的这一堆"（比如某个 App 的验证码历史），
 //    而全量导出他没法用 —— 几万行塞进一个 CSV，打开就卡死。
 //    🔴 当前筛选为空 = 没有限定条件 ⇒ 那就是整库，和"全量"不冲突。
+// v0.0.49：★ 视图下导出的就是**眼睛看到的这批**（self.items）—— nbStar 是派生量、
+//    SQL 导不出"只要标星的"，而按 SQL 范围导会把非标星的一起倒进文件，
+//    恰恰违背"导出我正在看的这一堆"这个初衷。确认框的数 = items.count，
+//    和真正写进文件的条数严格相等（v0.0.44 立过的纪律）。
 - (void)onExport:(id)sender {
-    NSArray<NSString *> *searchBundles = [self bundlesMatchingSearch:self.searchText];
-    NSInteger n = [NotifyStore countWithBundle:self.filterBundle
-                                         since:[self sinceFromSeg]
-                                        search:self.searchText
-                                 searchBundles:searchBundles
-                                    unreadOnly:self.unreadOnly];
+    NSInteger n;
+    if (self.starOnly) {
+        n = (NSInteger)self.items.count;
+    } else {
+        NSArray<NSString *> *searchBundles = [self bundlesMatchingSearch:self.searchText];
+        n = [NotifyStore countWithBundle:self.filterBundle
+                                  since:[self sinceFromSeg]
+                                 search:self.searchText
+                          searchBundles:searchBundles
+                             unreadOnly:self.unreadOnly];
+    }
     if (n <= 0) {
         // 和 `onClear:` 同一条纪律：没有可导出的东西就别弹确认框。
         [self alertTitle:@"没有可导出的记录"
@@ -338,16 +364,23 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
         return;
     }
 
-    // 🔴 确认框里的数必须就是**这次真正会写进文件的条数**：
-    //    它来自同一个 `NBPrepareScope`（`countWithBundle:`），和下面 `doExport` 查的是一批数据。
-    //    这里如果拿 `self.items.count` 就会少算 —— 列表被 `LIMIT 2000` 截断过，
-    //    而导出**不带** LIMIT（v0.0.35 的 `onClear:` 已经为"报列表条数、实际动全表"买过一次单）。
-    NSMutableString *msg = [NSMutableString stringWithFormat:
-        @"将把当前筛选下的 %ld 条记录导出成 CSV。", (long)n];
-    if ((NSInteger)self.items.count != n) {
-        [msg appendFormat:@"\n\n（列表里只显示了 %ld 条 —— 它一次最多显示 %ld 条，"
-                           "导出的文件里是完整的 %ld 条。）",
-         (long)self.items.count, (long)[NotifyStore listLimit], (long)n];
+    NSMutableString *msg;
+    if (self.starOnly) {
+        // ★ 视图：导出的就是列表这批，不存在"列表只显示了一部分"的差。
+        msg = [NSMutableString stringWithFormat:
+            @"将把 ★ 标星视图下的 %ld 条记录导出成 CSV。", (long)n];
+    } else {
+        // 🔴 确认框里的数必须就是**这次真正会写进文件的条数**：
+        //    它来自同一个 `NBPrepareScope`（`countWithBundle:`），和下面 `doExport` 查的是一批数据。
+        //    这里如果拿 `self.items.count` 就会少算 —— 列表被 `LIMIT 2000` 截断过，
+        //    而导出**不带** LIMIT（v0.0.35 的 `onClear:` 已经为"报列表条数、实际动全表"买过一次单）。
+        msg = [NSMutableString stringWithFormat:
+            @"将把当前筛选下的 %ld 条记录导出成 CSV。", (long)n];
+        if ((NSInteger)self.items.count != n) {
+            [msg appendFormat:@"\n\n（列表里只显示了 %ld 条 —— 它一次最多显示 %ld 条，"
+                               "导出的文件里是完整的 %ld 条。）",
+             (long)self.items.count, (long)[NotifyStore listLimit], (long)n];
+        }
     }
 
     UIAlertController *al = [UIAlertController alertControllerWithTitle:@"导出记录"
@@ -363,13 +396,24 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 }
 
 - (void)doExport {
-    NSArray<NSString *> *searchBundles = [self bundlesMatchingSearch:self.searchText];
-    NSArray<NSDictionary *> *rows =
-        [NotifyStore exportRowsWithBundle:self.filterBundle
-                                    since:[self sinceFromSeg]
-                                   search:self.searchText
-                            searchBundles:searchBundles
-                               unreadOnly:self.unreadOnly];
+    // v0.0.49：★ 视图导出内存里这批（和 onExport 报的数严格同源）；其余走 SQL 全量范围。
+    // 🔴 csvFromRows: 只读固定键（bundle/ts/title/subtitle/message/read），
+    //    items 里多带的 nbStar 键被忽略 —— 不需要先剥掉。
+    NSArray<NSDictionary *> *rows;
+    NSString *base;
+    if (self.starOnly) {
+        rows = self.items;
+        base = @"标星记录";
+    } else {
+        NSArray<NSString *> *searchBundles = [self bundlesMatchingSearch:self.searchText];
+        rows = [NotifyStore exportRowsWithBundle:self.filterBundle
+                                           since:[self sinceFromSeg]
+                                          search:self.searchText
+                                   searchBundles:searchBundles
+                                      unreadOnly:self.unreadOnly];
+        base = self.filterBundle.length ? [self appNameForBundle:self.filterBundle]
+                                        : @"消息盒子";
+    }
     if (!rows.count) {
         [self alertTitle:@"导出失败" text:@"一条记录都没读到。列表已刷新，可以再试一次。"];
         [self loadData];
@@ -430,6 +474,13 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
     NSMutableString *msg = [NSMutableString stringWithFormat:
         @"将把「%@」范围内的 %ld 条未读标成已读。\n\n只改「已读」标记，不会删除记录。",
         [self scopeDesc], (long)n];
+    // v0.0.49：★ 视图下的警告，和搜索同款口径 —— ★ 是**显示层**筛选（nbStar 派生、
+    //    不在库里），标记范围仍是 SQL 的「App + 时间」。不说清楚就会出现
+    //    "我在 ★ 视图里点全标已读，结果未读的非标星记录也被标了"。
+    // 🔴 和搜索那条分开写（不用 else if）：两个筛选可以同时开着，警告要同时出现。
+    if (self.starOnly) {
+        [msg appendFormat:@"\n\n⚠️ 「★ 标星」视图只影响列表显示，不限制标记范围。"];
+    }
     // 🔴 搜索词只影响**列表显示**，不参与标记范围。不说清楚就会出现
     //    "我搜了验证码、只看到 3 条，一点却全标了" —— 和 v0.0.35 `onClear:` 的坑同源。
     if (self.searchText.length) {
@@ -760,6 +811,23 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self.unreadSeg addTarget:self action:@selector(onUnread:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.unreadSeg];
 
+    // v0.0.49：★ 只看标星开关。创建方式对齐 markAllBtn（同屏已有的按钮写法：
+    //    UIButtonTypeSystem + 手动设字体/圆角/底色），不引第二套。
+    // 🔴 选中态只换标题颜色（secondaryLabel → systemOrange），不换底色 ——
+    //    和列表里 ★ 的 systemOrange 同一套视觉，用户把"橙色的 ★"和"开着的筛选"联系起来。
+    // 🔴 常驻可见（不像 markAllBtn 随 unreadOnly 进出）：★ 是这一版的核心入口，
+    //    而且它随时可点 —— 没有规则时点它，空列表会告诉用户去建什么规则。
+    self.starBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.starBtn setTitle:@"★ 标星" forState:UIControlStateNormal];
+    self.starBtn.titleLabel.font = [UIFont systemFontOfSize:14];
+    self.starBtn.layer.cornerRadius = 7;
+    self.starBtn.backgroundColor = [UIColor secondarySystemFillColor];
+    [self.starBtn setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
+    [self.starBtn setTitleColor:[UIColor systemOrangeColor] forState:UIControlStateSelected];
+    [self.starBtn addTarget:self action:@selector(onStar:)
+              forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.starBtn];
+
     // v0.0.38：「只看未读」时才出现的批量入口。
     // 🔴 为什么默认隐藏、而不是常驻：在「全部」模式下，列表里已读未读混在一起，
     //    「全标已读」的作用对象不明确（是这一屏？是整个库？），容易被当成"清空"。
@@ -845,11 +913,18 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    分段控件相应收窄。收窄后剩下约 `w-24-94`，两个四字/两字标题放得下。
     // 🔴 可见性在这里同步一次，而不是只在 `onUnread:` 里改 —— 布局可能因为
     //    别的原因此后重跑，两处状态必须由同一个判据（`self.unreadOnly`）决定。
-    CGFloat unreadW = w - 24;
+    // v0.0.49：这一行变成三件套 —— ★ 标星（常驻，最左）+ 全部/只看未读 +（未读时）全标已读。
+    //    ★ 放分段**左边**：它是这版的新维度，挨着分段才被看得出"和全部/未读是一伙的"；
+    //    但它常驻、全标已读按需出现，所以两者不抢右边那个位置。
+    // 🔴 320pt 窄屏验算：12+64+6 + 132(分段最小值) + 6 + 88(全标) = 308 ≤ 320 ✓。
+    CGFloat starW = 64;
+    CGFloat unreadW = w - 24 - starW - 6;
     self.markAllBtn.hidden = !self.unreadOnly;
     if (self.unreadOnly) unreadW -= (kNBMarkAllWidth + 6);
-    self.unreadSeg.frame = CGRectMake(12, y, MAX(120, unreadW), 30);
-    self.markAllBtn.frame = CGRectMake(12 + MAX(120, unreadW) + 6, y, kNBMarkAllWidth, 30);
+    CGFloat segW = MAX(120, unreadW);
+    self.starBtn.frame = CGRectMake(12, y, starW, 30);
+    self.unreadSeg.frame = CGRectMake(12 + starW + 6, y, segW, 30);
+    self.markAllBtn.frame = CGRectMake(12 + starW + 6 + segW + 6, y, kNBMarkAllWidth, 30);
     y += 30 + 6;
 
     // v0.0.40：筛选之外还有未读的常驻提示。
@@ -1096,6 +1171,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    库满之后条数恒定，只看条数会漏掉"最该刷新"的场景）。
     self.lastTotal = total;
     self.lastMaxId = [NotifyStore maxRowId];
+    // v0.0.49：规则指纹和库指纹一起记（见 refreshIfChanged：规则不在库里，得单独比）。
+    self.lastRules = [NotifyStore keywordRules];
 
     // v0.0.42：底部「还有 N 条更早记录」。必须排在 `reloadData` 之后（那时 items 才定）。
     [self updateMoreFooter];
@@ -1140,9 +1217,18 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                                              unreadOnly:self.unreadOnly];
     // v0.0.48：用**折叠前**的 queriedCount，不用 self.items.count —— 后者已被关键词
     //   折叠/过滤改小，会把"被规则收起的"误算成"被列表上限截断的"（第三禁忌）。
-    NSInteger shown = self.queriedCount;
+    // v0.0.49：★ 视图换成 queriedStarCount（标星后、折叠前）—— 视图里只有标星的行，
+    //    queriedCount 混着非标星的，拿它算差就是"底部说的数和列表装的不是同一个集合"。
+    NSInteger shown = self.starOnly ? self.queriedStarCount : self.queriedCount;
+    // v0.0.49：★ 视图下**没有数字可报** —— nbStar 是派生量，SQL 里没有这一列，
+    //    countWithBundle: 数不出"标星的还有几条"（也绝不能为了数它在 SQL 里复刻一遍
+    //    关键词匹配 —— 两套匹配逻辑必然对不上，v0.0.48 刚立过这条纪律）。
+    //    ⇒ 只在查询窗口真被截断时（scopeCount > 实际查回来的条数）提醒"更早的可能还有"，
+    //    不报数；窗口没截断 ⇒ 这个范围内每一行都看过了，标星的一条不漏。
+    BOOL starSaturated = self.starOnly && (scopeCount >= 0 && scopeCount > self.queriedCount);
     // scopeCount < 0 ⇒ DB 打不开，宁可不提示（跟 `updateHiddenUnread` 的处理一致）
-    NSInteger more = (scopeCount >= 0) ? (scopeCount - shown) : 0;
+    NSInteger more = starSaturated ? 1
+                                   : ((scopeCount >= 0) ? (scopeCount - shown) : 0);
 
     if (more <= 0) {
         self.table.tableFooterView = nil;
@@ -1160,9 +1246,17 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 🔴 「列表上限」这个数字从 `NotifyStore` 取，**不要**在界面里另写一个 2000
     // v0.0.43：文案跟着模式改一个字。只改数字不改文案的话，用户会去库里数
     //    「怎么还有 450 条我看不到」—— 而它们其实是他自己选了"只看未读"挡掉的。
+    // v0.0.49：★ 视图的文案**不带数字**（数不出，见上），只说"可能还有"——
+    //    报一个假数字比不报更糟（用户会去数，数出来不对就不再信这条提示）。
+    if (starSaturated) {
+        self.moreFooter.text = [NSString stringWithFormat:
+            @"更早的记录里可能还有标星的\n★ 视图一次最多查 %ld 条记录，更早的在库里翻不到",
+            (long)[NotifyStore listLimit]];
+    } else {
     self.moreFooter.text = [NSString stringWithFormat:
         @"下面还有 %ld 条更早的%@记录\n列表一次最多显示 %ld 条，更早的在库里、这里翻不到",
         (long)more, self.unreadOnly ? @"未读" : @"", (long)[NotifyStore listLimit]];
+    }
 
     CGFloat w = self.table.bounds.size.width;
     if (w <= 0) w = [UIScreen mainScreen].bounds.size.width;
@@ -1230,6 +1324,16 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 //    跳过去仍然只看未读才符合他的意图；强行切回「全部」等于替他改了个无关的选择。
 - (void)onHiddenHintTap {
     BOOL changed = NO;
+    // v0.0.49：★ 筛选也清。
+    // 🔴 为什么它和 unreadOnly 待遇不同（v0.0.41 刻意不动 unreadOnly）：
+    //    unreadOnly **不挡未读**（它挡的是已读），提示条承诺"看到未读"时它不妨碍；
+    //    而 starOnly **挡未读**（标星且未读才看得见）⇒ 不清它，用户点完提示条
+    //    还是看不到承诺的那些未读，提示就成了说谎。
+    if (self.starOnly) {
+        self.starOnly = NO;
+        self.starBtn.selected = NO;
+        changed = YES;
+    }
     if (self.filterBundle.length) {
         self.filterBundle = nil;
         changed = YES;
@@ -1244,8 +1348,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         changed = YES;
     }
     if (!changed) {
-        // 三个筛选本来都是开的 ⇒ 这个数只可能是"库里条数超过列表能显示的上限"造成的，
-        // 点它没有地方可跳。如实说明，别让用户白点一下还以为坏了。
+        // 四个筛选本来都是开的（App/时间/搜索/★，v0.0.49 起）⇒ 这个数只可能是
+        // "库里条数超过列表能显示的上限"造成的，点它没有地方可跳。如实说明，
+        // 别让用户白点一下还以为坏了。
         [self alertTitle:@"记录太多"
                     text:@"当前已经是「全部 App · 不限时间 · 无搜索」，"
                          @"但库里的记录超过了列表能显示的上限，有一部分翻不到。"
@@ -1269,10 +1374,21 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 // 🔴 foldedCount 在这里算（**与 showFolded 无关**）：它是"被 fold 规则命中的总条数"，
 //    提示条据此决定显隐和文案；showFolded 只决定这些行"显不显示"，不改变这个数。
 // 🔴 queriedCount 存**折叠前**的条数，专给 updateMoreFooter（第三禁忌，见属性注释）。
+// v0.0.49：★ 筛选（starOnly）加进来，**必须排在折叠之前**：
+//    🔴 顺序反了会出两种错 —— ① foldedCount 把"非标星且被折叠"的行也算进去，
+//       提示条的 N 就不是"这个视图里被收起的"了；② 非标星的行会带着 nbStar=NO
+//       混进 items，★ 视图就不纯。
+//    🔴 另一个后果：★ 视图下 foldedCount / queriedStarCount 都只数**标星的行**，
+//       这是刻意的 —— 提示条和底部条数必须和"用户眼前这个视图"同口径。
 - (NSArray<NSDictionary *> *)applyKeywordRulesToRows:(NSArray<NSDictionary *> *)rows {
     self.queriedCount = (NSInteger)rows.count;
+    self.queriedStarCount = 0;
     self.foldedCount = 0;
-    if (![NotifyStore keywordRules].count) return rows;
+    if (![NotifyStore keywordRules].count) {
+        // v0.0.49：没有规则 ⇒ 没有任何行可能被标星 ⇒ ★ 视图必然是空的。
+        //    原样返回（非 ★ 视图行为零变化），★ 视图给空数组，空列表里解释原因。
+        return self.starOnly ? @[] : rows;
+    }
 
     NSMutableArray *visible = [NSMutableArray array];
     for (NSDictionary *row in rows) {
@@ -1282,6 +1398,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                                                          appName:[self appNameForBundle:row[@"bundle"]]];
         BOOL star = (act & NBKeywordActionStar) != 0;
         BOOL fold = (act & NBKeywordActionFold) != 0;
+        // v0.0.49：★ 筛选第一道。非标星的行不进当前视图，也**不计入**任何计数。
+        if (self.starOnly && !star) continue;
+        self.queriedStarCount += 1;
         if (fold) self.foldedCount += 1;
         // 被折叠、且当前不在"显示收起的"模式 ⇒ 不进列表（但仍计入 foldedCount）
         if (fold && !self.showFolded) continue;
@@ -1349,9 +1468,20 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 - (void)refreshIfChanged {
     NSInteger total = [NotifyStore count];
     NSInteger topId = [NotifyStore maxRowId];
+    // v0.0.49：关键词规则的指纹也参与"要不要重查"的判定。
+    // 🔴🔴 为什么必须加：v0.0.48 起折叠/标星由 settings.plist 里的规则**派生**，
+    //    而规则改动**不走数据库** ⇒ 只比分率和 MAX(id) 的话，"改完规则回列表"
+    //    看到的是旧状态（v0.0.48 验机第 6 条"立即生效"在这个缺口下并不成立，
+    //    只是当时还没真机验到）。★ 视图对规则的依赖更直接：建完 ★ 规则回来
+    //    点 ★，列表必须是新的。
+    // 🔴 比**内容**不比 mtime：App 内改、Filza 手动改都算；NSArray/NSDictionary 的
+    //    isEqual: 是深比较，≤20 条规则的成本可以忽略（比一次 SQL 便宜得多）。
+    NSArray<NSDictionary *> *rulesNow = [NotifyStore keywordRules];
+    BOOL rulesChanged = ![rulesNow isEqual:self.lastRules];
     // 🔴 两个都得比：库满之后新增记录不会让条数变大（tweak 先裁掉一条最旧的），
     //    只有 `MAX(id)` 会变；反过来，删记录通常只让条数变小。
-    if (total == self.lastTotal && topId == self.lastMaxId) return;
+    if (total == self.lastTotal && topId == self.lastMaxId && !rulesChanged) return;
+    self.lastRules = rulesNow;
     // 🔴 DB 打不开时 `count` / `maxRowId` 双双回 -1，和上一次的 -1 相等 ⇒ 这里直接返回，
     //    列表保持原样。这是**故意的**：打不开库的时候"刷新"只会把好数据换成空列表。
     [self reloadKeepingOffset];
@@ -1411,6 +1541,18 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     if (self.unreadOnly) {
         [t appendString:@"\n\n（当前是「只看未读」，切上面「全部」可以看所有记录）"];
     }
+    // v0.0.49：★ 视图空时必须说清"它为什么空" —— 否则用户以为记录丢了。
+    //    两种空分开说：有 ★ 规则但这个范围没命中 ⇒ 只解释视图语义；
+    //    根本没有 ★ 规则 ⇒ 点醒去建规则（否则这个视图永远空着，比没做更糟）。
+    if (self.starOnly) {
+        if ([self anyStarRule]) {
+            [t appendString:@"\n\n（★ 视图只显示命中「★ 标星」规则的记录，"
+                              @"当前范围里没有）"];
+        } else {
+            [t appendString:@"\n\n（★ 视图还没有可显示的内容：去 设置 → 关键词规则 "
+                              @"添加一条带「★ 标星」动作的规则）"];
+        }
+    }
     // v0.0.48：列表被关键词规则折叠空时，**必须说清"其实有 N 条、被规则收着"** ——
     //    否则屏幕只剩"暂无记录"，用户会以为记录丢了（而它们是被自己设的规则收起的）。
     //    上面那条可点的 foldedHint 提示条是同一个事实的"可操作版"，这里补一句解释，不矛盾。
@@ -1448,11 +1590,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [NSString stringWithFormat:@"%@ · %@", app, [self timeName]];
 }
 
-// v0.0.36：把当前四个筛选维度拼成一行。
+// v0.0.36：把当前筛选维度拼成一行（v0.0.49 起是五个：App / 时间 / 已读状态 / ★ / 搜索）。
 - (NSString *)filterDesc {
     NSMutableArray *a = [NSMutableArray array];
     [a addObject:[self scopeDesc]];
     [a addObject:(self.unreadOnly ? @"只看未读" : @"全部状态")];
+    // v0.0.49：★ 维度。写在搜索之前 —— 它比搜索"更靠近列表语义"（筛的是行本身）。
+    if (self.starOnly) {
+        [a addObject:@"★ 只看标星"];
+    }
     if (self.searchText.length) {
         [a addObject:[NSString stringWithFormat:@"搜索「%@」", self.searchText]];
     }
@@ -1513,6 +1659,28 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.markAllBtn.hidden = !self.unreadOnly;
     [self.view setNeedsLayout];
     [self loadData];
+}
+
+// v0.0.49：★ 只看标星开关。
+// 🔴 走 `loadData` 整表重查，不自己过滤 `self.items` —— 和 `onUnread:` 同一条纪律：
+//    内存过滤只能过滤"已经查出来的 2000 条"，而 ★ 视图的语义是"这个范围内所有标星的"。
+// 🔴 不需要 `setNeedsLayout`：starBtn 常驻、分段行宽度不随 starOnly 变
+//    （布局分支只认 unreadOnly）—— 提示条的出现/消失由 loadData 末尾统一触发。
+- (void)onStar:(id)sender {
+    self.starOnly = !self.starOnly;
+    self.starBtn.selected = self.starOnly;
+    [self loadData];
+}
+
+// v0.0.49：有没有任何规则带 ★ 动作。
+// 🔴 为什么要有这个判断：★ 视图为空时分两种——"这个范围里没有标星的"和
+//    "根本没有任何规则会标星"。后者不说清楚，用户会以为功能坏了
+//    （v0.0.39 同款纪律：一个永远不触发还不解释的功能，比没做更糟）。
+- (BOOL)anyStarRule {
+    for (NSDictionary *r in [NotifyStore keywordRules]) {
+        if ([r[@"star"] boolValue]) return YES;
+    }
+    return NO;
 }
 
 #pragma mark - UITableView
