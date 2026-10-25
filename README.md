@@ -6062,3 +6062,66 @@ App 涨的 16608 B 与 v0.0.48 的 dylib 涨幅相同——`NotifyStore.m` 两�
 | deb | **1086670 B** |
 | 远端 | 代码 `6174401595` = 本地 `43d0ec3`，**9 文件逐 blob 一致** |
 | 改动 | 9 文件 **+103 / −10**（tweak 侧 v0.0.45 以来第一次逻辑改动） |
+
+
+## v0.0.52 · 删除盒子记录时同步清系统通知中心（精确 1:1）
+
+### 一、起因
+- 用户确认需求：不是「发布时按 App 拦」，而是**删除反向同步** —— 在盒子上删掉一条记录时，如果该通知在系统通知中心（锁屏 / 列表 / 横幅）还挂着，就一并从系统通知中心删掉。
+- 粒度：用户选「**精确 1:1 删这条**」 —— 记录时存系统 bulletin 唯一 ID，删盒子某条就只删系统里那一条（最贴合原话），而非按 bundle 整段清或手动按钮。
+- 查过现成越狱插件：BadgeSync（`com.newwares.badgesync`）做的是「用户在通知中心手动划掉通知时减角标」，反向、不主动移除通知，对本需求无帮助 ⇒ 走自建 BBServer 方案。
+
+### 二、改动（既定步骤 + 实际落点）
+1. `NotifyCommon.h`：新增 `NB_KEY_SYNC_CLEAR = @"syncClearNC"`（布尔，默认关）、`NOTIFYBOX_NC_CLEAR_DARWIN = @"com.yxh41.notifybox.ncClear"`（Darwin 通知名，不带 payload）、`NOTIFYBOX_NC_CLEAR_REQ = @"/var/mobile/Library/NotifyBox/nc_clear_req.plist"`（共享请求文件）。单一来源，防两处各写一个字符串对不上。
+2. `NotifyStore.h` + `.m`：
+   - `recordWithBundle:title:message:subtitle:date:` 扩成 `...:date:sysId:`；INSERT 加 `sys_id` 列。
+   - `openDB` 建表加 `sys_id TEXT`；**老库迁移**用 `PRAGMA table_info(notifications)` 探测后 `ALTER TABLE … ADD COLUMN sys_id TEXT`（SQLite 不支持 `ADD COLUMN IF NOT EXISTS`）。
+   - `deleteRow:` 删前读 `bundle`+`sys_id`，删成功且开关开且 sys_id 非空 ⇒ 调 `nbRequestClearNCWithSysId:bundle:`（写请求文件 + post Darwin）。
+   - `clearAll` / `deleteWithBundle:beforeTs:readOnly:` 显式**不触发**同步清（语义是「清日志」，且批量逐条发请求危险 / 无意义）。
+3. `Tweak.x`：
+   - `NBRecordItem` 记录时读系统 bulletin ID（`bulletinID` → 回退 `notificationIdentifier`，嵌套 `.bulletin` 再读一遍），传 `sysId`。
+   - 三个发布入口开头 `NBCaptureServerIfNeeded(self)`：在 publish hook 里（即 BBServer 内部队列上）capture `self` + `dispatch_get_current_queue()`，**绕开 extern __BBServerQueue 全局符号**（iOS 16 可能未导出，链接失败会进安全模式）。
+   - `%ctor` 在 SpringBoard 注册 `CFNotificationCenterAddObserver`（Darwin 通知 → `NBClearNCCallback`）。
+   - `NBClearNCCallback`：读请求文件，在 captured 队列上 `dispatch_sync` 调 `[gBBServer _clearBulletinIDs:@[sysId] forSectionID:bundle shouldSync:YES]`；**`respondsToSelector:` 守卫**，本机没有该方法 ⇒ 打日志跳过（不崩）。
+   - `NSObject (NBClearNC)` 分类声明 `_clearBulletinIDs:forSectionID:shouldSync:`（消编译警告；运行时仍靠 `respondsToSelector:` 守卫）。
+4. `SettingsViewController`：设置页新增「删除盒子记录时同步清系统通知中心」开关（默认关）；`NB_KEY_SYNC_CLEAR` 加进 `onSave` 保存数组（🔴 漏加 = 开关不落盘，老教训 s0x）。
+5. 版本 0.0.52（control + Info.plist 两处 + Tweak.x 三 banner + 头注如实写：tweak 侧有逻辑改动）。
+6. 判据 + CI + 本 README 章 + memory 实现记录（本步）。
+
+### 三、判据（锚点清单，跑常规 nb_push_api + CI 机器对拍）
+编译期 / 静态：
+- 版本四条：control `Version: 0.0.52`、Info.plist `CFBundleVersion`/`CFBundleShortVersionString` = 0.0.52、Tweak.x 三 banner 含 0.0.52（含新增的「同步清通知中心」banner 占位）。
+- 功能存在型：
+  - `NotifyCommon.h` 三个新 `#define`（syncClearNC / ncClear / nc_clear_req.plist）。
+  - `Tweak.x` 含 `NBCaptureServerIfNeeded`、`NBClearNCCallback`、`NSObject (NBClearNC)`、三入口各自 `NBCaptureServerIfNeeded(self)`。
+  - `NotifyStore.m` 含 `recordWithBundle:...sysId:`、`nbRequestClearNCWithSysId:bundle:`、`ALTER TABLE … ADD COLUMN sys_id`、`_clearBulletinIDs:forSectionID:shouldSync:`。
+  - `SettingsViewController.m` 含「删除盒子记录时同步清系统通知中心」文案 + 保存数组含 `NB_KEY_SYNC_CLEAR`。
+- 变异 / 反向（按前版纪律）：拿 v0.0.51 树跑 v0.0.52 判据应红（版本族 + 新功能存在型）；变异锚点必须唯一命中（==1，否则 SKIP 算失败）。
+- 包级反向：旧 deb 不该含新选择器 `NBClearNCCallback` / 新 UI 串；新 deb 必须含。
+真机运行时（**编译判据盖不住，只能真机验**）：
+- ① iOS 16 上 `bulletinID` 属性名是否对（回退 `notificationIdentifier` 兜底）；
+- ② 本机 BBServer 是否真有 `_clearBulletinIDs:forSectionID:shouldSync:`（无则日志 `[NC-CLEAR] 本机 BBServer 无 … ⇒ 跳过（不崩）`，功能优雅失效）。
+
+> 🔴 两个真机点若不准，表现不是崩，是「盒子删了、通知中心没动」 —— 所以验收口径必须是**看系统通知中心那条是否消失**，而不是看日志里有没有 `[NC-CLEAR] 已清`。
+
+### 四、大小记账
+- 待 CI 出包后回填（dylib 净增一个分类声明 + 一个 capture + 一个回调 + 几个字符串；App 净增一个开关行 + UI 串；历史多次验证「大小与改动量不线性」，以字节对拍为准，Z5）。
+
+### 五、安装与真机验机（6 条）
+1. 装完 uicache / respring。
+2. 设置页出现「删除盒子记录时同步清系统通知中心」开关，默认关；打开它。
+3. 等某 App 来一条通知（确认盒子里有这条、系统通知中心也挂着它）。
+4. 在盒子 App 里左滑删除**那一条**记录 ⇒ 系统通知中心**同一条**应消失（锁屏 / 通知列表 / 横幅 whichever 挂着）。
+5. 关闭开关再删 ⇒ 盒子记录没了，系统通知中心**不动**（验证开关真的控制行为）。
+6. 「批量清理 / 清空全部」不碰通知中心（设计如此：那是清日志，不是清系统通知）。
+
+### 六、风险与自踩（v0.0.52 设计期已排的雷）
+1. 🔴 **绕开 `extern __BBServerQueue`**：iOS 16 该全局符号可能未导出，tweak 加载链接失败 ⇒ 直接进安全模式。改在 publish hook 里 capture `self` + `dispatch_get_current_queue()`，零外部符号依赖。
+2. 🔴 **`_clearBulletinIDs:` 本机可能不存在**：必须 `respondsToSelector:` 守卫 + 日志；不存在就优雅跳过，绝不把「我以为有」变成闪退 / 安全模式。
+3. 🔴 **跨进程通道**：盒子 App 与 SpringBoard 原本无任何通道。Darwin 通知（不带 payload）+ 共享 plist 外带「要删哪个」 —— 机制成熟、不需 entitlement。
+4. 🔴 **只单条触发、批量 / 全不清**：共享请求文件是单文件、会被覆盖；批量逐条发请求既无意义又危险，且批量 / 全清语义是「清日志」。开关只对 `deleteRow:` 生效。
+5. 🔴 **bulletinID 属性名跨代不一致**：先 `bulletinID` 后回退 `notificationIdentifier`，嵌套 `.bulletin` 再读；读不到留空 ⇒ 功能自动失效，不影响记录。
+6. 🔴 **`dispatch_sync` 到 BBServer 队列**：回调在 CF 通知线程，必须 `dispatch_sync` 到 captured 队列才能调 `_clearBulletinIDs:`；队列为空（还没捕获过，即用户还没收到过任何通知就删）时日志跳过，不崩。
+
+### 七、交付
+- 待 nb_push_api + CI 跑通后回填（CI run_id / deb 字节 / 远端 blob 一致 / 改动文件数）。

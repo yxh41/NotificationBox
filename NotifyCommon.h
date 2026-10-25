@@ -318,6 +318,21 @@ static inline NSArray<NSString *> *NBStringArray(id v) {
 // 🔴 只有 App 侧写（设置页选择器）、tweak 侧读——和所有名单一样，别让 SpringBoard 写。
 #define NB_KEY_NO_RECORD_APPS @"noRecordApps"   // 数组或 "a,b"，空/缺失 = 全部记录
 
+// ---------- v0.0.52：删除盒子记录时同步清系统通知中心（精确 1:1） ----------
+// 语义：盒子上删某一条记录时，如果该通知在系统通知中心（锁屏 / 列表 / 横幅）还挂着，
+//   就用 BBServer._clearBulletinIDs:forSectionID:shouldSync: 把**那一条**从通知中心也删掉。
+//   只删那一条（按记录时存下来的系统 bulletin ID 精确匹配），不是整段清、不是按 bundle 清。
+// 🔴 跨进程通道：盒子 App（com.yxh41.notifybox）和 tweak（跑在 SpringBoard）之间
+//   原本没有任何通道。这里用 Darwin notification（不带 payload，机制成熟、不需 entitlement），
+//   "要删哪个"走外带共享文件（下面那个路径）。
+// 🔴 只有 App 侧写（删除时）、tweak 侧读（收到通知后执行）—— 和所有名单同族。
+#define NB_KEY_SYNC_CLEAR @"syncClearNC"   // 布尔，默认关
+// 🔴 Darwin 通知名（不带 payload）：App 删完一条、写完请求文件后 post 它。
+#define NOTIFYBOX_NC_CLEAR_DARWIN @"com.yxh41.notifybox.ncClear"
+// 🔴 共享请求文件：App 写 {sysId, bundle}，tweak 读后执行清除。
+//   单条删除用单文件足够（手动逐条删几乎不会竞态）；批量清理 / 清空全部不触发本通道。
+#define NOTIFYBOX_NC_CLEAR_REQ @"/var/mobile/Library/NotifyBox/nc_clear_req.plist"
+
 // ---------- 统一日志 ----------
 // 🔴 v0.0.12：原来 Tweak.x 里有份 static NBLog，新加的 NotifySpeaker/NotifyProbe 够不着。
 //    **复制一份日志函数**是最差解（两份轮转逻辑迟早走岔），所以把实现沉到 NotifyStore.m

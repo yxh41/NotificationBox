@@ -3,6 +3,7 @@
 #import <sqlite3.h>
 #import <errno.h>
 #import <string.h>
+#import <CoreFoundation/CoreFoundation.h>   // v0.0.52：Darwin 通知（清系统通知中心用）
 
 // ---------- 列表一次最多取多少条 ----------
 // 🔴 这个数**只和"列表能显示多少"有关**，和 `maxRecords`（库里留多少）是两件事：
@@ -95,7 +96,7 @@ void NBSharedLog(NSString *fmt, ...) {
     const char *sql = "CREATE TABLE IF NOT EXISTS notifications ("
                       "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                       "bundle TEXT, title TEXT, message TEXT, subtitle TEXT, "
-                      "ts REAL, read INTEGER DEFAULT 0, hash TEXT);"
+                      "ts REAL, read INTEGER DEFAULT 0, hash TEXT, sys_id TEXT);"
                       "CREATE INDEX IF NOT EXISTS idx_bundle ON notifications(bundle);"
                       "CREATE INDEX IF NOT EXISTS idx_ts ON notifications(ts);"
                       // v0.0.45：App 显示名表。**SpringBoard 写、盒子 App 读**。
@@ -110,6 +111,24 @@ void NBSharedLog(NSString *fmt, ...) {
                       "CREATE TABLE IF NOT EXISTS app_names ("
                       "bid TEXT PRIMARY KEY, name TEXT);";
     sqlite3_exec(db, sql, NULL, NULL, NULL);
+
+    // v0.0.52：老库补 sys_id 列（精确同步清通知中心用）。
+    // 🔴 SQLite 不支持 `ALTER TABLE … ADD COLUMN IF NOT EXISTS`，
+    //    所以先 PRAGMA table_info 探测，没有才 ALTER（避免对已是新结构的库重复 ALTER 报错）。
+    {
+        BOOL hasSysId = NO;
+        sqlite3_stmt *p = NULL;
+        if (sqlite3_prepare_v2(db, "PRAGMA table_info(notifications)", -1, &p, NULL) == SQLITE_OK) {
+            while (sqlite3_step(p) == SQLITE_ROW) {
+                const char *nm = (const char *)sqlite3_column_text(p, 1);
+                if (nm && strcmp(nm, "sys_id") == 0) { hasSysId = YES; break; }
+            }
+            sqlite3_finalize(p);
+        }
+        if (!hasSysId) {
+            sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN sys_id TEXT;", NULL, NULL, NULL);
+        }
+    }
     return db;
 }
 
@@ -344,7 +363,8 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
                    title:(NSString *)title
                  message:(NSString *)message
                subtitle:(NSString *)subtitle
-                    date:(NSDate *)date {
+                    date:(NSDate *)date
+                  sysId:(NSString *)sysId {
     if (!bundle.length) return;
     sqlite3 *db = [self openDB];
     if (!db) {
@@ -352,8 +372,10 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         return;
     }
 
-    const char *ins = "INSERT INTO notifications (bundle,title,message,subtitle,ts,hash) "
-                      "VALUES (?,?,?,?,?,?)";
+    // v0.0.52：加 sys_id 列（系统 bulletin ID，精确同步清通知中心用）。读不到时传 @""，
+    //   该列只是空串，不影响记录本身，feature 自动失效。
+    const char *ins = "INSERT INTO notifications (bundle,title,message,subtitle,ts,hash,sys_id) "
+                      "VALUES (?,?,?,?,?,?,?)";
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(db, ins, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, [bundle UTF8String], -1, SQLITE_TRANSIENT);
@@ -365,6 +387,7 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         NSString *h = [NSString stringWithFormat:@"%@|%@|%@", bundle, title ?: @"", message ?: @""];
         NSData *hd = [h dataUsingEncoding:NSUTF8StringEncoding];
         sqlite3_bind_text(stmt, 6, [[hd description] UTF8String], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 7, [sysId ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
         int rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE) {
             NBStoreLog(@"INSERT 失败 rc=%d err=%s bundle=%@", rc, sqlite3_errmsg(db), bundle);
@@ -712,6 +735,25 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     sqlite3 *db = [self openDB];
     if (!db) return NO;
     BOOL ok = NO;
+
+    // v0.0.52：删前读 bundle + sys_id（精确同步清通知中心用）。
+    // 🔴 必须先读后删：删完就 SELECT 不到了。这两个值只在"开启同步清且 sys_id 非空"时才用到。
+    NSString *delBundle = nil;
+    NSString *delSysId  = nil;
+    {
+        sqlite3_stmt *r = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT bundle, sys_id FROM notifications WHERE id=?", -1, &r, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(r, 1, (sqlite3_int64)rowId);
+            if (sqlite3_step(r) == SQLITE_ROW) {
+                const char *b = (const char *)sqlite3_column_text(r, 0);
+                const char *s = (const char *)sqlite3_column_text(r, 1);
+                if (b) delBundle = [NSString stringWithUTF8String:b];
+                if (s) delSysId  = [NSString stringWithUTF8String:s];
+            }
+            sqlite3_finalize(r);
+        }
+    }
+
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, "DELETE FROM notifications WHERE id=?", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, (sqlite3_int64)rowId);
@@ -720,7 +762,37 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     }
     if (!ok) NBStoreLog(@"DELETE 未删到 id=%ld err=%s", (long)rowId, sqlite3_errmsg(db));
     sqlite3_close(db);
+
+    // 🔴 删成功 + 开启同步清 + sys_id 非空 ⇒ 请求 tweak 把系统通知中心**那一条**也清掉。
+    //    放在 `sqlite3_close(db)` **之后**：请求文件用独立 writeToFile，不依赖这个 db 句柄；
+    //    且保证"记录确实从库里没了"才去清通知中心，避免"库没删成却把通知中心清了"的错位。
+    //    delBundle 也一并要求非空：sectionID 必须和 bulletinID 成对，否则 _clearBulletinIDs: 无效。
+    if (ok && delSysId.length && delBundle.length) {
+        NSDictionary *p = NBLoadSettings();
+        if ([p[NB_KEY_SYNC_CLEAR] boolValue]) {
+            [self nbRequestClearNCWithSysId:delSysId bundle:delBundle];
+        }
+    }
     return ok;
+}
+
+// v0.0.52：把"要清哪一条"写进共享请求文件，再 post Darwin 通知唤醒 tweak。
+// 🔴 文件用**覆盖写**：手动逐条删几乎不会竞态；批量清理 / 清空全部不触发本通道（见 deleteWithBundle:/clearAll）。
+// 🔴 整段 @try：这步只是"发个请求"，任何失败都不该影响"盒子记录已经删掉"这个结果。
++ (void)nbRequestClearNCWithSysId:(NSString *)sysId bundle:(NSString *)bundle {
+    @try {
+        NSDictionary *req = @{@"sysId": sysId ?: @"", @"bundle": bundle ?: @""};
+        [[NSFileManager defaultManager] createDirectoryAtPath:
+            [NOTIFYBOX_NC_CLEAR_REQ stringByDeletingLastPathComponent]
+                                     withIntermediateDirectories:YES attributes:nil error:nil];
+        [req writeToFile:NOTIFYBOX_NC_CLEAR_REQ atomically:YES];
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             CFSTR("com.yxh41.notifybox.ncClear"),
+                                             NULL, NULL, TRUE);
+        NBStoreLog(@"NC-CLEAR 已请求 sysId=%@ bundle=%@", sysId, bundle);
+    } @catch (NSException *e) {
+        NBStoreLog(@"NC-CLEAR 请求失败：%@", e);
+    }
 }
 
 #pragma mark - v0.0.45 批量删除
@@ -773,6 +845,10 @@ static sqlite3_stmt *NBPrepareDelete(sqlite3 *db, NSString *bundle, NSTimeInterv
 + (NSInteger)deleteWithBundle:(NSString *)bundle
                      beforeTs:(NSTimeInterval)beforeTs
                      readOnly:(BOOL)readOnly {
+    // 🔴 v0.0.52：批量删除**不触发**同步清通知中心。
+    //    本方法一次可能删成百上千条，"逐条写请求文件 + post Darwin"既无必要也危险
+    //    （共享请求文件是单文件、会被覆盖；且一次清上千条通知中心不符合"精确 1:1"的语义）。
+    //    同步清只服务于"手动删单条记录"这一个路径（见 deleteRow:）。
     if (!bundle.length && beforeTs <= 0 && !readOnly) return -2;   // 同上，拒绝无条件全删
     sqlite3 *db = [self openDB];
     if (!db) return -1;
@@ -795,6 +871,8 @@ static sqlite3_stmt *NBPrepareDelete(sqlite3 *db, NSString *bundle, NSTimeInterv
 // v0.0.35：返回真正删掉的条数（-1 = DB 打不开）。
 // 🔴 `sqlite3_changes` 必须在 `exec` 之后、**任何别的语句之前**取 ——
 //    它是"最近一条语句改了 N 行"，插一句别的就串了。
+// 🔴 v0.0.52：清空全部**不触发**同步清通知中心。理由同 deleteWithBundle: ——
+//    这是"清空我的盒子日志"，不是"清空系统通知中心"；且批量场景不该逐条发请求。
 + (NSInteger)clearAll {
     sqlite3 *db = [self openDB];
     if (!db) return -1;

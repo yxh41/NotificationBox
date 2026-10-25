@@ -1,4 +1,11 @@
-// Tweak.x —— v0.0.51（当前）：**tweak 侧有逻辑改动**（本版起）——
+// Tweak.x —— v0.0.52（当前）：**tweak 侧有逻辑改动** ——
+//   「删除盒子记录时同步清系统通知中心」（精确 1:1）：
+//   ① NBRecordItem 记录时读系统 bulletin ID（bulletinID / notificationIdentifier）存进库；
+//   ② %ctor 在 SpringBoard 注册 Darwin 通知观察者；盒子 App 删单条记录时写请求文件 + post；
+//   ③ 回调在捕获到的 BBServer 内部队列上调用 _clearBulletinIDs:forSectionID:shouldSync:，
+//      把那一条从系统通知中心也删掉（respondsToSelector: 守卫，本机没有就优雅跳过）。
+//   ④ 绕开 extern __BBServerQueue 外部符号：在 publish hook 里 capture self + dispatch_get_current_queue()。
+//   🔴 上一次 tweak 侧真的动是 v0.0.51：在 NBRecordItem 加「连记录都不要」per-App 闸门。
 //   「连记录都不要」per-App 名单：NBRecordItem 在 recordWithBundle: 之前加闸门
 //   （NotifyFilter shouldSkipRecordForBundle:，读 settings.plist 的 noRecordApps）。
 //   只掐"记"这一路，过滤/替换/换声/朗读照跑。
@@ -268,6 +275,70 @@ static BOOL NBClaimKey(NSString *key) {
 //    这对「过滤/替换」无害（幂等：判三次、替换三次结果一样），
 //    对**朗读**是灾难 —— 用户会听见同一句话被读三遍。
 //    所以必须把"是不是首次"这个事实交出去，而不是让每个下游自己再猜一遍。
+// ---------- v0.0.52：同步清系统通知中心（盒子删记录 → 通知中心也删那一条） ----------
+
+// 🔴 声明在 NSObject 上，避免编译器不认识 BBServer 类型而报警；
+//   真正有没有这个方法，运行时用 respondsToSelector: 守卫，没有就优雅跳过（不崩）。
+@interface NSObject (NBClearNC)
+- (void)_clearBulletinIDs:(NSArray<NSString *> *)identifiers
+            forSectionID:(NSString *)sectionID
+              shouldSync:(BOOL)shouldSync;
+@end
+
+// 🔴 捕获 BBServer 单例与其内部队列（在 publish hook 里、即 BB 队列上调用时 capture）。
+// 🔴 不用 extern __BBServerQueue：iOS 16 该全局符号可能未导出，
+//    tweak 加载时链接失败会直接进安全模式。改为在 hook 里 capture self + 当前队列，绕开外部符号。
+static __strong id gBBServer = nil;
+static dispatch_queue_t gBBServerQueue = nil;
+static void NBCaptureServerIfNeeded(id server) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gBBServer = server;          // 单例，强引用无碍
+        // 🔴 dispatch_get_current_queue() 已废弃，包一层忽略弃用警告
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        gBBServerQueue = dispatch_get_current_queue();
+        #pragma clang diagnostic pop
+        NBLog(@"=== [v0.0.52] 已捕获 BBServer 实例 + 队列（同步清通知中心可用）");
+    });
+}
+
+// 🔴 盒子 App 删记录后唤醒我们，在 BBServer 队列上精确清掉那一条通知。
+//   放在正确队列上是关键：_clearBulletinIDs:… 必须在 BBServer 内部队列上调，否则会报错。
+static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
+                             CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    @try {
+        NSDictionary *req = [NSDictionary dictionaryWithContentsOfFile:NOTIFYBOX_NC_CLEAR_REQ];
+        NSString *sysId = req[@"sysId"];
+        NSString *bundle = req[@"bundle"];
+        if (!sysId.length || !bundle.length) {
+            NBLog(@"!!! [NC-CLEAR] 请求文件缺 sysId/bundle，跳过");
+            return;
+        }
+        if (!gBBServer || !gBBServerQueue) {
+            NBLog(@"!!! [NC-CLEAR] 尚未捕获 BBServer 实例/队列，跳过");
+            return;
+        }
+        if (![gBBServer respondsToSelector:@selector(_clearBulletinIDs:forSectionID:shouldSync:)]) {
+            NBLog(@"!!! [NC-CLEAR] 本机 BBServer 无 _clearBulletinIDs:forSectionID:shouldSync: ⇒ 跳过（不崩）");
+            return;
+        }
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        dispatch_sync(gBBServerQueue, ^{
+        #pragma clang diagnostic pop
+            @try {
+                [gBBServer _clearBulletinIDs:@[sysId] forSectionID:bundle shouldSync:YES];
+                NBLog(@"=== [NC-CLEAR] 已清 sysId=%@ bundle=%@", sysId, bundle);
+            } @catch (NSException *e) {
+                NBLog(@"!!! [NC-CLEAR] 调用抛异常：%@", e);
+            }
+        });
+    } @catch (NSException *e) {
+        NBLog(@"!!! [NC-CLEAR] 回调异常：%@", e);
+    }
+}
+
 static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
                               int *counter, BOOL *firstTime) {
     if (firstTime) *firstTime = NO;
@@ -290,6 +361,19 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
             if (!date)         date  = NBSafeDate(inner, @"date");
         }
     }
+    // v0.0.52：读系统 bulletin ID（精确同步清通知中心用）。
+    // 🔴 先 bulletinID，再 notificationIdentifier（两代 API 名字不同，真机以哪个为准未知）；
+    //    嵌套包装的还要从 .bulletin 里再读一遍。读不到就留空（feature 自动失效，不影响记录）。
+    NSString *sysId = NBSafeStr(obj, @"bulletinID");
+    if (!sysId.length) sysId = NBSafeStr(obj, @"notificationIdentifier");
+    if (!sysId.length) {
+        id inner2 = NBSafeValue(obj, @"bulletin");
+        if (inner2 && inner2 != obj) {
+            if (!sysId.length) sysId = NBSafeStr(inner2, @"bulletinID");
+            if (!sysId.length) sysId = NBSafeStr(inner2, @"notificationIdentifier");
+        }
+    }
+
     // 有些 wrapper 用 bulletinID / requestID 之类的键放 section；读不到就只报诊断
     if (!bid.length) {
         if (*counter < 6) {
@@ -321,7 +405,7 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
               title.length ? title : @"(nil)",
               msg.length ? (msg.length > 40 ? [[msg substringToIndex:40] stringByAppendingString:@"..."] : msg) : @"(nil)");
     }
-    [NotifyStore recordWithBundle:bid title:title message:msg subtitle:sub date:date];
+    [NotifyStore recordWithBundle:bid title:title message:msg subtitle:sub date:date sysId:sysId];
     return bid;
 }
 
@@ -473,6 +557,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 %group GPB
 %hook BBServer
 - (void)publishBulletin:(id)bulletin destinations:(unsigned long long)destinations {
+    NBCaptureServerIfNeeded(self);   // v0.0.52：捕获 BBServer 实例 + 队列（同步清通知中心用）
     NBDecision d = NBPipeline(bulletin, nil, @"PB", &gHit1);
     if (!d.allow) return;
     %orig(bulletin, destinations);
@@ -487,6 +572,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 %group GPBR
 %hook BBServer
 - (void)publishBulletinRequest:(id)request destinations:(unsigned long long)destinations {
+    NBCaptureServerIfNeeded(self);   // v0.0.52：捕获 BBServer 实例 + 队列（同步清通知中心用）
     NBDecision d = NBPipeline(request, nil, @"PBR", &gHit2);
     if (!d.allow) return;
     %orig(request, destinations);
@@ -504,6 +590,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
                 forDestinations:(unsigned long long)destinations {
     // 第二个参数按 ENC 是 @（对象），本身就是 sectionID，直接当 bundle 用最可靠
     NSString *sid = [sectionID isKindOfClass:[NSString class]] ? (NSString *)sectionID : nil;
+    NBCaptureServerIfNeeded(self);   // v0.0.52：捕获 BBServer 实例 + 队列（同步清通知中心用）
     NBDecision d = NBPipeline(request, sid, @"PBRS", &gHit3);
     if (!d.allow) return;
     %orig(request, sectionID, destinations);
@@ -644,6 +731,14 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //       而且现场看起来完全不像是权限问题。这种坑不能留。
     BOOL soundRecovered = NO;
     if ([NBProc() isEqualToString:@"SpringBoard"]) {
+        // v0.0.52：注册 Darwin 通知观察者（盒子 App 删记录时唤醒我们清通知中心）。
+        // 🔴 只在 SpringBoard 注册：tweak 主逻辑都在 SpringBoard；backboardd 不处理通知中心。
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            NULL, NBClearNCCallback,
+            CFSTR("com.yxh41.notifybox.ncClear"), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        NBLog(@"=== [v0.0.52] 已注册 Darwin 通知观察者（NC 同步清除）");
         // 🔴 v0.0.19：延迟功能已整体删除 ⇒ 这里不再有"自愈"，只有**残留清理**。
         //    只在 SpringBoard 里做，理由同上一段（backboardd 是 root）。
         NBPurgeDelayLeftovers();
@@ -711,12 +806,13 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.51 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.52 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
           @"可用",
-          @"实验（默认关，按 App 各自一个音 + 时长上限 + 连发不叠加）");
+          @"实验（默认关，按 App 各自一个音 + 时长上限 + 连发不叠加）",
+          @"实验（默认关，删除单条记录时把那一条从通知中心也删掉）");
 
     // 只读探针：dump 一次 BBBulletin / BBSound 的类结构（内部自己保证只做一次）
     [NotifyProbe dumpClassesOnce];
@@ -749,7 +845,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.51 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.52 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
@@ -814,7 +910,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.51 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.52 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

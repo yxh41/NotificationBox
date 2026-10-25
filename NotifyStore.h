@@ -15,11 +15,14 @@ typedef NS_OPTIONS(NSUInteger, NBKeywordAction) {
 @interface NotifyStore : NSObject
 
 // 录制（tweak 调用）。date 传 nil 时自动用当前时间。
+// v0.0.52：sysId = 系统 bulletin ID（BBBulletin.bulletinID / notificationIdentifier），
+//   用于"盒子删记录时同步清系统通知中心"的精确 1:1 匹配；读不到传 nil，功能自动失效。
 + (void)recordWithBundle:(NSString *)bundle
                    title:(nullable NSString *)title
                  message:(nullable NSString *)message
                subtitle:(nullable NSString *)subtitle
-                    date:(nullable NSDate *)date;
+                    date:(nullable NSDate *)date
+                  sysId:(nullable NSString *)sysId;
 
 // 查询（盒子 App 调用）
 // v0.0.36：加 `unreadOnly`（只看未读）。四种筛选是**独立叠加**的

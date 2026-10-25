@@ -235,6 +235,15 @@ static const NSInteger kSubHit = 105;
            keyboard:UIKeyboardTypeNumberPad
                 key:@"autoCleanDays"];
 
+    // ---------- 删除盒子记录时同步清系统通知中心（v0.0.52） ----------
+    // 🔴 精确 1:1：盒子上删某一条记录时，如果该通知在系统通知中心还挂着，
+    //    就把它从通知中心也删掉（只删那一条，不是按 App 整段清）。
+    //    关闭时，删盒子记录只是删盒子里的日志，系统通知中心不动（默认关，避免意外）。
+    //    🔴 批量清理 / 清空全部**不触发**本开关（见 NotifyStore 注释）：那是"清日志"，语义不同。
+    [self addSwitchRow:@"删除盒子记录时同步清系统通知中心"
+                    on:[self boolOf:cur[NB_KEY_SYNC_CLEAR]]
+                   key:NB_KEY_SYNC_CLEAR];
+
     // ---------- 连记录都不要（v0.0.51） ----------
     // 🔴 单独一区、排在「推送拦截」**之前**：流水线上先记录后过滤——
     //    这个名单管"记不记"，下面那组管"弹不弹"。放一起才看得出两段的分工，
@@ -653,7 +662,7 @@ static const NSInteger kSubHit = 105;
     //    症状：点开、保存、再进来又变回关；而保存时没有任何报错，盘上压根没这个键。
     //    ⇒ 加开关时必须同时改这里（源码判据 s0x 盯着这一点）。
     for (NSString *k in @[NB_KEY_SPEAK_ENABLED, NB_KEY_DND_ENABLED, NB_KEY_SOUND_ENABLED,
-                          NB_KEY_SOUND_DUCK_OTHERS]) {
+                          NB_KEY_SOUND_DUCK_OTHERS, NB_KEY_SYNC_CLEAR]) {
         UISwitch *sw = self.switches[k];
         d[k] = @(sw ? sw.isOn : NO);
     }
