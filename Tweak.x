@@ -1,15 +1,17 @@
-// Tweak.x —— v0.0.54（当前）：**诊断版（第二轮）** ——
+// Tweak.x —— v0.0.55（当前）：**诊断版（第三轮，带类型签名）** ——
 //   v0.0.53 真机结论（两条硬事实）：
 //   ① `_clearBulletinIDs:forSectionID:shouldSync:` **存在**且能调（YES/NO 都不抛异常），
 //      但通知中心那条**不消失** ⇒ 「自证里的数对了 ≠ 界面上发生了」；
 //   ② `_bulletinIDsForSectionID:` / `bulletinIDsForSectionID:` 在 iOS 16 **都不存在**
 //      ⇒ 枚举反查 live ID 这条路断了（v0.0.53 的 [NC-DIAG] 一行都没打出来）。
-//   ⇒ v0.0.54 只做两件能真正推进的事（仍是只读诊断 + 两个候选都试，不改算法）：
-//   ① 把方法名清单从 %ctor **搬进清除回调**（开机那次早被日志窗口挤掉，这里一定在用户眼前），
-//      并且不只 BBServer，连 BBObserver / NCNotificationDispatcher / NCNotificationCenter /
-//      SBNotificationCenterController 一起打 ⇒ 拿到 ios16 真正可用的清除 API 清单；
-//   ② `bulletinID` 与 `notificationIdentifier` **两个候选都存**（"bID|nID"），清除时逐个试
-//      ⇒ 若病因是"存错 ID"，这一版当场就修好了；同时 [NC-ID] 日志给出 ID 来源证据。
+//   ⇒ v0.0.54 把方法名清单从 %ctor 搬进清除回调（开机那次早被日志窗口挤掉），
+//      并把 `bulletinID` 与 `notificationIdentifier` 两个候选都存（"bID|nID"）逐个试。
+//   ⇒ v0.0.55 补上 v0.0.54 缺的关键一维：**类型签名**。
+//      光有名字分不清 `removeNotificationRequest:`(1 参) 与
+//      `removeNotificationRequest:options:completion:`(3 参) ⇒ 下一版写调用还得猜 ⇒ 又一轮。
+//      这一版每行给「名字{类型签名}」，下一版就能一次写对（NSInvocation 也能按签名填参）。
+//      同时把候选类扩到 UNCNotificationRepository / UNCNotificationStore
+//      （iOS 16 通知栈换成 UserNotificationsCore 了，UNC 侧才是真账本的可能性要排除掉）。
 //   以下为 v0.0.52 功能主体（保留）：
 //   「删除盒子记录时同步清系统通知中心」（精确 1:1）：
 //   ① NBRecordItem 记录时读系统 bulletin ID（bulletinID / notificationIdentifier）存进库；
@@ -315,7 +317,25 @@ static void NBCaptureServerIfNeeded(id server) {
     });
 }
 
-// v0.0.54 诊断：把某个类上「清除 / 移除 / 投递 / bulletin」相关的方法名打出来。
+// v0.0.55 诊断：把入参类型签名里的**数字偏移**去掉，只留类型字符。
+//   "@32@0:8@16B24" → "@@:@B"（= self, SEL, object, BOOL）
+// 🔴 为什么必须带签名：v0.0.54 只打名字，光看名字分不清
+//    `removeNotificationRequest:`（1 参）与 `removeNotificationRequest:options:completion:`（3 参），
+//    下一版写调用只能靠猜 ⇒ 又是一轮。一次把名字+签名给全，下一版能直接写对。
+static NSString *NBDiagEnc(Method m) {
+    const char *e = method_getTypeEncoding(m);
+    if (!e) return @"?";
+    NSString *raw = [NSString stringWithUTF8String:e];
+    NSMutableString *clean = [NSMutableString stringWithCapacity:raw.length];
+    NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
+    for (NSUInteger i = 0; i < raw.length; i++) {
+        unichar ch = [raw characterAtIndex:i];
+        if (![digits characterIsMember:ch]) [clean appendFormat:@"%C", ch];
+    }
+    return clean;
+}
+
+// v0.0.55 诊断：把某个类上「清除 / 移除 / 撤回 / 删除」相关方法的**名字 + 类型签名**打出来。
 // 🔴 只读类结构、**不调用任何未知方法**（零风险）；这是"下一步该用哪个 API"的唯一依据。
 static void NBDiagDumpMethods(const char *clsName, NSString *label) {
     @try {
@@ -329,17 +349,20 @@ static void NBDiagDumpMethods(const char *clsName, NSString *label) {
             NSString *n = NSStringFromSelector(method_getName(ms[i]));
             NSString *low = [n lowercaseString];
             if ([low containsString:@"clear"] || [low containsString:@"remove"]
-                || [low containsString:@"dismiss"] || [low containsString:@"withdraw"]
-                || [low containsString:@"bulletin"] || [low containsString:@"deliver"]) {
-                [rel addObject:n];
+                || [low containsString:@"withdraw"] || [low containsString:@"dismiss"]
+                || [low containsString:@"delete"]) {
+                [rel addObject:[NSString stringWithFormat:@"%@{%@}", n, NBDiagEnc(ms[i])]];
             }
         }
         free(ms);
         NSArray *sorted = [rel sortedArrayUsingSelector:@selector(compare:)];
-        // 上限 120 条，避免单行过长被日志窗口吃掉
-        if (sorted.count > 120) sorted = [sorted subarrayWithRange:NSMakeRange(0, 120)];
-        NBLog(@"[NC-DIAG] %@ 共%u方法·相关%lu: %@", label, cnt,
-              (unsigned long)rel.count, [sorted componentsJoinedByString:@","]);
+        NSUInteger total = sorted.count;
+        NSArray *shown = sorted;
+        // 上限 18 条：日志窗口 ≈ 最后 50 行，7 个类各一行，不能刷屏刷掉真正要看的行
+        if (sorted.count > 18) shown = [sorted subarrayWithRange:NSMakeRange(0, 18)];
+        NBLog(@"[NC-DIAG] %@ 共%u方法·命中%lu%@: %@", label, cnt, (unsigned long)total,
+              total > 18 ? @"(只列前18)" : @"",
+              [shown componentsJoinedByString:@" "]);
     } @catch (__unused NSException *e) { }
 }
 
@@ -368,14 +391,17 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         dispatch_sync(gBBServerQueue, ^{
         #pragma clang diagnostic pop
             NBLog(@"=== [NC-CLEAR] 请求 sysId=%@ bundle=%@", sysId, bundle);
-            // 诊断 ①：把候选类上「清除/移除/投递/bulletin」相关方法名全打出来（只读，零风险）。
+            // 诊断 ①：把候选类上「清除/移除/撤回/删除」相关方法的**名字+签名**全打出来（只读，零风险）。
             //   🔴 放在**这里**而不是 %ctor：%ctor 那次输出在开机时，早被日志窗口挤掉了；
             //      这里正好在"用户删记录"这一刻，一定在他的日志里。
+            NBLog(@"[NC-DIAG] 捕获对象类=%@", NSStringFromClass([gBBServer class]));
             NBDiagDumpMethods("BBServer", @"BBServer");
             NBDiagDumpMethods("BBObserver", @"BBObserver");
-            NBDiagDumpMethods("NCNotificationDispatcher", @"NCNotificationDispatcher");
-            NBDiagDumpMethods("NCNotificationCenter", @"NCNotificationCenter");
-            NBDiagDumpMethods("SBNotificationCenterController", @"SBNotificationCenterController");
+            NBDiagDumpMethods("NCNotificationDispatcher", @"NCNotifDispatcher");
+            NBDiagDumpMethods("NCNotificationCenter", @"NCNotifCenter");
+            NBDiagDumpMethods("SBNotificationCenterController", @"SBNCCtrl");
+            NBDiagDumpMethods("UNCNotificationRepository", @"UNCRepo");
+            NBDiagDumpMethods("UNCNotificationStore", @"UNCStore");
             // 诊断 ②：sysId 可能是 "bID|nID"（两个候选都存了）⇒ 逐个试，YES/NO 各一次。
             NSArray *cands = [sysId componentsSeparatedByString:@"|"];
             for (NSString *cid in cands) {
@@ -888,7 +914,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.54 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.55 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -927,27 +953,12 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.54 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.55 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
-    // v0.0.53 诊断：把 BBServer 上跟「清除 / 移除 / 通知项 ID」相关的方法名全打出来。
-    // 🔴 目的：`_clearBulletinIDs:` 存在、调用也不抛异常，但通知中心那条没消失 ——
-    //    需要知道 iOS 16 到底还有哪些可用的枚举/清除方法，下一步按清单选正确的那个（不靠猜）。
-    // 🔴 只打名字，**不调用任何未知方法**（零风险）。
-    {
-        NSMutableArray *rel = [NSMutableArray array];
-        for (NSString *n in names) {
-            NSString *low = [n lowercaseString];
-            if ([low containsString:@"clear"] || [low containsString:@"remove"]
-                || [low containsString:@"dismiss"] || [low containsString:@"withdraw"]
-                || [low containsString:@"bulletinid"] || [low containsString:@"allbulletin"]) {
-                [rel addObject:n];
-            }
-        }
-        NBLog(@"=== [v0.0.53 诊断] 清除/枚举相关方法 %lu 条：%@ ===",
-              (unsigned long)rel.count,
-              [[rel sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" | "]);
-    }
+    // v0.0.55：删掉 v0.0.53 在这里（%ctor）打的那行方法清单。
+    //   🔴 理由：%ctor 是**开机**那一刻，日志窗口（≈最后 50 行）早就把它滚掉了 ——
+    //      用户根本看不到，白占日志预算。方法清单已整体搬到「用户删记录」那一刻（NBClearNCCallback）。
 
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
     if (h2) { NBLog(@"--> 挂 GPBR (publishBulletinRequest:destinations:)"); %init(GPBR); }
@@ -1011,7 +1022,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.54 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.55 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
