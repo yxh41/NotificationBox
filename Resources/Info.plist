@@ -5,11 +5,23 @@
     <key>CFBundleName</key>               <string>NotifyBox</string>
     <key>CFBundleDisplayName</key>        <string>消息盒子</string>
     <key>CFBundleIdentifier</key>         <string>com.yxh41.notifybox.app</string>
-    <key>CFBundleVersion</key>            <string>0.0.49</string>
-    <key>CFBundleShortVersionString</key> <string>0.0.49</string>
+    <key>CFBundleVersion</key>            <string>0.0.50</string>
+    <key>CFBundleShortVersionString</key> <string>0.0.50</string>
     <key>CFBundleExecutable</key>         <string>NotifyBoxApp</string>
     <key>CFBundlePackageType</key>        <string>APPL</string>
     <key>LSRequiresIPhoneOS</key>         <true/>
+    <!-- v0.0.50：桌面图标。CFBundleIconFiles 里写**不带扩展名**的名字；
+         SpringBoard 自己会找 AppIcon.png 并缩到各尺寸。满幅方图、圆角由系统加。 -->
+    <key>CFBundleIcons</key>
+    <dict>
+        <key>CFBundlePrimaryIcon</key>
+        <dict>
+            <key>CFBundleIconFiles</key>
+            <array>
+                <string>AppIcon</string>
+            </array>
+        </dict>
+    </dict>
     <key>UILaunchStoryboardName</key>     <string></string>
     <key>UIMainStoryboardFile</key>       <string></string>
     <key>UIApplicationSceneManifest</key>

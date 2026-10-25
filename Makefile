@@ -88,6 +88,12 @@ APPLICATION_NAME = NotifyBoxApp
 #      其实是构建配置。看到 undefined symbol 先查这里。
 NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/KeywordRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m app/NotifyExport.m app/NotifyStatsViewController.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m NBAppName.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
+# 🔴🔴 v0.0.50：桌面图标资源。**必须显式声明** —— theos 的 application.mk 只打包
+#      FILES 里列的 .m 和 INFOPLIST，Resources/ 目录下的其他文件**不会自动进包**：
+#      不写这一行的话 Info.plist 里的 CFBundleIcons 指向一个包里不存在的文件，
+#      SpringBoard 静默 fallback 到默认图标（不报错、没日志）⇒ 又是"看着配好了、就是不生效"。
+#      装完若图标没换，先查 deb 里有没有 Resources/AppIcon.png，再怀疑别的。
+NotifyBoxApp_RESOURCES = Resources/AppIcon.png
 # 🔴 App 侧也要 AVFoundation/AVFAudio：声音选择页要**试听**，那是在 App 里跑的 TTS。
 #    不链的话编译期就找不到 AVSpeechSynthesizer，而 tweak 侧那份救不了 App。
 NotifyBoxApp_FRAMEWORKS = UIKit Foundation MobileCoreServices AVFoundation AVFAudio AudioToolbox
