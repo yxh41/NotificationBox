@@ -6205,3 +6205,106 @@ TIM        删前 live=2  含本条=是 → ① → live=1  含本条=否
 同时记下一条读方法表的经验：段标题会写 `+ 无方法(共0)` ——
 `NCNotificationDispatcher` 就是这样，**它没有任何类方法**，拿不到单例，
 实例只能在 `NCBulletinNotificationSource - initWithDispatcher:observer:queue:` 里接住。
+
+## v0.0.60 → v0.0.61 · 「BB 账本删掉了」不等于「界面消失了」
+
+用户装上 v0.0.58/v0.0.59 后实测回传一句话：
+
+> **「没有消失，是不是因为没真正删除啊啊」**
+
+而日志里写得很漂亮：`删前 live=50 含本条=是` → `删后 live=49 含本条=否`，三组数据全中。
+
+**这就是本项目最贵的一课的第 N 次重演：自证里的数对了 ≠ 界面上发生了。**
+
+### 病因两条，都是判据自己的问题
+
+1. 🔴 **量错了层**。`BBServer - _allBulletinsForSectionID:` 量的是 **BB 账本**；
+   用户眼睛看的是 **NC 界面**（`NCBulletinNotificationSource` → `NCNotificationDispatcher`）。
+   账本干净了，界面可以一点不动。
+2. 🔴 **早停把唯一能动界面的那一步跳过了**。v0.0.58 的逻辑是「第 ① 步让计数变了 ⇒ `still=NO` ⇒ 停手」，
+   于是第 ⑥ 步（NC 原生撤回）**一次都没执行**。
+   「变了就停手」这种过早收口，等于用第一条（必然先成功的）证据把后面的证据全掐掉了。
+
+### v0.0.61 的做法
+
+**分两层量、分两层动手、取消一切早停。**
+
+```objc
+BOOL bbIn = NO, ncIn = NO;
+NSInteger bbN = NBLiveScan(gBBServer, bundle, cid, &bbIn);   // BB 账本
+NSInteger ncN = NBScanNC(gNCSource, cid, &ncIn);            // NC 界面（bulletinsToUUIDs）
+```
+
+四步全跑完，每步之后立刻复量同层：
+
+| 步 | 动作 | 量哪层 |
+|---|---|---|
+| ① | `[source observer:[source observer] removeBulletin:bullet]` | NC |
+| ② | `[dispatcher withdrawNotificationWithRequest:真request]` | NC |
+| ③ | `[server _removeBulletin:bullet shouldSync:NO]` | BB |
+| ④ | `[server _clearBulletinIDs:@[cid] forSectionID:bundle shouldSync:NO]` | BB（补刀，不改界面） |
+
+结论五态，**必须分别说 BB 与 NC**：
+
+```
+两层本来都没有（已被 App/用户清掉，无需处理）
+两层都已删掉（第 N 步起效）
+BB 已删、NC 仍在 ⇒ 界面不会变（正是你看到的现象）   ← v0.0.58/59 的真实状态
+NC 已删、BB 仍在（少见，需再查）
+两层都还在（全部失败）
+```
+
+### 🔴 顺序：先 NC、再删账本
+
+`observer:removeBulletin:` 的第一个参数、以及 `bulletin` 本身，都必须是**还有效**的对象。
+v0.0.60 一开始把它排在 `_removeBulletin:` 之后 —— 传进去的是已经失效的 bulletin，
+多半就是它一次都没生效的另一半原因。所以：
+
+1. 第 ①/② 步在账本还干净之前先跑；
+2. 第 ③ 步删账本之前**重新 `_bulletinsForIDs:` 取一次对象**，不用旧指针。
+
+### 真机 dump 核实过的签名（不是猜的）
+
+从 `nc_diag.txt` 里逐条对过，这四步用到的都在：
+
+| 类 | 方法 | 类型 |
+|---|---|---|
+| NCBulletinNotificationSource | `observer` | `@@:` |
+| NCBulletinNotificationSource | `setObserver:` | `v@:@` |
+| NCBulletinNotificationSource | `observer:removeBulletin:` | `v@:@@` |
+| NCBulletinNotificationSource | `bulletinsToUUIDs` | `@@:` |
+| NCBulletinNotificationSource | `uuidsToRequests` | `@@:` |
+| NCNotificationDispatcher | `withdrawNotificationWithRequest:` | `v@:@` |
+
+`observer:removeBulletin:` 就是 `BBObserverDelegate` 那条 ⇒ 第一个参数是 BBObserver，
+用 `- observer` 取。这一步**不需要 dispatcher、也不需要 request**，只要 source + bulletin。
+
+### 判据（唯一有效的那个）
+
+```
+删后 NC 含本条=否      ← 只有这个「否」代表界面上会变
+删后 BB 含本条=否      ← 只代表账本干净；v0.0.58/59 已经"绿"过两次，是假绿
+```
+
+### 包内对拍（v0.0.59 → v0.0.61，CI #117）
+
+```
+deb 1,093,438 B  md5 9598c099b44de4c30dd91c67f2caf5a0
+① 新增锚点（旧=0 且 新>0）  9/9 真锚点
+   NotifyBox v0.0.61 / v0.0.61 请求 / BB 已删、NC 仍在 / 两层本来都没有
+   删前 BB: live= / NC 映射= / observer:removeBulletin: / bulletinsToUUIDs / uuidsToRequests
+② 共有锚点（两版都有，只证"包是我们编的"）
+   withdrawNotificationWithRequest: / _removeBulletin:shouldSync: / _bulletinsForIDs:
+③ 反向对照（旧>0 且 新=0）  2/2 成立
+   本来就不在段内（…） / NotifyBox v0.0.59
+```
+
+顺带记一条：**dylib 体积 211,824 B，和 v0.0.60 一模一样（delta = 0）**，
+而源码动了 1.5 KB。体积连趋势都不可信，判"编进去没"只认串 / 选择器 / md5。
+
+### 已知风险（这一版是试验性的）
+
+第 ① 步 `observer:removeBulletin:` 是**第一次**在 BBServer 队列里调 NC 侧方法。
+v0.0.59 已经在这个队列里调过 `withdrawNotificationWithRequest:`（没卡死），
+所以风险不高；但如果装上后出现**桌面卡住 / 频繁 respring**，
+直接回退 v0.0.59（`_removeBulletin:` 那步确定不卡，只是界面不动）。
