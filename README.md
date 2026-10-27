@@ -7250,3 +7250,137 @@ dylib **228,688 → 228,688（完全同大小）**。但大小不可信，所以
 
 只动 App 的界面代码，不碰 tweak、不碰数据库、不碰 hook。
 真出问题（比如某块文字被卡片挡住）⇒ 装回 v0.0.69，通知中心那条的修复仍然在。
+## v0.0.71 —— UI 现代化：建统一视觉层 `NBTheme` + 设置页重排 7 组 + 说明搬独立页
+
+> 用户原话：**「然后 ui 再重新设计下，更具现代化，设置也整理一下，都要更合理，整洁」**。
+> 这一版主体全在盒子 App 侧；`Tweak.x` 只做一件事 —— **把写死的版本串全部改用 `NB_VER_STR`**（见第 5 节）。
+
+### 1. 先建视觉层，再改页面（`app/NBTheme.h` / `NBTheme.m`，新增）
+
+v0.0.70 之前每页各写各的：圆角 7 / 10 / 12 混用、边距 12 / 14 / 16 混用、字号 12~15 混用。
+**单看每一页都还行，连起来像三个 App** —— 这就是"不够现代化"的真实来源，不是缺动效。
+
+所以这一版先建 `NBTheme`（全站唯一一份颜色/尺寸/字体 + 构件工厂），页面只许引用、不许再写字面量：
+
+| 类别 | token |
+|---|---|
+| 尺寸 | `NBInset 16` / `NBRowH 50` / `NBRowHSwitch 56` / `NBRowHSub 64` / `NBFieldH 34` / `NBIconBox 28` / `NBCardRadius 12` / `NBSepInset 60` |
+| 颜色 | `NBPageBG()` 分组灰 / `NBCardBG()` 卡片白 / `NBValueColor()` / `NBSubColor()` / `NBSepColor()` |
+| 字体 | `NBFontTitle 16` / `NBFontSub 12` / `NBFontValue 15` / `NBFontHeader 13sb` / `NBFontField 16` |
+| 构件 | `NBNewCard` / `NBNewIconBox`（SF Symbol）/ `NBNewChevron` / `NBNewSeparator` / `NBNewHeaderLabel` / `NBNewFooterLabel` |
+
+🔴 **颜色配对纪律**（v0.0.70 踩过一次）：浅色模式下 `secondarySystemBackground` 与
+`systemGroupedBackground` **同为 `#F2F2F7`** ⇒ 拿前者当卡片、后者当底，**卡片会消失**。
+正确配对是 **`secondarySystemGroupedBackground`（白）压 `systemGroupedBackground`（灰）**，一对必须一起换。
+
+`NBNewIconBox` 显式容忍图标名写错：`systemImageNamed:` 返回 `nil` 时**只留一个纯色圆角方块**，
+不崩、也不留空白。
+
+### 2. 设置页重排：18 行平铺 → 7 组卡片
+
+| 组 | 内容 |
+|---|---|
+| 朗读 | 开关 / 朗读声音 / 朗读限定 App |
+| 免打扰 | 开关 / 开始时间 / 结束时间 / 生效 App |
+| 提示音 | 按 App 换音 / 默认音 ID / 默认音文件 / 最长秒数 / 按 App 分配 / 试听 / 压低音乐 |
+| 记录与清理 | 记录上限 / 自动清理天数 / 删记录时同步清通知中心 |
+| 拦截与过滤 | 不记录的 App / 白名单 / 黑名单 / 过滤关键词 |
+| 工具 | 内容替换 / 关键词规则 / 统计 / 批量清理 / 清空全部（红）/ App 枚举诊断 |
+| 关于 | 使用说明（独立页面） |
+
+行类型固定三种，不再每个设置项各写一套：
+
+```objc
+static const NSInteger kRowSwitch = 1;   // 图标 + 标题(+副标题) + UISwitch
+static const NSInteger kRowField  = 2;   // 图标 + 标题 + 右侧输入框
+static const NSInteger kRowAction = 3;   // 图标 + 标题(+副标题) + 取值 + chevron
+```
+
+- 右侧改**真 chevron 图标**（`chevron.right`），取值文字里手写的 `"›"` 在
+  `setActionValue:forKey:` 里**统一剥掉**（改十几处字面量不如在唯一出口剥一次，防双箭头）。
+- 🔴 **行高不写死**：标题允许 2 行（"删记录时同步清通知中心"在 320pt 窄屏要换行），
+  写死 50 会把第二行裁掉，而界面上**看不出来"被裁了"、只像少了一句话** ⇒ 用 `sizeThatFits:` 算。
+- 组内行间分隔线**懒建**（`viewWithTag:` 找回，只建一次）—— builder 那一刻还不知道自己是不是最后一行。
+- 属性结构从"平铺行数组"改成 `secRows / secTitles / secFooters / secCards / secHeaderLabels / secFooterLabels`；
+  老的 `hintLabel` / `kRowGroup` / `addGroup:` **全部删除**（包级对拍确认选择器已从二进制消失）。
+
+### 3. 使用说明搬进独立页面
+
+原来这段文字叫 `hintLabel`、**压在整个设置页最底部**，比所有设置项加起来还长 ——
+想改设置得先滑过一整屏说明，想查说明又得先滑过所有设置。
+
+现在点「关于 → 使用说明」进独立页（`UITextView`，可选中复制，方便贴回来问）。
+文字**一个字没删**（29 行字面量从 `git HEAD` 原样取出，逐行核对缺失 0 行），只是从"堆在页尾"改成"点进去看"。
+
+### 4. 主界面：顶部控件收进一张卡片 + 导航栏换图标
+
+- 5 个控件（时间段 / 搜索 / 全部-未读 / ★标星 / 全标已读）原来各自飘在灰色背景上，
+  现在收进一张白卡片：统一内边距 10、竖直节奏 10，两个按钮改**胶囊**（`cornerRadius = kNBTopH / 2`）。
+- 导航栏右侧 3 个中文文字按钮（设置 / 诊断 / 导出 / 清空）窄屏上会把标题挤掉，全换 SF Symbol：
+  `gearshape`（左）/ `waveform.path.ecg` / `square.and.arrow.up` / `trash`（红）。
+- 底色一律走 `NBPageBG()`：`ViewController` / `NotifyStatsViewController` / `NotifyDetailViewController`
+  三处不再各自写 `[UIColor systemGroupedBackgroundColor]`。
+
+🔴 **视图层级顺序 = z 序**：`topCard` **必须第一个 `addSubview`**。晚加的话白卡片会把分段/搜索/按钮
+盖住（白底盖白字，看着像"控件没了"）。
+
+### 5. tweak 侧唯一的改动：诊断文件不再自称旧版本
+
+用户回传的 `nc_diag(11).txt` 头部写着 `# NotifyBox v0.0.56 · 通知中心可用 API 清单`，
+而实际装的是 **v0.0.70** —— 因为那句在源码里是**写死的字面量**。
+
+⇒ **诊断文件不能用来判断"装的是哪一版"**，这会把人带偏。本版把 9 处写死版本串全部改用 `NB_VER_STR`：
+
+```
+# NotifyBox v0.0.56              →  # NotifyBox v%@
+# ---- v0.0.70 方法表            →  # ---- v%@ 方法表
+=== [v0.0.52] 已捕获 BBServer    →  === [v%@] 已捕获 BBServer
+=== [v0.0.52] 已注册 Darwin      →  === [v%@] 已注册 Darwin
+=== [NC-CLEAR] v0.0.70 …        →  === [NC-CLEAR] v%@ …
+=== [v0.0.70] 捕获 NC source     →  === [v%@] 捕获 NC source
+=== [尝试 %@ @%@] v0.0.70 …      →  === [尝试 %@ @%@] v%@ …
+=== [%@] NotifyBox v0.0.70 · %@ · 朗读自愈…  →  === [%@] NotifyBox v%@ · %@ …
+=== [%@] NotifyBox v0.0.70 · BBServer %u …   →  === [%@] NotifyBox v%@ · BBServer %u …
+```
+
+🔴 顺带踩到一个**只有真编译才抓得到**的坑：`#define NB_VER_STR` 原来躺在第 452 行的护栏常量堆里，
+而本版新改的引用在第 424 行 ⇒ **引用在定义之前** ⇒ `error: use of undeclared identifier 'NB_VER_STR'`。
+我上一轮跑的五道源码级自检（括号配平 / `_NonNull` / setter 自递归 / 版本四处一致 / 行尾）**全是文本层判据，
+没有一条能发现"符号可达性"问题**，四道全绿包却编不出来。
+⇒ 新增第 6 道判据：**逐个 `#define` 比行号，首次引用必须严格大于定义行**。
+
+### 6. 包级对拍（v0.0.70 → v0.0.71）
+
+体积：App `469,680 → 470,896`（+1216）；**dylib `228,688 → 228,688`（同大小但 md5 不同 ⇒ 又一次"大小不可信"）**。
+
+| 组 | 判据 | 结果 |
+|---|---|---|
+| A 新增（19 条） | `NBNewCard` / `NBNewIconBox` / `NBNewChevron` / `NBNewSeparator` / `NBNewHeaderLabel` / `NBNewFooterLabel` / `NBPageBG` / `NBFontHeader`（**非 static 函数名会进符号表**）、`layoutRow:width:height:` / `rowHeight:width:` / `usageText` / `onUsage:` / `addSection:footer:`、`secHeaderLabels` / `secFooterLabels`、`waveform.path.ecg` / `square.and.arrow.up` / `chevron.right` / `gearshape` | 70=0 → 71≥1 ✅ |
+| B 共有（7 条） | `setSeparatorStyle:` / `setEstimatedRowHeight:` / `setSearchBarStyle:` / `secondarySystemGroupedBackgroundColor` / `systemGroupedBackgroundColor` / `kCACornerCurveContinuous` / `setActionValue:forKey:` | 两版同值，无判别力，只记录 |
+| C 反向（3 条） | `addGroup:` 70=1→71=0、`setHintLabel:` 70=1→71=0、`hintLabel` 70=3→71=0 | ✅ 旧实现真的没了 |
+| D1（`__cstring`） | 版本号归一化为 `v#` 后，两版串多重集**完全相同**（234 类） | ✅ |
+| D2（`__ustring`） | 含中文的 `NSString` 字面量同样是 UTF-16、存在 `__TEXT,__ustring`；归一化后两版 **290 条完全相同** | ✅ |
+| E 版本戳 | `App/Info.plist` ShortVersion+BundleVersion `0.0.70 → 0.0.71`；dylib 含 `0.0.71` 1 处、旧串 0 处 | ✅ |
+
+🔴 **两组判据本身出过错，都是"判据域 ≠ 变异域"**，记在这里免得重犯：
+
+1. **D1 第一版直接对整个 dylib 跑 `[\x20-\x7e]{6,}`** ⇒ 差异里冒出 `98=2j3u` / `>SgD6Jbbd` / `{<IF/J`
+   这种"根本不是我写的字符串" —— 那是**代码签名区（`__LINKEDIT` 尾部）的二进制碰巧全是可打印字节**。
+   正解 = 先解析 Mach-O 段表，**只量 `__cstring`**。
+2. **只改 D1 还不够**：含中文的 `@"..."` 是 UTF-16 存在 `__ustring` 里的，`__cstring` 只装 ASCII 部分 ——
+   而本版改的两处正好是含中文的格式串 ⇒ **只查 `__cstring` 等于这两处改动完全看不见**。
+   ⇒ 补 D2。教训：**"某一组差异为空"要先问"这个域装得下这次改动吗"。**
+3. 判据写法也从"差异串里含 `0.0.7x` 就放行"改成**归一化后必须完全相同** ——
+   允许清单法天生漏项（旧串里的 `v0.0.52`、`v0.0.56` 不匹配清单，立刻误报 3 条）。
+4. E 组第一版拿 **App 二进制**查 `0.0.71`，两版都是 0 —— **App 的版本号在 `Info.plist` 里，二进制里根本没有**
+   ⇒ 那是期望写错，不是包不对。**期望值必须取自被测对象本身。**
+
+### 7. CI 两轮失败（都是编译期硬错，值得记）
+
+| 轮 | 报错 | 根因 |
+|---|---|---|
+| 1 | `Tweak.x:424:97: error: use of undeclared identifier 'NB_VER_STR'` | 宏定义在第 452 行，引用在 424 行 |
+| 2 | `app/SettingsViewController.m:162:49: error: use of undeclared identifier 'UILargeTitleDisplayModeNever'` | 正确名是 **`UINavigationItemLargeTitleDisplayModeNever`**，漏了 `UINavigationItem` 前缀 |
+
+⇒ 结论写死：**编译期是硬闸门，文本判据只能挡掉一部分。** 新增 API 常量名一律先查全名，
+不要凭"看着像"写。
