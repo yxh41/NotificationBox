@@ -390,6 +390,20 @@ static BOOL NBClaimKey(NSString *key) {
 - (void)withdrawBulletinRequestsWithPublisherBulletinID:(NSString *)publisherBulletinID
                                            forSectionID:(NSString *)sectionID;  // v@:@@
 - (void)withdrawBulletinID:(NSString *)bulletinID;                       // v@:@
+// ---- v0.0.72：按 bulletinID 直接摘（签名照 `nc_diag(11).txt` 的方法表逐字抄）----
+// 🔴🔴 这两行**不是可选的**：`gBBServer` 的类型是 `id`，选择器只要在整份 TU 里
+//    **没有被声明过**，clang 就报 `no known instance method for selector ...` ⇒ 直接编译失败。
+//    v0.0.72 就是这么炸的（四道文本自检全绿，因为括号/宏/行尾都没问题）：
+//    调用一个未声明的选择器在 C 里根本不是"运行时会不会崩"的问题，而是**编译期就过不去**。
+//    这一条已补进源码自检第 ⑨ 道（见 tools/check_selectors.py）。
+- (void)removeBulletinID:(NSString *)bulletinID
+      fromNoticesSection:(NSString *)sectionID;                          // v@:@@  从"通知区段"摘
+- (void)removeBulletinID:(NSString *)bulletinID
+             fromSection:(NSString *)sectionID
+                  inFeed:(unsigned long long)inFeed;                     // v@:@@Q 第 3 参是**位掩码**不是 BOOL
+- (void)_sendRemoveBulletin:(id)bulletin
+                    toFeeds:(unsigned long long)feeds
+                 shouldSync:(BOOL)shouldSync;                            // v@:@QB 广播给 observer（只观测）
 // ---- NC 原生路径（这条才会驱动界面）----
 - (void)withdrawNotificationWithRequest:(id)request;                     // v@:@  NCNotificationDispatcher
 - (id)notificationRequestWithSectionId:(NSString *)sectionID
