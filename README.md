@@ -7070,3 +7070,183 @@ static BOOL NBReqIsOurs(id req, NSArray *ids) {
 
 真出现卡屏/注销 ⇒ 装回 v0.0.67（`⓪` 仍会把账本清干净，只是界面不动），
 并在 `nc_diag.txt` 里找 `[清] ①` 那一行有没有 `抛:` 后缀。
+
+## v0.0.69 —— 顺序反了：我先把 NC 要用的那块砖自己拆了
+
+**现象**：`nc_diag(10).txt` 里**四层判据全绿，通知中心那条却纹丝不动**。
+
+```
+[找] … 匹配=精确（request.bulletin 命中）      ← 锁对了那条
+[dest] ✅ 已有实例（注册期 hook 接住的）        ← 刀有子弹
+[清] ① CSNotificationDispatcher … 已返回        ← 没抛错
+[清] ② destination:requestsClearing… 已返回     ← 没抛错
+[OBS-src] …                                    ← 系统确实收到通知了
+```
+
+**四层全绿而界面不动，这件事本身就是最强线索** —— 说明问题不在链条任何一环，
+而在「链条的**次序**」，或者「判据缺了一条」。
+
+**定案**：NC 那条驱动界面的清除，要求 `NCBulletinNotificationSource`
+把 `NCNotificationRequest` **翻回 `BBBulletin`**，再让 BB 自己撤一次
+（`_bulletinsToClearPerSectionIdForNotificationRequests:removingDestinations:`）。
+而我把 ⓪（`withdrawBulletinRequestsWithRecordID:`）和 ③（`_removeBulletin:`）
+**排在了 NC 之前** ⇒ 轮到 NC 时 BB 里早就没有本条了 ⇒ 它翻不出东西 ⇒ **静默什么都不做**。
+砖是我自己先拆掉的。
+
+这解释了那个一直对不上的现象：**账本每次都清得干干净净，界面十几版纹丝不动**。
+
+### 改法：把顺序落成代码结构，不写在注释里
+
+```objc
+// ⓪ + ③ 打包成块，**这里只定义、不执行**
+void (^bbCleanup)(void) = ^{
+    if (bullet && bbIn) { ⓪ withdrawBulletinRequestsWithRecordID: … }
+    bbRemove();
+};
+
+// NC 先走；等它**返回**再清账本
+NBFindAndForwardClear(@"主队列", ^{
+    dispatch_async(gBBServerQueue, ^{ bbCleanup(); });   // ← 补 ⓪ / ③
+});
+```
+
+- `NBForwardClearAsync` 新增 `done` 完成回调，`NBFindAndForwardClear` 的
+  **每一条早退分支**都必须把 `done` 交回去（否则 NC 那边一失败，账本永远不清）。
+- 没有 NC dispatcher / bulletin 的兜底路径才就地 `bbCleanup()`。
+
+> 🔴 **这条教训 v0.0.61 就写在 `Tweak.x` 文件头里了**（"先 NC 两步、再删 BB 账本"），
+> v0.0.65 重写流程时被我**亲手推翻**（把 ⓪ 提到最前，理由写着"不跨子系统、最安全"）。
+> ⇒ **写下来的教训没人守着，就会在下一次重构里静悄悄失效。注释守不住顺序，只有「块 + 完成回调」守得住。**
+
+### 顺手修掉的护栏缺陷（不修的话这次修复根本测不出来）
+
+`gActClearTried`（全进程 ≤2）与函数内 `static int tries`（全进程 ≤4）**从不重置** ⇒
+第 3 次删除之后，NC 那条路**永远不再尝试**，日志看起来就像"什么都没发生"。
+改为：每次 `[尝试]` 开头归零。
+
+> 🔴 **上限要按「每次操作」算，不能按「每个进程」算。**
+> 这是第三次犯同类错（`.nc_off`、`gNCBusy` 各一次）。永久禁用比不设防更难查。
+
+### 新增的唯一一条判据（只读）
+
+```
+[验] 清后 NC：扫 N 条，还能找到本条=是 / 否
+```
+
+- **否** ⇒ NC 模型真删了，界面若还不动就是**视图层没刷新**；
+- **是** ⇒ 是**刀不够狠**（系统只收到通知、没真删）。
+
+在这一行出现之前，「刀不够狠」和「视图没刷新」这两种完全不同的病因，
+在日志里长得一模一样。
+
+### 判据（真机五层）
+
+```
+[序] v0.0.69：先走 NC 清除（BB 里本条仍活着）   ← 顺序对了
+[找] … 匹配=精确                                ← 锁对那条
+[dest] ✅ 已有实例（注册期 hook）                ← 刀有子弹
+[清] ② destination:requestsClearing… 已返回
+[验] 清后 NC：还能找到本条=否                     ← 「否」= 真删了
+```
+
+### 包级对拍（v0.0.68 → v0.0.69）
+
+dylib 228,608 → 228,688（**+80**），源码改了 3 KB+。
+⇒ 再次印证「体积和改动量脱钩」，判「编进去没」只认串 / 选择器 / md5。
+
+### 风险与回退
+
+新增的只有**顺序**和一个完成回调，没有新增 hook、没有新增刀。
+最坏表现仍是「通知没消失」，不会影响其他通知。
+真出问题 ⇒ 装回 v0.0.68，并在 `nc_diag.txt` 里看 `[序]` 那一行有没有打印。
+
+---
+
+## v0.0.70 —— 只改界面：卡片化 + 顶部控件统一 + 详情页配色对齐
+
+> 🔴 **这一版 `Tweak.x` 一字未动**，`tweak 侧` 沿用 v0.0.69 的全部逻辑。
+> **故意拆成两个版本**：v0.0.69 验的是「通知中心那条会不会消失」，
+> v0.0.70 验的是「界面好不好看」。两件事混在一个包里，出问题时说不清是谁干的。
+
+### 1. 卡片化（`app/NotifyCell.m`）
+
+```objc
+static const CGFloat kNBCardInsetX = 12.0;   // 卡片左右内缩
+static const CGFloat kNBCardInsetY = 4.0;    // 上下留白（行距）
++ (CGFloat)height { return 98.0 + kNBCardInsetY * 2; }   // 98 → 106
+```
+
+- `init` 里建 `self.cardView`（`secondarySystemGroupedBackgroundColor` + 12pt 圆角 +
+  `kCACornerCurveContinuous`），**8 个子视图全部改挂到 `cardView`**；
+  cell 本身与 `contentView` 都设 `clearColor`。
+- `layoutSubviews` 全部改成**相对卡片原点**（`ox` / `oy` / `card.size`）。
+- 新增 `setHighlighted:animated:` ⇒ 按下时卡片换 `tertiarySystemFillColor`，松手恢复；
+  `prepareForReuse` 开头复位（否则复用的 cell 会带着上一次的按下色）。
+
+### 2. 顶部控件统一规格（`app/ViewController.m`）
+
+原来 `12 / 30 / 6 / 7` 各写各的，现在收敛成 5 个常量：
+
+```objc
+kNBTopMargin = 12;   // 左右边距
+kNBTopH      = 32;   // 分段 / 按钮 / 标星 的统一高度
+kNBTopGap    = 8;    // 行与行的竖向间距
+kNBTopRadius = 8;    // 按钮圆角（原来 2 处写 7）
+kNBHintH     = 20;   // 两条小字提示的统一高度
+```
+
+列表侧：`separatorStyle = None`（卡片之间靠留白分行）、底色
+`systemGroupedBackgroundColor`、`estimatedRowHeight = 0`（不许自动估高，否则卡片会被压扁）；
+搜索框 `UISearchBarStyleMinimal` + `backgroundImage = [[UIImage alloc] init]`（去掉那条 1px 分隔线）。
+
+### 3. 详情页配色对齐（`app/NotifyDetailViewController.m`）
+
+底色 → `systemGroupedBackgroundColor`；`headerBox` / `bodyView` → `secondarySystemGroupedBackgroundColor`。
+与列表页同一套配色，进详情页不再"突然变白"。
+
+### 🔴 一个会让卡片直接消失的坑
+
+第一版我把卡片设成 `secondarySystemBackgroundColor`、底色设成 `systemGroupedBackgroundColor` ——
+**浅色模式下两者同为 `#F2F2F7`** ⇒ 卡片和底色一样 ⇒ 卡片"消失"，圆角当然也看不见。
+
+正确配对：**`secondarySystemGroupedBackgroundColor`（白）压 `systemGroupedBackgroundColor`（灰）**，
+**这一对必须一起换**，换一半就等于没做。
+
+### 包级对拍（v0.0.69 → v0.0.70，14 条判据全绿）
+
+| 组 | 判据 | 结果 |
+|---|---|---|
+| A 新增 | `setSeparatorStyle:` / `setEstimatedRowHeight:` / `setSearchBarStyle:` / `setBackgroundImage:` / `setHighlighted:animated:` / `setCardView:` / `cardView` / `kCACornerCurveContinuous` | 69=0 → 70≥1 ✅ |
+| B 共有 | `secondarySystemGroupedBackgroundColor` / `tertiarySystemFillColor` / … | 两版都 1，无判别力，只记录 |
+| C 反向 | `secondarySystemBackgroundColor` | 69=1 → 70=0 ✅（旧色彻底不用了） |
+| D 逻辑未动 | 归一化版本串后，dylib 差异**只落在 `LC_UUID` + 代码签名区** | ✅ |
+| E 版本戳 | `v0.0.70` 新增；旧串残留恰好 1 处 | ✅ |
+
+**D 组是这一版最值钱的一条**：App 二进制 469,552 → 469,680（+128），
+dylib **228,688 → 228,688（完全同大小）**。但大小不可信，所以解析了 Mach-O：
+
+```
+差异 291 B = LC_UUID 16 + 版本串 16 + 代码签名 259        ← 分毫不差
+归一化版本串后剩 275 B，8 段，全部落在 LC_UUID(2728~2744) 与签名区(225264~228688)
+```
+
+⇒ 版本串之外，两个 dylib **逐字节相同** —— 这是"`Tweak.x` 一字未动"的硬证据，
+不是"我觉得我没改"。
+
+### 两个自己踩的坑（都写进判据纪律了）
+
+1. 🔴 **probe 用了错误的串**：查 `separatorStyle`（小写 s）匹配不到二进制里的
+   `setSeparatorStyle:`（大写 S）⇒ 四条明明编进去的改动全报「两版都 0」。
+   差点把"编进去了"误判成"漏编"。**查选择器要么查 setter 全名，要么大小写两种都查。**
+2. 🔴 **「逐字节相同」是错期望**：第一次跑就红。版本串改了 ⇒ `ld64` 必重算
+   `LC_UUID`、必重签 ⇒ 这两块**必然**变。**期望写错就改期望，不许改闸门迁就** ——
+   正确判据是"归一化后除这两类白名单外零差异"。
+
+> 另外 7 个新常量名（`kNBTopMargin` / `kNBTopH` / … / `kNBCardInsetX/Y`）probe 下来
+> **两版都 0** —— C 常量被内联后名字根本不进二进制。
+> 这类锚点**直接从判据表里删掉**，不留着当"恒绿"（留着就是假绿）。
+
+### 风险与回退
+
+只动 App 的界面代码，不碰 tweak、不碰数据库、不碰 hook。
+真出问题（比如某块文字被卡片挡住）⇒ 装回 v0.0.69，通知中心那条的修复仍然在。
