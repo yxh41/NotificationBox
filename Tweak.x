@@ -1,32 +1,35 @@
-// Tweak.x —— v0.0.65（当前）：**⓪ 官方撤回已证有效；不再往 NC 队列投，改为观测系统自己传不传** ——
-//   ✅ v0.0.64 真机（`nc_diag(6).txt`）两个结果，一个好消息一个坏消息：
-//      【好消息】⓪ `withdrawBulletinRequestsWithRecordID:forSectionID:` **真的生效**：
-//        5 次尝试全部 `BB live` 减 1、`含本条=是 → 否`
-//        （4→3 / 10→9 / 6→5 / 5→4 / 45→44）。这条三版都没执行过的路，是本轮唯一的实质进展。
-//      【坏消息】NC 块**一次都没执行**：日志里写了 `[guard] 已写 .nc_pending，进 NC 队列`、
-//        `dispatch_async` 也返回了，但块的第一行 `[NC] 进入 NC 队列` **0 命中**（30 秒窗口）。
-//        同一条 dispatch 在 v0.0.62 是能跑起来的 ⇒ 这次那条队列没被服务。
-//      🔴 更糟的是 `gNCBusy` 把后面 4 次尝试全挡了（日志里 4 条「本进程」）——
-//        **闸门没有超时，等于一次没跑成就永久禁用**。这和「`.nc_off` 一写就永久压制新版」
-//        是同一个设计缺陷，我犯了两遍。
-//   ⇒ v0.0.65 四条：
-//      ① **⓪ 之后直接删账本**，不再把动作投到 NC 队列（`gNCUseQueuePath = NO`）。
-//         投了也不跑，不如不投：⓪ 已经把账本清干净，本版就把这条唯一有效的路走到底。
-//      ② **闸门加超时**（8 秒自动放行），杜绝「一次没跑成 = 永久禁用」。
-//      ③ **新增观测 hook `observer:removeBulletin:`**：⓪ 之后唯一的问题是
-//         「系统有没有把 BB 撤回传给 NC」。这条 hook 跑在 **NC 自己的队列**上（系统调它就在那条队列），
-//         正好补上"我们投不进那条队列"的缺口 —— 让系统自己在正确的队列上打现场。
-//         日志里 ⓪ 成功很多次而 `[BB→NC]` 一条都没有 ⇒ BB 的撤回根本没到 NC，必须换路。
-//      ④ **[GQ] 实验通道**：从**全局队列**直接调 `withdrawNotificationWithRequest:`。
-//         敢试的理由：v0.0.61 卡屏的直接原因是「**在 BB 队列上**同步调 NC」⇒ 锁序成环；
-//         全局队列上我们**手里不持锁**，形不成环，最坏只是卡住一个工作线程。
-//         一个进程只试一次，且只 withdraw、只接受 post 时缓存的**系统真 request**。
-//   🔴 判据：`⓪ 之后 BB live=… 含本条=否`（账本已清）
-//            + `[BB→NC] …（此时⓪已成功 k 次）`（系统自己传没传到）
-//            + `[GQ] withdraw 已返回`（我们这条路通没通）。
-//   ---- 以下是 v0.0.64 的内容，仍然成立，保留 ----
-//      ⓪ 官方撤回（详见上）、绝不对未知类调 description（`NBStringish`）、写前日志、
-//      `gNCBusy` 闸门、`_requestUUIDForBulletinPublisherMatchID:` 换 uuid。
+// Tweak.x —— v0.0.66（当前）：**盯错方向了 —— 挂的是反向广播；本版改挂"请求清除"这一侧** ——
+//   ✅ v0.0.65 真机（`nc_diag(7).txt`）三件事：
+//      【1】⓪ 官方撤回**又 4/4 成功**（live 5→4 / 13→12 / 100→99 / 14→13，含本条 是→否）。
+//          这条已经是稳定的：只要 BB 里还在，⓪ 就能把它从账本里清掉。
+//      【2】用户实测：**通知中心里那条没消掉，还在**。⇒ **只清 BB 账本不会改界面**（再次确认）。
+//      【3】🔴🔴 我加的那个观测 hook `observer:removeBulletin:` —— **一次都没触发**
+//          （4 次尝试的结论行全是"系统自己传给 NC 共 0 次"）。
+//          用户还专门手动从通知中心滑掉了一条做对照，**同样没触发**。
+//   ⇒ 结论：**我盯的方向是反的。**
+//      `NCBulletinNotificationSource - observer:removeBulletin:` 是 **BBServer → NC** 的
+//      反向广播（"BB 那边删掉了，通知你一声"），不是"谁把这条清掉"的入口。
+//      真正的清除入口在另一侧 —— 从真机方法清单（`### NCNotificationDispatcher -方法 67 个`）看：
+//        - destination:requestsClearingNotificationRequests:        ← 目的地（NC 界面）**请求清除**
+//        - withdrawNotificationWithRequest:                         ← 真正执行撤回
+//        - _clearUnsafeNotification: / _didRemoveNotificationRequest:
+//        - (source 侧镜像) dispatcher:requestsClearingNotificationRequests:
+//          ↑ 这一跳才负责把 NC 的 request 翻成 bulletin 再交给 BBServer 去 withdraw
+//   ⇒ v0.0.66 四条：
+//      ① **观测改到"请求清除"这一侧**：dispatcher 的 `destination:requestsClearingNotificationRequests:`
+//         与 `withdrawNotificationWithRequest:`，加上 source 的 `dispatcher:requestsClearingNotificationRequests:`。
+//         用户下次手动滑一条，就能看到系统真正走的是哪一条（纯观测 + %orig 透传，不改行为）。
+//      ② **取 request 加"按内容扫"**：v0.0.65 只按 key 精确 ⇒ 缓存 43~100 条**一条都没中**
+//         （key 不是 cid）。现在再按 request 自己的 notificationIdentifier / bulletinID /
+//         recordID / publisherBulletinID 比一遍（只读 KVC，每键单独 @try）。
+//      ③ **[GQ] 不再空烧机会**：上一版无条件置 `gNCGlobalTried = YES`，导致一进程只探一次、
+//         没 request 也照样烧掉。现在**只有真的要投了才烧**。
+//      ④ **一次性 dump 缓存键形态**（前 5 个 key + section + nid）⇒ 下一版不用再猜键长什么样。
+//   🔴 判据：`观测计数: 目的地请求清除=N / dispatcher 撤回=M / source 请求清除=K`
+//      —— 用户**手动滑一条**之后这几个数有没有动，就是"系统自己走哪条路"的答案。
+//   ---- 以下是 v0.0.65 / v0.0.64 的内容，仍然成立，保留 ----
+//      ⓪ 官方撤回（有效，已稳定）、不投 NC 队列（投了不跑）、闸门带超时、
+//      绝不对未知类调 description（`NBStringish`）、写前日志、`_requestUUIDForBulletinPublisherMatchID:`。
 //   🔴 用户实测 v0.0.58/v0.0.59：「没有消失，是不是没真正删除啊啊」。
 //      日志里 BB 的 live 确实 50→49、含本条 是→否 —— 但界面不动。
 //      根因两条，都是我自己的错：
@@ -425,7 +428,7 @@ static NSString *const kNBGuardPending = @"/var/mobile/Library/NotifyBox/.nc_pen
 static NSString *const kNBGuardOff     = @"/var/mobile/Library/NotifyBox/.nc_off";
 // 🔴 版本号写进护栏文件：**每个新版本自动获得一次重试机会**。
 //    否则 v0.0.62 那次卡死留下的 `.nc_off` 会一直压着，新版明明修好了也测不到。
-#define NB_VER_STR @"0.0.65"
+#define NB_VER_STR @"0.0.66"
 static BOOL gNCSuppressed = NO;   // YES ⇒ 本进程不碰 NC 路径
 static BOOL gNCBusy = NO;         // YES ⇒ 上一次 NC 尝试还没回来（同进程内不再赌第二次）
 static NSTimeInterval gNCBusyAt = 0;   // 🔴 v0.0.65：闸门加上时间戳，超时自动放行
@@ -441,6 +444,11 @@ static int  gBBWithdrawOk = 0;    // ⓪ 成功清掉账本的次数（给观测
 static int  gBBToNCSeen   = 0;    // 系统自己把「BB 撤回」传给 NC 的次数（观测 hook 累加）
 static BOOL gNCGlobalTried = NO;  // [GQ] 实验通道：一个进程只从全局队列试一次
 static int  gGQWithdrawOk  = 0;   // [GQ] `withdrawNotificationWithRequest:` 返回了几次
+// ---------- v0.0.66：观测计数器（只为了回答"系统自己怎么删的"）----------
+static BOOL gCacheDumped   = NO;  // 缓存键形态只 dump 一次
+static int  gObsDispatcherClear = 0;  // dispatcher - destination:requestsClearingNotificationRequests:
+static int  gObsDispatcherWithdraw = 0;  // dispatcher - withdrawNotificationWithRequest:
+static int  gObsSrcClear   = 0;   // source - dispatcher:requestsClearingNotificationRequests:
 static NSMutableDictionary *gNCRequestByID = nil;  // notificationIdentifier → NCNotificationRequest
 
 // KVC 读一个字段，读不到就返回 nil。
@@ -471,6 +479,57 @@ static id NBStashedNCRequest(NSString *nid) {
     @synchronized ([NSObject class]) {
         return gNCRequestByID ? gNCRequestByID[nid] : nil;
     }
+}
+
+// 🔴🔴 v0.0.66：在**我们自己缓存**（post 那一刻系统递过来的真对象）里找本条的 request。
+//   v0.0.65 真机：只按 key 精确匹配 ⇒ 缓存里 43~100 条，cid **一条都对不上**
+//   （日志 `[GQ] 跳过：post 缓存里没捞到真 request`）。缓存明明在长，说明 key 不是 cid。
+//   ⇒ 本版加第二条：**按 request 自己的内容扫**。
+//   全是只读 KVC，每个键单独 @try（缺键会抛 NSUnknownKeyException，一次抛出带走整段）。
+//   扫的范围就是缓存本身（≤300 条，缓存自己就是这个上限）。
+//   🔴 先按 key 精确（便宜），再按内容扫 —— 次序不能反，不然每次删通知都要扫 300 条。
+static id NBFindCachedRequest(NSString *cid, NSString *recID, NSString *pubID,
+                              NSString *bundle, NSString **howOut, NSUInteger *cacheCntOut) {
+    if (howOut) *howOut = @"(无)";
+    NSDictionary *snap = nil;
+    @synchronized ([NSObject class]) {
+        snap = gNCRequestByID ? [gNCRequestByID copy] : nil;
+    }
+    if (cacheCntOut) *cacheCntOut = snap.count;
+    if (!snap.count) return nil;
+
+    // ① key 精确（至少能命中"缓存键就是 cid"的那种 App）
+    for (NSString *k in @[cid ?: @"", recID ?: @"", pubID ?: @""]) {
+        if (!k.length) continue;
+        id r = NBStashedNCRequest(k);   // 复用上面的单键查法，保持只有一处实现
+        if (r) { if (howOut) *howOut = [@"key=" stringByAppendingString:k]; return r; }
+    }
+
+    // ② 按内容扫：拿 request 自己的标识字段和我们手里的 cid 比
+    NSMutableArray *wanted = [NSMutableArray array];
+    for (NSString *w in @[cid ?: @"", recID ?: @"", pubID ?: @""]) {
+        if (w.length) [wanted addObject:w];
+    }
+    if (!wanted.count) return nil;
+    NSArray *idKeys = @[@"notificationIdentifier", @"bulletinID",
+                        @"recordID", @"publisherBulletinID"];
+    for (NSString *k in snap) {
+        id r = snap[k];
+        if (!r) continue;
+        @try {
+            NSString *sid = NBKVCStr(r, @"sectionIdentifier");
+            if (sid.length && bundle.length && ![sid isEqualToString:bundle]) continue;  // 别人的段，跳过
+            for (NSString *idk in idKeys) {
+                NSString *v = NBKVCStr(r, idk);
+                if (!v.length) continue;
+                if ([wanted containsObject:v]) {
+                    if (howOut) *howOut = [NSString stringWithFormat:@"内容键 %@", idk];
+                    return r;
+                }
+            }
+        } @catch (__unused NSException *e) { }
+    }
+    return nil;
 }
 
 // 集合/数组通吃地取第一个元素。
@@ -823,12 +882,12 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             NBLog(@"!!! [NC-CLEAR] 尚未捕获 BBServer 实例/队列，跳过");
             return;
         }
-        NBLog(@"=== [NC-CLEAR] v0.0.65 请求 sysId=%@ bundle=%@", sysId, bundle);
+        NBLog(@"=== [NC-CLEAR] v0.0.66 请求 sysId=%@ bundle=%@", sysId, bundle);
         // 方法表是静态信息，只在文件不存在时写一次
         if (![[NSFileManager defaultManager] fileExistsAtPath:NOTIFYBOX_NC_DIAG_PATH]) {
             NBDiagWriteFile(sysId, bundle);
         }
-        NBDiagStep(@"\n=== [尝试 %@ @%@] v0.0.65 async sysId=%@ bundle=%@\n",
+        NBDiagStep(@"\n=== [尝试 %@ @%@] v0.0.66 async sysId=%@ bundle=%@\n",
                    [NSDate date], NBProc(), sysId, bundle);
 
         NSArray  *cands   = [sysId componentsSeparatedByString:@"|"];
@@ -924,11 +983,13 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             } else {
                 verdict = @"BB 已删；NC 侧状态见上面的 [NC] 行";
             }
-            NBDiagStep(@"  删后 BB: live=%ld 含本条=%@ | NC: 映射=%ld req数=%ld uuid=%@ req=%@ | 系统自己传给 NC 共 %d 次\n  ⇒ %@\n",
+            NBDiagStep(@"  删后 BB: live=%ld 含本条=%@ | NC: 映射=%ld req数=%ld uuid=%@ req=%@ | 系统自己传给 NC 共 %d 次\n",
                        (long)bbN2, bbAfter ? @"是" : @"否",
                        (long)ncCnt2, (long)ncReqCnt2,
                        ncHadUUID ? @"有" : @"无", ncHadReq ? @"有" : @"无",
-                       gBBToNCSeen, verdict);
+                       gBBToNCSeen);
+            NBDiagStep(@"  观测计数: 目的地请求清除=%d / dispatcher 撤回=%d / source 请求清除=%d\n  ⇒ %@\n",
+                       gObsDispatcherClear, gObsDispatcherWithdraw, gObsSrcClear, verdict);
             NBLog(@"=== [NC-CLEAR] 删后 BB含=%@ ⇒ %@", bbAfter ? @"是" : @"否", verdict);
         };
 
@@ -961,6 +1022,30 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                    gNCSourceQueue ? @"有" : @"无",
                    (unsigned long)gNCRequestByID.count,
                    gNCSuppressed ? @"是" : @"否");
+
+            // ---------- v0.0.66：把「缓存里到底是什么键」一次性看清楚 ----------
+            // v0.0.65 真机：缓存 43→63→69→100 条一直在长（说明 NBStashNCRequest 正常在存），
+            // 但按 cid 精确查**一条都没中** ⇒ 键肯定不是 cid。不猜了，直接打前 5 条出来。
+            if (!gCacheDumped) {
+                NSDictionary *snap0 = nil;
+                @synchronized ([NSObject class]) {
+                    snap0 = gNCRequestByID ? [gNCRequestByID copy] : nil;
+                }
+                if (snap0.count) {
+                    gCacheDumped = YES;
+                    NSArray *ks0 = [snap0 allKeys];
+                    NSUInteger n0 = ks0.count < 5 ? ks0.count : 5;
+                    NBDiagStep(@"  [cache] 共 %lu 条，前 %lu 个键：\n",
+                               (unsigned long)snap0.count, (unsigned long)n0);
+                    for (NSUInteger i0 = 0; i0 < n0; i0++) {
+                        id r0 = snap0[ks0[i0]];
+                        NBDiagStep(@"    key=%@ | section=%@ nid=%@\n",
+                                   NBClip(ks0[i0], 50),
+                                   NBClip(NBKVCStr(r0, @"sectionIdentifier"), 30),
+                                   NBClip(NBKVCStr(r0, @"notificationIdentifier"), 50));
+                    }
+                }
+            }
 
             // ---------- ⓪ BB 自己的官方撤回（真机**从未执行过**这条路，见文件头说明）----------
             // 🔴 为什么排在最前面：它跑在 BBServer **自己的队列**上（我们本来就在这条队列上），
@@ -1018,23 +1103,23 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             // 为什么非试不可：把动作投进 NC 自己的队列，v0.0.64 已经证明**块从没被执行**；
             //   而 ⓪ 只清 BB 账本，界面那条还在。这条路是剩下的唯一可能真正驱动界面的。
             if (!gNCGlobalTried && gNCDispatcher && bullet) {
-                gNCGlobalTried = YES;
-                id reqGQ = nil;
-                NSString *keyGQ = @"(无)";
-                for (NSString *k in @[cid.length ? cid : @"", recID ?: @"", pubID ?: @""]) {
-                    if (!k.length) continue;
-                    id r = NBStashedNCRequest(k);
-                    if (r) { reqGQ = r; keyGQ = k; break; }
-                }
+                NSString *howGQ = nil;
+                NSUInteger cacheN = 0;
+                id reqGQ = NBFindCachedRequest(cid, recID, pubID, bundleC, &howGQ, &cacheN);
                 if (!reqGQ) {
-                    NBDiagStep(@"  [GQ] 跳过：post 缓存里没捞到真 request（**不造 request**）\n");
+                    // 🔴 v0.0.66：**没找到就不烧掉这次机会**（上一版无条件置 YES ⇒ 一进程只探了一次就没了）
+                    NBDiagStep(@"  [GQ] 跳过：缓存 %lu 条里没找到本条的 request（**不造 request**）\n",
+                               (unsigned long)cacheN);
                 } else {
-                    NBDiagStep(@"  [GQ] 将要投全局队列（键=%@）\n", keyGQ);
+                    gNCGlobalTried = YES;
+                    NBDiagStep(@"  [GQ] 将要投全局队列（%@@缓存 %lu 条）\n", howGQ, (unsigned long)cacheN);
                     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                         NBDiagStep(@"  [GQ] 进入全局队列\n");
                         NSString *sid = NBKVCStr(reqGQ, @"sectionIdentifier");
-                        NBDiagStep(@"  [GQ] request 类=%@ section=%@\n",
-                                   NSStringFromClass([reqGQ class]), sid.length ? sid : @"(无)");
+                        NBDiagStep(@"  [GQ] request 类=%@ section=%@ nid=%@\n",
+                                   NSStringFromClass([reqGQ class]),
+                                   sid.length ? sid : @"(无)",
+                                   NBClip(NBKVCStr(reqGQ, @"notificationIdentifier"), 60));
                         if (sid.length && ![sid isEqualToString:bundleC]) {
                             NBDiagStep(@"  [GQ] 跳过：属于 %@ 不是 %@（撤了会误删别人的通知）\n", sid, bundleC);
                         } else {
@@ -1654,7 +1739,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         // 🔴 v0.0.64：这条 queue 是关键 —— 系统平时就在它上面回调 source。
         //    NC 的删除动作必须回到这条队列上执行（v0.0.61 在 BB 队列上调用 ⇒ 卡死注销）。
         gNCSourceQueue = (dispatch_queue_t)queue;
-        NBLog(@"=== [v0.0.65] 捕获 NC source，dispatcher=%@ queue=%@",
+        NBLog(@"=== [v0.0.66] 捕获 NC source，dispatcher=%@ queue=%@",
               dispatcher ? NSStringFromClass([dispatcher class]) : @"(nil)",
               queue ? @"有" : @"(nil)");
     }
@@ -1677,11 +1762,51 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     }
     %orig;
 }
+// 🔴 v0.0.66：这条才是"请求清除"在 source 侧的那一跳。
+//   dispatcher 收到目的地的清除请求后，会把它转给 source，由 source 把 NC request 翻成 bulletin
+//   再交给 BBServer 去 withdraw。**用户手动清一条时它应该会响** —— 如果不响，
+//   就说明手动清除根本不经过 BB，那我们的 ⓪ 也就注定不会改变界面。
+- (void)dispatcher:(id)dispatcher requestsClearingNotificationRequests:(id)requests {
+    gObsSrcClear++;
+    if (gObsSrcClear <= 15) {
+        NBDiagStep(@"  [OBS] source dispatcher:requestsClearing…（第 %d 次，%lu 条）\n",
+                   gObsSrcClear, (unsigned long)NBCollectionCount(requests));
+    }
+    %orig;
+}
 %end
 %hook NCNotificationDispatcher
 - (void)postNotificationWithRequest:(id)request {
     gNCDispatcher = self;
     NBStashNCRequest(request);   // 存「通知标识 → 真 request 对象」，删除时直接拿来撤回
+    %orig;
+}
+// ---------- 🔴🔴 v0.0.66：**纯观测**——系统自己"清掉通知"到底走哪条路 ----------
+// 为什么盯这两条（依据是真机方法清单，不是猜）：
+//   `NCNotificationDispatcher` 只有 67 个方法，其中和"清掉"直接相关的就这几条：
+//     - destination:requestsClearingNotificationRequests:   ← 目的地（NC 界面）**请求清除**
+//     - withdrawNotificationWithRequest:                    ← 真正执行撤回
+//     - _clearUnsafeNotification: / _didRemoveNotificationRequest:
+//   而 `NCBulletinNotificationSource` 上有一组同名镜像 `dispatcher:requestsClearingNotificationRequests:`
+//   —— 它是 dispatcher → source 的那一跳，负责把 NC 的 request 翻成 bulletin 再交给 BBServer。
+// 🔴 v0.0.65 真机教训：我盯的 `observer:removeBulletin:` 是**反方向**的广播
+//   （BBServer 通知 NC "这条没了"）⇒ 用户手动清一条时它**一次都没触发**（4 次尝试全 0）。
+//   盯错了方向，等于整轮白看。这次把"请求清除"这一侧也挂上。
+- (void)destination:(id)destination requestsClearingNotificationRequests:(id)requests {
+    gObsDispatcherClear++;
+    if (gObsDispatcherClear <= 15) {
+        NBDiagStep(@"  [OBS] dispatcher destination:%@ requestsClearing…（第 %d 次，%lu 条）\n",
+                   destination ? NSStringFromClass([destination class]) : @"(nil)",
+                   gObsDispatcherClear, (unsigned long)NBCollectionCount(requests));
+    }
+    %orig;
+}
+- (void)withdrawNotificationWithRequest:(id)request {
+    gObsDispatcherWithdraw++;
+    if (gObsDispatcherWithdraw <= 15) {
+        NBDiagStep(@"  [OBS] dispatcher withdrawNotificationWithRequest:（第 %d 次）nid=%@\n",
+                   gObsDispatcherWithdraw, NBClip(NBKVCStr(request, @"notificationIdentifier"), 50));
+    }
     %orig;
 }
 %end
@@ -1852,7 +1977,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.65 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.66 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -1891,7 +2016,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.65 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.66 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     // v0.0.55：删掉 v0.0.53 在这里（%ctor）打的那行方法清单。
@@ -1960,7 +2085,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.65 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.66 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
