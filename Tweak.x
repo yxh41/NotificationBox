@@ -1,33 +1,35 @@
-// Tweak.x —— v0.0.67（当前）：**拿到系统那条路了 —— 改走「destination 请求清除」，并按 section 找 request** ——
-//   ✅ v0.0.66 真机（`nc_diag(8).txt`）定案四件事，两条是全新信息：
-//      【1】[OBS] 触发了，而且**成对**：
-//             dispatcher `destination:<CSNotificationDispatcher> requestsClearing…（2 条）`
-//             source     `dispatcher:requestsClearing…（2 条）`
-//           条数一致 ⇒ 这两跳就是同一次清除的上下游。**方向终于对上了。**
-//      【2】🔴🔴 但 `dispatcher 撤回` = **0** ⇒ 系统自己清通知时
-//            `withdrawNotificationWithRequest:` **一次都不走**。
-//            ⇒ v0.0.65/0.0.66 把希望全押在 withdraw 上，**押错的是这一条，不是挂点**。
-//      【3】🔴🔴 `[cache]` 揭穿了「按 id 找 request」为什么永远失败：
-//            `key=7700421581079711010 | section=com.ss.iphone.ugc.Aweme`
-//            —— 缓存键是**纯数字 nid**，而我们手里 cid 是 UUID、recordID 是 `f__-XoQCXfP67C4A`。
-//            **两套命名体系，结构性对不上**，再换几种比法也没用。
-//      【4】⓪ 官方撤回**又 5/5 成功**（14→13），账本一直很干净 —— 缺的只有界面那一步。
-//   ⇒ v0.0.67 四条：
-//      ① **按 `sectionIdentifier` 找 request**（不再按 id）。`uuidsToRequests` 的 value 侧扫一遍，
-//         命中本 App 的就是**真系统对象**，不是我造的。
-//      ② **照着系统那条路动手**：抓到真的 `destination`（CSNotificationDispatcher）实例，
-//         调 `[dispatcher destination:dest requestsClearingNotificationRequests:{那条 request}]`。
-//         这是系统自己清通知走的路，我第一次照抄它。
-//      ③ **读映射不投 NC 队列，借系统的手进去**：OBS hook 本来就跑在 NC 自己的队列上
-//         ⇒ 在那里顺手做映射普查与查找。这绕开了 v0.0.64「投进去块从没被执行」的死结。
-//      ④ **一次看清 `NCNotificationRequest` 的构造器**：按关键字把自己的方法表追加进 diag 文件。
-//         造不出 request 是这一路的死结，看清楚下一版才能一次写对。
-//   🔴 判据（三层，缺一层就不算成）：
-//      `[找] … 命中本 App 的真 request` → `[清] destination:requestsClearing… 已返回`
-//      → **人眼确认通知中心那条消失**。前两行绿了第三行没绿，就是**又一种假绿**。
-//   ---- 以下是 v0.0.66 / v0.0.65 / v0.0.64 的内容，仍然成立，保留 ----
-//      ⓪ 官方撤回（有效，已稳定）、不投 NC 队列（投了不跑）、闸门带超时、
-//      绝不对未知类调 description（`NBStringish`）、写前日志、`_requestUUIDForBulletinPublisherMatchID:`。
+// Tweak.x —— v0.0.68（当前）：**request 找到了，但「发送那一刀」没发出去 —— 补上 destination** ——
+//   ✅ v0.0.67 真机（`nc_diag(9).txt`）三件事，一好一坏一新：
+//      【1】✅ **按 section 找 request 成功了**：扫 176 条 `uuidsToRequests` 命中
+//            `NCNotificationRequest section=com.apple.mobilephone nid=E18CDC81-…`
+//            —— 真系统对象到手，不再是"捞不到 request"。
+//      【2】🔴🔴 但 `[清] 跳过 destination（实例=(nil) 方法=有）`：
+//            destination 实例全靠 OBS hook 抓，而那一轮 **OBS 触发 0 次**
+//            （`观测计数: 目的地请求清除=0 / dispatcher 撤回=0 / source 请求清除=0`）
+//            ⇒ **唯一能驱动界面的那一刀从来没发出去过**，最后只落到兜底 withdraw（已知无效）。
+//      【3】🔴 方法表摊开后发现两把还没用过的钥匙：
+//            `NCNotificationRequest - bulletin`（`@@:`，直接给 BBBulletin ⇒ **精确匹配**）
+//            `NCNotificationDispatcher - destinationsRegistry`（`@@:` ⇒ **同步拿 destination**）
+//            `CSNotificationDispatcher - withdrawNotificationRequest:`（**界面层**的那一刀）
+//            `NCNotificationRequest - requestDestinations`（request 自己知道投给了谁）
+//   ⇒ v0.0.68 四条：
+//      ① **精确锁定本条**：section 只用来缩小范围，定案靠 `request.bulletin` 的 bulletinID /
+//         recordID / publisherBulletinID 与我们的比。上一版只按 section 取第一条 ——
+//         而实测三个 id 全不一样，同一个 App 在 NC 里可以有多条 ⇒ 那一刀很可能撤错了别人那条。
+//      ② **同步补抓 destination**（`NBProbeDestinations`）：先 `destinationsRegistry`，
+//         再 `requestDestinations`，两条路找 `CSNotificationDispatcher`。**不再依赖 OBS 触发。**
+//      ③ **多打一把真正对着界面的刀**：`[CSNotificationDispatcher withdrawNotificationRequest:]`
+//         排第一，`[dispatcher destination:dest requestsClearing…]` 第二，`withdraw` 只做兜底。
+//      ④ 删掉 `NBFindCachedRequest`：缓存键实测是「纯数字 nid / App 自造串」，
+//         拿 BB 的 UUID 去里面找**结构性无解**，留着只会把下一轮又骗一次。
+//   🔴 判据（四层，缺一层都不算成）：
+//      `[找] … 匹配=精确` → `[dest] ✅ 拿到 CSNotificationDispatcher`
+//      → `[清] ① withdrawNotificationRequest 已返回` → **人眼确认那条消失**。
+//      前三层绿了第四层没绿，就是又一种假绿。
+//   ---- 以下是 v0.0.67 / v0.0.66 / v0.0.65 / v0.0.64 的内容，仍然成立，保留 ----
+//      成对触发（dispatcher+source）、系统自己不走 withdraw、⓪ 官方撤回稳定生效、
+//      不投 NC 队列（投了不跑）、闸门带超时、绝不对未知类调 description（`NBStringish`）、
+//      写前日志、`_requestUUIDForBulletinPublisherMatchID:`。
 //   🔴 用户实测 v0.0.58/v0.0.59：「没有消失，是不是没真正删除啊啊」。
 //      日志里 BB 的 live 确实 50→49、含本条 是→否 —— 但界面不动。
 //      根因两条，都是我自己的错：
@@ -389,6 +391,12 @@ static BOOL NBClaimKey(NSString *key) {
 //    `requests` 实测是集合（日志里能数出条数），按 `@@:@@` 发。
 - (void)destination:(id)destination requestsClearingNotificationRequests:(id)requests;   // v@:@@
 - (void)dispatcher:(id)dispatcher requestsClearingNotificationRequests:(id)requests;     // v@:@@
+// ---- v0.0.68：签名全部照真机方法表抄（nc_diag(9).txt，v0.0.67 自己 dump 出来的）----
+- (id)destinationsRegistry;                        // @@:  NCNotificationDispatcher 的 destination 注册表
+- (id)registeredDestinations;                      // @@:  NCNotificationDestinationsRegistry 内的集合
+- (id)bulletin;                                   // @@:  NCNotificationRequest → **BBBulletin**（精确匹配的钥匙）
+- (id)requestDestinations;                         // @@:  NCNotificationRequest 自己记录了要投给谁
+- (void)withdrawNotificationRequest:(id)request;   // v@:@ CSNotificationDispatcher —— **界面层**的那一刀
 @end
 
 // 🔴 捕获 BBServer 单例与其内部队列（在 publish hook 里、即 BB 队列上调用时 capture）。
@@ -433,7 +441,7 @@ static NSString *const kNBGuardPending = @"/var/mobile/Library/NotifyBox/.nc_pen
 static NSString *const kNBGuardOff     = @"/var/mobile/Library/NotifyBox/.nc_off";
 // 🔴 版本号写进护栏文件：**每个新版本自动获得一次重试机会**。
 //    否则 v0.0.62 那次卡死留下的 `.nc_off` 会一直压着，新版明明修好了也测不到。
-#define NB_VER_STR @"0.0.67"
+#define NB_VER_STR @"0.0.68"
 static BOOL gNCSuppressed = NO;   // YES ⇒ 本进程不碰 NC 路径
 static BOOL gNCBusy = NO;         // YES ⇒ 上一次 NC 尝试还没回来（同进程内不再赌第二次）
 static NSTimeInterval gNCBusyAt = 0;   // 🔴 v0.0.65：闸门加上时间戳，超时自动放行
@@ -470,8 +478,9 @@ static NSMutableDictionary *gNCRequestByID = nil;  // notificationIdentifier →
 static BOOL      gMapDumped  = NO;   // 映射普查只做一次
 static BOOL      gAPIDumped  = NO;   // 方法表只追加一次
 static NSString *gWantBundle = nil;  // 最近一次要删的 App（给「按 section 找 request」用）
-static __strong id gCSDestination = nil;  // OBS 抓到的真 destination（CSNotificationDispatcher 实例）
-static __strong id gFoundNCReq = nil;     // 按 section 找到的**真** request（系统对象，不是我造的）
+static NSArray  *gWantIDs    = nil;  // v0.0.68：本条的 cid / recordID / publisherID（精确匹配用）
+static __strong id gCSDestination = nil;  // 真 destination（CSNotificationDispatcher 实例）
+static __strong id gFoundNCReq = nil;     // 找到的**真** request（系统对象，不是我造的）
 static int  gActClearTried = 0;      // 正向清除尝试次数（全进程 ≤2）
 
 // KVC 读一个字段，读不到就返回 nil。
@@ -504,56 +513,15 @@ static id NBStashedNCRequest(NSString *nid) {
     }
 }
 
-// 🔴🔴 v0.0.66：在**我们自己缓存**（post 那一刻系统递过来的真对象）里找本条的 request。
-//   v0.0.65 真机：只按 key 精确匹配 ⇒ 缓存里 43~100 条，cid **一条都对不上**
-//   （日志 `[GQ] 跳过：post 缓存里没捞到真 request`）。缓存明明在长，说明 key 不是 cid。
-//   ⇒ 本版加第二条：**按 request 自己的内容扫**。
-//   全是只读 KVC，每个键单独 @try（缺键会抛 NSUnknownKeyException，一次抛出带走整段）。
-//   扫的范围就是缓存本身（≤300 条，缓存自己就是这个上限）。
-//   🔴 先按 key 精确（便宜），再按内容扫 —— 次序不能反，不然每次删通知都要扫 300 条。
-static id NBFindCachedRequest(NSString *cid, NSString *recID, NSString *pubID,
-                              NSString *bundle, NSString **howOut, NSUInteger *cacheCntOut) {
-    if (howOut) *howOut = @"(无)";
-    NSDictionary *snap = nil;
-    @synchronized ([NSObject class]) {
-        snap = gNCRequestByID ? [gNCRequestByID copy] : nil;
-    }
-    if (cacheCntOut) *cacheCntOut = snap.count;
-    if (!snap.count) return nil;
-
-    // ① key 精确（至少能命中"缓存键就是 cid"的那种 App）
-    for (NSString *k in @[cid ?: @"", recID ?: @"", pubID ?: @""]) {
-        if (!k.length) continue;
-        id r = NBStashedNCRequest(k);   // 复用上面的单键查法，保持只有一处实现
-        if (r) { if (howOut) *howOut = [@"key=" stringByAppendingString:k]; return r; }
-    }
-
-    // ② 按内容扫：拿 request 自己的标识字段和我们手里的 cid 比
-    NSMutableArray *wanted = [NSMutableArray array];
-    for (NSString *w in @[cid ?: @"", recID ?: @"", pubID ?: @""]) {
-        if (w.length) [wanted addObject:w];
-    }
-    if (!wanted.count) return nil;
-    NSArray *idKeys = @[@"notificationIdentifier", @"bulletinID",
-                        @"recordID", @"publisherBulletinID"];
-    for (NSString *k in snap) {
-        id r = snap[k];
-        if (!r) continue;
-        @try {
-            NSString *sid = NBKVCStr(r, @"sectionIdentifier");
-            if (sid.length && bundle.length && ![sid isEqualToString:bundle]) continue;  // 别人的段，跳过
-            for (NSString *idk in idKeys) {
-                NSString *v = NBKVCStr(r, idk);
-                if (!v.length) continue;
-                if ([wanted containsObject:v]) {
-                    if (howOut) *howOut = [NSString stringWithFormat:@"内容键 %@", idk];
-                    return r;
-                }
-            }
-        } @catch (__unused NSException *e) { }
-    }
-    return nil;
-}
+// ⛔ v0.0.68：`NBFindCachedRequest` 已删除。
+//   它做的是「在 post 缓存里按 cid / recordID / publisherID 找 request」，而
+//   v0.0.67 真机（nc_diag(9).txt）把缓存键的真实形态摊开了：
+//       key=7700421581079711010            section=com.ss.iphone.ugc.Aweme
+//       key=com.huaye.Drinking-2026-10-25-15-01
+//   有的 App 用纯数字 nid、有的用它自己拼的串 —— **都不是 BB 那边的 UUID**。
+//   ⇒ 拿 cid/recordID/publisherID 去这个字典里找，**结构性无解**，留着只会把下一轮又骗一次。
+//   真要找本条，用 v0.0.68 的 `NBFindOurRequest`（按 section 缩小范围 +
+//   `request.bulletin` 的 bulletinID 精确比对），它拿的是系统自己的对象。
 
 // 集合/数组通吃地取第一个元素。
 // 🔴 v0.0.57 真机踩过：`_bulletinsForIDs:` 返回的是 **NSSet**，我写 `bs[0]`
@@ -915,49 +883,93 @@ static void NBMapCensus(id source) {
     }
 }
 
-// value 可能是 request 本身，也可能是一组 request（数组/集合/字典），深度 ≤2 就收手。
-static id NBMatchRequestDeep(id v, NSString *bundle, int depth) {
-    if (!v || !bundle.length || depth > 2) return nil;
-    NSString *sid = NBKVCStr(v, @"sectionIdentifier");
-    if (sid.length) return [sid isEqualToString:bundle] ? v : nil;   // 是 request ⇒ 直接判定
-    id arr = nil;
-    if ([v isKindOfClass:[NSArray class]])      arr = v;
-    else if ([v isKindOfClass:[NSSet class]])   arr = [(NSSet *)v allObjects];
-    if (arr) {
-        for (id e in arr) {
-            id r = NBMatchRequestDeep(e, bundle, depth + 1);
-            if (r) return r;
-        }
-        return nil;
-    }
-    if ([v isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *d = (NSDictionary *)v;
-        for (id k in d) {
-            id r = NBMatchRequestDeep(d[k], bundle, depth + 1);
-            if (r) return r;
-        }
+// 集合（数组/集合/任何有 allObjects 的）→ NSArray；不是集合就返回 nil。只读，不遍历内部。
+static NSArray *NBObjectsOf(id v) {
+    if (!v) return nil;
+    if ([v isKindOfClass:[NSArray class]]) return (NSArray *)v;
+    if ([v isKindOfClass:[NSSet class]])   return [(NSSet *)v allObjects];
+    if ([v respondsToSelector:@selector(allObjects)]) {
+        @try {
+            id a = [v allObjects];
+            if ([a isKindOfClass:[NSArray class]]) return (NSArray *)a;
+        } @catch (__unused NSException *e) { }
     }
     return nil;
 }
 
-// 在 `uuidsToRequests` 的 **value 侧**找「属于这个 App」的 request。
-// 🔴 为什么不按 id 找：v0.0.66 真机铁证 —— 缓存键是纯数字 nid（7700421581079711010），
-//    我们手里只有 UUID 和 `f__-XoQCXfP67C4A` 这种 recordID ⇒ 两种命名体系，**永远对不上**。
-//    `sectionIdentifier` 是系统必写、而且我们一定知道的字段 ⇒ 换它当锚点。
-static id NBFindRequestBySection(id source, NSString *bundle, NSUInteger *scannedOut) {
+// 把 value 侧可能是「request」或「一组 request」的情况摊平成 request 数组（深度 ≤2）。
+static void NBCollectRequestsIn(id v, NSMutableArray *out, int depth) {
+    if (!v || !out || depth > 2) return;
+    NSString *sid = NBKVCStr(v, @"sectionIdentifier");
+    if (sid.length) { [out addObject:v]; return; }      // 有 sectionIdentifier ⇒ 当它是 request
+    NSDictionary *d = [v isKindOfClass:[NSDictionary class]] ? (NSDictionary *)v : nil;
+    if (d) {
+        for (id k in d) NBCollectRequestsIn(d[k], out, depth + 1);
+        return;
+    }
+    NSArray *arr = NBObjectsOf(v);
+    if (arr) {
+        for (id e in arr) NBCollectRequestsIn(e, out, depth + 1);
+    }
+}
+
+// 🔴🔴 v0.0.68：**精确**判定「这个 request 是不是我们这一条」。
+//   判据来自上一版自己 dump 出来的真机方法表（nc_diag(9).txt 第 462 行起）：
+//   `NCNotificationRequest - bulletin`（`@@:`）直接返回 **BBBulletin** ⇒
+//   拿它的 bulletinID / recordID / publisherBulletinID 跟我们的比，**一比一个准**。
+//   🔴 为什么非加这一层：v0.0.67 只按 section 匹配就动手，而实测命中的
+//      nid=E18CDC81… 与我们的 bulletinID=D29F20AB… / recordID=F5C756A8… **三个全不一样**
+//      ⇒ 同一个 App 在 NC 里可以有多条通知，只按 section 取第一条**很可能撤错了别人那条**。
+static BOOL NBReqIsOurs(id req, NSArray *ids) {
+    if (!req || !ids.count) return NO;
+    for (NSString *k in @[@"notificationIdentifier", @"uuid"]) {
+        NSString *v = NBKVCStr(req, k);
+        if (v.length && [ids containsObject:v]) return YES;
+    }
+    id b = NBSafeValue(req, @"bulletin");       // 🔴 关键：request 自带 BB bulletin
+    if (b) {
+        for (NSString *k in @[@"bulletinID", @"recordID", @"publisherBulletinID"]) {
+            NSString *v = NBKVCStr(b, k);
+            if (v.length && [ids containsObject:v]) return YES;
+        }
+    }
+    return NO;
+}
+
+// 在 `uuidsToRequests` 里找本条 request。
+//   优先返回**精确命中**（NBReqIsOurs）；一个都没精确命中时退回「section 命中的第一条」，
+//   并把 howOut 写清楚 —— 日志里能一眼看出这一刀是稳的还是碰运气的。
+static id NBFindOurRequest(id source, NSString *bundle, NSArray *ids,
+                           NSString **howOut, NSUInteger *scannedOut, int *secHitsOut) {
+    if (howOut) *howOut = @"(无)";
     if (scannedOut) *scannedOut = 0;
+    if (secHitsOut) *secHitsOut = 0;
     if (!source || !bundle.length) return nil;
     @try {
         id m = [source uuidsToRequests];
         if (![m isKindOfClass:[NSDictionary class]]) return nil;
         NSDictionary *d = (NSDictionary *)m;
-        NSUInteger i = 0;
-        for (id k in d) {
-            i++;
-            id r = NBMatchRequestDeep(d[k], bundle, 0);
-            if (r) { if (scannedOut) *scannedOut = i; return r; }
+        NSMutableArray *all = [NSMutableArray arrayWithCapacity:d.count];
+        for (id k in d) NBCollectRequestsIn(d[k], all, 0);
+        if (scannedOut) *scannedOut = all.count;
+        int secHits = 0;
+        id loose = nil;
+        for (id req in all) {
+            NSString *sid = NBKVCStr(req, @"sectionIdentifier");
+            if (!sid.length || ![sid isEqualToString:bundle]) continue;
+            secHits++;
+            if (NBReqIsOurs(req, ids)) {
+                if (howOut) *howOut = @"精确（request.bulletin 命中）";
+                if (secHitsOut) *secHitsOut = secHits;
+                return req;
+            }
+            if (!loose) loose = req;
         }
-        if (scannedOut) *scannedOut = i;
+        if (secHitsOut) *secHitsOut = secHits;
+        if (loose) {
+            if (howOut) *howOut = @"仅 section 命中（**可能撤错条**）";
+            return loose;
+        }
         return nil;
     } @catch (__unused NSException *e) { return nil; }
 }
@@ -991,7 +1003,7 @@ static void NBDiagAppendAPIOnce(void) {
     gAPIDumped = YES;
     @try {
         NSMutableString *buf = [NSMutableString stringWithCapacity:(1 << 14)];
-        [buf appendFormat:@"\n# ---- v0.0.67 方法表（关键字筛：bulletin/request/clear/remov/withdraw/dismiss/destination）----\n"];
+        [buf appendFormat:@"\n# ---- v0.0.68 方法表（关键字筛：bulletin/request/clear/remov/withdraw/dismiss/destination）----\n"];
         NSArray *kw = @[@"ulletin", @"equest", @"lear", @"emov", @"ithdraw", @"ismiss", @"estination"];
         NSArray *classes = @[@"NCNotificationRequest", @"NCNotificationDispatcher",
                              @"NCBulletinNotificationSource", @"CSNotificationDispatcher", @"BBServer"];
@@ -1031,6 +1043,109 @@ static void NBDiagAppendAPIOnce(void) {
     }
 }
 
+// ================= v0.0.68：先拿到**真 destination**，再动手 =================
+// 🔴🔴 v0.0.67 的致命缺口，日志一句话说明了：
+//      `[清] 跳过 destination（实例=(nil) 方法=有）`
+//    因为 destination 实例全靠 OBS hook 抓，而那一轮 **OBS 触发 0 次**
+//    （`观测计数: 目的地请求清除=0 / dispatcher 撤回=0 / source 请求清除=0`）
+//    ⇒ 唯一有能力驱动界面的那一步**从来没发出去过**。
+// 🔴 正规入口就在方法表里：`NCNotificationDispatcher - destinationsRegistry`（`@@:`）。
+//    目标类 = `CSNotificationDispatcher`（CoverSheet = 通知中心界面本身），
+//    它自己有 `- withdrawNotificationRequest:` —— 那一刀才真正对着界面。
+// 🔴 全程只碰 `isKindOfClass` / `count` / 类名，**绝不对未知对象调 description**（v0.0.63 教训）。
+static BOOL NBIsCSDest(id o) {
+    if (!o) return NO;
+    Class c = NSClassFromString(@"CSNotificationDispatcher");
+    return c ? [o isKindOfClass:c] : NO;
+}
+
+static id NBFindCSDestIn(id v, int depth) {
+    if (!v || depth > 3) return nil;
+    if (NBIsCSDest(v)) return v;
+    if ([v isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)v;
+        for (id k in d) {
+            id r = NBFindCSDestIn(d[k], depth + 1);
+            if (r) return r;
+        }
+        return nil;
+    }
+    NSArray *arr = NBObjectsOf(v);
+    if (arr) {
+        for (id e in arr) {
+            id r = NBFindCSDestIn(e, depth + 1);
+            if (r) return r;
+        }
+        return nil;
+    }
+    // registry 可能把 destination 藏在 registeredDestinations 里（名字不确定，两种都试）
+    if ([v respondsToSelector:@selector(registeredDestinations)]) {
+        id inner = nil;
+        @try { inner = [v registeredDestinations]; } @catch (__unused NSException *e) { }
+        if (inner) {
+            id r = NBFindCSDestIn(inner, depth + 1);
+            if (r) return r;
+        }
+    }
+    return nil;
+}
+
+// 同步补抓 destination。**不依赖 OBS hook 有没有触发** —— 这正是上一版栽的地方。
+// 两条来源依次试：① dispatcher 的 destinationsRegistry ② request 自己的 requestDestinations
+// （后者如果直接给对象，那就最省事：request 自己知道它被投给了谁）。
+static void NBProbeDestinations(id req) {
+    if (gCSDestination) return;
+    if (!gNCDispatcher) return;
+    @try {
+        id reg = nil;
+        @try { reg = [gNCDispatcher destinationsRegistry]; } @catch (__unused NSException *e) { }
+        NBDiagStep(@"  [dest] registry=<%@> 条数=%ld\n",
+                   NBClassName(reg), (long)NBCollectionCount(reg));
+        NSArray *arr = NBObjectsOf(reg);
+        if (arr) {
+            NSUInteger n = arr.count < 8 ? arr.count : 8;
+            for (NSUInteger i = 0; i < n; i++) {
+                NBDiagStep(@"    reg #%lu <%@>\n", (unsigned long)i, NBClassName(arr[i]));
+            }
+        }
+        id found = NBFindCSDestIn(reg, 0);
+        if (found) {
+            gCSDestination = found;
+            NBDiagStep(@"  [dest] ✅ 从 registry 拿到 <%@> 实例\n", NBClassName(found));
+        } else {
+            NBDiagStep(@"  [dest] registry 里没找到 CSNotificationDispatcher，改试 request.requestDestinations\n");
+        }
+    } @catch (NSException *e) {
+        NBDiagStep(@"  [dest] registry 探测抛: %@\n", e.reason);
+    }
+    if (gCSDestination || !req) return;
+    @try {
+        id rd = nil;
+        @try { rd = [req requestDestinations]; } @catch (__unused NSException *e) { }
+        NBDiagStep(@"  [dest] req.requestDestinations=<%@> 条数=%ld\n",
+                   NBClassName(rd), (long)NBCollectionCount(rd));
+        NSArray *rda = NBObjectsOf(rd);
+        if (rda) {
+            NSUInteger n = rda.count < 4 ? rda.count : 4;
+            for (NSUInteger i = 0; i < n; i++) {
+                NBDiagStep(@"    rd #%lu <%@> 值=%@\n", (unsigned long)i, NBClassName(rda[i]),
+                           NBSafeClip(rda[i], 50));
+            }
+        } else {
+            NBDiagStep(@"    rd 值=%@\n", NBSafeClip(rd, 60));
+        }
+        id found2 = NBFindCSDestIn(rd, 0);
+        if (found2) {
+            gCSDestination = found2;
+            NBDiagStep(@"  [dest] ✅ 从 requestDestinations 拿到 <%@> 实例\n", NBClassName(found2));
+        } else {
+            NBDiagStep(@"  [dest] ⛔ 两条来源都没拿到 CSNotificationDispatcher（只能退回 dispatcher 层那一刀）\n");
+        }
+    } @catch (NSException *e) {
+        NBDiagStep(@"  [dest] requestDestinations 探测抛: %@\n", e.reason);
+    }
+}
+
 // 照着**系统自己那条路**走一次：destination 请求清除。
 // 依据（nc_diag(8).txt）：手动清通知 = dispatcher `destination:requestsClearing…`
 // + source `dispatcher:requestsClearing…`，**成对、条数一致**、且 `withdraw` 0 次。
@@ -1038,7 +1153,7 @@ static void NBDiagAppendAPIOnce(void) {
 //    自然队列；而 v0.0.64 那次投进 `NCBulletinNotificationSource` 自己的 queue，**块从没被执行**。
 //    主队列是唯一有保证会被服务的队列。
 // 🔴 为什么不在 hook 里就地调：那等于在系统自己的清除调用里再发起一次清除 ⇒ 重入。
-static void NBForwardClearAsync(id req) {
+static void NBForwardClearAsync(id req, NSString *how) {
     if (!req || !gNCDispatcher) return;
     if (gNCSuppressed) {
         NBDiagStep(@"  [清] 跳过（上次卡死过 ⇒ gNCSuppressed，删 %@ 可恢复）\n", kNBGuardOff);
@@ -1052,8 +1167,13 @@ static void NBForwardClearAsync(id req) {
         NBDiagStep(@"  [清] 跳过：req 属于 %@ 不是 %@（撤了会误删别人的通知）\n", sid, want);
         return;
     }
-    NBDiagStep(@"  [清] 将要投主队列（第 %d 次）req 类=%@ section=%@ nid=%@\n",
-               gActClearTried, NBClassName(req),
+    // 🔴 动手之前先补抓 destination（这一步 v0.0.67 漏了 ⇒ `实例=(nil)` ⇒ 唯一能驱动界面的
+    //    那一刀从来没发出去过）。顺带把 request 自己的「目的地清单」也摊开 —— 它如果直接给
+    //    对象，下一版连 registry 都不用查。
+    NBProbeDestinations(req);
+    NBDiagStep(@"  [清] 将要投主队列（第 %d 次）匹配=%@ req 类=%@ section=%@ nid=%@\n",
+               gActClearTried, how ?: @"?",
+               NBClassName(req),
                sid.length ? sid : @"(无)",
                NBSafeClip(NBKVCStr(req, @"notificationIdentifier"), 56));
     // 护栏：卡死也有痕迹（同 .nc_pending 那套，带版本戳 ⇒ 新版自动获得一次重试）
@@ -1062,31 +1182,48 @@ static void NBForwardClearAsync(id req) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NBDiagStep(@"  [清] 进入主队列\n");
         BOOL ok = NO;
+        // ---- ① 界面层：CSNotificationDispatcher 自己的 withdrawNotificationRequest: ----
+        // 这是最对着「界面那条」的一刀：CoverSheet 就是通知中心的列表本身。
+        if (gCSDestination && [gCSDestination respondsToSelector:@selector(withdrawNotificationRequest:)]) {
+            NBDiagStep(@"  [清] ① 将要调用 <%@> withdrawNotificationRequest:\n", NBClassName(gCSDestination));
+            @try {
+                [gCSDestination withdrawNotificationRequest:req];
+                ok = YES;
+                NBDiagStep(@"  [清] ① withdrawNotificationRequest 已返回\n");
+            } @catch (NSException *e) {
+                NBDiagStep(@"  [清] ① withdrawNotificationRequest 抛: %@\n", e.reason);
+            }
+        } else {
+            NBDiagStep(@"  [清] ① 跳过（destination=%@ 方法=%@）\n",
+                       gCSDestination ? @"有" : @"(nil)",
+                       [gCSDestination respondsToSelector:@selector(withdrawNotificationRequest:)] ? @"有" : @"无");
+        }
+        // ---- ② dispatcher 层：系统自己真走的那条（v0.0.66 实测成对触发的上游）----
         if (gCSDestination
             && [gNCDispatcher respondsToSelector:@selector(destination:requestsClearingNotificationRequests:)]) {
             NSSet *one = [NSSet setWithObject:req];
-            NBDiagStep(@"  [清] 将要调用 destination:<%@> requestsClearing…（1 条）\n",
+            NBDiagStep(@"  [清] ② 将要调用 destination:<%@> requestsClearing…（1 条）\n",
                        NBClassName(gCSDestination));
             @try {
                 [gNCDispatcher destination:gCSDestination requestsClearingNotificationRequests:one];
                 ok = YES;
-                NBDiagStep(@"  [清] destination:requestsClearing… 已返回\n");
+                NBDiagStep(@"  [清] ② destination:requestsClearing… 已返回\n");
             } @catch (NSException *e) {
-                NBDiagStep(@"  [清] destination 抛: %@\n", e.reason);
+                NBDiagStep(@"  [清] ② destination 抛: %@\n", e.reason);
             }
         } else {
-            NBDiagStep(@"  [清] 跳过 destination（实例=%@ 方法=%@）\n",
+            NBDiagStep(@"  [清] ② 跳过（destination=%@ 方法=%@）\n",
                        gCSDestination ? @"有" : @"(nil)",
                        [gNCDispatcher respondsToSelector:@selector(destination:requestsClearingNotificationRequests:)] ? @"有" : @"无");
         }
+        // ---- ③ 兜底：v0.0.59 已证「会返回」，但单独用过两版都没让界面变 ----
         if (!ok && [gNCDispatcher respondsToSelector:@selector(withdrawNotificationWithRequest:)]) {
-            // 兜底：v0.0.59 已证「会返回」，但从没让界面变过 ⇒ 只在上面没调成时补一刀
-            NBDiagStep(@"  [清] 兜底调用 withdrawNotificationWithRequest:\n");
+            NBDiagStep(@"  [清] ③ 兜底调用 withdrawNotificationWithRequest:\n");
             @try {
                 [gNCDispatcher withdrawNotificationWithRequest:req];
-                NBDiagStep(@"  [清] withdraw 已返回\n");
+                NBDiagStep(@"  [清] ③ withdraw 已返回\n");
             } @catch (NSException *e) {
-                NBDiagStep(@"  [清] withdraw 抛: %@\n", e.reason);
+                NBDiagStep(@"  [清] ③ withdraw 抛: %@\n", e.reason);
             }
         }
         NBDiagStep(@"  [清] 完成 ok=%@ want=%@ ⇒ **这时去看通知中心那条还在不在**\n",
@@ -1105,16 +1242,26 @@ static void NBFindAndForwardClear(NSString *why) {
     if (!gWantBundle.length || !gNCSource) return;
     tries++;
     NSUInteger scanned = 0;
-    id r = NBFindRequestBySection(gNCSource, gWantBundle, &scanned);
+    int secHits = 0;
+    NSString *how = nil;
+    id r = NBFindOurRequest(gNCSource, gWantBundle, gWantIDs, &how, &scanned, &secHits);
     if (r) {
         gFoundNCReq = r;
-        NBDiagStep(@"  [找] %@：uuidsToRequests 扫 %lu 条 ⇒ **命中本 App 的真 request** section=%@ nid=%@\n",
-                   why, (unsigned long)scanned,
+        NBDiagStep(@"  [找] %@：扫 %lu 条 request，同段 %d 条 ⇒ 选中 匹配=%@ section=%@ nid=%@\n",
+                   why, (unsigned long)scanned, secHits, how ?: @"?",
                    NBSafeClip(NBKVCStr(r, @"sectionIdentifier"), 40),
                    NBSafeClip(NBKVCStr(r, @"notificationIdentifier"), 56));
-        NBForwardClearAsync(r);
+        // 把它自带的 bulletin 也打出来 —— 这是「到底是不是我们那条」的唯一硬证据
+        @try {
+            id b = NBSafeValue(r, @"bulletin");
+            NBDiagStep(@"  [找] req.bulletin=<%@> bulletinID=%@ recordID=%@\n",
+                       NBClassName(b),
+                       NBSafeClip(NBKVCStr(b, @"bulletinID"), 40),
+                       NBSafeClip(NBKVCStr(b, @"recordID"), 40));
+        } @catch (__unused NSException *e) { }
+        NBForwardClearAsync(r, how);
     } else {
-        NBDiagStep(@"  [找] %@：uuidsToRequests 扫 %lu 条，没有 section=%@ 的 request\n",
+        NBDiagStep(@"  [找] %@：扫 %lu 条 request，没有 section=%@ 的（同段 0 条）\n",
                    why, (unsigned long)scanned, gWantBundle);
     }
 }
@@ -1166,12 +1313,12 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             NBLog(@"!!! [NC-CLEAR] 尚未捕获 BBServer 实例/队列，跳过");
             return;
         }
-        NBLog(@"=== [NC-CLEAR] v0.0.67 请求 sysId=%@ bundle=%@", sysId, bundle);
+        NBLog(@"=== [NC-CLEAR] v0.0.68 请求 sysId=%@ bundle=%@", sysId, bundle);
         // 方法表是静态信息，只在文件不存在时写一次
         if (![[NSFileManager defaultManager] fileExistsAtPath:NOTIFYBOX_NC_DIAG_PATH]) {
             NBDiagWriteFile(sysId, bundle);
         }
-        NBDiagStep(@"\n=== [尝试 %@ @%@] v0.0.67 async sysId=%@ bundle=%@\n",
+        NBDiagStep(@"\n=== [尝试 %@ @%@] v0.0.68 async sysId=%@ bundle=%@\n",
                    [NSDate date], NBProc(), sysId, bundle);
 
         NSArray  *cands   = [sysId componentsSeparatedByString:@"|"];
@@ -1180,6 +1327,10 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         //    也要用它去 `uuidsToRequests` 里按 section 找 request。
         gWantBundle = bundleC;
         gFoundNCReq = nil;
+        // 🔴 v0.0.68：三个候选 id 也记到全局。上一版只按 section 匹配就动手，而同一个 App
+        //    在 NC 里可以有好几条通知（实测命中 nid 与我们的 bulletinID/recordID 三个全不一样）
+        //    ⇒ 必须用 `request.bulletin` 的 bulletinID 做精确比对，否则可能撤错条。
+        gWantIDs = cands.count ? [cands copy] : nil;
         // 方法表（按关键字筛）只追加一次：`NCNotificationRequest` 的构造器我还没见过真名，
         // 而"造不出 request 就只能等系统送"是这一路的死结 ⇒ 一次看清，下版一次写对。
         NBDiagAppendAPIOnce();
@@ -1391,30 +1542,22 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             //      ⇒ 原来这条 [GQ]（只会调 withdraw）押错了方向，撤掉。
             //   ② 缓存键是纯数字 nid，我们手里是 UUID / `f__-XoQ…` ⇒ 按 id 找**结构性无效**。
             //      ⇒ 改成在 `uuidsToRequests` 里**按 sectionIdentifier 找**（系统必写、我们必知）。
+            // 🔴 v0.0.68 补：section 只用来**缩小范围**，真正定案靠 `request.bulletin` 的 bulletinID。
             // 🔴 读映射必须在正确的队列上（NC 自己的队列或主队列），否则可能和写操作撞车。
             //    这里先投**主队列**（有保证会被服务），OBS hook 里那条在 NC 队列上、谁先到谁做。
             if (gNCDispatcher && bullet && !gFoundNCReq) {
-                NSString *howGQ = nil;
-                NSUInteger cacheN = 0;
-                id reqGQ = NBFindCachedRequest(cid, recID, pubID, bundleC, &howGQ, &cacheN);
-                if (reqGQ) {
-                    // 缓存里意外命中（新到的通知才有这种运气）⇒ 直接用，省一次遍历
-                    gFoundNCReq = reqGQ;
-                    NBDiagStep(@"  [找] 缓存直接命中（%@，共 %lu 条）⇒ 不必遍历映射\n",
-                               howGQ, (unsigned long)cacheN);
-                    NBForwardClearAsync(reqGQ);
-                } else {
-                    NBDiagStep(@"  [找] 缓存 %lu 条里没有本条（键是纯数字 nid，与 cid 不同命名体系）⇒ 投主队列遍历映射\n",
-                               (unsigned long)cacheN);
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        NBDiagStep(@"  [找] 进入主队列\n");
-                        if (!gMapDumped) {
-                            gMapDumped = YES;
-                            NBMapCensus(gNCSource);
-                        }
-                        NBFindAndForwardClear(@"主队列");
-                    });
-                }
+                // 🔴 v0.0.68：缓存这条路对老通知天然无效（缓存在 SpringBoard 起来后才开始攒）。
+                //    不再先查缓存再兜底 —— 直接走「扫映射 + 精确比对」，少一层无关分支。
+                NBDiagStep(@"  [找] 缓存 %lu 条对本条无效（键是纯数字 nid / App 自造串，与我们的 cid 不同命名体系）⇒ 投主队列扫映射\n",
+                           (unsigned long)gNCRequestByID.count);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NBDiagStep(@"  [找] 进入主队列\n");
+                    if (!gMapDumped) {
+                        gMapDumped = YES;
+                        NBMapCensus(gNCSource);
+                    }
+                    NBFindAndForwardClear(@"主队列");
+                });
             }
 
             // ---------- 🔴 v0.0.65：⓪ 之后**直接**删账本，不再把动作投到 NC 队列 ----------
@@ -2020,7 +2163,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         // 🔴 v0.0.64：这条 queue 是关键 —— 系统平时就在它上面回调 source。
         //    NC 的删除动作必须回到这条队列上执行（v0.0.61 在 BB 队列上调用 ⇒ 卡死注销）。
         gNCSourceQueue = (dispatch_queue_t)queue;
-        NBLog(@"=== [v0.0.67] 捕获 NC source，dispatcher=%@ queue=%@",
+        NBLog(@"=== [v0.0.68] 捕获 NC source，dispatcher=%@ queue=%@",
               dispatcher ? NSStringFromClass([dispatcher class]) : @"(nil)",
               queue ? @"有" : @"(nil)");
     }
@@ -2278,7 +2421,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.67 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.68 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -2317,7 +2460,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.67 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.68 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     // v0.0.55：删掉 v0.0.53 在这里（%ctor）打的那行方法清单。
@@ -2386,7 +2529,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.67 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.68 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
