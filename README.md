@@ -6907,3 +6907,166 @@ deb 1,099,874 B  md5 7ff543686f1a5fc8b23785af6dbba786  control Version: 0.0.67
 手机自己会写下 `.nc_off`，下次开桌面不再重复。
 
 真出现卡屏/注销 ⇒ 装回 v0.0.66（`⓪` 仍然会把账本清干净，只是界面不动）。
+
+## v0.0.68 —— 那一刀从来没发出去过：我把「必须拿到的东西」挂在「可能不发生的事件」上
+
+### 一条日志，两个数字，一个结论
+
+`nc_diag(9).txt` 里这一轮只剩两行有用：
+
+```
+[清] 跳过 destination（实例=(nil) 方法=有）
+观测计数: 目的地请求清除=0 / dispatcher 撤回=0 / source 请求清除=0
+```
+
+**「实例=(nil)」是结果，「计数全 0」是原因。** 上一版我把 destination 实例的唯一来源
+押在 `dispatcher:destination:requestsClearingNotificationRequests:` 这个观测 hook 上 ——
+它只要被触发一次，就能顺手把 `destination` 参数存下来。可这一轮它**一次都没被触发**
+（用户删的是别的东西，系统没走清除路径），于是 `gCSDestination` 永远是 `nil`，
+于是唯一能驱动界面的那一刀**从头到尾没有发出去过**。
+
+> 🔴 这是和「押错了刀」同一族错误的另一面：
+> **我把一个「必须拿到手的东西」，挂在一个「可能不发生的事件」上。**
+> 判据不应该是「它发生过吗」，而应该是**「它一定会发生吗」**。
+> 换了刀却忘了换「刀从哪来」—— 等于换了枪没换子弹。
+
+### 第二个错：只按 section 匹配，会撤错条
+
+上一版拿到的那次成功，日志是这样：
+
+```
+[找] NC 队列(OBS)：扫 176 条 request，同段 1 条 ⇒ 选中 section=com.apple.mobilephone nid=E18CDC81-…
+```
+
+看着像成功，其实只对了一半 —— 我们手里是：
+
+| 我们持有的 | 值 |
+| --- | --- |
+| `bulletinID` | `D29F20AB…` |
+| `recordID` | `F5C756A8…` |
+| 命中的 `nid` | `E18CDC81…` |
+
+**三个全不一样。** 而且同一段里 `BB live=2`（不止一条）。
+「同段只有 1 条」是撞运气，不是判据。正解在方法表里一直躺着：
+`NCNotificationRequest - bulletin`（返回类型 `@@:`）—— **request 自己带着它对应的 BBBulletin**，
+拿它的 `bulletinID` / `recordID` / `publisherBulletinID` 和手里的三个 ID 比，
+才是这条 request 「是不是我那条」的硬证据。
+
+### 这一版做了四件事
+
+**① 同步补抓 destination（不再等事件）**
+
+```objc
+static void NBProbeDestinations(id req) {
+    // ① [dispatcher destinationsRegistry] —— 方法表里 `@@:`，同步就能拿到
+    // ② 退而求其次 [req requestDestinations] —— request 自己知道它被投给了谁
+}
+```
+
+**② 注册期就接住实例**
+
+```objc
+- (void)registerDestination:(id)destination {
+    if (destination && NBIsCSDest(destination)) { gCSDestination = destination; gCSDestFromHook = YES; }
+    %orig;
+}
+- (void)_registerDestination:(id)destination { /* 同上 */ %orig; }
+```
+
+destination 是 `NCNotificationDispatcher` 启动时**注册**进去的 —— 那是「一定会发生」的时刻。
+挂在那里，比等一次未必出现的清除事件可靠得多。
+
+**③ 用 `request.bulletin` 精确锁定本条**
+
+```objc
+static BOOL NBReqIsOurs(id req, NSArray *ids) {
+    for (NSString *k in @[@"notificationIdentifier", @"uuid"]) { … }
+    id b = NBSafeValue(req, @"bulletin");          // 🔴 request 自带 BB bulletin
+    if (b) for (NSString *k in @[@"bulletinID", @"recordID", @"publisherBulletinID"]) { … }
+}
+```
+
+匹配分成两支，日志会明说走了哪支：`精确（request.bulletin 命中）` 或
+`仅 section 命中（**可能撤错条**）` —— 后者是退回分支，出现即代表**没有硬证据**。
+
+**④ 三把刀，按「离界面由近到远」排**
+
+| 顺序 | 刀 | 依据 |
+| --- | --- | --- |
+| ① | `[CSNotificationDispatcher withdrawNotificationRequest:]` | CoverSheet 就是通知中心列表本身，这是**界面层** |
+| ② | `[dispatcher destination:CSDest requestsClearing…]` | v0.0.66 实测 = 系统自己清通知时真走的那条 |
+| ③ | `[dispatcher withdrawNotificationWithRequest:]` | 兜底；v0.0.59 已证「会返回」，但单独用过两版界面都没变 |
+
+全部投**主队列**执行（`CSNotificationDispatcher` 是 UI 派发器，主线程是它的自然队列）。
+
+### 删掉的死路
+
+`NBFindCachedRequest` 整个删除。它干的活是「拿 cid / recordID / publisherBulletinID
+去 `uuidsToRequests` 那个字典里找 request」，而那个字典的键是**纯数字 nid**
+（`7700421581079711010`）或 App 自造串（`com.huaye.Drinking-2026-10-25-15-01`）——
+和我们手里的 UUID 属于**两套永远对不上的命名体系**。
+留着它只会让下一轮又多一条「看起来像在找、其实结构性无解」的日志。
+
+> 同一个判断的另一半：**锚点选错，不是比法不够。** 上一版试了四种键去比，
+> 全都比不中，因为那些键本来就不该出现在那个字典里。
+
+### 四层判据（装好后请这样验）
+
+| 层 | 日志锚点 | 它证明什么 |
+| --- | --- | --- |
+| ① 锁对那条 | `[找] … 匹配=精确` | 找到的是**我们那条**，不是同段的别人 |
+| ② 拿到 destination | `[dest] ✅ 已有实例 <CSNotificationDispatcher>（来源：注册期 hook）` | 刀有子弹了 |
+| ③ 刀发出去了 | `[清] ① withdrawNotificationRequest 已返回` | 调用真到达、没抛异常 |
+| ④ **人眼** | 那条通知**消失** | 🔴 只有这一层算数 |
+
+如果 ② 还是红的，日志会给：
+
+```
+[dest] registry=<类名> 条数=N
+  reg #0 <XXX>
+  reg #1 <YYY>
+  …
+[dest] req.requestDestinations=<类名> 条数=N
+[dest] ⛔ 两条来源都没拿到 CSNotificationDispatcher
+```
+
+**那就是「到底有哪些 destination 可用」的完整答案**，下一版照着挑，不用再猜。
+
+### 三个期望表错误（这一轮的自省）
+
+包级对拍第一次跑出 **4 条不合格**，四条全是**我自己的期望表写错**，没有一条是代码问题：
+
+| 判据 | 我写的 | 真相 | 修法 |
+| --- | --- | --- | --- |
+| `精确（request.bulletin 命中）` | 带前导空格 | 源码是 `*howOut = @"精确…"`，空格来自 `匹配=%@` | 逐字取自源码字面量 |
+| `bulletin` 选择器 | 当「新增」判据 | v0.0.67 包里本来就有 `bulletin\0`（BB 侧同名选择器） | 降级为**非判别性**共有项 |
+| `NBFindCachedRequest` | 旧=有、新=0 | **static C 函数名根本不进二进制** ⇒ 两版都 0 ⇒ 恒绿 | 改用函数体里唯一格式串 `内容键 %@` |
+| `NBStashedNCRequest` | 应该也没了 | 它是**故意保留**的老 `[NC] ②` 兜底（带 section 复核） | 期望改成「定义 1 + 调用 1 = 2」 |
+
+> 🔴 三次都栽在同一件事上：**判据串取自「我记得 / 它打印出来长什么样」，而不是「源码里的字面量」。**
+> 记忆里已经写着「期望值必须取自被测对象本身」，这一轮又犯了三遍。
+
+### 包级对拍结果
+
+| 项 | v0.0.67 | v0.0.68 |
+| --- | --- | --- |
+| deb 体积 | 1,099,874 B | 1,101,246 B |
+| deb md5 | `7ff543686f1a5fc8b23785af6dbba786` | `3e4b50fd8cb06c439ff1a6deaa86f273` |
+| dylib 体积 | 228,608 B | **228,608 B（delta 0）** |
+| control Version | 0.0.67 | 0.0.68 |
+
+判据：**A 新增 20 条 / B 共有 5 条 / C 反向 2 条 = 27 条，不合格 0**，且每一条都验过「有区分力」
+（新增项在旧包里必须为 0，反向项在新包里必须为 0）。
+
+> ⚠️ `dylib 228,608 = 228,608`，而源码改了 21 KB+ —— **体积和改动量脱钩**这件事已经撞了十几次，
+> 判「编进去没」只认串 / 选择器 / md5，体积连趋势都不可信。
+
+### 风险与回退
+
+新增的两处 hook（`registerDestination:` / `_registerDestination:`）都只是**读参数存指针**，
+不改变返回值、不吞掉原实现（`%orig` 照常调用），风险极低。
+三把刀里 ① 是**新调用**的私有方法，若它内部状态不对，最坏表现是「通知没消失」，
+不至于影响其他通知 —— 因为它每次只处理**一条** request，且调用前已经用 `sectionIdentifier` 复核过归属。
+
+真出现卡屏/注销 ⇒ 装回 v0.0.67（`⓪` 仍会把账本清干净，只是界面不动），
+并在 `nc_diag.txt` 里找 `[清] ①` 那一行有没有 `抛:` 后缀。
