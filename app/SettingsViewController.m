@@ -15,6 +15,8 @@
 #import "InstalledApps.h"
 #import "NotifyStatsViewController.h"
 #import "KeywordRulesViewController.h"
+// v0.0.71：统一视觉层（颜色 / 圆角 / 图标 / 分组卡片的唯一来源）
+#import "NBTheme.h"
 #import <errno.h>
 #import <string.h>
 
@@ -29,17 +31,28 @@
 //    现在改成**一个 rows 数组按加入顺序排**，每行的类型存在自己的 tag 里。
 //    这不是为了好看 —— 是为了以后加/删/挪一行不用改布局代码。
 
-static const NSInteger kRowSwitch = 1;   // 标题 + UISwitch
-static const NSInteger kRowGroup  = 2;   // 标题 + 输入框
-static const NSInteger kRowAction = 3;   // 标题 + 右侧说明 + 可点
+static const NSInteger kRowSwitch = 1;   // 图标 + 标题(+副标题) + UISwitch
+static const NSInteger kRowField  = 2;   // 图标 + 标题 + 右侧输入框
+static const NSInteger kRowAction = 3;   // 图标 + 标题(+副标题) + 右侧取值 + chevron
 
 // box 的 tag 表示"行类型"，子视图 tag 一律从 101 起，两套编号互不干扰
 // （viewWithTag: 只搜子树，不会返回 receiver 自己）
-static const NSInteger kSubTitle = 101;
-static const NSInteger kSubField = 102;
-static const NSInteger kSubSwitch = 103;
-static const NSInteger kSubValue = 104;
-static const NSInteger kSubHit = 105;
+static const NSInteger kSubTitle  = 101;
+static const NSInteger kSubSub    = 102;   // 副标题（灰色第二行）
+static const NSInteger kSubField  = 103;
+static const NSInteger kSubSwitch = 104;
+static const NSInteger kSubValue  = 105;
+static const NSInteger kSubHit    = 106;
+static const NSInteger kSubIcon   = 107;
+static const NSInteger kSubChev   = 108;
+static const NSInteger kSubSep    = 109;   // 卡片内的行分隔线（layout 时懒建）
+
+// ---------- v0.0.71 统一几何（见 NBTheme.h 的 token 说明） ----------
+static const CGFloat kIconX = 16.0;    // 图标左边距
+static const CGFloat kTextX = 56.0;    // 行文字起点 = 16 + 28(图标) + 12(间距)
+static const CGFloat kPadR  = 16.0;    // 右侧内边距
+static const CGFloat kSecGap = 26.0;   // 组与组之间的间距
+static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
 
 // 🔴 v0.0.19：这里原来有个 `NBIsDigits()`，只被"延迟秒数"那个字段用。
 //    延迟功能删掉之后它变成死代码，`-Werror -Wunused-function` 直接把编译打断
@@ -51,7 +64,18 @@ static const NSInteger kSubHit = 105;
 
 @interface SettingsViewController () <UITextFieldDelegate>
 @property (nonatomic, strong) UIScrollView *scroll;
-@property (nonatomic, strong) NSMutableArray<UIView *> *rows;        // 统一的行，按加入顺序
+// 🔴 v0.0.71：结构从「一串平铺的行」改成「分组 → 组卡片 → 行」。
+//    原来 20 多行一个接一个排下来、中间一个标题都没有，用户只能靠"上下滑到第几行"
+//    来认位置；说明文字又是一整屏的灰字堆在底部。现在按话题分 7 组，
+//    每组一个白卡片、一个灰标题、必要时一条灰脚注。
+//    ⚠️ 行本身仍然是"一个 UIView + tag"那套（tag 区分行类型，子视图 tag 从 101 起）——
+//      换掉的只是**容器与排布**，保存/校验/跳转逻辑一行没动。
+@property (nonatomic, strong) NSMutableArray<NSMutableArray<UIView *> *> *secRows;
+@property (nonatomic, strong) NSMutableArray<NSString *> *secTitles;
+@property (nonatomic, strong) NSMutableArray<NSString *> *secFooters;
+@property (nonatomic, strong) NSMutableArray<UIView *> *secCards;
+@property (nonatomic, strong) NSMutableArray *secHeaderLabels;   // UILabel 或 NSNull
+@property (nonatomic, strong) NSMutableArray *secFooterLabels;   // UILabel 或 NSNull
 @property (nonatomic, strong) NSMutableArray<UITextField *> *fields;
 // 🔴 每个输入框对应哪个设置键，**跟着字段一起存**。
 //    写死下标的话，只要在中间插一个新字段，后面所有键就整体错位一格：
@@ -63,16 +87,36 @@ static const NSInteger kSubHit = 105;
 //    症状是"我明明开了免打扰，一保存自己变回关"，而且**完全不报错**。
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UISwitch *> *switches;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *actionRows;
-@property (nonatomic, strong) UILabel *hintLabel;
 @property (nonatomic, strong) UILabel *statusLabel;
 
-- (void)addSwitchRow:(NSString *)title on:(BOOL)on key:(NSString *)key;
-- (void)addGroup:(NSString *)title
-              ph:(NSString *)ph
-           value:(NSString *)value
-        keyboard:(UIKeyboardType)kb
-             key:(NSString *)key;
-- (UIView *)addActionRow:(NSString *)title key:(NSString *)key action:(SEL)sel;
+- (void)addSection:(NSString *)title footer:(NSString *)footer;
+- (void)addSwitchRow:(NSString *)title
+                 sub:(NSString *)sub
+                icon:(NSString *)sym
+                tint:(UIColor *)tint
+                  on:(BOOL)on
+                 key:(NSString *)key;
+- (void)addActionRow:(NSString *)title
+                 sub:(NSString *)sub
+                icon:(NSString *)sym
+                tint:(UIColor *)tint
+                 key:(NSString *)key
+         destructive:(BOOL)destructive
+              action:(SEL)sel;
+- (void)addFieldRow:(NSString *)title
+               icon:(NSString *)sym
+               tint:(UIColor *)tint
+                 ph:(NSString *)ph
+              value:(NSString *)value
+           keyboard:(UIKeyboardType)kb
+                key:(NSString *)key;
+- (CGFloat)rowHeight:(UIView *)box width:(CGFloat)cw;
+- (void)layoutRow:(UIView *)box width:(CGFloat)cw height:(CGFloat)h;
+- (NSMutableArray<UIView *> *)currentRows;
+- (void)attachIcon:(NSString *)sym tint:(UIColor *)tint to:(UIView *)box;
+- (void)attachTitle:(NSString *)title sub:(NSString *)sub to:(UIView *)box;
+- (void)onUsage:(id)sender;
+- (NSString *)usageText;
 - (void)refreshActionValues;
 - (void)setActionValue:(NSString *)text forKey:(NSString *)key;
 - (NSString *)strOf:(id)v;
@@ -103,6 +147,7 @@ static const NSInteger kSubHit = 105;
 - (NSString *)timeText:(id)v;
 - (void)onVoice:(id)sender;
 - (void)onAppDiag:(id)sender;
+- (void)onKeywordRules:(id)sender;
 - (void)fail:(NSString *)msg;
 - (void)onKeyboard:(NSNotification *)n;
 @end
@@ -112,25 +157,39 @@ static const NSInteger kSubHit = 105;
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"设置";
-    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    self.view.backgroundColor = NBPageBG();
+    // 本页是表单、不是内容列表 ⇒ 不跟首页抢大标题
+    self.navigationItem.largeTitleDisplayMode = UILargeTitleDisplayModeNever;
 
+    // v0.0.71：左侧由文字「关闭」改成 ‹ 返回箭头（它本来就是 push 进来的，
+    //    用"关闭"会让人以为这是个弹窗；而且文字按钮在窄屏上会挤掉中间的标题）。
+    UIImage *back = [UIImage systemImageNamed:@"chevron.left"];
     self.navigationItem.leftBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain
+        [[UIBarButtonItem alloc] initWithImage:back
+                                         style:UIBarButtonItemStylePlain
                                         target:self action:@selector(onClose:)];
-    // 🔴 左右分工要清楚：左边关闭=放弃本页输入框的改动，右边保存=落盘。
+    // 🔴 左右分工要清楚：左边返回=放弃本页输入框的改动，右边保存=落盘。
     //    子页面（黑白名单/声音/替换规则）是"点一下立即生效"，本页是"表单要按保存"——
     //    两种模式并存不统一，但各自都符合用户当下的预期：选东西时不想再点保存，
     //    改数字时不想被"点一下就存"绑架。
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"保存" style:UIBarButtonItemStyleDone
-                                        target:self action:@selector(onSave:)];
+    UIBarButtonItem *save = [[UIBarButtonItem alloc] initWithTitle:@"保存"
+                                                            style:UIBarButtonItemStyleDone
+                                                           target:self action:@selector(onSave:)];
+    save.tintColor = [UIColor systemBlueColor];
+    self.navigationItem.rightBarButtonItem = save;
 
     self.scroll = [[UIScrollView alloc] init];
     self.scroll.alwaysBounceVertical = YES;
     self.scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    self.scroll.backgroundColor = NBPageBG();
     [self.view addSubview:self.scroll];
 
-    self.rows = [NSMutableArray array];
+    self.secRows = [NSMutableArray array];
+    self.secTitles = [NSMutableArray array];
+    self.secFooters = [NSMutableArray array];
+    self.secCards = [NSMutableArray array];
+    self.secHeaderLabels = [NSMutableArray array];
+    self.secFooterLabels = [NSMutableArray array];
     self.fields = [NSMutableArray array];
     self.fieldKeys = [NSMutableArray array];
     self.actionRows = [NSMutableDictionary dictionary];
@@ -138,187 +197,186 @@ static const NSInteger kSubHit = 105;
 
     NSDictionary *cur = NBLoadSettings();
 
-    // ---------- 朗读 ----------
-    [self addSwitchRow:@"朗读通知（用系统语音念出来）"
+    // =====================================================================
+    // v0.0.71：设置项按话题分 7 组。
+    // 🔴 分组的依据不是"代码里谁挨着谁"，而是**用户心里的赛道**：
+    //    念出来 / 别吵我 / 怎么响 / 留多少 / 挡什么 / 干活 / 关于。
+    //    说明文字从行标题里搬进每组底部的灰脚注 —— 标题短了才扫得快，
+    //    现在的 iOS 设置页就是这个套路（标题一行、解释在组尾）。
+    // =====================================================================
+
+    UIColor *blue   = [UIColor systemBlueColor];
+    UIColor *indigo = [UIColor systemIndigoColor];
+    UIColor *orange = [UIColor systemOrangeColor];
+    UIColor *teal   = [UIColor systemTealColor];
+    UIColor *purple = [UIColor systemPurpleColor];
+    UIColor *gray   = [UIColor systemGrayColor];
+
+    // ---------- 1. 朗读 ----------
+    [self addSection:@"朗读"
+              footer:@"打开后会占用音频通道，可能让正在播放的音乐变小或暂停 —— "
+                     @"这是系统语音合成的固有行为，不是故障。"
+                     @"朗读只念「替换后」的文字；被过滤规则拦下的通知不念。"
+                     @"若朗读导致桌面崩溃重启，插件会在下次开机时自动把朗读关掉。"];
+    [self addSwitchRow:@"朗读通知"
+                   sub:@"用系统语音念出通知内容"
+                  icon:@"speaker.wave.2.fill"
+                  tint:blue
                     on:[self boolOf:cur[NB_KEY_SPEAK_ENABLED]]
                    key:NB_KEY_SPEAK_ENABLED];
-    [self addActionRow:@"朗读声音" key:@"voice" action:@selector(onVoice:)];
-    [self addActionRow:@"朗读限定 App" key:@"speakapps" action:@selector(onSpeakApps:)];
+    [self addActionRow:@"朗读声音" sub:nil icon:@"waveform" tint:blue
+                   key:@"voice" destructive:NO action:@selector(onVoice:)];
+    [self addActionRow:@"朗读限定 App" sub:nil icon:@"square.grid.2x2.fill" tint:blue
+                   key:@"speakapps" destructive:NO action:@selector(onSpeakApps:)];
 
-    // ---------- 免打扰时段（v0.0.21）----------
-    // 这是 v0.0.19 删掉「延迟推送」之后的安全替代：
+    // ---------- 2. 免打扰 ----------
+    // v0.0.21：这是删掉「延迟推送」之后的安全替代。
     // 延迟想解决的其实是"别在某个时间点吵我"，而它必须**改系统的发布时间**才能做到
     // （两次撞死）；这里只是**我们自己不弹**，不碰 BB 内部 ⇒ 零系统风险。
-    [self addSwitchRow:@"免打扰时段（这段时间不弹，只记录）"
+    [self addSection:@"免打扰"
+              footer:@"可跨零点，例如 23:00 → 07:00。"
+                     @"只影响「弹不弹」，记录照旧落库。"];
+    [self addSwitchRow:@"免打扰时段"
+                   sub:@"这段时间不弹，但仍然记录"
+                  icon:@"moon.fill"
+                  tint:indigo
                     on:[self boolOf:cur[NB_KEY_DND_ENABLED]]
                    key:NB_KEY_DND_ENABLED];
-    [self addGroup:@"开始时间（HH:mm，例如 23:00）"
-                 ph:@"23:00"
-              value:[self timeText:cur[NB_KEY_DND_START]]
-           keyboard:UIKeyboardTypeNumbersAndPunctuation
-                key:NB_KEY_DND_START];
-    [self addGroup:@"结束时间（HH:mm，可跨零点，例如 07:00）"
-                 ph:@"07:00"
-              value:[self timeText:cur[NB_KEY_DND_END]]
-           keyboard:UIKeyboardTypeNumbersAndPunctuation
-                key:NB_KEY_DND_END];
-    [self addActionRow:@"免打扰生效的 App" key:@"dndapps" action:@selector(onDndApps:)];
+    [self addFieldRow:@"开始时间" icon:@"clock.fill" tint:indigo
+                   ph:@"23:00" value:[self timeText:cur[NB_KEY_DND_START]]
+             keyboard:UIKeyboardTypeNumbersAndPunctuation key:NB_KEY_DND_START];
+    [self addFieldRow:@"结束时间" icon:@"clock.fill" tint:indigo
+                   ph:@"07:00" value:[self timeText:cur[NB_KEY_DND_END]]
+             keyboard:UIKeyboardTypeNumbersAndPunctuation key:NB_KEY_DND_END];
+    [self addActionRow:@"免打扰生效的 App" sub:nil icon:@"bell.slash.fill" tint:indigo
+                   key:@"dndapps" destructive:NO action:@selector(onDndApps:)];
 
-    // ---------- 按 App 换提示音（v0.0.21，实验）----------
+    // ---------- 3. 提示音 ----------
     // 🔴 真机 PROBE 数据说明这是"造系统对象"：默认提示音**不带 BBSound**（sound=nil），
     //    而 BBSound 没有工厂方法、alertType 只读 ⇒ 只能 alloc + 填 soundType/systemSoundID。
     //    失败的表现是"这条通知不出声"。所以：默认关、必须点名 App、可试听、每次留痕、有自愈。
-    [self addSwitchRow:@"按 App 换提示音（实验）"
+    [self addSection:@"提示音（实验）"
+              footer:@"文件优先于 ID。秒数 0 = 不限，清空 = 默认 8 秒。"
+                     @"「压低音乐」只对长提示音有效 —— 短促的系统音走的是另一条通道，"
+                     @"系统不允许它去抢音频会话，这不是开关坏了。"];
+    [self addSwitchRow:@"按 App 换提示音"
+                   sub:@"实验功能，默认关闭"
+                  icon:@"music.note"
+                  tint:orange
                     on:[self boolOf:cur[NB_KEY_SOUND_ENABLED]]
                    key:NB_KEY_SOUND_ENABLED];
-    // 🔴 v0.0.28：文案从「提示音 ID / 提示音文件」改成「默认提示音 …」。
-    //    这一版起这两个值不再直接决定"所有目标 App 用什么音"，而是**新 App 的起始音**
-    //    （每个 App 的音存在 soundMap 里，可以在下面的「按 App 分配提示音」里逐个改）。
-    //    不改文案的后果很具体：用户在按 App 页给微信选了 a.mp3，回来看到这里还写着
-    //    "提示音文件 b.wav"，会以为配置互相打架 —— 其实一个管默认、一个管个体。
-    [self addGroup:@"默认提示音 ID（1000~1035，填完点下面的试听）"
-                 ph:@"1007"
-              value:[self strOf:cur[NB_KEY_SOUND_ID]]
-           keyboard:UIKeyboardTypeNumberPad
-                key:NB_KEY_SOUND_ID];
+    [self addFieldRow:@"默认提示音 ID" icon:@"number" tint:orange
+                   ph:@"1007" value:[self strOf:cur[NB_KEY_SOUND_ID]]
+             keyboard:UIKeyboardTypeNumberPad key:NB_KEY_SOUND_ID];
     // 🔴🔴 v0.0.26：自定义音频文件。**排在 ID 下面**，因为它的优先级比 ID 高 ——
     //    顺序即语义，用户从上往下读："先看有没有文件，没有才用 ID"。
-    [self addActionRow:@"默认提示音文件（优先于上面的 ID）"
-                    key:@"soundfile" action:@selector(onSoundFile:)];
+    [self addActionRow:@"默认提示音文件" sub:@"优先于上面的 ID" icon:@"doc.fill" tint:orange
+                   key:@"soundfile" destructive:NO action:@selector(onSoundFile:)];
     // v0.0.27：最长播放秒数。**排在文件下面**：它管的是"播多久"，紧跟着"播什么"讲。
     // 🔴 为什么必须有这一项：v0.0.26 实测出不一致 —— 同一份设置，wav 最多响 30 秒
     //    （A 通道没有 stop API，系统硬上限），mp3 从头响到尾（B 通道能 stop）。
-    //    用户只会觉得"是不是没生效"。这一项把两条通道的时长拉齐到同一个语义。
-    [self addGroup:@"最长播放秒数（0 = 不限；清空 = 默认 8）"
-                 ph:@"8（默认）"
-              value:[self strOf:cur[NB_KEY_SOUND_MAX_SEC]]
-           keyboard:UIKeyboardTypeDecimalPad
-                key:NB_KEY_SOUND_MAX_SEC];
-    // v0.0.28：这一行的 key 仍然复用 `soundapps`（只在代码里作为"这一行"的标识，
-    // 不再写盘）—— 真正的数据是 soundMap。副标题见 refreshValues 里那段。
-    [self addActionRow:@"按 App 分配提示音"
-                    key:@"soundapps" action:@selector(onSoundApps:)];
-    [self addActionRow:@"试听这个提示音" key:@"soundpreview" action:@selector(onSoundPreview:)];
-    // ---------- v0.0.32：来通知时压低别人音乐 ----------
-    // 排在"播什么/播多久"之后：这三项是同一个话题（这条提示音怎么响）。
-    // 🔴 文案里必须写「只对长提示音」：A 通道（AudioServicesPlaySystemSound）不管 AVAudioSession，
-    //    短音无论如何都压不住别人。不写这句，用户配了个 1 秒的短音、打开开关、发现音乐没变，
-    //    会认定"开关坏了"—— 而代码完全正常。
-    [self addSwitchRow:@"来通知时压低音乐（只对长提示音有效）"
+    [self addFieldRow:@"最长播放秒数" icon:@"timer" tint:orange
+                   ph:@"8（默认）" value:[self strOf:cur[NB_KEY_SOUND_MAX_SEC]]
+             keyboard:UIKeyboardTypeDecimalPad key:NB_KEY_SOUND_MAX_SEC];
+    [self addActionRow:@"按 App 分配提示音" sub:nil icon:@"square.grid.2x2.fill" tint:orange
+                   key:@"soundapps" destructive:NO action:@selector(onSoundApps:)];
+    [self addActionRow:@"试听这个提示音" sub:nil icon:@"play.circle.fill" tint:orange
+                   key:@"soundpreview" destructive:NO action:@selector(onSoundPreview:)];
+    [self addSwitchRow:@"来通知时压低音乐"
+                   sub:@"只对长提示音有效"
+                  icon:@"speaker.slash.fill"
+                  tint:orange
                     on:[self boolOf:cur[NB_KEY_SOUND_DUCK_OTHERS]]
                    key:NB_KEY_SOUND_DUCK_OTHERS];
 
-    // ---------- 延迟推送：v0.0.19 已整体移除 ----------
-    // 🔴 这里**故意连这个开关都不放**。历史上它两次把用户手机搞坏：
-    //    v0.0.14 跨队列调原方法 ⇒ 桌面 SIGTRAP 进安全模式；
-    //    v0.0.16 改 bulletin 的时间字段 ⇒ 通知全不弹（每次重排又 +5 秒，永远到不了）。
-    //    ⇒ 留一个"填秒数"的输入框，等于留一个能把通知弄没的开关。
-    //    完整证据链在仓库 notifybox/README.md 的「v0.0.19」那一章。
-
-    // ---------- 记录 ----------
+    // ---------- 4. 记录 ----------
+    [self addSection:@"记录与清理"
+              footer:@"上限默认 500，超出后淘汰最旧的。"
+                     @"列表一次最多显示 2000 条：上限填得更大时，更早的记录翻不到，"
+                     @"要用首页的「导出」才能看到（导出不受此限）。"
+                     @"「自动清理」按时间裁，填 0 或清空 = 关闭，与上限各自独立生效。"];
     id mx = cur[@"maxRecords"];
     NSString *mxStr = [mx respondsToSelector:@selector(stringValue)] ? [mx stringValue]
                      : ([mx isKindOfClass:[NSString class]] ? (NSString *)mx : @"");
-    [self addGroup:@"记录上限（条）"
-                 ph:@"500"
-              value:mxStr
-           keyboard:UIKeyboardTypeNumberPad
-                key:@"maxRecords"];
-
+    [self addFieldRow:@"记录上限" icon:@"tray.full.fill" tint:teal
+                   ph:@"500" value:mxStr
+             keyboard:UIKeyboardTypeNumberPad key:@"maxRecords"];
     // v0.0.47：自动清理「保留最近 N 天」（0 = 关闭，默认）。
-    // 🔴 说明写清楚：这是"更老的都不要了"，连未读一起删；和"记录上限"是两件事——
-    //    上限是库里最多留多少条，自动清理是按时间裁。两条都设时各自独立生效。
+    // 🔴 这是"更老的都不要了"，连未读一起删；和"记录上限"是两件事。
     NSInteger acd = [NotifyStore autoCleanDays];
-    [self addGroup:@"自动清理：保留最近 N 天（0=关闭）"
-                 ph:@"0"
-              value:(acd > 0 ? [NSString stringWithFormat:@"%ld", (long)acd] : @"")
-           keyboard:UIKeyboardTypeNumberPad
-                key:@"autoCleanDays"];
-
+    [self addFieldRow:@"自动清理天数" icon:@"arrow.counterclockwise.circle.fill" tint:teal
+                   ph:@"0" value:(acd > 0 ? [NSString stringWithFormat:@"%ld", (long)acd] : @"")
+             keyboard:UIKeyboardTypeNumberPad key:@"autoCleanDays"];
     // ---------- 删除盒子记录时同步清系统通知中心（v0.0.52） ----------
     // 🔴 精确 1:1：盒子上删某一条记录时，如果该通知在系统通知中心还挂着，
     //    就把它从通知中心也删掉（只删那一条，不是按 App 整段清）。
-    //    关闭时，删盒子记录只是删盒子里的日志，系统通知中心不动（默认关，避免意外）。
     //    🔴 批量清理 / 清空全部**不触发**本开关（见 NotifyStore 注释）：那是"清日志"，语义不同。
-    [self addSwitchRow:@"删除盒子记录时同步清系统通知中心"
+    [self addSwitchRow:@"删记录时同步清通知中心"
+                   sub:@"只删对应的那一条"
+                  icon:@"bell.fill"
+                  tint:teal
                     on:[self boolOf:cur[NB_KEY_SYNC_CLEAR]]
                    key:NB_KEY_SYNC_CLEAR];
 
-    // ---------- 连记录都不要（v0.0.51） ----------
-    // 🔴 单独一区、排在「推送拦截」**之前**：流水线上先记录后过滤——
+    // ---------- 5. 拦截与过滤 ----------
+    // v0.0.51：单独一区、排在「黑白名单」**之前**：流水线上先记录后过滤——
     //    这个名单管"记不记"，下面那组管"弹不弹"。放一起才看得出两段的分工，
     //    用户也不会把"不记录"误当成"第二个黑名单"。
-    [self addActionRow:@"不记录的 App（连记录都不留）" key:@"norecord"
-               action:@selector(onNoRecordApps:)];
+    [self addSection:@"拦截与过滤"
+              footer:@"「不记录的 App」管记不记，「白名单 / 黑名单」管弹不弹 —— "
+                     @"两回事，可以同时生效。被拦下的通知仍然会记进盒子里，"
+                     @"方便回头查本来要推什么。"
+                     @"白名单一旦填了，就等于「只保留这些 App」，其它全部不弹（有杀伤力）。"];
+    [self addActionRow:@"不记录的 App" sub:@"连记录都不留" icon:@"eye.slash.fill" tint:purple
+                   key:@"norecord" destructive:NO action:@selector(onNoRecordApps:)];
+    [self addActionRow:@"白名单" sub:@"只推送这些" icon:@"checkmark.circle.fill" tint:purple
+                   key:@"white" destructive:NO action:@selector(onWhite:)];
+    [self addActionRow:@"黑名单" sub:@"不推送这些" icon:@"nosign" tint:purple
+                   key:@"black" destructive:NO action:@selector(onBlack:)];
+    [self addFieldRow:@"过滤关键词" icon:@"line.3.horizontal.decrease.circle.fill" tint:purple
+                   ph:@"红包,限时" value:[self strOf:cur[@"blockKeywords"]]
+             keyboard:UIKeyboardTypeDefault key:@"blockKeywords"];
 
-    // ---------- 推送拦截 ----------
-    [self addActionRow:@"白名单（只推送这些）" key:@"white" action:@selector(onWhite:)];
-    [self addActionRow:@"黑名单（不推送这些）" key:@"black" action:@selector(onBlack:)];
-    [self addGroup:@"过滤关键词（逗号分隔，命中就不弹）"
-                 ph:@"红包,限时,领取"
-              value:[self strOf:cur[@"blockKeywords"]]
-           keyboard:UIKeyboardTypeDefault
-                key:@"blockKeywords"];
-
-    // ---------- 工具 ----------
-    [self addActionRow:@"内容替换规则" key:@"replace" action:@selector(onReplace:)];
-    // v0.0.46：统计。**排在"诊断"之前** —— 诊断是排查用的，统计是天天想看的。
-    [self addActionRow:@"统计（哪个 App 最烦人）" key:@"stats" action:@selector(onStats:)];
-    // v0.0.48：关键词规则（标星 / 自动折叠）。排在统计下面、诊断上面 —— 和统计一样是"天天用"的。
-    [self addActionRow:@"关键词规则" key:@"kwrule" action:@selector(onKeywordRules:)];
-    [self addActionRow:@"App 枚举诊断" key:@"appdiag" action:@selector(onAppDiag:)];
+    // ---------- 6. 工具 ----------
+    [self addSection:@"工具" footer:nil];
+    [self addActionRow:@"内容替换规则" sub:@"只改通知上显示的文字"
+                  icon:@"arrow.left.arrow.right" tint:gray
+                   key:@"replace" destructive:NO action:@selector(onReplace:)];
+    // v0.0.48：关键词规则（标星 / 自动折叠）
+    [self addActionRow:@"关键词规则" sub:@"标星 / 自动折叠" icon:@"tag.fill" tint:gray
+                   key:@"kwrule" destructive:NO action:@selector(onKeywordRules:)];
+    // v0.0.46：统计，排在"诊断"之前 —— 诊断是排查用的，统计是天天想看的。
+    [self addActionRow:@"统计" sub:@"哪个 App 最烦人" icon:@"chart.bar.fill" tint:gray
+                   key:@"stats" destructive:NO action:@selector(onStats:)];
     // v0.0.45：批量清理。**放在「清空全部记录」上面** ——
     // 用户想清的是"某一批"，而"全清"是那个操作的极端形式；
     // 把"更常用、更安全的"排在前面，能少一点误点全清。
-    [self addActionRow:@"批量清理记录" key:@"batchclean" action:@selector(onBatchClean:)];
-    [self addActionRow:@"清空全部记录" key:@"clear" action:@selector(onClearAll:)];
+    [self addActionRow:@"批量清理记录" sub:@"按时间 / 已读 / 某个 App"
+                  icon:@"archivebox.fill" tint:gray
+                   key:@"batchclean" destructive:NO action:@selector(onBatchClean:)];
+    [self addActionRow:@"清空全部记录" sub:nil icon:@"trash.fill" tint:[UIColor systemRedColor]
+                   key:@"clear" destructive:YES action:@selector(onClearAll:)];
+    [self addActionRow:@"App 枚举诊断" sub:@"排查用" icon:@"magnifyingglass" tint:gray
+                   key:@"appdiag" destructive:NO action:@selector(onAppDiag:)];
 
-    self.hintLabel = [[UILabel alloc] init];
-    self.hintLabel.numberOfLines = 0;
-    self.hintLabel.font = [UIFont systemFontOfSize:12];
-    self.hintLabel.textColor = [UIColor secondaryLabelColor];
-    self.hintLabel.text =
-        @"说明\n"
-        @"• 保存后立即生效，不用 respring。\n"
-        @"• 白名单一旦填了，就等于「只保留这些 App」，其它全部不弹（有杀伤力）。\n"
-        @"• 白名单/黑名单/朗读限定都点进去选，可以搜索；点一下立即生效，没有保存按钮。\n"
-        @"• 被拦下的通知仍然会记进盒子里，方便回头查本来要推什么。\n"
-        @"• 「不记录的 App」是另一回事：选上的 App **连记录都不落库**（盒子里不留痕迹），\n"
-        @"  但通知照常弹出、朗读/换音/替换都照跑 —— 它管「记不记」，黑白名单管「弹不弹」。\n"
-        @"  已有的记录不受影响；想清掉已有的，用下面的「批量清理记录 / 清空全部记录」。\n"
-        @"• 内容替换只改通知上显示的文字；盒子里存的仍是原文。\n"
-        @"• 记录上限默认 500；超出后自动淘汰最旧的。\n"
-        @"• 「自动清理：保留最近 N 天」= 每次打开盒子自动删掉 N 天前的记录（连未读一起，\n"
-        @"  因为「保留最近 N 天」就是「更老的都不要了」）；填 0 或清空 = 关闭。\n"
-        @"  它和「记录上限」是两件事：上限管「库里最多留多少条」，清理管「按时间裁」，可同时开。\n"
-        // 🔴🔴 v0.0.45：把"填大了会怎样"写进界面。
-        //    列表一次最多显示 2000 条 ⇒ 上限填到 2000 以上时，
-        //    超出那部分**翻不到**，只能用「导出」看。
-        //    不写这句，用户填了 99999 会以为自己留了 10 万条 ——
-        //    那正是本项目最忌的"两个指标互相矛盾"（列表说的和库里的不是一回事）。
-        @"• 列表一次最多显示 2000 条：上限填得更大时，更早的记录翻不到，\n"
-        @"  要用首页的「导出」才能看到（导出不带这个上限）。\n"
-        @"• 「批量清理记录」可按时间（7/30 天前）、按已读、按某个 App 删；\n"
-        @"  确认框里报的条数就是真会删掉的条数。\n"
-        @"• 朗读默认关闭。打开后会占用音频通道，可能让正在播放的音乐变小或暂停 ——\n"
-        @"  这是系统语音合成的固有行为，不是 bug。\n"
-        @"• 朗读只念「替换后」的文字（跟通知上看到的一致）；被过滤规则拦下的通知不念。\n"
-        @"• 如果朗读导致桌面崩溃重启，插件会在下次开机时**自动把朗读关掉**，\n"
-        @"  并往日志写一行「朗读自毁保护触发」，不需要你做任何事。\n"
-        @"• 延迟推送已在 v0.0.19 移除（不是关闭）。它两次把手机搞坏：\n"
-        @"  一次让桌面崩进安全模式，一次让通知一条都不弹，所以整个拿掉了。\n"
-        @"  如果你手里那版还填着秒数，装上这版会自动把它清掉，不用你手动改。\n"
-        @"• 顺带修好一个会丢数据的问题：数据库锁。以前盒子 App 和桌面同时写库时，\n"
-        @"  SQLite 直接返回 busy（日志里 INSERT 失败 rc=5），那条通知就静默丢了；\n"
-        @"  现在会最多等 2 秒再放弃。\n"
-        @"• 存储位置：\n  /var/mobile/Library/NotifyBox/settings.plist";
-    [self.scroll addSubview:self.hintLabel];
+    // ---------- 7. 关于 ----------
+    // 🔴 v0.0.71：原来那一整屏「说明」灰字（二十多条）搬进了独立页面。
+    //    原因很实际：它比所有设置项加起来还长，压在最底下 ⇒
+    //    想改设置要滑过一整屏说明，想查说明又要滑过所有设置。
+    //    文字一个字没删，只是从"堆在设置页底部"改成"点进去看"。
+    [self addSection:@"关于"
+              footer:@"保存后立即生效，不用 respring。\n"
+                     @"设置文件：/var/mobile/Library/NotifyBox/settings.plist"];
+    [self addActionRow:@"使用说明" sub:@"每条设置到底管什么"
+                  icon:@"questionmark.circle.fill" tint:gray
+                   key:@"usage" destructive:NO action:@selector(onUsage:)];
 
     self.statusLabel = [[UILabel alloc] init];
     self.statusLabel.numberOfLines = 0;
-    self.statusLabel.font = [UIFont systemFontOfSize:12];
+    self.statusLabel.font = [NBFontSub() fontWithSize:12];
     self.statusLabel.textColor = [UIColor secondaryLabelColor];
     [self.scroll addSubview:self.statusLabel];
+
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(onKeyboard:)
@@ -337,50 +395,103 @@ static const NSInteger kSubHit = 105;
 
 #pragma mark - 行的创建
 
-- (void)addSwitchRow:(NSString *)title on:(BOOL)on key:(NSString *)key {
-    UIView *box = [[UIView alloc] init];
-    box.tag = kRowSwitch;
-    box.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-    box.layer.cornerRadius = 10;
-    box.clipsToBounds = YES;
-    [self.scroll addSubview:box];
+// ---------- 分组 ----------
+// 每组一个白卡片 + 一个灰标题 + 可选灰脚注。
+// 🔴 卡片只在 layout 里摆放（builder 里不做 frame）：所有位置由同一处几何代码算，
+//    否则"谁最后设置 frame 谁说了算"——那正是 v0.0.13 之前那套平铺布局的老毛病。
+- (void)addSection:(NSString *)title footer:(NSString *)footer {
+    NSMutableArray<UIView *> *rows = [NSMutableArray array];
+    [self.secRows addObject:rows];
+    [self.secTitles addObject:title ?: @""];
+    [self.secFooters addObject:footer ?: @""];
 
+    UIView *card = NBNewCard();
+    [self.scroll addSubview:card];
+    [self.secCards addObject:card];
+
+    UILabel *head = title.length ? NBNewHeaderLabel(title) : nil;
+    if (head) [self.scroll addSubview:head];
+    [self.secHeaderLabels addObject:head ?: (id)[NSNull null]];
+
+    UILabel *foot = footer.length ? NBNewFooterLabel(footer) : nil;
+    if (foot) [self.scroll addSubview:foot];
+    [self.secFooterLabels addObject:foot ?: (id)[NSNull null]];
+}
+
+// 当前这一组的行数组（没调过 addSection 就自动开一组无名分组，防崩）
+- (NSMutableArray<UIView *> *)currentRows {
+    if (!self.secRows.count) [self addSection:nil footer:nil];
+    return self.secRows.lastObject;
+}
+
+// 每行统一的左半边：彩色图标方块
+- (void)attachIcon:(NSString *)sym tint:(UIColor *)tint to:(UIView *)box {
+    UIView *icon = NBNewIconBox(sym, tint);
+    icon.tag = kSubIcon;
+    [box addSubview:icon];
+}
+
+// 每行统一的标题（+可选副标题）
+- (void)attachTitle:(NSString *)title sub:(NSString *)sub to:(UIView *)box {
     UILabel *l = [[UILabel alloc] init];
     l.text = title;
-    l.font = [UIFont systemFontOfSize:14];
+    l.font = NBFontTitle();
     l.textColor = [UIColor labelColor];
     l.numberOfLines = 2;
     l.tag = kSubTitle;
     [box addSubview:l];
 
+    if (sub.length) {
+        UILabel *s = [[UILabel alloc] init];
+        s.text = sub;
+        s.font = NBFontSub();
+        s.textColor = NBSubColor();
+        s.numberOfLines = 2;
+        s.tag = kSubSub;
+        [box addSubview:s];
+    }
+}
+
+// ---------- 开关行 ----------
+- (void)addSwitchRow:(NSString *)title
+                 sub:(NSString *)sub
+                icon:(NSString *)sym
+                tint:(UIColor *)tint
+                  on:(BOOL)on
+                 key:(NSString *)key {
+    UIView *box = [[UIView alloc] init];
+    box.tag = kRowSwitch;
+    box.backgroundColor = [UIColor clearColor];       // 白底由外面的卡片出
+
+    [self attachIcon:sym tint:tint to:box];
+    [self attachTitle:title sub:sub to:box];
+
     UISwitch *sw = [[UISwitch alloc] init];
     sw.on = on;
     sw.tag = kSubSwitch;
+    // iOS 13+ 的开关自带尺寸，不写死宽度（大字号/无障碍下写死会被裁）
     [box addSubview:sw];
     // 🔴 按 key 存（v0.0.21 兑现了这里原本的警告）。
     if (key.length && self.switches) self.switches[key] = sw;
 
-    [self.rows addObject:box];
+    [[self currentRows] addObject:box];
+    [self.secCards.lastObject addSubview:box];
 }
 
-- (void)addGroup:(NSString *)title
-              ph:(NSString *)ph
-           value:(NSString *)value
-        keyboard:(UIKeyboardType)kb
-             key:(NSString *)key {
+// ---------- 输入行 ----------
+- (void)addFieldRow:(NSString *)title
+               icon:(NSString *)sym
+               tint:(UIColor *)tint
+                 ph:(NSString *)ph
+              value:(NSString *)value
+           keyboard:(UIKeyboardType)kb
+                key:(NSString *)key {
     UIView *box = [[UIView alloc] init];
-    box.tag = kRowGroup;
-    box.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-    box.layer.cornerRadius = 10;
-    box.clipsToBounds = YES;
-    [self.scroll addSubview:box];
+    box.tag = kRowField;
+    box.backgroundColor = [UIColor clearColor];
 
-    UILabel *l = [[UILabel alloc] init];
-    l.text = title;
-    l.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    l.textColor = [UIColor labelColor];
-    l.tag = kSubTitle;
-    [box addSubview:l];
+    [self attachIcon:sym tint:tint to:box];
+    [self attachTitle:title sub:nil to:box];
 
     UITextField *f = [[UITextField alloc] init];
     f.text = value.length ? value : @"";
@@ -389,40 +500,53 @@ static const NSInteger kSubHit = 105;
     f.autocapitalizationType = UITextAutocapitalizationTypeNone;
     f.autocorrectionType = UITextAutocorrectionTypeNo;
     f.clearButtonMode = UITextFieldViewModeWhileEditing;
-    f.borderStyle = UITextBorderStyleRoundedRect;
-    f.font = [UIFont systemFontOfSize:14];
+    f.borderStyle = UITextBorderStyleNone;
+    f.textAlignment = NSTextAlignmentRight;
+    f.font = NBFontField();
+    f.textColor = [UIColor labelColor];
     f.delegate = self;
     f.returnKeyType = UIReturnKeyDone;
     f.tag = kSubField;
     [box addSubview:f];
 
-    [self.rows addObject:box];
+    [[self currentRows] addObject:box];
+    [self.secCards.lastObject addSubview:box];
     [self.fields addObject:f];
     [self.fieldKeys addObject:key ?: @""];
 }
 
-// 入口行：左边标题，右边「已选 N 个 ›」，整行可点。
-- (UIView *)addActionRow:(NSString *)title key:(NSString *)key action:(SEL)sel {
+// ---------- 入口行（可点，右侧取值 + chevron） ----------
+- (void)addActionRow:(NSString *)title
+                 sub:(NSString *)sub
+                icon:(NSString *)sym
+                tint:(UIColor *)tint
+                 key:(NSString *)key
+         destructive:(BOOL)destructive
+              action:(SEL)sel {
     UIView *box = [[UIView alloc] init];
     box.tag = kRowAction;
-    box.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-    box.layer.cornerRadius = 10;
-    box.clipsToBounds = YES;
-    [self.scroll addSubview:box];
+    box.backgroundColor = [UIColor clearColor];
 
-    UILabel *t = [[UILabel alloc] init];
-    t.text = title;
-    t.font = [UIFont systemFontOfSize:15];
-    t.textColor = [UIColor labelColor];
-    t.tag = kSubTitle;
-    [box addSubview:t];
+    [self attachIcon:sym tint:tint to:box];
+    [self attachTitle:title sub:sub to:box];
+    if (destructive) {
+        UILabel *l = (UILabel *)[box viewWithTag:kSubTitle];
+        l.textColor = [UIColor systemRedColor];
+    }
 
     UILabel *v = [[UILabel alloc] init];
-    v.font = [UIFont systemFontOfSize:12];
-    v.textColor = [UIColor secondaryLabelColor];
+    v.font = NBFontValue();
+    v.textColor = NBValueColor();
     v.textAlignment = NSTextAlignmentRight;
+    v.numberOfLines = 1;
+    v.lineBreakMode = NSLineBreakByTruncatingTail;
     v.tag = kSubValue;
     [box addSubview:v];
+
+    // 右侧箭头用真图标，不再靠文字里手写 " ›"（那个在深色/大字号下会歪）
+    UIImageView *chev = NBNewChevron();
+    chev.tag = kSubChev;
+    [box addSubview:chev];
 
     // 透明按钮铺满整行接收点击。用 UIButton 而不是 UITapGestureRecognizer：
     // 手势会和 UIScrollView 的滑动打架（滑一下被当成点击）。
@@ -431,9 +555,38 @@ static const NSInteger kSubHit = 105;
     [hit addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
     [box addSubview:hit];
 
-    [self.rows addObject:box];
+    [[self currentRows] addObject:box];
+    [self.secCards.lastObject addSubview:box];
     if (key.length) self.actionRows[key] = box;
-    return box;
+}
+
+// ---------- 自适应行高 ----------
+// 🔴 每行的高度必须由**文字实际占多少**决定，不能写死：
+//    标题允许 2 行（"删记录时同步清通知中心"在 320pt 窄屏要换行），
+//    写死 50 的话第二行字会被裁掉，而界面上看不出来"被裁了"、只像少了一句话。
+- (CGFloat)rowHeight:(UIView *)box width:(CGFloat)cw {
+    NSInteger kind = box.tag;
+    UILabel *t = (UILabel *)[box viewWithTag:kSubTitle];
+    UILabel *s = (UILabel *)[box viewWithTag:kSubSub];
+
+    CGFloat rightW = 0;
+    if (kind == kRowSwitch) {
+        UIView *sw = [box viewWithTag:kSubSwitch];
+        CGSize sz = [sw intrinsicContentSize];
+        if (sz.width <= 0 || sz.height <= 0) sz = CGSizeMake(51, 31);
+        rightW = sz.width + 12;
+    } else if (kind == kRowAction) {
+        rightW = 24;                       // 只给 chevron 留位置，取值宽度在 layout 里再算
+    } else {
+        rightW = cw * 0.42;                // 输入框那一列
+    }
+
+    CGFloat labW = MAX(60.0, cw - kTextX - kPadR - rightW);
+    CGFloat h = t ? [t sizeThatFits:CGSizeMake(labW, CGFLOAT_MAX)].height : 20;
+    if (s) h += 2 + [s sizeThatFits:CGSizeMake(labW, CGFLOAT_MAX)].height;
+
+    CGFloat minH = (kind == kRowSwitch) ? NBRowHSwitch : NBRowH;
+    return MAX(minH, h + 22);
 }
 
 #pragma mark - 刷新入口行的右侧说明
@@ -443,7 +596,13 @@ static const NSInteger kSubHit = 105;
     if (!box) return;
     UILabel *v = (UILabel *)[box viewWithTag:kSubValue];
     if (![v isKindOfClass:[UILabel class]]) return;
-    v.text = text;
+    // 🔴 v0.0.71：右侧箭头改成了真正的 chevron 图标，所以取值文字里那只**手写的 "›" 必须去掉**，
+    //    否则会出现"文字尾巴一个 ›、右边图标又一个 ›"的双箭头。
+    //    在这里统一剥一次，而不是去改十几处调用点的字面量 ——
+    //    改字面量那种做法会在下次新增取值时又漏一处。
+    NSString *t = [text stringByReplacingOccurrencesOfString:@"›" withString:@""];
+    t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    v.text = t;
     [box setNeedsLayout];
 }
 
@@ -566,65 +725,152 @@ static const NSInteger kSubHit = 105;
 
 #pragma mark - 布局
 
+// 单行的内部摆放（卡片坐标系）
+- (void)layoutRow:(UIView *)box width:(CGFloat)cw height:(CGFloat)h {
+    NSInteger kind = box.tag;
+
+    UIView *icon = [box viewWithTag:kSubIcon];
+    icon.frame = CGRectMake(kIconX, (h - NBIconBox) / 2.0, NBIconBox, NBIconBox);
+    // 图标里面那张图（没有这个子视图时 frame 设置无害）
+    UIImageView *glyph = (UIImageView *)[icon viewWithTag:9001];
+    glyph.frame = CGRectMake(5, 5, NBIconBox - 10, NBIconBox - 10);
+
+    UILabel *t = (UILabel *)[box viewWithTag:kSubTitle];
+    UILabel *s = (UILabel *)[box viewWithTag:kSubSub];
+
+    CGFloat rightW = 0;
+    CGFloat rightX = cw - kPadR;
+
+    if (kind == kRowSwitch) {
+        UIView *sw = [box viewWithTag:kSubSwitch];
+        // UISwitch 尺寸写死的话，大字号/无障碍下会被裁掉。
+        // intrinsicContentSize 在未 layout 时是 (-1,-1)，做一次兜底。
+        CGSize sz = [sw intrinsicContentSize];
+        if (sz.width <= 0 || sz.height <= 0) sz = CGSizeMake(51, 31);
+        sw.frame = CGRectMake(rightX - sz.width, (h - sz.height) / 2.0, sz.width, sz.height);
+        rightW = sz.width + 12;
+
+    } else if (kind == kRowAction) {
+        UILabel *v = (UILabel *)[box viewWithTag:kSubValue];
+        UIImageView *chev = (UIImageView *)[box viewWithTag:kSubChev];
+        CGFloat chevW = 8, chevH = 14;
+        chev.frame = CGRectMake(rightX - chevW, (h - chevH) / 2.0, chevW, chevH);
+
+        CGFloat maxVW = MAX(40.0, cw - kTextX - 24 - chevW - 8);
+        CGSize vs = [v sizeThatFits:CGSizeMake(maxVW, h)];
+        CGFloat vw = MIN(vs.width, maxVW);
+        v.frame = CGRectMake(rightX - chevW - 6 - vw, (h - vs.height) / 2.0, vw, vs.height);
+        rightW = cw - (rightX - chevW - 6 - vw);
+
+        UIButton *hit = [box viewWithTag:kSubHit];
+        hit.frame = CGRectMake(0, 0, cw, h);
+
+    } else {   // kRowField
+        UITextField *f = (UITextField *)[box viewWithTag:kSubField];
+        CGFloat fw = MIN(170.0, cw * 0.45);
+        f.frame = CGRectMake(rightX - fw, (h - NBFieldH) / 2.0, fw, NBFieldH);
+        rightW = fw + 12;
+    }
+
+    CGFloat labW = MAX(60.0, cw - kTextX - kPadR - rightW);
+    if (s) {
+        CGFloat th = [t sizeThatFits:CGSizeMake(labW, CGFLOAT_MAX)].height;
+        CGFloat sh = [s sizeThatFits:CGSizeMake(labW, CGFLOAT_MAX)].height;
+        CGFloat total = th + 2 + sh;
+        t.frame = CGRectMake(kTextX, (h - total) / 2.0, labW, th);
+        s.frame = CGRectMake(kTextX, t.frame.origin.y + th + 2, labW, sh);
+    } else {
+        CGFloat th = [t sizeThatFits:CGSizeMake(labW, CGFLOAT_MAX)].height;
+        t.frame = CGRectMake(kTextX, (h - th) / 2.0, labW, th);
+    }
+}
+
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+
     CGFloat w = self.view.bounds.size.width;
-    CGFloat x = 12;
-    CGFloat cw = w - x * 2;
+    CGFloat cw = w - NBInset * 2;
     CGFloat y = 12;
 
     self.scroll.frame = CGRectMake(0, 0, w, self.view.bounds.size.height);
 
-    for (UIView *box in self.rows) {
-        NSInteger kind = box.tag;
-        UIView *title = [box viewWithTag:kSubTitle];
+    NSUInteger n = self.secRows.count;
+    for (NSUInteger i = 0; i < n; i++) {
+        NSMutableArray<UIView *> *rows = self.secRows[i];
+        UIView *card = self.secCards[i];
 
-        if (kind == kRowSwitch) {
-            CGFloat bh = 54;
-            box.frame = CGRectMake(x, y, cw, bh);
-            UIView *sw = [box viewWithTag:kSubSwitch];
-            // UISwitch 尺寸写死的话，大字号/无障碍下会被裁掉。
-            // intrinsicContentSize 在未 layout 时是 (-1,-1)，做一次兜底。
-            CGSize sz = [sw intrinsicContentSize];
-            if (sz.width <= 0 || sz.height <= 0) sz = CGSizeMake(51, 31);
-            CGFloat lw = MAX(60.0, cw - 14 - sz.width - 24);
-            CGSize ls = [title sizeThatFits:CGSizeMake(lw, CGFLOAT_MAX)];
-            title.frame = CGRectMake(14, (bh - ls.height) / 2.0, lw, ls.height);
-            sw.frame = CGRectMake(cw - 14 - sz.width, (bh - sz.height) / 2.0, sz.width, sz.height);
-            y += bh + 10;
-
-        } else if (kind == kRowGroup) {
-            CGFloat bh = 72;
-            box.frame = CGRectMake(x, y, cw, bh);
-            title.frame = CGRectMake(12, 8, cw - 24, 18);
-            UIView *f = [box viewWithTag:kSubField];
-            f.frame = CGRectMake(12, 30, cw - 24, 34);
-            y += bh + 10;
-
-        } else {   // kRowAction
-            CGFloat bh = 46;
-            box.frame = CGRectMake(x, y, cw, bh);
-            UILabel *v = (UILabel *)[box viewWithTag:kSubValue];
-            CGSize vs = [v sizeThatFits:CGSizeMake(cw - 24, bh)];
-            CGFloat vw = MIN(vs.width, cw - 24 - 100);
-            v.frame = CGRectMake(cw - 14 - vw, (bh - vs.height) / 2.0, vw, vs.height);
-            CGFloat tw = cw - 14 - vw - 14 - 10;
-            title.frame = CGRectMake(14, 0, MAX(40.0, tw), bh);
-            UIView *hit = [box viewWithTag:kSubHit];
-            hit.frame = CGRectMake(0, 0, cw, bh);
-            y += bh + 10;
+        // ---- 组标题 ----
+        id hl = self.secHeaderLabels[i];
+        if ([hl isKindOfClass:[UILabel class]]) {
+            UILabel *lb = (UILabel *)hl;
+            CGSize hs = [lb sizeThatFits:CGSizeMake(cw - 8, CGFLOAT_MAX)];
+            lb.frame = CGRectMake(NBInset + 4, y, cw - 8, hs.height);
+            y += hs.height + kHeadGap;
+        } else if (i > 0) {
+            y += 6;   // 无标题的组：只补一点空隙，别和上一组脚注贴在一起
         }
+
+        // ---- 卡片（高度 = 各行高之和）----
+        NSMutableArray<NSNumber *> *heights = [NSMutableArray array];
+        CGFloat cardH = 0;
+        for (UIView *box in rows) {
+            CGFloat rh = [self rowHeight:box width:cw];
+            [heights addObject:@(rh)];
+            cardH += rh;
+        }
+        card.frame = CGRectMake(NBInset, y, cw, cardH);
+
+        // ---- 行 + 行间分隔线 ----
+        CGFloat ry = 0;
+        NSUInteger cnt = rows.count;
+        for (NSUInteger j = 0; j < cnt; j++) {
+            UIView *box = rows[j];
+            CGFloat rh = [heights[j] doubleValue];
+            box.frame = CGRectMake(0, ry, cw, rh);
+            [self layoutRow:box width:cw height:rh];
+
+            if (j + 1 < cnt) {
+                // 🔴 分隔线**懒建**（只在 layout 里建一次，用 tag 找回来）：
+                //    builder 那一刻还不知道自己是不是最后一行。
+                UIView *sep = [box viewWithTag:kSubSep];
+                if (!sep) {
+                    sep = NBNewSeparator();
+                    sep.tag = kSubSep;
+                    [box addSubview:sep];
+                }
+                sep.frame = CGRectMake(kTextX, rh - 0.5, cw - kTextX, 0.5);
+            }
+            ry += rh;
+        }
+
+        y += cardH;
+
+        // ---- 组脚注 ----
+        id fl = self.secFooterLabels[i];
+        if ([fl isKindOfClass:[UILabel class]]) {
+            UILabel *lb = (UILabel *)fl;
+            CGSize fs = [lb sizeThatFits:CGSizeMake(cw - 8, CGFLOAT_MAX)];
+            lb.frame = CGRectMake(NBInset + 4, y + 8, cw - 8, fs.height);
+            y += 8 + fs.height;
+        }
+
+        y += (i + 1 < n) ? kSecGap : 20;
     }
 
-    CGSize hs = [self.hintLabel sizeThatFits:CGSizeMake(cw - 8, CGFLOAT_MAX)];
-    self.hintLabel.frame = CGRectMake(x + 4, y + 8, cw - 8, hs.height);
-    y += hs.height + 16;
+    // ---- 页脚状态文字 ----
+    // 🔴 不显示时高度必须是 0：它空着的时候如果还占位置，
+    //    症状是"设置页底部永远有一块空白"，很难归因到"一行没人写的文字"。
+    if (self.statusLabel.text.length) {
+        CGSize ss = [self.statusLabel sizeThatFits:CGSizeMake(cw - 8, CGFLOAT_MAX)];
+        self.statusLabel.hidden = NO;
+        self.statusLabel.frame = CGRectMake(NBInset + 4, y, cw - 8, ss.height);
+        y += ss.height + 24;
+    } else {
+        self.statusLabel.hidden = YES;
+        self.statusLabel.frame = CGRectZero;
+    }
 
-    CGSize ss = [self.statusLabel sizeThatFits:CGSizeMake(cw - 8, CGFLOAT_MAX)];
-    self.statusLabel.frame = CGRectMake(x + 4, y, cw - 8, ss.height);
-    y += ss.height + 24;
-
-    self.scroll.contentSize = CGSizeMake(w, y);
+    self.scroll.contentSize = CGSizeMake(w, y + 24);
 }
 
 #pragma mark - 键盘
@@ -643,6 +889,69 @@ static const NSInteger kSubHit = 105;
     [textField resignFirstResponder];
     return YES;
 }
+
+- (NSString *)usageText {
+    // 🔴 v0.0.71：这段文字原来叫 `hintLabel`，**压在整个设置页的最底部**。
+    //    它比所有设置项加起来还长 ⇒ 想改设置得先滑过一整屏说明，想查说明又得先滑过所有设置。
+    //    现在搬进独立页面：文字**一个字没删**（下面这些行是从 git HEAD 里原样取出来的），
+    //    只是从"堆在页尾"改成"点进去看"。
+    NSString *s =
+        @"说明\n"
+        @"• 保存后立即生效，不用 respring。\n"
+        @"• 白名单一旦填了，就等于「只保留这些 App」，其它全部不弹（有杀伤力）。\n"
+        @"• 白名单/黑名单/朗读限定都点进去选，可以搜索；点一下立即生效，没有保存按钮。\n"
+        @"• 被拦下的通知仍然会记进盒子里，方便回头查本来要推什么。\n"
+        @"• 「不记录的 App」是另一回事：选上的 App **连记录都不落库**（盒子里不留痕迹），\n"
+        @"  但通知照常弹出、朗读/换音/替换都照跑 —— 它管「记不记」，黑白名单管「弹不弹」。\n"
+        @"  已有的记录不受影响；想清掉已有的，用下面的「批量清理记录 / 清空全部记录」。\n"
+        @"• 内容替换只改通知上显示的文字；盒子里存的仍是原文。\n"
+        @"• 记录上限默认 500；超出后自动淘汰最旧的。\n"
+        @"• 「自动清理：保留最近 N 天」= 每次打开盒子自动删掉 N 天前的记录（连未读一起，\n"
+        @"  因为「保留最近 N 天」就是「更老的都不要了」）；填 0 或清空 = 关闭。\n"
+        @"  它和「记录上限」是两件事：上限管「库里最多留多少条」，清理管「按时间裁」，可同时开。\n"
+        @"• 列表一次最多显示 2000 条：上限填得更大时，更早的记录翻不到，\n"
+        @"  要用首页的「导出」才能看到（导出不带这个上限）。\n"
+        @"• 「批量清理记录」可按时间（7/30 天前）、按已读、按某个 App 删；\n"
+        @"  确认框里报的条数就是真会删掉的条数。\n"
+        @"• 朗读默认关闭。打开后会占用音频通道，可能让正在播放的音乐变小或暂停 ——\n"
+        @"  这是系统语音合成的固有行为，不是 bug。\n"
+        @"• 朗读只念「替换后」的文字（跟通知上看到的一致）；被过滤规则拦下的通知不念。\n"
+        @"• 如果朗读导致桌面崩溃重启，插件会在下次开机时**自动把朗读关掉**，\n"
+        @"  并往日志写一行「朗读自毁保护触发」，不需要你做任何事。\n"
+        @"• 延迟推送已在 v0.0.19 移除（不是关闭）。它两次把手机搞坏：\n"
+        @"  一次让桌面崩进安全模式，一次让通知一条都不弹，所以整个拿掉了。\n"
+        @"  如果你手里那版还填着秒数，装上这版会自动把它清掉，不用你手动改。\n"
+        @"• 顺带修好一个会丢数据的问题：数据库锁。以前盒子 App 和桌面同时写库时，\n"
+        @"  SQLite 直接返回 busy（日志里 INSERT 失败 rc=5），那条通知就静默丢了；\n"
+        @"  现在会最多等 2 秒再放弃。\n"
+        @"• 存储位置：\n  /var/mobile/Library/NotifyBox/settings.plist";;
+    return s;
+}
+
+- (void)onUsage:(id)sender {
+    UIViewController *vc = [[UIViewController alloc] init];
+    vc.title = @"使用说明";
+    vc.view.backgroundColor = NBPageBG();
+
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectZero];
+    tv.editable = NO;
+    tv.selectable = YES;                  // 可复制，方便贴回来问
+    tv.font = [UIFont systemFontOfSize:13];
+    tv.textColor = [UIColor labelColor];
+    tv.backgroundColor = NBPageBG();
+    tv.textContainerInset = UIEdgeInsetsMake(16, 16, 24, 16);
+    tv.text = [self usageText];
+    tv.translatesAutoresizingMaskIntoConstraints = NO;
+    [vc.view addSubview:tv];
+    [NSLayoutConstraint activateConstraints:@[
+        [tv.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor],
+        [tv.leadingAnchor constraintEqualToAnchor:vc.view.leadingAnchor],
+        [tv.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor],
+        [tv.bottomAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.bottomAnchor],
+    ]];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
 
 #pragma mark - 保存
 

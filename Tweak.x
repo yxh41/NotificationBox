@@ -1,4 +1,14 @@
-// Tweak.x —— v0.0.70（当前）：**本版只改盒子 App 的界面，tweak 侧一字未动** ——
+// Tweak.x —— v0.0.71（当前）：**tweak 侧逻辑依旧一字未动，只修"版本串写死"这一件事** ——
+//   ⇒ v0.0.71 说明：
+//      本版主体是「盒子 App 的界面现代化 + 设置页重排」（App 侧，见 app/NBTheme.h/.m），
+//      tweak 侧只有一处修正：**诊断文件里写死的版本串全部改用 `NB_VER_STR`**。
+//      起因：`nc_diag(11).txt` 头部自称 `v0.0.56`，而实际装的是 v0.0.70 ——
+//      因为那句是字面量 ⇒ **诊断文件不能用来判断"装的是哪一版"**，会把人带偏。
+//      现在文件头、方法表标题、各条运行时日志戳都走同一个 `NB_VER_STR`。
+//      ⚠️ 反过来说：「诊断文件里出现 `# ---- v0.0.70 方法表`」在 v0.0.70 之后不再是历史标注，
+//      而是当前版本号本身（这一行也改成 `%@` 了）；判"装的哪一版"请看**文件头那一行**。
+//   ---- 以下是 v0.0.70 的内容，仍然成立，保留 ----
+// v0.0.70：**那一版只改盒子 App 的界面，tweak 侧一字未动** ——
 //   ⇒ v0.0.70 说明：
 //      tweak 侧沿用 v0.0.69 的全部逻辑（NC 清除先于清账本 + 清后读回 + 每次删除归零计数），
 //      一条都不改。**故意拆成两个版本**：v0.0.69 验的是「通知中心那条会不会消失」，
@@ -411,7 +421,7 @@ static void NBCaptureServerIfNeeded(id server) {
         #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         gBBServerQueue = dispatch_get_current_queue();
         #pragma clang diagnostic pop
-        NBLog(@"=== [v0.0.52] 已捕获 BBServer 实例 + 队列（同步清通知中心可用）");
+        NBLog(@"=== [v%@] 已捕获 BBServer 实例 + 队列（同步清通知中心可用）", NB_VER_STR);
     });
 }
 
@@ -439,7 +449,7 @@ static NSString *const kNBGuardPending = @"/var/mobile/Library/NotifyBox/.nc_pen
 static NSString *const kNBGuardOff     = @"/var/mobile/Library/NotifyBox/.nc_off";
 // 🔴 版本号写进护栏文件：**每个新版本自动获得一次重试机会**。
 //    否则 v0.0.62 那次卡死留下的 `.nc_off` 会一直压着，新版明明修好了也测不到。
-#define NB_VER_STR @"0.0.70"
+#define NB_VER_STR @"0.0.71"
 static BOOL gNCSuppressed = NO;   // YES ⇒ 本进程不碰 NC 路径
 static BOOL gNCBusy = NO;         // YES ⇒ 上一次 NC 尝试还没回来（同进程内不再赌第二次）
 static NSTimeInterval gNCBusyAt = 0;   // 🔴 v0.0.65：闸门加上时间戳，超时自动放行
@@ -628,7 +638,10 @@ static void NBDiagCollectClass(NSMutableString *buf, const char *clsName) {
 //    不用在几百 KB 的 tweak.log 里翻、也不会因为长行折行而漏读（v0.0.54/55 就栽在这）。
 static NSUInteger NBDiagWriteFile(NSString *sysId, NSString *bundle) {
     NSMutableString *buf = [NSMutableString stringWithCapacity:(1 << 18)];
-    [buf appendString:@"# NotifyBox v0.0.56 · 通知中心可用 API 清单\n"];
+    // 🔴 v0.0.71：原来是写死的 `v0.0.56` 字面量 ⇒ v0.0.70 上跑出来的诊断文件
+    //    第一行仍说自己 0.0.56。改成 NB_VER_STR，从此跟着版本走。
+    [buf appendString:[NSString stringWithFormat:@"# NotifyBox v%@ · 通知中心可用 API 清单\n",
+                                                      NB_VER_STR]];
     [buf appendFormat:@"# 生成时刻: %@\n", [NSDate date]];
     [buf appendFormat:@"# 触发时删的记录: sysId=%@ bundle=%@\n", sysId, bundle];
     [buf appendString:@"# 格式: [-+]选择器<TAB>类型签名   (签名里的数字偏移已去掉; @=对象 B=BOOL v=void)\n"];
@@ -1008,7 +1021,7 @@ static void NBDiagAppendAPIOnce(void) {
     gAPIDumped = YES;
     @try {
         NSMutableString *buf = [NSMutableString stringWithCapacity:(1 << 14)];
-        [buf appendFormat:@"\n# ---- v0.0.70 方法表（关键字筛：bulletin/request/clear/remov/withdraw/dismiss/destination）----\n"];
+        [buf appendFormat:@"\n# ---- v%@ 方法表（关键字筛：bulletin/request/clear/remov/withdraw/dismiss/destination）----\n", NB_VER_STR];
         NSArray *kw = @[@"ulletin", @"equest", @"lear", @"emov", @"ithdraw", @"ismiss", @"estination"];
         NSArray *classes = @[@"NCNotificationRequest", @"NCNotificationDispatcher",
                              @"NCBulletinNotificationSource", @"CSNotificationDispatcher", @"BBServer"];
@@ -1348,13 +1361,13 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             NBLog(@"!!! [NC-CLEAR] 尚未捕获 BBServer 实例/队列，跳过");
             return;
         }
-        NBLog(@"=== [NC-CLEAR] v0.0.70 请求 sysId=%@ bundle=%@", sysId, bundle);
+        NBLog(@"=== [NC-CLEAR] v%@ 请求 sysId=%@ bundle=%@", NB_VER_STR, sysId, bundle);
         // 方法表是静态信息，只在文件不存在时写一次
         if (![[NSFileManager defaultManager] fileExistsAtPath:NOTIFYBOX_NC_DIAG_PATH]) {
             NBDiagWriteFile(sysId, bundle);
         }
-        NBDiagStep(@"\n=== [尝试 %@ @%@] v0.0.70 async sysId=%@ bundle=%@\n",
-                   [NSDate date], NBProc(), sysId, bundle);
+        NBDiagStep(@"\n=== [尝试 %@ @%@] v%@ async sysId=%@ bundle=%@\n",
+                   [NSDate date], NBProc(), NB_VER_STR, sysId, bundle);
 
         NSArray  *cands   = [sysId componentsSeparatedByString:@"|"];
         NSString *bundleC = [bundle copy];
@@ -2222,7 +2235,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         // 🔴 v0.0.64：这条 queue 是关键 —— 系统平时就在它上面回调 source。
         //    NC 的删除动作必须回到这条队列上执行（v0.0.61 在 BB 队列上调用 ⇒ 卡死注销）。
         gNCSourceQueue = (dispatch_queue_t)queue;
-        NBLog(@"=== [v0.0.70] 捕获 NC source，dispatcher=%@ queue=%@",
+        NBLog(@"=== [v%@] 捕获 NC source，dispatcher=%@ queue=%@", NB_VER_STR,
               dispatcher ? NSStringFromClass([dispatcher class]) : @"(nil)",
               queue ? @"有" : @"(nil)");
     }
@@ -2381,7 +2394,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             NULL, NBClearNCCallback,
             CFSTR("com.yxh41.notifybox.ncClear"), NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
-        NBLog(@"=== [v0.0.52] 已注册 Darwin 通知观察者（NC 同步清除）");
+        NBLog(@"=== [v%@] 已注册 Darwin 通知观察者（NC 同步清除）", NB_VER_STR);
         // 🔴🔴 v0.0.62/63：NC 路径的「卡死自恢复」检查。
         //    `.nc_pending` 在进 NC 路径前写、正常跑完删 ⇒ 它还在 = 上次没回来。
         //    `.nc_off` = 永久禁用，只删 BB 账本（不卡，但界面也不变）。
@@ -2501,8 +2514,8 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.70 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
-          NBProc(), [NotifySpeaker diagnosticLine],
+    NBLog(@"=== [%@] NotifyBox v%@ · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
+          NBProc(), NB_VER_STR, [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
           @"可用",
@@ -2540,8 +2553,8 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.70 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
-          NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
+    NBLog(@"=== [%@] NotifyBox v%@ · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+          NBProc(), NB_VER_STR, cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     // v0.0.55：删掉 v0.0.53 在这里（%ctor）打的那行方法清单。
     //   🔴 理由：%ctor 是**开机**那一刻，日志窗口（≈最后 50 行）早就把它滚掉了 ——
@@ -2609,7 +2622,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.70 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v%@ %@ ===", NBProc(), NB_VER_STR,
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }

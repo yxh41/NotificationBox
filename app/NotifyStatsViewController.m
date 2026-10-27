@@ -1,6 +1,7 @@
 #import "NotifyStatsViewController.h"
 #import "NotifyStore.h"
 #import "InstalledApps.h"
+#import "NBTheme.h"
 
 #pragma mark - 一行统计（名称 + 条数 + 一根条形）
 
@@ -112,7 +113,7 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"自定义时间窗";
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    self.view.backgroundColor = NBPageBG();   // v0.0.71 与全站统一：分组灰底 + 白卡片
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"完成"
                                          style:UIBarButtonItemStyleDone
@@ -197,7 +198,7 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"统计";
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    self.view.backgroundColor = NBPageBG();   // v0.0.71 与全站统一：分组灰底 + 白卡片
 
     self.dimSeg = [[UISegmentedControl alloc] initWithItems:@[@"按 App", @"按小时", @"按天"]];
     self.dimSeg.selectedSegmentIndex = 0;

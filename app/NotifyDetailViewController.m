@@ -2,6 +2,7 @@
 #import "NotifyStore.h"
 #import "AppIconLoader.h"
 #import "NotifyCommon.h"
+#import "NBTheme.h"
 
 // 一条通知的详情：App / 时间 / 标题 / 副标题 / **正文全文**（可滚动、可选中复制）。
 //
@@ -46,7 +47,7 @@
     //    浅色模式下它正好也是 #F2F2F7 那种浅灰 ⇒ 白底上两块浅灰块，看着像"没加载完"。
     //    换成分组灰底之后，卡片必须跟着换成 `secondarySystemGroupedBackground`（白），
     //    **一对要一起换**：只换底不换卡片 = 浅灰压浅灰，卡片直接消失。
-    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    self.view.backgroundColor = NBPageBG();
 
     UIBarButtonItem *copy = [[UIBarButtonItem alloc] initWithTitle:@"复制"
                                                             style:UIBarButtonItemStylePlain

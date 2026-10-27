@@ -9,6 +9,8 @@
 // v0.0.42：App 显示名（bundle -> 名字）。列表要显示它，搜索也要用它匹配。
 #import "InstalledApps.h"
 #import "NotifyExport.h"     // v0.0.44 导出
+// v0.0.71：统一视觉层（颜色 / 圆角 / 图标 / 分组卡片的唯一来源）
+#import "NBTheme.h"
 
 // v0.0.38：「全标已读」按钮的固定宽度。「全标已读」4 个汉字 @14pt ≈ 56pt，
 // 加左右各 16pt 内边距 ⇒ 88 够宽裕。写常量是因为布局里要拿它算分段控件的宽度，
@@ -52,6 +54,8 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    同一屏里「今天/近7天/全部」这个 UISegmentedControl 一直是好的，
 //    那就用同一种控件，行为 100% 可预期，也顺手去掉 88/44 的高度赌博。
 @property (nonatomic, strong) UISegmentedControl *unreadSeg;
+// v0.0.71：顶部控制区的那张白卡片（时间分段/搜索/★+未读/两条提示都装在里面）
+@property (nonatomic, strong) UIView *topCard;
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSArray<NSDictionary *> *items;
 @property (nonatomic, strong) NSArray<NSString *> *bundles;
@@ -232,38 +236,41 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
     // v0.0.70：卡片化之后，底色必须是**分组灰**（不是 systemBackground 的白）。
     //    卡片用 secondarySystemBackground（浅色模式下是纯白）压在灰底上 ⇒ 才有层次；
     //    两者都用 systemBackground 的话卡片会"消失"，只剩一点圆角阴影。
-    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    self.view.backgroundColor = NBPageBG();
     // 在同一日志里打一条「App 活着」，用来和 tweak 的日志对照（见 NotifyStore.h 注释）
     [NotifyStore markAppAlive];
-    // 诊断入口：把 tweak.log 尾部搬进 App，免去用 Filza 翻文件
-    // v0.0.35：右侧多一个「清空」。`rightBarButtonItems` 里**第一个在最右**，
-    // 所以「诊断」放第一位（更常用），「清空」在它左边 —— 一个不可撤销的动作
-    // 不该占着最显眼的右上角。
+    // ---------- v0.0.71 导航栏改成图标按钮 ----------
+    // 🔴 原来是 4 个纯文字按钮（设置 / 诊断 / 导出 / 清空），右侧并排三个中文词
+    //    在窄屏上会把中间的标题挤掉，而且"清空"这个不可撤销的动作和"诊断"一样大、
+    //    一样显眼。改成图标 + 保留语义顺序：
+    //      · 最右（最显眼）= 诊断，最常用；
+    //      · 中间 = 导出；
+    //      · 最左 = 清空，红色，且它是三个里最不常用的。
+    //    `rightBarButtonItems` 里**第一个在最右**，所以数组顺序 = 诊断、导出、清空。
     UIBarButtonItem *diag =
-        [[UIBarButtonItem alloc] initWithTitle:@"诊断"
+        [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"waveform.path.ecg"]
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(onDiag:)];
+    UIBarButtonItem *export =
+        [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"square.and.arrow.up"]
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onExport:)];
     UIBarButtonItem *clear =
-        [[UIBarButtonItem alloc] initWithTitle:@"清空"
+        [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"trash"]
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(onClear:)];
     clear.tintColor = [UIColor systemRedColor];   // 不可撤销 ⇒ 和详情页的「删除」同一套视觉
-    // v0.0.44：导出。放在「诊断」和「清空」中间 —— 它比诊断常用、比清空安全，
-    //    而最右上角留给最常用的「诊断」（`rightBarButtonItems` 里第一个在最右）。
-    UIBarButtonItem *export =
-        [[UIBarButtonItem alloc] initWithTitle:@"导出"
-                                         style:UIBarButtonItemStylePlain
-                                        target:self
-                                        action:@selector(onExport:)];
     self.navigationItem.rightBarButtonItems = @[diag, export, clear];
     // 🔴 v0.0.8：设置留在自己 App 里，不再往设置 App 装 PreferenceLoader 载荷
     self.navigationItem.leftBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"设置"
+        [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"gearshape"]
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(onSettings:)];
+
     [self buildUI];
     [self loadData];
 
@@ -771,7 +778,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 - (void)showText:(NSString *)text title:(NSString *)title {
     UIViewController *vc = [[UIViewController alloc] init];
     vc.title = title;
-    vc.view.backgroundColor = [UIColor systemBackgroundColor];
+    vc.view.backgroundColor = NBPageBG();   // v0.0.71 与全站统一
 
     UITextView *tv = [[UITextView alloc] initWithFrame:CGRectZero];
     tv.editable = NO;
@@ -799,6 +806,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 }
 
 - (void)buildUI {
+    // v0.0.71：**第一个**加进 view 的子视图 ⇒ 永远在所有控件下面。
+    // 🔴 顺序是有意义的：晚加的话它会把分段/搜索/按钮盖住（白色卡片盖白字，看着像控件没了）。
+    self.topCard = [[UIView alloc] init];
+    self.topCard.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    self.topCard.layer.cornerRadius = NBCardRadius;   // 与列表卡片同一圆角
+    self.topCard.layer.cornerCurve = kCACornerCurveContinuous;
+    self.topCard.clipsToBounds = YES;
+    [self.view addSubview:self.topCard];
+
     // 时间分段
     // v0.0.37：第 0 段原名「今天」，但它实际返回的是 `now - 86400`（最近 24 小时），
     //    不是今天 00:00 —— 名不符实。今天 19:30 时，「今天」会把昨天 19:30 之后的
@@ -837,7 +853,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.starBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.starBtn setTitle:@"★ 标星" forState:UIControlStateNormal];
     self.starBtn.titleLabel.font = [UIFont systemFontOfSize:14];
-    self.starBtn.layer.cornerRadius = kNBTopRadius;
+    // v0.0.71：胶囊形（高度的一半），和分段控件同一套圆角语言
+    self.starBtn.layer.cornerRadius = kNBTopH / 2.0;
     self.starBtn.backgroundColor = [UIColor secondarySystemFillColor];
     [self.starBtn setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
     [self.starBtn setTitleColor:[UIColor systemOrangeColor] forState:UIControlStateSelected];
@@ -852,7 +869,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.markAllBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.markAllBtn setTitle:@"全标已读" forState:UIControlStateNormal];
     self.markAllBtn.titleLabel.font = [UIFont systemFontOfSize:14];
-    self.markAllBtn.layer.cornerRadius = kNBTopRadius;
+    self.markAllBtn.layer.cornerRadius = kNBTopH / 2.0;   // v0.0.71 胶囊
     self.markAllBtn.backgroundColor = [UIColor secondarySystemFillColor];
     [self.markAllBtn addTarget:self action:@selector(onMarkAllRead:)
               forControlEvents:UIControlEventTouchUpInside];
@@ -905,7 +922,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.table.separatorStyle = UITableViewCellSeparatorStyleNone;
     // 🔴 灰色大底必须由 tableView 出（cell 和卡片都是透明的/半透的）：
     //    这是"分层"的唯一来源。少了这一句，卡片和背景同色 ⇒ 看起来只是"行高变大了"。
-    self.table.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    self.table.backgroundColor = NBPageBG();
     // 自重算高度会关闭行高缓存，本表行高是常量 ⇒ 明确关掉，省掉一次没必要的测量
     self.table.estimatedRowHeight = 0;
     // 🔴 自定义 cell：Default 样式的 UITableViewCell **不显示 detailTextLabel**，
@@ -922,74 +939,86 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
     CGFloat safeBottom = self.view.safeAreaInsets.bottom;
-    CGFloat y = top + 6;
+    CGFloat y = top + 8;
 
-    self.timeSeg.frame = CGRectMake(kNBTopMargin, y, w - kNBTopMargin * 2, kNBTopH);
-    y += kNBTopH + kNBTopGap;
+    // =====================================================================
+    // v0.0.71：顶部控制区收进**一张白卡片**。
+    // 🔴 原来这 5 行控件（时间分段 / 搜索 / ★+未读+全标已读 / 两条提示）各自浮在灰底上，
+    //    横向边距还不统一（分段用 12、搜索框用 0）⇒ 看起来像"几个不相干的东西掉在上方"。
+    //    现在统一：一张卡片、一个内边距（10）、一条竖直节奏（10pt）。
+    // 🔴 两条提示的可见性判据必须和 `cy` 的累加用**同一个** BOOL 变量：
+    //    一处写 `> 0`、另一处写 `!= 0`，这种不一致不报错、只让布局悄悄错位。
+    // =====================================================================
+    BOOL showHint = (self.hiddenUnread > 0 && self.items.count > 0);
+    BOOL showFoldedHint = (self.foldedCount > 0);
 
-    // v0.0.37：搜索框回到固定 44 —— 不再有 scope bar 要挤进来。
+    CGFloat cardX = NBInset;
+    CGFloat cardW = w - NBInset * 2;
+    CGFloat inX = cardX + 10;
+    CGFloat inW = cardW - 20;
+    CGFloat cy = y + 10;
+
+    // 时间分段
+    self.timeSeg.frame = CGRectMake(inX, cy, inW, kNBTopH);
+    cy += kNBTopH + 10;
+
+    // 搜索框：UISearchBar 自带左右内边距，往外放 4 才不会看起来陷进去
     // 🔴 别用 `sizeThatFits:` / `intrinsicContentSize` 去"自动算"：
     //    UISearchBar 是普通 UIView，未布局时回 (0,0) ⇒ 搜索框直接消失。
-    self.searchBar.frame = CGRectMake(0, y, w, 44);
-    y += 44 + 2;
+    self.searchBar.frame = CGRectMake(inX - 4, cy - 4, inW + 8, 40);
+    cy += 40;
 
-    // v0.0.37：全部 / 只看未读，自己的一段（原来这里是系统的 scope bar，不显示）
-    // v0.0.38：「只看未读」模式下右侧腾出 `kNBMarkAllWidth` 给「全标已读」，
-    //    分段控件相应收窄。收窄后剩下约 `w-24-94`，两个四字/两字标题放得下。
-    // 🔴 可见性在这里同步一次，而不是只在 `onUnread:` 里改 —— 布局可能因为
-    //    别的原因此后重跑，两处状态必须由同一个判据（`self.unreadOnly`）决定。
-    // v0.0.49：这一行变成三件套 —— ★ 标星（常驻，最左）+ 全部/只看未读 +（未读时）全标已读。
-    //    ★ 放分段**左边**：它是这版的新维度，挨着分段才被看得出"和全部/未读是一伙的"；
-    //    但它常驻、全标已读按需出现，所以两者不抢右边那个位置。
-    // 🔴 320pt 窄屏验算：12+64+6 + 132(分段最小值) + 6 + 88(全标) = 308 ≤ 320 ✓。
-    CGFloat starW = 64;
-    CGFloat unreadW = w - kNBTopMargin * 2 - starW - kNBTopGap;
+    // v0.0.49：三件套 —— ★ 标星（常驻，最左）+ 全部/只看未读 +（未读时）全标已读。
+    // 🔴 320pt 窄屏验算：卡片内宽 320-32-20=268；★68 + 8 + 分段(110) = 186 ≤ 268 ✓，
+    //    再加「全标已读」88 + 8 ⇒ 282 > 268 ⇒ 所以分段用 MAX(110, …) 兜底前先减。
+    CGFloat starW = 68;
+    CGFloat markW = kNBMarkAllWidth;
     self.markAllBtn.hidden = !self.unreadOnly;
-    if (self.unreadOnly) unreadW -= (kNBMarkAllWidth + kNBTopGap);
-    CGFloat segW = MAX(120, unreadW);
-    self.starBtn.frame = CGRectMake(kNBTopMargin, y, starW, kNBTopH);
-    self.unreadSeg.frame = CGRectMake(kNBTopMargin + starW + kNBTopGap, y, segW, kNBTopH);
-    self.markAllBtn.frame = CGRectMake(kNBTopMargin + starW + kNBTopGap + segW + kNBTopGap,
-                                       y, kNBMarkAllWidth, kNBTopH);
-    y += kNBTopH + kNBTopGap;
+    CGFloat segW = inW - starW - kNBTopGap - (self.unreadOnly ? (markW + kNBTopGap) : 0);
+    segW = MAX(100, segW);
+    self.starBtn.frame = CGRectMake(inX, cy, starW, kNBTopH);
+    self.unreadSeg.frame = CGRectMake(inX + starW + kNBTopGap, cy, segW, kNBTopH);
+    self.markAllBtn.frame = CGRectMake(inX + starW + kNBTopGap + segW + kNBTopGap,
+                                       cy, markW, kNBTopH);
+    cy += kNBTopH;
 
     // v0.0.40：筛选之外还有未读的常驻提示。
     // 🔴 不显示时高度必须是 **0**，而且要把 frame 也清零 ——
-    //    只 `hidden = YES` 而保留 frame 的话，`y` 已经加过了 ⇒ 下面凭空多 24pt 空白，
-    //    症状是"图标栏和列表整体下移一点点"，肉眼很难归因。
-    // 🔴 可见性判据和 `y` 累加必须用**同一个** `showHint` 变量，
-    //    不能一处写 `self.hiddenUnread > 0`、另一处写 `!= 0`（这类不一致不会报错）。
+    //    只 `hidden = YES` 而保留 frame 的话，卡片底部会凭空多一截空白。
     // 🔴🔴 为什么要串上 `self.items.count > 0`：**列表为空时 `updateEmptyView`
     //    已经在屏幕正中说了同一件事**（还带「当前筛选」）。
     //    这边再飘一条，同一句话就占了两处屏幕。
-    //    提示条只管「**列表非空时一个字都没有**」这个场景。
-    BOOL showHint = (self.hiddenUnread > 0 && self.items.count > 0);
     self.hiddenHint.hidden = !showHint;
     if (showHint) {
-        self.hiddenHint.frame = CGRectMake(kNBTopMargin, y, w - kNBTopMargin * 2, kNBHintH);
-        y += kNBHintH + 2;
+        cy += 8;
+        self.hiddenHint.frame = CGRectMake(inX, cy, inW, kNBHintH);
+        cy += kNBHintH;
     } else {
         self.hiddenHint.frame = CGRectZero;
     }
 
-    // v0.0.48：被关键词规则收起的条数提示。紧贴 hiddenHint 之后、图标栏之前，
-    // 共用同一个 `y` 累加器（不显示时高度 0、frame 清零 —— 和 hiddenHint 同一套教训）。
+    // v0.0.48：被关键词规则收起的条数提示。
     // 🔴 可见性判据**故意不串 `items.count`**（和 hiddenHint 相反）：列表被折叠空时
     //    **更要显示**，否则用户看到"暂无记录"以为没数据，其实有 N 条被规则收着。
-    BOOL showFoldedHint = (self.foldedCount > 0);
     self.foldedHint.hidden = !showFoldedHint;
     if (showFoldedHint) {
-        self.foldedHint.frame = CGRectMake(kNBTopMargin, y, w - kNBTopMargin * 2, kNBHintH);
-        y += kNBHintH + 2;
+        cy += showHint ? 2 : 8;
+        self.foldedHint.frame = CGRectMake(inX, cy, inW, kNBHintH);
+        cy += kNBHintH;
     } else {
         self.foldedHint.frame = CGRectZero;
     }
 
-    // v0.0.70：图标栏上下各留 6pt，让它和列表之间也有一条"呼吸缝"——
-    //    以前是紧贴着的，卡片圆角一出现就显得挤。
+    cy += 10;   // 卡片下内边距
+    self.topCard.frame = CGRectMake(cardX, y, cardW, cy - y);
+    y = cy + 8;
+
+    // v0.0.70：图标栏上下各留 6pt，让它和列表之间也有一条"呼吸缝"
+    // v0.0.71：卡片化之后它自己也收进一张白底，和下面的列表卡片、上面的控制卡片同一套层次
     y += 6;
+    self.iconBar.backgroundColor = [UIColor clearColor];
     self.iconBar.frame = CGRectMake(0, y, w, 56);
-    y += 56 + 2;
+    y += 56 + 6;
 
     self.table.frame = CGRectMake(0, y, w, h - y - safeBottom);
 }
