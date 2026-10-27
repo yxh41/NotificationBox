@@ -1,11 +1,19 @@
-// Tweak.x —— v0.0.59（当前）：**功能已打通（真机 3/3），本版只修结论措辞** ——
-//   ✅ v0.0.58 真机结果：`_removeBulletin:shouldSync:NO`（用真 BBBulletin 对象）**第 1 步就中**：
-//        workbuddy live 50→49 含本条 是→否；TIM 2→1；微信 17→16。后五步一次都没轮到。
-//      ⇒ iOS 16 上正确的删除姿势 = `_bulletinsForIDs:` 取真对象（🔴 返回 **NSSet**，不能下标）
-//        再 `_removeBulletin:shouldSync:NO`。`_clearBulletinIDs:` 那条老路确认空转。
-//   🔴 v0.0.59 只修一件事：结论行改成三态。v0.0.58 日志里 13 条有 10 条是「本来就不在段内」
-//      （App 被点开过 ⇒ 系统早把通知清了），却统一打印「已从段内消失」——
-//      看着像 100% 成功，其实只动了 3 条。**措辞必须等于它真正证明的那件事**。
+// Tweak.x —— v0.0.60（当前）：**分两层量、分两层动手，取消早停** ——
+//   🔴 用户实测 v0.0.58/v0.0.59：「没有消失，是不是没真正删除啊啊」。
+//      日志里 BB 的 live 确实 50→49、含本条 是→否 —— 但界面不动。
+//      根因两条，都是我自己的错：
+//        ① **只量了 BB 账本**（`_allBulletinsForSectionID:`）。BB 是账本，NC 才是界面。
+//        ② 第 ① 步让 BB 计数变了 ⇒ `still=NO` ⇒ **早停** ⇒ 后面「NC 原生撤回」
+//           （唯一驱动界面的那步）**一次都没执行**。
+//   ⇒ v0.0.60 改成：BB 层与 NC 层**分别量**（`NBLiveScan` + `NBScanNC`）、**分别动手**、
+//      **不许早停**。NC 侧三条路：`observer:removeBulletin:`（BB 撤回广播的 NC 入口）、
+//      `withdrawNotificationWithRequest:`（用 source 自己缓存的**真 request**，不是我造的）、
+//      以及 `_clearBulletinIDs:` 补刀。
+//   ✅ v0.0.58 已知有效的那一步保留：`_bulletinsForIDs:` 取真对象（🔴 返回 **NSSet**，不能下标）
+//      再 `_removeBulletin:shouldSync:NO` —— 它只保证「账本删掉」，不保证「界面消失」。
+//   🔴 本版唯一的验收判据：`删后 NC 含本条=否`。只有这个「否」才代表界面上会变；
+//      `删后 BB 含本条=否` 只代表账本干净了 —— 这一条 v0.0.58/59 已经"绿"过两次，是假绿。
+//
 //   v0.0.57 的历史（当年的尝试方向，保留作背景）：
 //   v0.0.56 探针取回的 `nc_diag.txt` 里，BBServer 有 253 个实例方法，关键几条：
 //     - withdrawBulletinRequestsWithRecordID:forSectionID:        v@:@@   ← iOS16 正规撤回
@@ -325,6 +333,12 @@ static BOOL NBClaimKey(NSString *key) {
 - (void)withdrawNotificationWithRequest:(id)request;                     // v@:@  NCNotificationDispatcher
 - (id)notificationRequestWithSectionId:(NSString *)sectionID
                         notificationId:(NSString *)notificationId;       // 类方法，用 (id)cls 发
+// ---- v0.0.60：NCBulletinNotificationSource（BB 与 NC 之间的桥）----
+- (id)dispatcher;                                                        // @@:  拿 dispatcher
+- (id)observer;                                                          // @@:  拿 BBObserver
+- (void)observer:(id)observer removeBulletin:(id)bulletin;               // v@:@@ BB 撤回时 NC 侧真正的入口
+- (id)bulletinsToUUIDs;                                                  // @@:  bulletin → NC uuid
+- (id)uuidsToRequests;                                                   // @@:  NC uuid → 真 request
 @end
 
 // 🔴 捕获 BBServer 单例与其内部队列（在 publish hook 里、即 BB 队列上调用时 capture）。
@@ -538,6 +552,71 @@ static void NBDiagAppend(NSString *text) {
     } @catch (__unused NSException *e) { }
 }
 
+// ---------- v0.0.60：NC 层的读与取 ----------
+// 🔴 为什么必须有这一层：`_allBulletinsForSectionID:` 量的是 **BB 账本**，
+//    而用户眼睛看的是 **NC 界面**。v0.0.58 只量了 BB，一看"数变了"就宣布成功，
+//    结果界面上那条还在 ⇒ 判据的量根本不对层。
+//    这里补上 NC 侧的两个映射：`bulletinsToUUIDs`（bulletin→uuid）与 `uuidsToRequests`（uuid→request）。
+static NSInteger NBScanNC(id source, NSString *cid, BOOL *found) {
+    if (found) *found = NO;
+    if (!source) return -1;
+    @try {
+        id m = [source bulletinsToUUIDs];
+        if (!m) return -1;
+        NSArray *keys = nil;
+        if ([m isKindOfClass:[NSDictionary class]]) keys = [(NSDictionary *)m allKeys];
+        else if ([m isKindOfClass:[NSSet class]])   keys = [(NSSet *)m allObjects];
+        else if ([m respondsToSelector:@selector(allKeys)]) keys = [m allKeys];
+        if (!keys) return -1;
+        if (found) {
+            for (id k in keys) {
+                NSString *kb = [k isKindOfClass:[NSString class]] ? (NSString *)k : NBKVCStr(k, @"bulletinID");
+                if (kb.length && [kb isEqualToString:cid]) { *found = YES; break; }
+            }
+        }
+        return (NSInteger)keys.count;
+    } @catch (__unused NSException *e) { return -1; }
+}
+
+// bulletin ID → NC 侧 uuid（key 可能是 BBBulletin 对象，也可能就是字符串）
+static NSString *NCNUUIDForBulletin(id source, NSString *cid) {
+    if (!source || !cid.length) return nil;
+    @try {
+        id m = [source bulletinsToUUIDs];
+        if (![m isKindOfClass:[NSDictionary class]]) return nil;
+        NSDictionary *d = (NSDictionary *)m;
+        for (id k in d) {
+            NSString *kb = [k isKindOfClass:[NSString class]] ? (NSString *)k : NBKVCStr(k, @"bulletinID");
+            if (kb.length && [kb isEqualToString:cid]) {
+                id v = d[k];
+                if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
+                return [v description];
+            }
+        }
+    } @catch (__unused NSException *e) { }
+    return nil;
+}
+
+// uuid → 真 NCNotificationRequest（source 自己缓存着，是**真对象**，不是我造的）
+static id NBNCRequestForUUID(id source, NSString *uuid) {
+    if (!source || !uuid.length) return nil;
+    @try {
+        id m = [source uuidsToRequests];
+        if ([m isKindOfClass:[NSDictionary class]]) return ((NSDictionary *)m)[uuid];
+    } @catch (__unused NSException *e) { }
+    return nil;
+}
+
+// 兜底：用工厂现造一个（uuid 优先，没有就用 bulletin id）
+static id NBMakeNCRequest(NSString *bundle, NSString *cidOrUUID) {
+    Class rq = objc_getClass("NCNotificationRequest");
+    if (!rq || !cidOrUUID.length) return nil;
+    if (![rq respondsToSelector:@selector(notificationRequestWithSectionId:notificationId:)]) return nil;
+    @try {
+        return [(id)rq notificationRequestWithSectionId:bundle notificationId:cidOrUUID];
+    } @catch (__unused NSException *e) { return nil; }
+}
+
 // 🔴 盒子 App 删记录后唤醒我们，在 BBServer 队列上精确清掉那一条通知。
 //   放在正确队列上是关键：_clearBulletinIDs:… 必须在 BBServer 内部队列上调，否则会报错。
 static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
@@ -560,7 +639,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         #pragma clang diagnostic pop
             NSMutableString *rec = [NSMutableString string];
             [rec appendFormat:@"\n=== [尝试 %@] sysId=%@ bundle=%@\n", [NSDate date], sysId, bundle];
-            NBLog(@"=== [NC-CLEAR] v0.0.59 请求 sysId=%@ bundle=%@", sysId, bundle);
+            NBLog(@"=== [NC-CLEAR] v0.0.60 请求 sysId=%@ bundle=%@", sysId, bundle);
             NBLog(@"[NC-DIAG] 捕获对象类=%@", NSStringFromClass([gBBServer class]));
             // 方法表是静态信息，只在文件不存在时写一次；之后只追加「本次尝试记录」
             if (![[NSFileManager defaultManager] fileExistsAtPath:NOTIFYBOX_NC_DIAG_PATH]) {
@@ -572,182 +651,129 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 if (!cid.length) continue;
                 [rec appendFormat:@"cid=%@\n", cid];
 
-                // ---- ① 删前基准（一次读同时给出：段内总数 + 本条在不在）----
-                //   🔴 判据必须找「我们这一条」，不能只看总数：
-                //      v0.0.57 看到 live 50→49 就想收口，但用户这中间自己划掉一条也会 50→49 ⇒ 无法归因。
-                BOOL still = NO;
-                NSInteger n0 = NBLiveScan(gBBServer, bundle, cid, &still);
-                [rec appendFormat:@"  删前 live=%ld 含本条=%@\n", (long)n0, still ? @"是" : @"否"];
-                NBLog(@"=== [NC-CLEAR] 删前 live=%ld 含本条=%@", (long)n0, still ? @"是" : @"否");
-                // v0.0.59：三态结论需要两个量 ——
-                //   was     = 动手之前它到底在不在（不在就没得删，不能报"已删除"）
-                //   winStep = 第几步让它消失的（0=没有任何一步成功）
-                // 🔴 这两条是 v0.0.58 的教训：那份日志里 10 条记录「删前 含本条=否」，
-                //    我什么都没做，结论行却写着「已从段内消失」—— 原因与结论对不上，就是假绿。
-                BOOL was = still;
+                // ===== v0.0.60：分两层量、分两层动手，**取消早停** =====
+                // 🔴 v0.0.58 的错（用户实测「没消失」后才看清）：
+                //    ① 只量了 BB 账本（`_allBulletinsForSectionID:`），一看总数变了就 still=NO 停手
+                //    ② 于是第 ⑥ 步「NC 原生撤回」——**唯一驱动界面的那步**——一次都没执行
+                //    ⇒ BB 是账本，NC 才是界面。两层必须分别量、分别动手，且**不许早停**。
+                BOOL bbIn = NO, ncIn = NO;
+                NSInteger bbN = NBLiveScan(gBBServer, bundle, cid, &bbIn);
+                NSInteger ncN = NBScanNC(gNCSource, cid, &ncIn);
+                BOOL wasAny = (bbIn || ncIn);
                 NSInteger winStep = 0;
+                [rec appendFormat:@"  删前 BB: live=%ld 含本条=%@ | NC: 映射=%ld 含本条=%@\n",
+                 (long)bbN, bbIn ? @"是" : @"否", (long)ncN, ncIn ? @"是" : @"否"];
+                [rec appendFormat:@"  环境 source=%@ dispatcher=%@ 缓存=%lu\n",
+                 gNCSource ? NSStringFromClass([gNCSource class]) : @"(nil)",
+                 gNCDispatcher ? NSStringFromClass([gNCDispatcher class]) : @"(nil)",
+                 (unsigned long)gNCRequestByID.count];
+                NBLog(@"=== [NC-CLEAR] 删前 BB含=%@ NC含=%@ src=%@ dsp=%@",
+                      bbIn ? @"是" : @"否", ncIn ? @"是" : @"否",
+                      gNCSource ? @"有" : @"无", gNCDispatcher ? @"有" : @"无");
 
-                // ---- ② 按 ID 取真实对象（NSSet 也要能取出来，见 NBFirstObject 的注释）----
                 id bullet = nil;
-                @try {
-                    bullet = NBFirstObject([gBBServer _bulletinsForIDs:@[cid]]);
-                    [rec appendFormat:@"  _bulletinsForIDs ⇒ %@\n",
-                     bullet ? NSStringFromClass([bullet class]) : @"(没取到)"]; 
-                } @catch (NSException *e) {
-                    [rec appendFormat:@"  _bulletinsForIDs 抛: %@\n", e.reason];
-                }
-                NSString *rID = nil, *pID = nil;
+                @try { bullet = NBFirstObject([gBBServer _bulletinsForIDs:@[cid]]); }
+                @catch (NSException *e) { [rec appendFormat:@"  _bulletinsForIDs 抛: %@\n", e.reason]; }
                 if (bullet) {
-                    rID = NBKVCStr(bullet, @"recordID");
-                    pID = NBKVCStr(bullet, @"publisherBulletinID");
-                    [rec appendFormat:@"  bulletinID=%@ recordID=%@ publisherID=%@ section=%@\n",
-                     NBKVCStr(bullet, @"bulletinID"), rID, pID, NBKVCStr(bullet, @"sectionID")];
+                    [rec appendFormat:@"  bulletinID=%@ recordID=%@ publisherID=%@\n",
+                     NBKVCStr(bullet, @"bulletinID"), NBKVCStr(bullet, @"recordID"),
+                     NBKVCStr(bullet, @"publisherBulletinID")];
                 }
 
-                // ---- ③ 一步步试：每步之后立刻按同一口径量一次，谁先让它消失谁就是答案 ----
-                //   🔴 「一步一量」是本版的核心纪律：v0.0.52~57 都把多个调用串在一起，
-                //      结果既不知道谁有用、也不知道到底有没有用。
-                //   🔴 一旦本条已不在段内就停手，避免后面的调用把归因搅乱。
-
-                // 第 1 步：按对象删（最"原生"，BB 应该会通知 observer ⇒ 界面跟着走）
-                if (still && bullet && [gBBServer respondsToSelector:@selector(_removeBulletin:shouldSync:)]) {
+                // ---------- 第 1 步：BB 账本删（v0.0.58 真机已证有效）----------
+                if (bbIn && bullet && [gBBServer respondsToSelector:@selector(_removeBulletin:shouldSync:)]) {
                     @try {
                         [gBBServer _removeBulletin:bullet shouldSync:NO];
                         BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
-                        still = f;
-                        if (!f) winStep = 1;
-                        [rec appendFormat:@"  ① _removeBulletin:shouldSync:NO ⇒ live=%ld 含本条=%@%@\n",
-                         (long)n, f ? @"是" : @"否", f ? @"（没删掉）" : @" ★本条已消失"];
-                        NBLog(@"=== [NC-CLEAR] ① _removeBulletin ⇒ live=%ld 含本条=%@",
-                              (long)n, f ? @"是" : @"否");
+                        if (!f && !winStep) winStep = 1;
+                        [rec appendFormat:@"  ① BB _removeBulletin ⇒ BB live=%ld 含本条=%@\n",
+                         (long)n, f ? @"是" : @"否"];
                     } @catch (NSException *e) {
-                        [rec appendFormat:@"  ① _removeBulletin 抛: %@\n", e.reason];
+                        [rec appendFormat:@"  ① BB _removeBulletin 抛: %@\n", e.reason];
                     }
-                } else if (still) {
-                    [rec appendString:@"  ① 跳过（没取到对象）\n"];
+                } else if (!bbIn) {
+                    [rec appendString:@"  ① 跳过（BB 里本来就没有）\n"];
                 }
 
-                // 第 2 步：按对象数组删（段级接口，签名 v@:@@B）
-                if (still && bullet && [gBBServer respondsToSelector:@selector(_removeBulletins:forSectionID:shouldSync:)]) {
+                // ---------- 第 2 步：直接替 BB 走一遍「撤回观察者广播」----------
+                //   🔴 `NCBulletinNotificationSource - observer:removeBulletin:` 就是 BB 广播撤回时
+                //      NC 侧真正的入口。我们手动 `_removeBulletin:` 未必触发广播 ⇒ 这里自己走一遍。
+                //      这一步不需要 dispatcher/request，只要 source + bulletin 对象。
+                if (bullet && gNCSource
+                    && [gNCSource respondsToSelector:@selector(observer:removeBulletin:)]) {
                     @try {
-                        [gBBServer _removeBulletins:@[bullet] forSectionID:bundle shouldSync:NO];
-                        BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
-                        still = f;
-                        if (!f) winStep = 2;
-                        [rec appendFormat:@"  ② _removeBulletins:forSectionID: ⇒ live=%ld 含本条=%@%@\n",
-                         (long)n, f ? @"是" : @"否", f ? @"（没删掉）" : @" ★本条已消失"];
-                        NBLog(@"=== [NC-CLEAR] ② _removeBulletins ⇒ live=%ld 含本条=%@",
-                              (long)n, f ? @"是" : @"否");
+                        id obs = nil;
+                        @try { obs = [gNCSource observer]; } @catch (__unused NSException *e) { }
+                        [gNCSource observer:obs removeBulletin:bullet];
+                        BOOL f = NO; NSInteger n = NBScanNC(gNCSource, cid, &f);
+                        if (!f && !winStep) winStep = 2;
+                        [rec appendFormat:@"  ② NC observer:removeBulletin: ⇒ NC 映射=%ld 含本条=%@\n",
+                         (long)n, f ? @"是" : @"否"];
+                        NBLog(@"=== [NC-CLEAR] ② NC observer:removeBulletin ⇒ NC含=%@", f ? @"是" : @"否");
                     } @catch (NSException *e) {
-                        [rec appendFormat:@"  ② _removeBulletins 抛: %@\n", e.reason];
+                        [rec appendFormat:@"  ② NC observer:removeBulletin 抛: %@\n", e.reason];
                     }
+                } else if (!gNCSource) {
+                    [rec appendString:@"  ② 跳过（没抓到 NC source）\n"];
                 }
 
-                // 第 3 步：按 recordID 撤回（iOS 16 的正规入口）
-                if (still && [gBBServer respondsToSelector:
-                        @selector(withdrawBulletinRequestsWithRecordID:forSectionID:)]) {
-                    NSString *useRID = rID.length ? rID : cid;
-                    @try {
-                        [gBBServer withdrawBulletinRequestsWithRecordID:useRID forSectionID:bundle];
-                        BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
-                        still = f;
-                        if (!f) winStep = 3;
-                        [rec appendFormat:@"  ③ withdraw…WithRecordID=%@ ⇒ live=%ld 含本条=%@%@\n",
-                         useRID, (long)n, f ? @"是" : @"否", f ? @"（没删掉）" : @" ★本条已消失"];
-                        NBLog(@"=== [NC-CLEAR] ③ withdraw…WithRecordID ⇒ live=%ld 含本条=%@",
-                              (long)n, f ? @"是" : @"否");
-                    } @catch (NSException *e) {
-                        [rec appendFormat:@"  ③ withdraw…WithRecordID 抛: %@\n", e.reason];
-                    }
-                }
-
-                // 第 4 步：按 publisherBulletinID 撤回（App 侧 ID，有时才是对的）
-                if (still && pID.length && [gBBServer respondsToSelector:
-                        @selector(withdrawBulletinRequestsWithPublisherBulletinID:forSectionID:)]) {
-                    @try {
-                        [gBBServer withdrawBulletinRequestsWithPublisherBulletinID:pID forSectionID:bundle];
-                        BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
-                        still = f;
-                        if (!f) winStep = 4;
-                        [rec appendFormat:@"  ④ withdraw…WithPublisherID=%@ ⇒ live=%ld 含本条=%@%@\n",
-                         pID, (long)n, f ? @"是" : @"否", f ? @"（没删掉）" : @" ★本条已消失"];
-                        NBLog(@"=== [NC-CLEAR] ④ withdraw…WithPublisherID ⇒ live=%ld 含本条=%@",
-                              (long)n, f ? @"是" : @"否");
-                    } @catch (NSException *e) {
-                        [rec appendFormat:@"  ④ withdraw…WithPublisherID 抛: %@\n", e.reason];
-                    }
-                }
-
-                // 第 5 步：单参 withdrawBulletinID:
-                if (still && [gBBServer respondsToSelector:@selector(withdrawBulletinID:)]) {
-                    @try {
-                        [gBBServer withdrawBulletinID:cid];
-                        BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
-                        still = f;
-                        if (!f) winStep = 5;
-                        [rec appendFormat:@"  ⑤ withdrawBulletinID: ⇒ live=%ld 含本条=%@%@\n",
-                         (long)n, f ? @"是" : @"否", f ? @"（没删掉）" : @" ★本条已消失"];
-                        NBLog(@"=== [NC-CLEAR] ⑤ withdrawBulletinID ⇒ live=%ld 含本条=%@",
-                              (long)n, f ? @"是" : @"否");
-                    } @catch (NSException *e) {
-                        [rec appendFormat:@"  ⑤ withdrawBulletinID 抛: %@\n", e.reason];
-                    }
-                }
-
-                // 第 6 步：NC 原生撤回（这条才驱动界面。BB 侧删了但界面不动时靠它）
-                //   🔴 request 优先用「通知到达那一刻抓到的真对象」（NBStashNCRequest 存的），
-                //      抓不到就用工厂 `+notificationRequestWithSectionId:notificationId:` 现造。
-                if (still) {
-                    id ncReq = NBStashedNCRequest(cid);
-                    NSString *how = @"缓存对象";
-                    if (!ncReq) {
-                        Class rq = objc_getClass("NCNotificationRequest");
-                        if (rq && [rq respondsToSelector:
-                                @selector(notificationRequestWithSectionId:notificationId:)]) {
-                            @try {
-                                ncReq = [(id)rq notificationRequestWithSectionId:bundle notificationId:cid];
-                                how = @"工厂新造";
-                            } @catch (NSException *e) {
-                                [rec appendFormat:@"  ⑥ 造 request 抛: %@\n", e.reason];
-                            }
-                        }
-                    }
+                // ---------- 第 3 步：NC 原生撤回（用 source 自己缓存的**真 request**）----------
+                if (gNCSource || gNCDispatcher) {
+                    NSString *uuid = NCNUUIDForBulletin(gNCSource, cid);
+                    id ncReq = NBNCRequestForUUID(gNCSource, uuid);
+                    NSString *src = @"source缓存";
+                    if (!ncReq) { ncReq = NBStashedNCRequest(cid); src = @"自己缓存"; }
+                    if (!ncReq) { ncReq = NBMakeNCRequest(bundle, uuid.length ? uuid : cid); src = @"工厂新造"; }
+                    [rec appendFormat:@"  uuid=%@ req=%@(%@)\n",
+                     uuid.length ? uuid : @"(无)", ncReq ? @"有" : @"无", src];
                     if (ncReq && gNCDispatcher
                         && [gNCDispatcher respondsToSelector:@selector(withdrawNotificationWithRequest:)]) {
                         @try {
                             [gNCDispatcher withdrawNotificationWithRequest:ncReq];
-                            BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
-                            still = f;
-                            if (!f) winStep = 6;
-                        [rec appendFormat:@"  ⑥ NC withdraw(%@) ⇒ live=%ld 含本条=%@\n",
-                             how, (long)n, f ? @"是" : @"否"];
-                            NBLog(@"=== [NC-CLEAR] ⑥ NC withdraw(%@) ⇒ live=%ld 含本条=%@",
-                                  how, (long)n, f ? @"是" : @"否");
+                            BOOL f = NO; NSInteger n = NBScanNC(gNCSource, cid, &f);
+                            if (!f && !winStep) winStep = 3;
+                            [rec appendFormat:@"  ③ NC withdraw ⇒ NC 映射=%ld 含本条=%@\n",
+                             (long)n, f ? @"是" : @"否"];
+                            NBLog(@"=== [NC-CLEAR] ③ NC withdraw ⇒ NC含=%@", f ? @"是" : @"否");
                         } @catch (NSException *e) {
-                            [rec appendFormat:@"  ⑥ NC withdraw 抛: %@\n", e.reason];
+                            [rec appendFormat:@"  ③ NC withdraw 抛: %@\n", e.reason];
                         }
                     } else {
-                        [rec appendFormat:@"  ⑥ 跳过（request=%@ dispatcher=%@）\n",
+                        [rec appendFormat:@"  ③ 跳过（req=%@ dispatcher=%@）\n",
                          ncReq ? @"有" : @"无", gNCDispatcher ? @"有" : @"无"];
                     }
                 }
 
-                // 结论行（v0.0.59 三态）：**"本来就不在" 不许写成 "已删除"**
-                //   🔴 v0.0.58 的真机日志里 13 条有 10 条属于「本来就不在」，
-                //      却统一打印「已从段内消失」⇒ 看着像 100% 成功，其实只动了 3 条。
-                //      判据的措辞必须等于它真正证明的那件事。
-                NSString *verdict;
-                if (!was) {
-                    verdict = @"本来就不在段内（可能已被 App 或用户清掉，无需处理）";
-                } else if (!still && winStep > 0) {
-                    verdict = [NSString stringWithFormat:@"本次已删掉（第 %ld 步生效）", (long)winStep];
-                } else if (!still) {
-                    verdict = @"已消失，但没记到是哪一步（异常）";
-                } else {
-                    verdict = @"仍在段内（六步全部失败）";
+                // ---------- 第 4 步：老 API 补一刀（v0.0.57 单独用无效，这里当"标记已清"）----------
+                if (bbIn && [gBBServer respondsToSelector:@selector(_clearBulletinIDs:forSectionID:shouldSync:)]) {
+                    @try {
+                        [gBBServer _clearBulletinIDs:@[cid] forSectionID:bundle shouldSync:NO];
+                        [rec appendString:@"  ④ _clearBulletinIDs（补刀，不改界面）\n"];
+                    } @catch (NSException *e) {
+                        [rec appendFormat:@"  ④ _clearBulletinIDs 抛: %@\n", e.reason];
+                    }
                 }
-                [rec appendFormat:@"  ⇒ %@\n", verdict];
-                NBLog(@"=== [NC-CLEAR] 结论：%@ cid=%@", verdict, cid);
+
+                // ---------- 复查两层：结论必须分别说 BB 与 NC ----------
+                BOOL bb2 = NO, nc2 = NO;
+                NSInteger bbn = NBLiveScan(gBBServer, bundle, cid, &bb2);
+                NSInteger ncn = NBScanNC(gNCSource, cid, &nc2);
+                NSString *verdict;
+                if (!wasAny) {
+                    verdict = @"两层本来都没有（已被 App/用户清掉，无需处理）";
+                } else if (!bb2 && !nc2) {
+                    verdict = [NSString stringWithFormat:@"两层都已删掉（第 %ld 步起效）", (long)winStep];
+                } else if (!bb2 && nc2) {
+                    verdict = @"BB 已删、NC 仍在 ⇒ 界面不会变（正是你看到的现象）";
+                } else if (bb2 && !nc2) {
+                    verdict = @"NC 已删、BB 仍在（少见，需再查）";
+                } else {
+                    verdict = @"两层都还在（全部失败）";
+                }
+                [rec appendFormat:@"  删后 BB: live=%ld 含本条=%@ | NC: 映射=%ld 含本条=%@\n  ⇒ %@\n",
+                 (long)bbn, bb2 ? @"是" : @"否", (long)ncn, nc2 ? @"是" : @"否", verdict];
+                NBLog(@"=== [NC-CLEAR] 删后 BB含=%@ NC含=%@ ⇒ %@",
+                      bb2 ? @"是" : @"否", nc2 ? @"是" : @"否", verdict);
 
             }
             NBDiagAppend(rec);
@@ -1285,7 +1311,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.59 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.60 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -1324,7 +1350,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.59 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.60 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     // v0.0.55：删掉 v0.0.53 在这里（%ctor）打的那行方法清单。
@@ -1393,7 +1419,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.59 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.60 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
