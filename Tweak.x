@@ -1118,7 +1118,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             //    而日志里只有「ncQueue=有」，连它是不是 dispatch queue 都看不出来。
             //    `[obj class]` 对任意对象都安全（不碰 dispatch 内部结构），可以放心打。
             NBDiagStep(@"  [NC] 队列身份 %p class=%@ 与BB队列相同=%@\n",
-                       (void *)ncq,
+                       (__bridge void *)ncq,
                        ncq ? NSStringFromClass([(id)ncq class]) : @"(nil)",
                        (ncq == gBBServerQueue) ? @"是" : @"否");
             dispatch_async(ncq, ^{
