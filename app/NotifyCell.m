@@ -1,4 +1,5 @@
 #import "NotifyCell.h"
+#import "NBTheme.h"
 
 @interface NotifyCell ()
 // 🔴 v0.0.70：卡片容器。以前所有子视图直接挂在 `contentView` 上、靠系统分隔线区分行，
@@ -17,8 +18,20 @@
 @property (nonatomic, strong) UILabel *subLabel;
 @property (nonatomic, strong) UILabel *msgLabel;
 @property (nonatomic, strong) UILabel *timeLabel;
-@property (nonatomic, strong) UIView *dotView;      // v0.0.35 未读点
-// v0.0.48：关键词规则标星（右上角 ★）。**展示时派生、不落库** —— 规则一改即时生效。
+// v0.0.72：未读标记改成**卡片右上角的书签**（带未读数），v0.0.35 的左侧蓝点已删除。
+// 🔴 为什么用 CAShapeLayer 画、不用圆角矩形：书签的样子是**底下有个 V 形缺口**，
+//    圆角矩形做不出来（它只能是"标签"，不是"书签"）。缺口只能靠路径画。
+// 🔴 为什么底色层和数字分开两层：缺口只该裁到**底色**上，
+//    如果把 shape 当 pinView 的 mask，里面的数字 label 也会被一起裁——
+//    虽然这次数字恰好在缺口上方、看不出来，但那种"碰巧没露馅"的写法迟早翻车。
+@property (nonatomic, strong) UIView *pinView;        // 书签容器（右上角）
+@property (nonatomic, strong) CAShapeLayer *pinShape; // 书签底色（带 V 缺口）
+@property (nonatomic, strong) UILabel *pinLabel;      // 未读数
+// 🔴 未读/条数都存**原始量**，不拿 pinView.hidden 反推 —— 布局要按数字位数算宽度，
+//    "看视图状态反推数据状态"在本项目已经栽过（attributedText 时序、标星）。
+@property (nonatomic, assign) BOOL isUnread;
+@property (nonatomic, assign) NSInteger unreadCount;
+// v0.0.48：关键词规则标星（v0.0.72 起在**右下角** ★）。**展示时派生、不落库**。
 @property (nonatomic, strong) UILabel *starLabel;
 // 🔴 布局判据用这个原始 BOOL，**不拿 starLabel.hidden 反推**：
 //    "拿视图状态反推数据状态"本项目栽过（attributedText 时序），星也必须存一份原始量。
@@ -34,6 +47,9 @@
 // 🔴 内部方法必须显式声明：项目开 -Werror，靠"定义在前面"来解析选择器太脆
 //    （本项目栽过三次：kAutoChainTrigger / uiscrollerInternalVelocity / forceLayoutVisibleCells）。
 - (void)nbRender;
+// v0.0.72：未读书签的唯一入口（数字 + 显隐）。和 nbRender 分开：
+// 书签不参与高亮，混进 nbRender 会让"只翻了一次未读"也重算一遍正文富文本。
+- (void)nbUpdatePin;
 @end
 
 // v0.0.44：把 `query` 在 `text` 里出现的每一处都标出来。
@@ -84,9 +100,20 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
 // 🔴🔴 v0.0.70：98 → 106。加的 8pt **不是给内容的**，是给卡片上下的留白（各 4pt）。
 //    卡片内部可用高度仍是 98 ⇒ 下面 layoutSubviews 里所有 y 坐标**一个都不用改**
 //    （只是整体平移卡片原点）。改行高时必须同步这里的 8，否则卡片会被压扁或架空。
+// 🔴🔴 v0.0.72：卡片内部 98 → 112（行高 106 → 120）。
+//    **为什么非加不可**：用户要求「时间放到内容下面」。原来是"时间跟标题同一水平线、
+//    右对齐"，它不占竖向空间；挪到内容下方就**凭空多出一行 15pt + 间距**。
+//    🔴 那能不能不加高、靠压正文腾地方？不能。有副标题时正文只剩 34pt，
+//       而两行 13pt 正文本身就要 ≈31pt —— 再压就是把两行正文截成一行半，
+//       用户会看到"正文显示不全"，比多占 14pt 难受得多。
+//    🔴 代价讲清楚：行高是常量、被 `tableView.rowHeight` 直接用 ⇒
+//       每屏少看约 1 条（≈700pt 可视区：106 时 6.6 条 → 120 时 5.8 条）。
+//       这个代价换的是"时间、未读、正文三者不再互相挤"，值得。
 static const CGFloat kNBCardInsetX = 12.0;   // 卡片左右内缩
 static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
-+ (CGFloat)height { return 98.0 + kNBCardInsetY * 2; }
+// 卡片内部可用高度（行高 = 它 + 上下留白）。layoutSubviews 里 h 就是这个数。
+static const CGFloat kNBCardInteriorH = 112.0;
++ (CGFloat)height { return kNBCardInteriorH + kNBCardInsetY * 2; }
 
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
     self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
@@ -101,8 +128,8 @@ static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
     //    看起来像"整行被框住了"。选中反馈改在 setHighlighted: 里只染卡片自己。
     self.selectionStyle = UITableViewCellSelectionStyleNone;
     self.cardView = [[UIView alloc] init];
-    self.cardView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-    self.cardView.layer.cornerRadius = 12;
+    self.cardView.backgroundColor = NBCardBG();
+    self.cardView.layer.cornerRadius = NBCardRadius;
     self.cardView.layer.cornerCurve = kCACornerCurveContinuous;   // 和系统卡片同一个曲率
     self.cardView.clipsToBounds = YES;
     [self.contentView addSubview:self.cardView];
@@ -113,14 +140,6 @@ static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
     self.iconBox.layer.cornerRadius = 9;
     self.iconBox.clipsToBounds = YES;
     [self.cardView addSubview:self.iconBox];
-
-    // v0.0.35：未读点。放在图标左边（见 layoutSubviews 里的 DOT_X/ICON_X）。
-    // 默认 hidden —— 万一某处忘了调 setUnread:，宁可少一个点，也不要给所有行都点上。
-    self.dotView = [[UIView alloc] init];
-    self.dotView.backgroundColor = [UIColor systemBlueColor];
-    // 圆的半径在 layoutSubviews 里按 dotD / 2 算（改尺寸不会忘同步）
-    self.dotView.hidden = YES;
-    [self.cardView addSubview:self.dotView];
 
     self.iconView = [[UIImageView alloc] init];
     self.iconView.contentMode = UIViewContentModeScaleAspectFit;
@@ -150,7 +169,10 @@ static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
     self.timeLabel = [[UILabel alloc] init];
     self.timeLabel.font = [UIFont systemFontOfSize:11];
     self.timeLabel.textColor = [UIColor tertiaryLabelColor];
-    self.timeLabel.textAlignment = NSTextAlignmentRight;
+    // v0.0.72：右对齐 → 左对齐。它从"标题右侧"挪到了"内容正下方"，
+    // 位置从"行尾"变成"行首"，对齐方式必须跟着改 ——
+    // 否则右对齐会让时间贴着卡片右缘，和上一行正文的左缘彻底脱开，看着像另一条记录的时间。
+    self.timeLabel.textAlignment = NSTextAlignmentLeft;
     [self.cardView addSubview:self.timeLabel];
 
     // v0.0.45：subtitle 单独一行。
@@ -178,7 +200,7 @@ static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
     self.msgLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     [self.cardView addSubview:self.msgLabel];
 
-    // v0.0.48：右上角 ★（关键词"标星"动作）。默认藏 —— 和未读点一样，
+    // v0.0.48：右下角 ★（关键词"标星"动作）。默认藏 —— 和未读书签一样，
     // 万一某处忘了调 setStarred:，宁可少一颗星，也不要给所有行都点上。
     // 🔴 systemOrange：金/橙在浅色底上醒目，又不是"行情红绿"那种会误读成涨跌的颜色。
     self.starLabel = [[UILabel alloc] init];
@@ -189,15 +211,31 @@ static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
     self.starLabel.hidden = YES;
     [self.cardView addSubview:self.starLabel];
 
+    // v0.0.72：右上角**未读书签**（替代 v0.0.35 的左侧蓝点）。
+    // 默认 hidden —— 万一某处忘了调 setUnread:count:，宁可少一个书签，
+    // 也不要给所有行都挂上（复用池里最容易串的就是这种"默认可见的装饰"）。
+    self.pinView = [[UIView alloc] init];
+    self.pinView.backgroundColor = [UIColor clearColor];   // 底色由 pinShape 画（要带缺口）
+    self.pinView.hidden = YES;
+    self.pinShape = [CAShapeLayer layer];
+    self.pinShape.fillColor = [UIColor systemBlueColor].CGColor;
+    [self.pinView.layer addSublayer:self.pinShape];
+    self.pinLabel = [[UILabel alloc] init];
+    self.pinLabel.font = [UIFont boldSystemFontOfSize:11];
+    self.pinLabel.textColor = [UIColor whiteColor];
+    self.pinLabel.textAlignment = NSTextAlignmentCenter;
+    [self.pinView addSubview:self.pinLabel];
+    // 🔴 最后 add：书签要压在卡片内所有内容的上面（含 ★）。
+    //    视图层级顺序 = z 序，这一条在本项目已经栽过（topCard 必须第一个 add）。
+    [self.cardView addSubview:self.pinView];
+
     return self;
 }
 
 - (void)layoutSubviews {
     [super layoutSubviews];
     // v0.0.70：先摆卡片，再把**所有**内部坐标改成相对卡片。
-    // 🔴 关键：卡片内高度 = cell 高 - 上下留白 = 98，和 v0.0.69 之前的 contentView 高**完全相同**
-    //    ⇒ 下面那一整套 y 坐标（10/25/47/63）一个都不用重算，只换原点。
-    //    这也是为什么行高只加 8：加的是卡片外的留白，不是内容空间。
+    // v0.0.72：卡片内部高 98 → 112（多了「时间」那一行，见 +height 的注释）。
     CGRect card = CGRectInset(self.contentView.bounds, kNBCardInsetX, kNBCardInsetY);
     self.cardView.frame = card;
     CGFloat w = card.size.width;
@@ -207,44 +245,78 @@ static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
     CGFloat pad = 14;
     CGFloat side = 46;
 
-    // v0.0.35：左侧让出 8pt 给未读点。
-    // 🔴 未读/已读两态**共用同一个 iconX**（不是"只有未读才右移"）：
-    //    否则同一屏里图标左缘会参差不齐，比没有点更乱。
-    // v0.0.70：12 → 10（卡片自己已经内缩了 12，再留 12 会显得太空）
-    CGFloat dotD = 8;
-    CGFloat dotX = 10;
-    CGFloat iconX = dotX + dotD + 2;
-    self.dotView.frame = CGRectMake(ox + dotX, oy + (h - dotD) / 2, dotD, dotD);
-    // 半径按 dotD 算，改尺寸时不用记得同步 cornerRadius
-    self.dotView.layer.cornerRadius = dotD / 2;
-
+    // v0.0.72：**左缘对齐**。v0.0.35~71 这里是 `dotX(10) + dotD(8) + 2 = 20`，
+    // 那 20pt 是给蓝点让位留出来的 ⇒ 图标左缘比卡片的 14pt 内边距多缩进了 6pt，
+    // 而标题/正文又从 78 起 —— 三个左缘互不相等，一屏十几张卡片叠起来边缘就"毛"了。
+    // 蓝点删掉后图标直接回到 `pad`，图标/标题/正文/时间四者的左缘关系变成
+    // 「图标 14，文字一律 72」，左侧一整列彻底齐。
+    CGFloat iconX = pad;
     self.iconBox.frame = CGRectMake(ox + iconX, oy + (h - side) / 2, side, side);
     self.iconView.frame = self.iconBox.bounds;
     self.letterLabel.frame = self.iconBox.bounds;
 
     CGFloat textX = iconX + side + 12;
-    CGFloat timeW = 78;
-    // v0.0.42 竖向排版（总高 98）：
-    //   App 名  y=10~24    ← 新增那一行
-    //   标题    y=25~45    （时间跟标题同一水平线）
-    //   正文    y=47~87    （两行 13pt）
-    // 🔴 标题和时间的 y 差 1pt 是**故意的**：时间 11pt、标题 15pt，基线对齐靠这一格补。
-    // v0.0.48：右上角 ★。标星时给 App 名那一行**收宽**，避免 ★ 和 App 名尾字重叠。
-    // 🔴 判据用原始 `self.starred`，不用 starLabel.hidden（见属性注释）。
-    CGFloat starW = self.starred ? 20 : 0;
-    self.starLabel.frame = CGRectMake(ox + w - pad - 18, oy + 8, 18, 18);
-    self.appLabel.frame     = CGRectMake(ox + textX, oy + 10, w - textX - pad - starW, 14);
-    self.titleLabel2.frame  = CGRectMake(ox + textX, oy + 25, w - textX - timeW - pad, 20);
-    self.timeLabel.frame    = CGRectMake(ox + w - pad - timeW, oy + 26, timeW, 16);
-    // v0.0.45：有副标题时正文下移一行；没有就完全回到原来的 47/40。
+    CGFloat textW = w - textX - pad;
+
+    // v0.0.72 竖向排版（卡片内部 112）：
+    //   App 名   y=8~22
+    //   标题     y=23~42   ← 时间挪走后**独占整行宽**（以前要让出 78pt 给时间）
+    //   副标题   y=43~58   （有才占位）
+    //   正文     y=59 或 43，两行 13pt（≈31pt）
+    //   时间     y=h-21~h-6（**贴底**，左对齐）｜ ★ 同一行右端
+    // 🔴 时间用「贴底」而不是「接在正文后面」：接在正文后面的话，
+    //    没有副标题的行和有的行会差 16pt ⇒ 同一屏里的时间**上下错位**，
+    //    滚动时看着像在跳。贴底让所有行的时间落在同一条水平线上。
+    CGFloat timeH = 15;
+    CGFloat timeY = h - 6 - timeH;
+    self.appLabel.frame    = CGRectMake(ox + textX, oy + 8, textW, 14);
+    self.titleLabel2.frame = CGRectMake(ox + textX, oy + 23, textW, 19);
+    // v0.0.45：有副标题时正文下移一行；没有就完全回到原来的位置。
     // 🔴 判据用 `rawSubtitle`（原始串），**不用** `subLabel.text` ——
     //    `attributedText` 赋值之后 `.text` 的取值时机不保证早于本方法，
     //    拿视图状态反推数据状态这种事在本项目已经栽过（观测者把被观测量改了）。
     BOOL hasSub = (self.rawSubtitle.length > 0);
     self.subLabel.hidden    = !hasSub;
-    self.subLabel.frame     = CGRectMake(ox + textX, oy + 47, w - textX - pad, 16);
-    self.msgLabel.frame     = CGRectMake(ox + textX, oy + (hasSub ? 63 : 47),
-                                         w - textX - pad, hasSub ? 34 : 40);
+    self.subLabel.frame     = CGRectMake(ox + textX, oy + 43, textW, 15);
+    CGFloat msgY = hasSub ? 59 : 43;
+    // 🔴 正文高度取「到底部时间之间还剩多少」，再兜一个 31pt 下限：
+    //    宁可和上方元素挤 1~2pt，也绝不让正文压到时间上（压上去就是字叠字）。
+    CGFloat msgH = MAX(31.0, timeY - 3 - msgY);
+    self.msgLabel.frame = CGRectMake(ox + textX, oy + msgY, textW, msgH);
+
+    self.timeLabel.frame = CGRectMake(ox + textX, oy + timeY, textW - 24, timeH);
+    // v0.0.48：★ 从右上角挪到**右下角**（右上角让给未读书签），和时间同一行、右对齐。
+    self.starLabel.frame = CGRectMake(ox + w - pad - 18, oy + timeY - 1, 18, 16);
+
+    // v0.0.72：右上角未读书签。
+    // 🔴 宽度按**数字位数**算，不写死：一位数 18、两位数 24、三位数 30。
+    //    写死一个宽度的话，99 条未读时数字会被挤出书签外（这种"只在少数数据下翻车"
+    //    的 bug 最难被发现 —— 平时测试永远只有 1~2 位）。
+    // 🔴 显隐判据用原始 `self.isUnread`，不用 pinView.hidden。
+    if (self.isUnread) {
+        NSString *num = self.pinLabel.text ?: @"1";
+        // 🔴 先转成**有符号**整数再减：`num.length` 是 NSUInteger，
+        //    空串时 `length - 1` 会下溢成天文数字 ⇒ 书签被撑到屏幕外。
+        NSInteger digits = (NSInteger)num.length;
+        CGFloat pinW = 18.0 + (CGFloat)MAX((NSInteger)0, digits - 1) * 6.0;
+        CGFloat pinH = 20;
+        // 右缩进 14（比卡片圆角 12 多让 2pt）：卡片是 clipsToBounds，
+        // 贴着圆角切的地方会被削掉一个角，看起来像书签缺了一块。
+        self.pinView.frame = CGRectMake(ox + w - pad - pinW, oy, pinW, pinH);
+        UIBezierPath *p = [UIBezierPath bezierPath];
+        [p moveToPoint:CGPointMake(0, 0)];
+        [p addLineToPoint:CGPointMake(pinW, 0)];
+        [p addLineToPoint:CGPointMake(pinW, pinH)];
+        [p addLineToPoint:CGPointMake(pinW / 2, pinH - 5)];   // 底下的 V 形缺口
+        [p addLineToPoint:CGPointMake(0, pinH)];
+        [p closePath];
+        self.pinShape.frame = self.pinView.bounds;
+        self.pinShape.path = p.CGPath;
+        self.pinLabel.frame = CGRectMake(0, 1, pinW, 14);
+        // 🔴 App 名那一行要给书签让位：书签 y=0~20，App 名 y=8~22，两者**竖向重叠 12pt**
+        //    ⇒ 不让位就会字压在书签上。标题(y=23)在书签下方，不用让。
+        self.appLabel.frame = CGRectMake(ox + textX, oy + 8, MAX(0, textW - pinW - 6), 14);
+    }
 }
 
 // v0.0.70：按下时只染**卡片**，不染整行。
@@ -255,7 +327,7 @@ static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
     [super setHighlighted:highlighted animated:animated];
     self.cardView.backgroundColor = highlighted
         ? [UIColor tertiarySystemFillColor]
-        : [UIColor secondarySystemGroupedBackgroundColor];
+        : NBCardBG();
 }
 
 - (void)setIcon:(UIImage *)icon letter:(NSString *)letter {
@@ -335,14 +407,37 @@ static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
     self.timeLabel.text = text;
 }
 
-- (void)setUnread:(BOOL)unread {
-    // 只切 hidden、不改颜色：`hidden` 不参与布局计算，也就不会因为
-    // 未读/已读切换而触发多余的 layout 抖动。
-    self.dotView.hidden = !unread;
+// v0.0.72：未读 = 卡片右上角书签（带未读数）。v0.0.35 的蓝点已删除。
+- (void)setUnread:(BOOL)unread count:(NSInteger)count {
+    _isUnread = unread;
+    self.unreadCount = count;
+    [self nbUpdatePin];
+    // 🔴 必须重排：书签**宽度取决于数字位数**（一位 18 / 两位 24），
+    //    只改 text 不重排的话，从「9 条」变成「12 条」时数字会被挤出书签外。
+    //    这里不用 `hidden` 就够了 —— 书签宽度参与布局计算，和旧蓝点不一样。
+    [self setNeedsLayout];
 }
 
-// v0.0.48：关键词"标星"动作。和未读点一样只切 hidden（★ 不改变其它元素布局，
-// 只有 App 名那一行在标星时收宽，见 layoutSubviews）。
+- (void)nbUpdatePin {
+    // 🔴 判据用原始 BOOL，不用 pinView.hidden（见属性注释）。
+    self.pinView.hidden = !self.isUnread;
+    if (!self.isUnread) {
+        self.pinLabel.text = nil;
+        return;
+    }
+    // 99 以上写「99+」：书签是角标，不是计数器，三位数会把宽度撑到盖住 App 名。
+    NSInteger n = self.unreadCount;
+    if (n > 99) {
+        self.pinLabel.text = @"99+";
+    } else {
+        // 🔴 `MAX(1, n)`：未读但调用方没给数（或给了 0）时也要显示 1 ——
+        //    空白书签看着像"漏渲染"，比显示一个偏小的数更让人怀疑功能坏了。
+        self.pinLabel.text = [NSString stringWithFormat:@"%ld", (long)MAX((NSInteger)1, n)];
+    }
+}
+
+// v0.0.48：关键词"标星"动作。只切 hidden，★ **不改变任何其它元素的布局**
+// （v0.0.72 起它在右下角和「时间」同一行，位置固定；标星不参与任何收宽计算）。
 // 🔴🔴 必须直接写 `_starred`，⛔ 不许写 `self.starred = starred;` —— 那就是
 //    在 setter 里调自己 ⇒ 无限递归 ⇒ 一标星就爆栈（CI #98 的 clang
 //    -Wunused-property-ivar 逮到的正是这个：ivar 没在 accessor 里被引用）。
@@ -382,11 +477,14 @@ static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
     self.rawBodyColor = nil;
     self.hlQuery = nil;
     self.timeLabel.text = nil;
-    // 🔴 v0.0.35：未读点**必须**在这里复位。
-    //    不复位的话，第 3 行（未读）被复用到第 30 行（已读）时会把蓝点一起带过去 ——
-    //    这是 cell 复用最经典的串行 bug，而且单元测试抓不到、代码看着也没错：
-    //    cellForRow 里明明调了 setUnread:NO，显示的却还是上一个 cell 的点。
-    self.dotView.hidden = YES;
+    // 🔴 v0.0.72：未读书签**必须连同数字一起复位**。
+    //    v0.0.35 那会儿只复位 `dotView.hidden` 就够了（点没有内容）；
+    //    书签里**有数字**，只藏视图不清 text 的话，下一行是未读时
+    //    会先按上一行的位数排好宽度，再被新数字冲掉 —— 表现为"书签宽度闪一下"。
+    self.isUnread = NO;
+    self.unreadCount = 0;
+    self.pinView.hidden = YES;
+    self.pinLabel.text = nil;
     // 🔴 v0.0.48：★ 同理必须复位（否则上一行标了星、这一行规则没命中，星会串过来）。
     self.starred = NO;
     self.starLabel.hidden = YES;

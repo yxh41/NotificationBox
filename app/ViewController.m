@@ -67,6 +67,13 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // 🔴 存引用是为了**只刷新红点、不重建按钮** —— 重建会让 `contentSize` 重设，
 //    把图标栏的滚动位置重置到最左（选了第 10 个 App，点开一条就跳回开头）。
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *unreadDots;
+// v0.0.72：每个 App 在**当前列表里**还有几条未读（key = bundle），给 cell 的未读书签用。
+// 🔴 为什么从 `self.items` 数、而不是查库：书签和列表是**互相解释的两个数**
+//    （本项目栽过：红点按全库算、列表按时间窗查 ⇒ 用户看到「有红点 → 点进去暂无记录」）。
+//    `items` 就是眼睛看到的这一批，从它数出来的数永远不会和列表打架。
+// 🔴 为什么不在 cellForRow 里现算：那是 O(列表长度) × 每次滚动重排，
+//    而它只在「整表重查」和「点开一条变已读」这两处才会变 ⇒ 在这两处重建一次就够。
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *nbUnreadByBundle;
 // v0.0.38：「只看未读」时右侧多一个「全标已读」。
 // 🔴 为什么放在分段控件同一行、而不是导航栏：右边已经有「诊断」「清空」两个，
 //    再塞一个会把标题「消息盒子 (N)」挤没 —— iPhone 竖屏导航栏就只有那么宽。
@@ -163,6 +170,8 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)doExport;
 // v0.0.36：只刷新图标栏红点（不重建按钮，避免图标栏滚动位置被重置）
 - (void)refreshUnreadDots;
+// v0.0.72：重建"每个 App 在当前列表里还有几条未读"（未读书签的唯一数据源）。
+- (void)rebuildBundleUnread;
 // v0.0.37：全部 / 只看未读（自己的分段控件，替掉没渲染出来的系统 scope bar）
 - (void)onUnread:(UISegmentedControl *)seg;
 // v0.0.49：★ 只看标星开关；以及"有没有任何规则带 ★ 动作"（★ 视图为空时区分
@@ -1162,6 +1171,21 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     }
 }
 
+// v0.0.72：从 `self.items` 数出每个 App 的未读条数（不查库，见属性注释）。
+// 🔴 必须在 `self.items` **赋值之后**、`reloadData` 调 cellForRow **之前**调用；
+//    顺序反了的话第一屏拿到的是上一批的计数 —— 症状是"刚删完/刚标已读，书签上的数还是旧的"。
+- (void)rebuildBundleUnread {
+    NSMutableDictionary<NSString *, NSNumber *> *m = [NSMutableDictionary dictionary];
+    for (NSDictionary *d in self.items) {
+        // 0 = 未读（建表默认值），非 0 = 已读，和 cellForRow 的口径一致。
+        if ([d[@"read"] integerValue] != 0) continue;
+        NSString *bid = d[@"bundle"];
+        if (![bid isKindOfClass:[NSString class]] || !bid.length) continue;
+        m[bid] = @([m[bid] integerValue] + 1);
+    }
+    self.nbUnreadByBundle = m;
+}
+
 - (NSString *)shortName:(NSString *)bid {
     if ([bid isEqualToString:@"全部"]) return @"全部";
     NSArray *parts = [bid componentsSeparatedByString:@"."];
@@ -1215,6 +1239,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                                    unreadOnly:self.unreadOnly];
     // v0.0.48：给查询结果套关键词规则（标星 + 折叠）。**无规则时原样返回 ⇒ 行为零变化。**
     self.items = [self applyKeywordRulesToRows:queried];
+    // v0.0.72：未读书签的计数必须紧跟 `self.items` 重建（见方法注释里的顺序要求）。
+    [self rebuildBundleUnread];
     [self.table reloadData];
     [self updateEmptyView];
 
@@ -1775,10 +1801,14 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // （cell 内部是"先存后渲"，顺序无关）。传 nil 时不高亮 —— 正常浏览不该有黄底。
     [c setHighlightQuery:self.searchText];
     [c setTimeText:[fmt stringFromDate:date]];
-    // v0.0.35：`read` 字段数据层早就有了（`queryWithBundle:` 的 SELECT 里一直带着），
+    // v0.0.72：`read` 字段数据层早就有了（`queryWithBundle:` 的 SELECT 里一直带着），
     // 只是 cell 从来没用过 ⇒ `markRead:` 写了等于没写，用户看不出哪条看过。
     // 0 = 未读（建表默认值），非 0 = 已读。
-    [c setUnread:([d[@"read"] integerValue] == 0)];
+    // 🔴 v0.0.72：从「左侧蓝点」改成「右上角带数字的书签」，所以要把**该 App 在
+    //    当前列表里的未读条数**一起传下去。数取自 `nbUnreadByBundle`（与列表同口径），
+    //    ⛔ 不许在这里查库（每次 cellForRow 都查 = 滚动时几十次 SQL）。
+    [c setUnread:([d[@"read"] integerValue] == 0)
+           count:[self.nbUnreadByBundle[bid] integerValue]];
     // v0.0.48：关键词"标星"动作（★ 展示时派生，nil ⇒ NO ⇒ 不显示，无规则时走这条）。
     [c setStarred:[d[@"nbStar"] boolValue]];
     return c;
@@ -1805,7 +1835,24 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         [self reloadKeepingOffset];
     } else if ([d isKindOfClass:[NSMutableDictionary class]]) {
         [(NSMutableDictionary *)d setObject:@1 forKey:@"read"];
-        [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+        // v0.0.72：这一步只改一行、**不重查库**，所以未读计数必须在这里手动重建，
+        // 否则整屏的未读书签会停在"标已读之前"的数 —— 而那条记录的书签明明已经消失了，
+        // 剩下的同 App 卡片却还写着同一个数（同一个界面里两个数互相矛盾）。
+        // 🔴 顺序：改内存 → 重建计数 → reloadRows（cellForRow 读的是重建后的字典）。
+        [self rebuildBundleUnread];
+        // 🔴 v0.0.72：书签上的数是**该 App** 的未读条数 ⇒ 同一个 App 的**其它可见行**
+        //    也得一起刷，否则读掉一条之后，屏幕上同 App 的另外几张卡片还写着旧数。
+        //    仍然用 `reloadRows` 而不是整表 `reloadData`：**数量没变**，
+        //    它只重排这几行、滚动位置不动（"数量变不变"才是这个 API 的判据，见删除场景）。
+        NSString *bid = d[@"bundle"];
+        NSMutableArray<NSIndexPath *> *paths = [NSMutableArray arrayWithObject:indexPath];
+        for (NSIndexPath *ip in [tableView indexPathsForVisibleRows]) {
+            if (ip.section != indexPath.section || ip.row == indexPath.row) continue;
+            if (ip.row >= (NSInteger)self.items.count) continue;   // 越界就当没有这一行
+            NSString *other = self.items[ip.row][@"bundle"];
+            if ([other isEqualToString:bid]) [paths addObject:ip];
+        }
+        [tableView reloadRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationNone];
         // v0.0.41：红点**和顶部提示条**一起重算。
         // 🔴 原来这里只调了 `refreshUnreadDots` —— 红点跟着变了，提示条没变。
         //    "这行刚变已读"影响的正是**两个**派生量：该 App 的未读数（红点）、

@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.71"
+#define NB_VER_STR @"0.0.72"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -476,6 +476,17 @@ static NSTimeInterval gNCBusyAt = 0;   // 🔴 v0.0.65：闸门加上时间戳�
 static BOOL gNCUseQueuePath = NO;
 static int  gBBWithdrawOk = 0;    // ⓪ 成功清掉账本的次数（给观测 hook 做时间参照）
 static int  gBBToNCSeen   = 0;    // 系统自己把「BB 撤回」传给 NC 的次数（观测 hook 累加）
+// ---------- v0.0.72：新刀「按 bulletinID 直接摘」的两个计数 ----------
+// 🔴 为什么换这把刀（全量 dump 重挖的结论，`nc_diag(11).txt` 前半段 253 个方法）：
+//    已试的 31 条里失败原因只有四类，而 `removeBulletinID:…` 这一族**一次绕开其中两个**：
+//      ① 不需要 destination 实例（`destination:requestsClearing…` 那个死结）；
+//      ② 锚点精确到 **bulletinID（个体）**，不是 section（`BB live=2` 时按 section 匹配会撤错条）。
+// 🔴 计数分开记，是因为它们回答的是**两个不同的问题**：
+//    `gBBRemoveByIDOk` = 刀有没有真的把账本摘掉；
+//    `gBBSendRemoveSeen` = 摘掉之后**有没有广播给 observer（NC）** —— 界面变不变看这一个。
+//    两者都涨而界面不动 ⇒ 问题在 NC 那一侧；只有前者涨 ⇒ 刀只改了账本，还是老毛病。
+static int  gBBRemoveByIDOk = 0;  // 新刀返回且**读回确认已删**的次数
+static int  gBBSendRemoveSeen = 0; // 观测：BBServer - _sendRemoveBulletin:toFeeds:shouldSync: 被调次数
 // ⛔ v0.0.67：`gNCGlobalTried` / `gGQWithdrawOk` 已随旧 [GQ] 通道一起删除 ——
 //    那条通道只会调 `withdrawNotificationWithRequest:`，而 v0.0.66 真机证明
 //    系统自己清通知时 **withdraw 一次都不走**（观测计数 = 0）。
@@ -1423,6 +1434,9 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         __block NSInteger winStep  = 0;
         __block BOOL      bbWithdrew = NO;   // ⓪ 官方撤回之后 BB 里是不是没了
         __block BOOL      bbHadAtStart = NO; // 一开始 BB 里到底有没有（⓪ 会改写 bbIn，得单独记）
+        // v0.0.72：新刀「按 bulletinID 直接摘」有没有把本条摘掉（**读回确认**，不是看返回值——
+        // 这几个方法全返回 void，"没抛异常"根本不等于"删掉了"）。
+        __block BOOL      bbRemovedByID = NO;
 
         // ---------- ③④ 删 BB 账本（最后做，且重新取对象）+ 拼结论 ----------
         void (^bbRemove)(void) = ^{
@@ -1472,6 +1486,12 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 verdict = @"BB 本来就没有；NC 侧见上面的 [NC] 行";
             } else if (bbAfter) {
                 verdict = @"BB 仍在（删不掉）";
+            } else if (bbRemovedByID) {
+                // v0.0.72：新刀**读回确认**摘掉了。判据分两问，日志里两个数都要看：
+                //   `_sendRemove` 涨了 ⇒ 刀走到了"广播给 observer"那一跳；
+                //   `BB→NC` 也涨了  ⇒ NC 真的收到了 ⇒ 界面该变；
+                //   两个都不涨 ⇒ 这把刀和 ⓪ 一样，只改账本。
+                verdict = @"✅ ⑤ 新刀 removeBulletinID 摘掉了本条（读回确认）⇒ 界面看 _sendRemove / BB→NC 两个观测计数";
             } else if (bbWithdrew && winStep == 2) {
                 verdict = @"✅ ⓪ 官方撤回清掉 BB + ② NC withdraw 也跑了 ⇒ 界面应会变（本轮最强态）";
             } else if (bbWithdrew) {
@@ -1496,8 +1516,9 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                        (long)ncCnt2, (long)ncReqCnt2,
                        ncHadUUID ? @"有" : @"无", ncHadReq ? @"有" : @"无",
                        gBBToNCSeen);
-            NBDiagStep(@"  观测计数: 目的地请求清除=%d / dispatcher 撤回=%d / source 请求清除=%d\n  ⇒ %@\n",
-                       gObsDispatcherClear, gObsDispatcherWithdraw, gObsSrcClear, verdict);
+            NBDiagStep(@"  观测计数: 目的地请求清除=%d / dispatcher 撤回=%d / source 请求清除=%d / ⑤新刀成功=%d / _sendRemove=%d\n  ⇒ %@\n",
+                       gObsDispatcherClear, gObsDispatcherWithdraw, gObsSrcClear,
+                       gBBRemoveByIDOk, gBBSendRemoveSeen, verdict);
             NBLog(@"=== [NC-CLEAR] 删后 BB含=%@ ⇒ %@", bbAfter ? @"是" : @"否", verdict);
         };
 
@@ -1564,6 +1585,69 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             //    但 `BB live` 在调 NC **之前**就已经 `含本条=否` —— 砖是我自己先拆掉的。
             //    ⇒ 所以这里**不再执行**，只定义；由 `[账本]` 那一跳在 NC 返回后调用。
             void (^bbCleanup)(void) = ^{
+            // ---------- ⑤ v0.0.72 新刀：按 **bulletinID** 直接摘（⓪ 之前先试）----------
+            // 🔴 为什么排在 ⓪ 之前：⓪ 是"官方撤回"，它只改账本、不广播（v0.0.65 已证
+            //    `BB→NC` 计数不涨）。新刀如果真能驱动界面，就**不该**先被 ⓪ 把场面弄乱；
+            //    而且它有**读回确认**，摘不掉也不会误导后面的步骤（bbIn 保持真值）。
+            // 🔴 两条候选的差别只有一个：K2 多一个 `inFeed:` 参数（ENC 是 `Q`，
+            //    也就是 unsigned long long 的**位掩码**，不是 BOOL）。
+            //    我们不知道该给哪一位 ⇒ 先给 0（"不在任何 feed"），摘不掉再试 1。
+            //    ⛔ 这不算"同轮押两个新挂点"：两条都是**同族、同一个锚点（cid）**，
+            //    而且每条都立刻读回 BB 账本，日志里能一眼看出是哪一条起了作用。
+            if (bullet && bbIn && cid.length) {
+                if ([gBBServer respondsToSelector:@selector(removeBulletinID:fromNoticesSection:)]) {
+                    NBDiagStep(@"  ⑤K1 将要调用 removeBulletinID:%@ fromNoticesSection:%@\n", cid, bundleC);
+                    @try {
+                        [gBBServer removeBulletinID:cid fromNoticesSection:bundleC];
+                        BOOL f = NO;
+                        NSInteger n = NBLiveScan(gBBServer, bundleC, cid, &f);
+                        NBDiagStep(@"  ⑤K1 已返回 ⇒ BB live=%ld 含本条=%@（此刻 _sendRemove 累计 %d 次）\n",
+                                   (long)n, f ? @"是" : @"否", gBBSendRemoveSeen);
+                        if (!f) { bbIn = NO; bbRemovedByID = YES; gBBRemoveByIDOk++; }
+                    } @catch (NSException *e) {
+                        NBDiagStep(@"  ⑤K1 抛: %@\n", e.reason);
+                    }
+                } else {
+                    NBDiagStep(@"  ⑤K1 跳过（removeBulletinID:fromNoticesSection: 不存在）\n");
+                }
+            }
+            if (bullet && bbIn && cid.length) {
+                if ([gBBServer respondsToSelector:@selector(removeBulletinID:fromSection:inFeed:)]) {
+                    NBDiagStep(@"  ⑤K2 将要调用 removeBulletinID:%@ fromSection:%@ inFeed:0\n", cid, bundleC);
+                    @try {
+                        [gBBServer removeBulletinID:cid fromSection:bundleC inFeed:0];
+                        BOOL f = NO;
+                        NSInteger n = NBLiveScan(gBBServer, bundleC, cid, &f);
+                        NBDiagStep(@"  ⑤K2(inFeed:0) 已返回 ⇒ BB live=%ld 含本条=%@（此刻 _sendRemove 累计 %d 次）\n",
+                                   (long)n, f ? @"是" : @"否", gBBSendRemoveSeen);
+                        if (!f) { bbIn = NO; bbRemovedByID = YES; gBBRemoveByIDOk++; }
+                    } @catch (NSException *e) {
+                        NBDiagStep(@"  ⑤K2 抛: %@\n", e.reason);
+                    }
+                } else {
+                    NBDiagStep(@"  ⑤K2 跳过（removeBulletinID:fromSection:inFeed: 不存在）\n");
+                }
+            }
+            if (bullet && bbIn && cid.length
+                && [gBBServer respondsToSelector:@selector(removeBulletinID:fromSection:inFeed:)]) {
+                NBDiagStep(@"  ⑤K2b 将要调用 removeBulletinID:%@ fromSection:%@ inFeed:1（前两种都没摘掉）\n",
+                           cid, bundleC);
+                @try {
+                    [gBBServer removeBulletinID:cid fromSection:bundleC inFeed:1];
+                    BOOL f = NO;
+                    NSInteger n = NBLiveScan(gBBServer, bundleC, cid, &f);
+                    NBDiagStep(@"  ⑤K2b(inFeed:1) 已返回 ⇒ BB live=%ld 含本条=%@（此刻 _sendRemove 累计 %d 次）\n",
+                               (long)n, f ? @"是" : @"否", gBBSendRemoveSeen);
+                    if (!f) { bbIn = NO; bbRemovedByID = YES; gBBRemoveByIDOk++; }
+                } @catch (NSException *e) {
+                    NBDiagStep(@"  ⑤K2b 抛: %@\n", e.reason);
+                }
+            }
+            if (bbRemovedByID) {
+                NBDiagStep(@"  ⑤ 小结：新刀已把本条从 BB 账本摘掉 ⇒ 后面的 ⓪/③ 会自动跳过\n");
+            } else if (bullet && bbHadAtStart) {
+                NBDiagStep(@"  ⑤ 小结：新刀**没摘掉**（三条候选都试过）⇒ 退回 ⓪ 官方撤回\n");
+            }
             if (bullet && bbIn) {
                 NSString *rID = recID.length ? recID : cid;
                 if (rID.length
@@ -1601,7 +1685,11 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 if (!f0) { bbWithdrew = YES; gBBWithdrawOk++; }
                 NBDiagStep(@"  ⓪ 之后 BB live=%ld 含本条=%@\n", (long)n0, f0 ? @"是" : @"否");
             } else {
-                NBDiagStep(@"  ⓪ 跳过（BB 里本来就没有对象）\n");
+                // 🔴 v0.0.72：这句话原来只写"本来就没有"。新刀插在前面之后，
+                //    走到这个 else 的**绝大多数情况**是"刚被 ⑤ 摘掉了"——
+                //    照旧写会让人以为这一条根本没进过 BB（假绿第 ⑧ 型：否定式恒真）。
+                NBDiagStep(@"  ⓪ 跳过（%@）\n",
+                           bbRemovedByID ? @"刚被 ⑤ 新刀摘掉，无需官方撤回" : @"BB 里本来就没有对象");
             }
             // 清完账本后打结论（bbRemove 内部会做 ③ / ④ / 读回 / verdict）
             bbRemove();
@@ -2140,6 +2228,34 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 %end
 
 
+// ---------- v0.0.72：观测「把删除广播给 observer（NC）」的那一跳 ----------
+// 🔴 为什么非要这一条：v0.0.72 的新刀（`removeBulletinID:…`）和 ⓪（`withdrawBulletinRequests…`）
+//    外形很像 —— 都是"把 BB 账本里那一条拿掉"。两者的**唯一实质区别**在于
+//    **拿掉之后有没有通知观察者**。没有这一跳，界面永远不动，而账本早就干净了
+//    （32 条老刀的失败原因全收敛到这一点）。
+// 🔴 所以这条 hook 是**只读观测**：计数 + 少量日志，原样透传，绝不改参数、绝不吞调用。
+// 🔴 日志必须**带上限**（≤20 条）：NBDiagStep 是**无条件追加**文件的，
+//    而这个方法在整个 SpringBoard 生命周期里会被系统自己调很多次，
+//    不限量就等于拿诊断文件刷屏（并且把真正的删除记录挤出日志窗口）。
+%group GOBSREM
+%hook BBServer
+- (void)_sendRemoveBulletin:(id)bulletin toFeeds:(unsigned long long)feeds shouldSync:(BOOL)sync {
+    gBBSendRemoveSeen++;
+    if (gBBSendRemoveSeen <= 20) {
+        // 🔴 只读**已知安全**的 KVC 键。⛔ 绝不对 bulletin 调 description
+        //    （v0.0.63 真机 9/9 全灭就是因为它会摸内部锁）。
+        NBDiagStep(@"  [OBS-rem] _sendRemoveBulletin 第 %d 次 feeds=%llu sync=%d section=%@ recordID=%@ bulletinID=%@（此时 ⑤ 新刀成功 %d 次）\n",
+                   gBBSendRemoveSeen, feeds, (int)sync,
+                   NBClip(NBKVCStr(bulletin, @"sectionID"), 30),
+                   NBClip(NBKVCStr(bulletin, @"recordID"), 40),
+                   NBClip(NBKVCStr(bulletin, @"bulletinID"), 40),
+                   gBBRemoveByIDOk);
+    }
+    %orig;
+}
+%end
+%end
+
 // 🔴 v0.0.25：SBNCSoundController 的**前向声明**。
 //
 // 为什么写它：Logos 在 %hook 里生成的函数签名，self 的类型取决于 Logos 版本/配置
@@ -2565,9 +2681,20 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h1 = [names containsObject:@"publishBulletin:destinations:"];
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
+    // ---------- v0.0.72：新刀与它的观测点 ----------
+    // 🔴 三条都先查名字再决定挂/调：
+    //    `⑤K1` / `⑤K2` 是**要调用的刀**（不是 hook），查不到就不调（respondsToSelector 还会再兜一次）；
+    //    `_sendRemoveBulletin:toFeeds:shouldSync:` 是**要 hook 的观测点**。
+    // 🔴 为什么要在这里就把结果打出来：这三条名字来自 dump（静态），
+    //    而"dump 里有 ≠ 这台机器上跑得通"是本项目反复踩到的（手册有、本机没有的类已经四个）。
+    //    开机日志能留下的信息有限，所以把结果编进那一行 NBLog 里，不额外占行。
+    BOOL h4 = [names containsObject:@"removeBulletinID:fromNoticesSection:"];
+    BOOL h5 = [names containsObject:@"removeBulletinID:fromSection:inFeed:"];
+    BOOL h6 = [names containsObject:@"_sendRemoveBulletin:toFeeds:shouldSync:"];
 
-    NBLog(@"=== [%@] NotifyBox v%@ · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
-          NBProc(), NB_VER_STR, cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
+    NBLog(@"=== [%@] NotifyBox v%@ · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ · 新刀K1=%@ K2=%@ 广播观测=%@ ===",
+          NBProc(), NB_VER_STR, cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO",
+          h4 ? @"YES" : @"NO", h5 ? @"YES" : @"NO", h6 ? @"YES" : @"NO");
 
     // v0.0.55：删掉 v0.0.53 在这里（%ctor）打的那行方法清单。
     //   🔴 理由：%ctor 是**开机**那一刻，日志窗口（≈最后 50 行）早就把它滚掉了 ——
@@ -2576,6 +2703,8 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     if (h1) { NBLog(@"--> 挂 GPB (publishBulletin:destinations:)");  %init(GPB); }
     if (h2) { NBLog(@"--> 挂 GPBR (publishBulletinRequest:destinations:)"); %init(GPBR); }
     if (h3) { NBLog(@"--> 挂 GPBRS (_publishBulletinRequest:forSectionID:forDestinations:)"); %init(GPBRS); }
+    // 🔴 v0.0.72：只挂"广播观测"这一条。两条新刀是**调用**、不是 hook，不需要 %init。
+    if (h6) { NBLog(@"--> 挂 GOBSREM (_sendRemoveBulletin:toFeeds:shouldSync:)"); %init(GOBSREM); }
 
     // ---------- v0.0.25：换提示音的新挂点 ----------
     //
