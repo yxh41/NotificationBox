@@ -159,7 +159,10 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     self.title = @"设置";
     self.view.backgroundColor = NBPageBG();
     // 本页是表单、不是内容列表 ⇒ 不跟首页抢大标题
-    self.navigationItem.largeTitleDisplayMode = UILargeTitleDisplayModeNever;
+    // 🔴 常量全名是 `UINavigationItemLargeTitleDisplayModeNever`，不是
+    //    `UILargeTitleDisplayModeNever`（少了 `UINavigationItem` 前缀，编译期直接报
+    //    "use of undeclared identifier"，而这类错**只有真编译才能发现**）。
+    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
 
     // v0.0.71：左侧由文字「关闭」改成 ‹ 返回箭头（它本来就是 push 进来的，
     //    用"关闭"会让人以为这是个弹窗；而且文字按钮在窄屏上会挤掉中间的标题）。
@@ -924,7 +927,7 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
         @"• 顺带修好一个会丢数据的问题：数据库锁。以前盒子 App 和桌面同时写库时，\n"
         @"  SQLite 直接返回 busy（日志里 INSERT 失败 rc=5），那条通知就静默丢了；\n"
         @"  现在会最多等 2 秒再放弃。\n"
-        @"• 存储位置：\n  /var/mobile/Library/NotifyBox/settings.plist";;
+        @"• 存储位置：\n  /var/mobile/Library/NotifyBox/settings.plist";
     return s;
 }
 

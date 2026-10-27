@@ -234,8 +234,9 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
     [super viewDidLoad];
     self.title = @"消息盒子";
     // v0.0.70：卡片化之后，底色必须是**分组灰**（不是 systemBackground 的白）。
-    //    卡片用 secondarySystemBackground（浅色模式下是纯白）压在灰底上 ⇒ 才有层次；
-    //    两者都用 systemBackground 的话卡片会"消失"，只剩一点圆角阴影。
+    // 🔴 v0.0.71 更正：卡片用的是 `secondarySystemGroupedBackground`（白），
+    //    不是 `secondarySystemBackground` —— 浅色模式下后者与分组灰**同为 #F2F2F7**，
+    //    卡片会"消失"。这一对必须一起换（见 NBTheme.h 顶部的颜色配对纪律）。
     self.view.backgroundColor = NBPageBG();
     // 在同一日志里打一条「App 活着」，用来和 tweak 的日志对照（见 NotifyStore.h 注释）
     [NotifyStore markAppAlive];
