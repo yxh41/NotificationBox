@@ -6308,3 +6308,97 @@ deb 1,093,438 B  md5 9598c099b44de4c30dd91c67f2caf5a0
 v0.0.59 已经在这个队列里调过 `withdrawNotificationWithRequest:`（没卡死），
 所以风险不高；但如果装上后出现**桌面卡住 / 频繁 respring**，
 直接回退 v0.0.59（`_removeBulletin:` 那步确定不卡，只是界面不动）。
+
+## v0.0.62 · 卡屏注销：跨子系统调用必须回到它自己的队列
+
+v0.0.61 装上后用户回传两件事：
+
+> **「还是没效果，而且会造成卡屏一段时间后注销」**
+
+### 先查痕迹，别先查结论
+
+```
+nc_diag(3).txt 里 grep：
+  'NC 映射' = 0    'observer=' = 0    'BB 已删' = 0    'v0.0.61' = 0
+记录条数 = 14，最后一条是 08:48，措辞还是 v0.0.59 的三态
+```
+
+**一条 v0.0.61 的记录都没有。** 而我的 `NBDiagAppend(rec)` 写在整段流程**末尾**
+⇒ 卡死时一行都没落盘 ⇒ 故障发生了、却什么都看不到。
+
+**这比 bug 本身更坏。** 从这一版起定成纪律：
+
+> **写前日志**。任何"可能把进程搞死"的路径，诊断必须在**动手之前**逐步落盘，
+> 不许"跑完再一次性写"。
+
+### 根因（结构性，不用猜）
+
+v0.0.61 新加的三个 NC 动作，全都跑在 **BBServer 的队列上**：
+
+| 动作 | 子系统 |
+|---|---|
+| `NBScanNC` → `[source bulletinsToUUIDs]` | NC |
+| `[source observer:obs removeBulletin:bullet]` | NC |
+| `[dispatcher withdrawNotificationWithRequest:req]` | NC |
+
+NC 侧的锁与 BB 侧锁序相反 ⇒ 互相等待 ⇒ 主线程被拖住 ⇒ 看门狗杀进程 ⇒ 「卡一会儿然后注销」。
+
+🔴 **v0.0.59 为什么不卡**：它的早停逻辑让这些 NC 调用**一次都没执行**。
+v0.0.61 拆掉早停，就把一直藏着的地雷踩响了。**「以前不崩」不等于「那行代码没问题」。**
+
+### 🔴 新纪律
+
+> **跨子系统的调用，必须回到那个子系统自己的队列上执行。**
+>
+> 判据很简单：`initWithDispatcher:observer:queue:` 把 `queue` 递给你，
+> 就是系统在说「以后要跟我说话，请在**这条**队列上说」。
+> 拿到队列却不用、自己找一条队列调，等于自造死锁。
+> **抓不到那条队列 ⇒ 宁可不调**，也不许在主链路队列上碰它。
+
+### v0.0.62 的具体做法（API 一个没换，只改队列和时机）
+
+1. 捕获 `gNCSourceQueue`（hook `initWithDispatcher:observer:queue:` 的第 3 个参数）。
+2. **取消所有 `dispatch_sync`**，三段 `dispatch_async`：
+
+```
+BB 队列：选 cid → _bulletinsForIDs: 取 bulletin → 量 BB
+   └─ NC 队列：量 NC → ① observer:removeBulletin: → ② withdraw → 复量 NC
+         └─ BB 队列：③ 重新取对象 → _removeBulletin → ④ _clearBulletinIDs → 拼结论
+```
+
+   **谁的队列测谁的东西**：BB 的量在 BB 队列上做，NC 的量在 NC 队列上做。
+3. `NBDiagStep()`：每步做完立刻 append 一行。
+4. 三个「不调」的护栏，每条都写进 diag：`gNCSuppressed` / 没抓到 NC 队列 / `ncq == gBBServerQueue`。
+
+### 卡死自恢复（复用「朗读自愈」那套思路）
+
+| 文件 | 作用 |
+|---|---|
+| `.nc_pending` | 进 NC 路径前写，两步跑完立刻删。**留到下次开机 = 上一次卡死了** |
+| `.nc_off` | 开机看到 `.nc_pending` 还在 ⇒ 建这个 ⇒ **永久禁用 NC 路径**（只删 BB 账本：不卡，但界面不变）。删掉它 + respring 可重新尝试 |
+
+设计取向写在最前面：**先保证手机能用，再谈功能。**
+一个会把桌面卡死的功能，比不做这个功能更糟。
+
+### 包内对拍（v0.0.61 → v0.0.62，CI #118）
+
+```
+deb 1,095,002 B  md5 90b1978bbc53f370c33027183c4bb576  control Version: 0.0.62
+dylib 212,000 B（0.0.61 = 211,824，delta +176）
+
+① 新增锚点（旧=0 且 新>0）  10/10
+   NotifyBox v0.0.62 / v0.0.62 请求 / v0.0.62 async / [NC队列] 删前 NC 映射=
+   [guard] 已写 .nc_pending / [guard] NC 两步跑完 / ncQueue=%@ / .nc_pending / .nc_off / 上次 NC 路径卡死过
+② 共有锚点  4/4   observer:removeBulletin: / withdrawNotificationWithRequest: /
+                  _removeBulletin:shouldSync: / BB 已删、NC 仍在
+③ 反向对照  2/2   NotifyBox v0.0.61 / ① 跳过（没取到有效 bulletin 对象）
+不合格 0
+```
+
+### 这一版的正确验收顺序
+
+1. **还会不会卡屏 / 注销** —— 比"删没删掉"优先。
+2. 没卡 ⇒ 看 `nc_diag.txt` 新增段里的 `①` / `②` 两行与 `删后 BB含=? NC含=?`，
+   **只有 `NC含=否` 才算界面会变**。
+3. **又卡了** ⇒ 手机会自己写下 `.nc_off`，下次开桌面不再卡（不会反复）。
+   把 `nc_diag.txt` 发来即可 —— 这次一定能在最后一行看到死在哪一步。
