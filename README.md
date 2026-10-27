@@ -6402,3 +6402,67 @@ dylib 212,000 B（0.0.61 = 211,824，delta +176）
    **只有 `NC含=否` 才算界面会变**。
 3. **又卡了** ⇒ 手机会自己写下 `.nc_off`，下次开桌面不再卡（不会反复）。
    把 `nc_diag.txt` 发来即可 —— 这次一定能在最后一行看到死在哪一步。
+
+## v0.0.63 · 不造 request、四种比法全试、映射形态 dump 出来
+
+v0.0.62 真机回传（`nc_diag(4).txt`）两条记录，四行关键日志：
+
+```
+环境 source=NCBulletinNotificationSource dispatcher=NCNotificationDispatcher ncQueue=有 抑制=否
+[guard] 已写 .nc_pending，进 NC 队列
+[NC队列] 删前 NC 映射=1062 含本条=否
+① NC observer:removeBulletin ⇒ NC 映射=1061 含本条=否
+uuid=(无) req=有(工厂新造)      ← 第一条记录到此为止
+```
+
+第二条记录只有到 `[guard]` 就没了 —— **连 `[NC队列] 删前` 都没打印**。
+
+### 三条结论
+
+**① 卡屏/注销修好了。** NC 调用搬回 NC 自己的队列之后，流程跑到 ① 并正常返回（1062→1061）。
+「**跨子系统调用必须回到它自己的队列**」这条纪律成立。
+
+**② 新的卡死点是 ② `withdrawNotificationWithRequest:`，元凶是"工厂新造的假 request"。**
+铁证就是第二条记录：它排在死块后面，**永远轮不到** ⇒ 整条 NC 队列被上一条堵死。
+
+> 🔴 造一个系统不认识的 request 去撤回 = **把别人的队列卡死**。
+> 「照着类工厂造一个对象」看着最保险，实际是最危险的做法之一。
+
+**③ 映射匹配不上。** 1062 条里按 key 比对前后都是「否」⇒ `uuid=(无)`。
+而 `1062→1061` 少的那条**未必是我们这条** ⇒ 「少一条」当判据是假的。
+
+### v0.0.63 的改法
+
+| 改动 | 为什么 |
+|---|---|
+| `NBMakeNCRequest` **恒返回 nil** | 只接受真 request；没有就跳过 ②。函数留着只为留注释 |
+| ② 前加 `sectionIdentifier` 校验 | 真 request 也可能不属于这个 App，映射匹配错就会误删别人的通知 |
+| `NCMatchEntry` **四种比法全试** | ① key 是字符串 ② key 的 `bulletinID`/`publisherBulletinID`/`recordID` ③ value 是字符串（方向相反）④ key 的 description 包含 |
+| `NBScanNC2` 同时读**两张**映射 | `bulletinsToUUIDs` 条数 + `uuidsToRequests` 条数 + 是否命中 + uuid，diag 多记一个 `req数=` |
+| `NBDumpNCMapsOnce` | 一次性 dump 两张映射前几对的**类名+描述** ⇒ 下一版不用再猜 key 是什么 |
+| 护栏文件写**版本号** | 只有同一版本卡死才继续禁用 ⇒ **每个新版本自动获得一次重试机会** |
+
+最后一条是修上一版的设计缺陷：v0.0.62 卡死留下的 `.nc_off` 会一直压着新版，
+**明明修好了也测不到**。
+
+### 包内对拍（v0.0.62 → v0.0.63，CI #119）
+
+```
+deb 1,096,232 B  md5 b07d5310e4e30eb8ae2c02d1a164bf47  control Version: 0.0.63
+① 新增锚点（旧=0 且 新>0）  11/11
+② 共有锚点  4/4
+③ 反向对照  2/2   NotifyBox v0.0.62 / ② 跳过（拿不到 request）
+不合格 0
+```
+
+🔴 **dylib 212,000 B，与 v0.0.62 分毫不差（delta=0）**，而源码改了 4.4 KB。
+体积这个指标第 N 次被证伪 —— 判"编进去没"只认串 / 选择器 / md5。
+
+### 下一次要看的三个位置
+
+1. `[map] bulletinsToUUIDs 共 … 前 3 对：k[…]=…  v[…]=…` —— **key 到底是什么形态**。
+   看完就能定死匹配规则，不用再试四种。
+2. `② 候选 request=有/无`：
+   - 还是 `无` ⇒ 真 request 拿不到，得换路（从 dispatcher 的 `destinationsRegistry` 里取）；
+   - `有` ⇒ 看 `② NC withdraw` 那行有没有让 `含本条` 变「否」。
+3. `req数` 前后变化 —— 判断我们这条到底动没动（防「少一条」假绿）。
