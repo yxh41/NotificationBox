@@ -60,6 +60,24 @@ if not TOK:
 # 🔴 直连 api.github.com（显式不带 ProxyHandler）：代理对 api 偶发 502。
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+# 🔴🔴 起手先验 https 能力 —— 这条报错**长得完全不像网络问题**，实测白丢一轮：
+#   本机默认 `python`（.workbuddy/binaries/python/versions/3.13.12.old.10788）
+#   的 `_ssl` DLL 加载失败（`ImportError: DLL load failed while importing _ssl`），
+#   于是 urllib **静默地不注册 HTTPSHandler**，等到真正发请求时才抛
+#   `URLError('unknown url type: https')` —— 看着像 URL 拼错，其实是这个解释器残废。
+#   同一台机器上 versions/3.13.12（无 .old 后缀）是好的 ⇒ 判据 = 换解释器，不是改代码。
+if not any(h.__class__.__name__ == "HTTPSHandler" for h in OPENER.handlers):
+    try:
+        import ssl as _ssl_probe  # noqa: F401
+        _why = "ssl 可导入，但 urllib 没注册 HTTPSHandler"
+    except Exception as _e:
+        _why = "import ssl 失败：%r" % (_e,)
+    print("✗ 这个 python 用不了 https（%s）" % _why)
+    print("  典型症状：请求时报 URLError('unknown url type: https')，看着像 URL 错了。")
+    print("  本机可用解释器：C:/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.exe")
+    print("  当前解释器  ：%s" % sys.executable)
+    sys.exit(3)
+
 
 def scrub(s):
     if not s:
