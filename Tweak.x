@@ -9,6 +9,10 @@
 //      **不许早停**。NC 侧三条路：`observer:removeBulletin:`（BB 撤回广播的 NC 入口）、
 //      `withdrawNotificationWithRequest:`（用 source 自己缓存的**真 request**，不是我造的）、
 //      以及 `_clearBulletinIDs:` 补刀。
+//   🔴 执行顺序也改了：**先 NC 两步、再删 BB 账本**。因为 `observer:removeBulletin:`
+//      要拿一个**还有效**的 bulletin 对象；先把账本删了再传进去，等于传个已失效对象
+//      （v0.0.58 就是排在这个位置之后，很可能也是它一次都没生效的原因之一）。
+//      删账本那步现在会**重新取一次对象**，避免用旧指针。
 //   ✅ v0.0.58 已知有效的那一步保留：`_bulletinsForIDs:` 取真对象（🔴 返回 **NSSet**，不能下标）
 //      再 `_removeBulletin:shouldSync:NO` —— 它只保证「账本删掉」，不保证「界面消失」。
 //   🔴 本版唯一的验收判据：`删后 NC 含本条=否`。只有这个「否」才代表界面上会变；
@@ -680,44 +684,40 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                      NBKVCStr(bullet, @"publisherBulletinID")];
                 }
 
-                // ---------- 第 1 步：BB 账本删（v0.0.58 真机已证有效）----------
-                if (bbIn && bullet && [gBBServer respondsToSelector:@selector(_removeBulletin:shouldSync:)]) {
-                    @try {
-                        [gBBServer _removeBulletin:bullet shouldSync:NO];
-                        BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
-                        if (!f && !winStep) winStep = 1;
-                        [rec appendFormat:@"  ① BB _removeBulletin ⇒ BB live=%ld 含本条=%@\n",
-                         (long)n, f ? @"是" : @"否"];
-                    } @catch (NSException *e) {
-                        [rec appendFormat:@"  ① BB _removeBulletin 抛: %@\n", e.reason];
-                    }
-                } else if (!bbIn) {
-                    [rec appendString:@"  ① 跳过（BB 里本来就没有）\n"];
-                }
-
-                // ---------- 第 2 步：直接替 BB 走一遍「撤回观察者广播」----------
+                // ---------- 第 1 步：NC 侧先收撤回广播（**必须排在删账本之前**）----------
                 //   🔴 `NCBulletinNotificationSource - observer:removeBulletin:` 就是 BB 广播撤回时
-                //      NC 侧真正的入口。我们手动 `_removeBulletin:` 未必触发广播 ⇒ 这里自己走一遍。
-                //      这一步不需要 dispatcher/request，只要 source + bulletin 对象。
-                if (bullet && gNCSource
+                //      NC 侧真正的入口。我们手动 `_removeBulletin:` 未必触发那条广播 ⇒ 这里自己走一遍。
+                //   🔴 **顺序不能反**：这一步要拿一个**还有效**的 bulletin 对象。若先把 BB 账本删了，
+                //      传进去的就是已失效对象 —— 要么抛、要么静默无效（v0.0.58 把它排在删账本之后，
+                //      大概率就是这个原因一次都没生效）。
+                //   这一步不需要 dispatcher/request，只要有 source + observer + bulletin。
+                if (bullet && ncIn && gNCSource
                     && [gNCSource respondsToSelector:@selector(observer:removeBulletin:)]) {
+                    id obs = nil;
                     @try {
-                        id obs = nil;
-                        @try { obs = [gNCSource observer]; } @catch (__unused NSException *e) { }
-                        [gNCSource observer:obs removeBulletin:bullet];
-                        BOOL f = NO; NSInteger n = NBScanNC(gNCSource, cid, &f);
-                        if (!f && !winStep) winStep = 2;
-                        [rec appendFormat:@"  ② NC observer:removeBulletin: ⇒ NC 映射=%ld 含本条=%@\n",
-                         (long)n, f ? @"是" : @"否"];
-                        NBLog(@"=== [NC-CLEAR] ② NC observer:removeBulletin ⇒ NC含=%@", f ? @"是" : @"否");
-                    } @catch (NSException *e) {
-                        [rec appendFormat:@"  ② NC observer:removeBulletin 抛: %@\n", e.reason];
+                        if ([gNCSource respondsToSelector:@selector(observer)]) obs = [gNCSource observer];
+                    } @catch (__unused NSException *e) { }
+                    if (!obs) {
+                        [rec appendString:@"  ① 跳过（source.observer 为 nil）\n"];
+                    } else {
+                        @try {
+                            [gNCSource observer:obs removeBulletin:bullet];
+                            BOOL f = NO; NSInteger n = NBScanNC(gNCSource, cid, &f);
+                            if (!f && !winStep) winStep = 1;
+                            [rec appendFormat:@"  ① NC observer:removeBulletin: ⇒ NC 映射=%ld 含本条=%@\n",
+                             (long)n, f ? @"是" : @"否"];
+                            NBLog(@"=== [NC-CLEAR] ① NC observer:removeBulletin ⇒ NC含=%@", f ? @"是" : @"否");
+                        } @catch (NSException *e) {
+                            [rec appendFormat:@"  ① NC observer:removeBulletin 抛: %@\n", e.reason];
+                        }
                     }
                 } else if (!gNCSource) {
-                    [rec appendString:@"  ② 跳过（没抓到 NC source）\n"];
+                    [rec appendString:@"  ① 跳过（没抓到 NC source）\n"];
+                } else if (!ncIn) {
+                    [rec appendString:@"  ① 跳过（NC 映射里本来就没有）\n"];
                 }
 
-                // ---------- 第 3 步：NC 原生撤回（用 source 自己缓存的**真 request**）----------
+                // ---------- 第 2 步：NC 原生撤回（用 source 自己缓存的**真 request**）----------
                 if (gNCSource || gNCDispatcher) {
                     NSString *uuid = NCNUUIDForBulletin(gNCSource, cid);
                     id ncReq = NBNCRequestForUUID(gNCSource, uuid);
@@ -731,17 +731,41 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         @try {
                             [gNCDispatcher withdrawNotificationWithRequest:ncReq];
                             BOOL f = NO; NSInteger n = NBScanNC(gNCSource, cid, &f);
-                            if (!f && !winStep) winStep = 3;
-                            [rec appendFormat:@"  ③ NC withdraw ⇒ NC 映射=%ld 含本条=%@\n",
+                            if (!f && !winStep) winStep = 2;
+                            [rec appendFormat:@"  ② NC withdraw ⇒ NC 映射=%ld 含本条=%@\n",
                              (long)n, f ? @"是" : @"否"];
-                            NBLog(@"=== [NC-CLEAR] ③ NC withdraw ⇒ NC含=%@", f ? @"是" : @"否");
+                            NBLog(@"=== [NC-CLEAR] ② NC withdraw ⇒ NC含=%@", f ? @"是" : @"否");
                         } @catch (NSException *e) {
-                            [rec appendFormat:@"  ③ NC withdraw 抛: %@\n", e.reason];
+                            [rec appendFormat:@"  ② NC withdraw 抛: %@\n", e.reason];
                         }
                     } else {
-                        [rec appendFormat:@"  ③ 跳过（req=%@ dispatcher=%@）\n",
+                        [rec appendFormat:@"  ② 跳过（req=%@ dispatcher=%@）\n",
                          ncReq ? @"有" : @"无", gNCDispatcher ? @"有" : @"无"];
                     }
+                }
+
+                // ---------- 第 3 步：BB 账本删（v0.0.58 真机已证有效）----------
+                //   🔴 放在 NC 两步**之后**，并且**重新取一次对象**：
+                //      前两步可能已经把这条带走了，旧 `bullet` 可能已失效 ⇒ 用它等于白调。
+                if (bbIn && [gBBServer respondsToSelector:@selector(_removeBulletin:shouldSync:)]) {
+                    id bullet2 = nil;
+                    @try { bullet2 = NBFirstObject([gBBServer _bulletinsForIDs:@[cid]]); }
+                    @catch (__unused NSException *e) { }
+                    if (!bullet2) {
+                        [rec appendString:@"  ③ 跳过（NC 两步之后 BB 里已没有对象）\n"];
+                    } else {
+                        @try {
+                            [gBBServer _removeBulletin:bullet2 shouldSync:NO];
+                            BOOL f = NO; NSInteger n = NBLiveScan(gBBServer, bundle, cid, &f);
+                            if (!f && !winStep) winStep = 3;
+                            [rec appendFormat:@"  ③ BB _removeBulletin ⇒ BB live=%ld 含本条=%@\n",
+                             (long)n, f ? @"是" : @"否"];
+                        } @catch (NSException *e) {
+                            [rec appendFormat:@"  ③ BB _removeBulletin 抛: %@\n", e.reason];
+                        }
+                    }
+                } else if (!bbIn) {
+                    [rec appendString:@"  ③ 跳过（BB 里本来就没有）\n"];
                 }
 
                 // ---------- 第 4 步：老 API 补一刀（v0.0.57 单独用无效，这里当"标记已清"）----------
