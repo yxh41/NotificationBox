@@ -904,10 +904,12 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 verdict = @"BB 已删（③ _removeBulletin）；NC 没撤到 request";
             } else if (winStep == 1) {
                 verdict = @"BB 已删；NC 只走了撤回广播（第 1 步），没撤 request";
-            } else if (!ncHadUUID) {
-                verdict = @"BB 已删；NC 没换到 uuid ⇒ 没走到撤回（界面大概率不变）";
             } else if (!ncHadReq) {
-                verdict = @"BB 已删；拿到 uuid 但 uuidsToRequests 里没有 request ⇒ 没撤";
+                // 🔴 v0.0.64：② 不再要求先有 uuid ⇒ 这里按「有没有真 request」说，
+                //    而不是按「有没有 uuid」说（uuid 一直是「无」，按它说会误导）。
+                verdict = @"BB 已删；没捞到真 request（uuid 映射 + 本地缓存都没有）⇒ 没走到撤回";
+            } else if (!ncHadUUID) {
+                verdict = @"BB 已删；request 是从本地缓存拿的（uuid 映射里没换到）";
             } else {
                 verdict = @"BB 已删；NC 侧状态见上面的 [NC] 行";
             }
@@ -1109,13 +1111,33 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 }
 
                 // --- ② 只接受真 request（⛔ 绝不工厂造：v0.0.62 就是造了假 request 把队列堵死的）---
-                if (gNCDispatcher && ncUUID.length
+                // 🔴 v0.0.64：**不再要求先有 uuid**。原来 `ncUUID.length` 是前置条件，
+                //    而真机上 uuid 一直是「无」⇒ ② 一次都没进过。
+                //    现在的取法有两条，两条拿到的**都是系统造的真对象**：
+                //      (a) uuid → uuidsToRequests[uuid]
+                //      (b) post 那一刻我们自己缓存的 request（`NCNotificationDispatcher
+                //          -postNotificationWithRequest:` 里存下来的，见 NBStashNCRequest）
+                //    两条都没有 ⇒ 跳过，绝不自己造。
+                if (gNCDispatcher
                     && [gNCDispatcher respondsToSelector:@selector(withdrawNotificationWithRequest:)]) {
-                    id ncReq = NBNCRequestForUUID(gNCSource, ncUUID);
-                    ncHadReq = (ncReq != nil);
-                    NBDiagStep(@"  [NC] ② uuid=%@ ⇒ request=%@\n", ncUUID, ncReq ? @"有" : @"无");
+                    id ncReq = ncUUID.length ? NBNCRequestForUUID(gNCSource, ncUUID) : nil;
+                    NSString *ncReqFrom = ncReq ? @"uuid→uuidsToRequests" : @"(无)";
                     if (!ncReq) {
-                        NBDiagStep(@"  [NC] ② 跳过：这个 uuid 在 uuidsToRequests 里没有 request\n");
+                        // (b) 缓存后备：拿 cid / recordID / publisherID 三个键去试
+                        NSArray *candKeys = @[cid.length ? cid : @"",
+                                              recID.length ? recID : @"",
+                                              pubID.length ? pubID : @""];
+                        for (NSString *k in candKeys) {
+                            if (!k.length) continue;
+                            id r2 = NBStashedNCRequest(k);
+                            if (r2) { ncReq = r2; ncReqFrom = [@"缓存键=" stringByAppendingString:k]; break; }
+                        }
+                    }
+                    ncHadReq = (ncReq != nil);
+                    NBDiagStep(@"  [NC] ② uuid=%@ ⇒ request=%@（来源 %@）\n",
+                               ncUUID.length ? ncUUID : @"(无)", ncReq ? @"有" : @"无", ncReqFrom);
+                    if (!ncReq) {
+                        NBDiagStep(@"  [NC] ② 跳过：uuid 映射和本地缓存都没捞到真 request（**不造 request**）\n");
                     } else {
                         NSString *reqSid = NBKVCStr(ncReq, @"sectionIdentifier");
                         NBDiagStep(@"  [NC] ② request 类=%@ section=%@\n",
@@ -1142,8 +1164,9 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     }
                 } else if (!gNCDispatcher) {
                     NBDiagStep(@"  [NC] ② 跳过（没有 dispatcher）\n");
-                } else if (!ncUUID.length) {
-                    NBDiagStep(@"  [NC] ② 跳过（没换到 uuid，**不造 request**）\n");
+                } else {
+                    // 以前这里还有一条 `!ncUUID.length` 的分支 —— 现在 uuid 不再是前置条件，已删
+                    NBDiagStep(@"  [NC] ② 跳过（dispatcher 没有 withdrawNotificationWithRequest:）\n");
                 }
 
                 ncCnt2 = ncCnt;
