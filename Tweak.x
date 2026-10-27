@@ -827,7 +827,10 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         __block NSString *cid      = nil;
         __block BOOL      bbIn     = NO;
         __block BOOL      ncIn     = NO;
-        __block BOOL      ncAfter  = NO;
+        // 🔴 v0.0.64：`ncAfter` 已删除。它的唯一用途是"扫 1062 条看本条还在不在"，
+        //    而那条判据正是逼我去调 description、把 NC 队列搞死的元凶；
+        //    现在判据改成 `uuid=有/无` + `req=有/无` + `winStep` + `bbWithdrew`。
+        //    （删掉声明不留变量，否则 -Werror -Wunused-but-set-variable 直接编译失败）
         __block BOOL      ncRan     = NO;  // NC 块到底有没有进去跑
         __block BOOL      ncHadUUID = NO;  // 有没有换到 uuid
         __block BOOL      ncHadReq  = NO;  // 有没有拿到真 request
@@ -1128,7 +1131,6 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                 @try {
                                     ncReqCnt2 = NBCollectionCount([gNCSource uuidsToRequests]);
                                 } @catch (__unused NSException *e) { }
-                                ncAfter = NO;   // 已经拿到真 request 并撤了，先按"动了"记
                                 // ② 比 ① 强 ⇒ **无条件**覆盖（① 已经把 winStep 置成 1 了，
                                 // 这里若写 `if (!winStep)` 就永远进不了 2 —— 死分支）
                                 winStep = 2;
