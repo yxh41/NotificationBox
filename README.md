@@ -6466,3 +6466,119 @@ deb 1,096,232 B  md5 b07d5310e4e30eb8ae2c02d1a164bf47  control Version: 0.0.63
    - 还是 `无` ⇒ 真 request 拿不到，得换路（从 dispatcher 的 `destinationsRegistry` 里取）；
    - `有` ⇒ 看 `② NC withdraw` 那行有没有让 `含本条` 变「否」。
 3. `req数` 前后变化 —— 判断我们这条到底动没动（防「少一条」假绿）。
+
+
+---
+
+## v0.0.64 —— 进 NC 队列必死：元凶是 `description`；顺手补上一条从没执行过的官方撤回
+
+### 真机回传 `nc_diag(5).txt`：一组数字就够定案
+
+把 22 条记录按「有没有进 NC 队列」分两堆：
+
+| 分组 | 条数 | 结果 |
+|---|---|---|
+| 进了 NC 队列 | **9** | 9 条全部没回来，**连第一行都没打印** |
+| 走「缺一 ⇒ 跳过 NC」 | **12** | 12 条全部走完，结论齐全 |
+| 其它 | 1 | — |
+
+一条卡住可以叫偶然，9/9 就只能是必然：**死的位置在 NC 块的第一句**。
+而那一句里，v0.0.63 唯一新增的动作是 `NBDumpNCMapsOnce` —— 它调了 `[k description]` / `[v description]`。
+
+### 结论：绝不对未知类调 `description`
+
+`BBBulletin` / `NCNotificationRequest` 的 `-description` 会摸内部锁，
+或者递归描述整包 payload。在 NC 队列上调它 = 当场自杀。
+
+> 🔴 这和「不要在别人的队列上同步调用别的子系统」是同一个教训的两面：
+> **未知对象不只是"方法不能乱调"，连"把它打印出来"都不行。**
+> 我加 dump 的初衷是「少猜一点」，结果把一个本来能跑的版本整死
+> —— **观测方法本身是头号风险源**（这条已经是第三次踩）。
+
+v0.0.64 新增 `NBStringish`：只认 `NSString` / `NSNumber`，其余一律返回 nil。
+`NBSafeStr` / `NBKVCStr` / `NBClip` 全部改走它。
+**少显示一个字段，远好过把手机卡死。**
+
+### 🔴 顺手发现的真问题：官方撤回一次都没执行过
+
+翻 README 对账时发现，跟 description 无关，但更值得修：
+
+| 版本 | 发生了什么 | 后果 |
+|---|---|---|
+| v0.0.57 | 按清单试 withdraw 系 | 死在 `_bulletinsForIDs:` 返回 **NSSet**、`bs[0]` 抛异常 |
+| v0.0.58 | 修好 NSSet，第 1 步 `_removeBulletin:shouldSync:NO` 就成功 | **早停** ⇒ ②~⑥ 全部没轮到 |
+| v0.0.61 | 重写成 async、全部重排 | **忘了把 withdraw 放回去** |
+
+⇒ `withdrawBulletinRequestsWithRecordID:forSectionID:` 这条 iOS 16 的正规撤回，
+**真机上一次都没跑过**。而它跑在 BBServer **自己的队列**上（我们本来就在这条队列上），
+没有跨子系统风险，是成本最低的一刀。本版把它放在**最前面（⓪）**，每调一个立刻量一次 BB。
+
+### 还有一个「白等了两版」的闸门
+
+② `withdrawNotificationWithRequest:` 的前置条件里带了 `ncUUID.length`，
+而真机上 uuid **一直是「无」** ⇒ **② 一次都没进过**。
+换句话说：v0.0.62 起我一直在调 ①，② 从来没被真正测过。
+
+修法不是"再找一个换 uuid 的 API"，而是**把前置条件去掉**。
+现在 ② 的取法有两条，拿到的**都是系统造的真对象**：
+
+- (a) `uuid` → `uuidsToRequests[uuid]`
+- (b) **post 那一刻我们自己缓存的 request**
+  （`NCNotificationDispatcher -postNotificationWithRequest:` 里存下来的）
+
+两条都没有就跳过，**绝不自己造**（v0.0.62 的假 request 把整条 NC 队列堵死过）。
+
+### v0.0.64 的九条改动
+
+| 改动 | 为什么 |
+|---|---|
+| 新增 `NBStringish`，三个取值函数改走它 | 绝不对未知类调 description（本轮根因） |
+| 删 `NCMatchEntry` 第 ④ 种比法 | 它就是那个 description 调用 |
+| 删 `NBDumpNCMapsOnce` 整个函数 | 同上 |
+| 写前日志：先写「将要调用 X」，再调 X，再写结果 | v0.0.63 是调完才写 ⇒ 第一句死掉就零落盘 |
+| `gNCBusy` 闸门 | 上次 NC 块没回来 ⇒ 本进程再也不进（v0.0.63 是 9 条排队陪葬） |
+| ⓪ 官方撤回（recordID + publisherBulletinID 两把钥匙） | 从没执行过的正规路，且无跨子系统风险 |
+| ① 挪到 uuid 查询**之前** | ① 是唯一被证明「会返回」的 NC 调用，先让它结果落盘 |
+| ② 去掉 uuid 前置条件 + 加「post 时缓存」后备 | 真机 uuid 一直是「无」⇒ ② 一次都没进过 |
+| 删两处死分支 | `winStep=1` 从没赋值；`if(!winStep) winStep=2` 永远进不了 2 |
+
+### 编译期撞了两次墙（CI #120 / #121）
+
+都是 `-Werror` 把「删了调用方没删定义」直接变成编译失败：
+
+```
+Tweak.x:830:27: error: variable 'ncAfter' set but not used [-Werror,-Wunused-but-set-variable]
+Tweak.x:458:11: error: unused function 'NBStashedNCRequest' [-Werror,-Wunused-function]
+```
+
+🔴 值得记的是第二个。我本来打算加 `__attribute__((unused))` 糊过去，
+转念一想 —— **它正好是「② 拿不到真 request」的现成解**：
+`postNotificationWithRequest:` 那一刻我们就缓存了系统造的真 request，
+按 cid / recordID / publisherID 三个键去捞，比"遍历 1062 条映射"稳得多。
+⇒ **编译器的 unused 警告，有时是在说「你还有一条线没接上」。**
+
+### 包内对拍（v0.0.63 → v0.0.64，CI #122）
+
+```
+deb 1,096,486 B  md5 2299431e90962decec92977fca0c3725  control Version: 0.0.64
+① 新增锚点（旧=0 且 新>0）  15/15
+② 共有锚点  3/3
+③ 反向对照  5/5   [map] bulletinsToUUIDs 共 / [map] uuidsToRequests 共 / NotifyBox v0.0.63
+不合格 0
+```
+
+🔴 **dylib 两个版本都是 212,000 B，delta = +0**，而源码改了 5 KB 出头。
+体积与改动量脱钩这件事已经撞了第 N 次 —— **判「编进去没」只认串 / 选择器 / md5。**
+
+### 这一轮要看的四行
+
+1. `⓪ 将要调用 withdrawBulletinRequestsWithRecordID:…` → `⓪ …WithRecordID 已返回` → `⓪ 之后 BB live=… 含本条=…`
+   - 「已返回」+「含本条=否」⇒ **官方撤回升效**（本轮最大收获），直接看界面消没消。
+   - 「已返回」+「含本条=是」⇒ 这条 API 不动账本，往下看。
+2. `[NC] 进入 NC 队列` —— **这行有没有出现**
+   - 没出现 ⇒ 连块都没进，看上面那道闸的日志。
+   - 出现了 ⇒ **description 这个根因成立**，v0.0.63 的 9/9 全灭问题解决。
+3. `[NC] ② uuid=… ⇒ request=…（来源 …）`
+   - 来源是 `缓存键=…` ⇒ 缓存这条路走通了，说明 uuid 映射根本指望不上。
+   - 还是「无」⇒ 两条都断了，下一版只能从 dispatcher 的 destinations 里找。
+4. `[NC] ② withdraw 已返回` + `② 之后 req数=…` —— req数 前后变化才算真撤掉。
