@@ -6781,3 +6781,129 @@ deb 1,096,616 B  md5 853894603e5dc6afc801655b1d7459f8  control Version: 0.0.66
 
 另外会多出一段 `[cache] 共 N 条，前 5 个键：…`，这段直接告诉我们缓存键长什么样，
 不用再靠猜。
+
+---
+
+## v0.0.67 —— 拿到系统那条路了；同时承认上一版**押错了刀**
+
+### 一条日志定案两件事
+
+`nc_diag(8).txt` 里最有价值的不是那 24 行流程，而是两组数字：
+
+```
+[OBS] dispatcher destination:<CSNotificationDispatcher> requestsClearing…（第 1 次，2 条）
+[OBS] source dispatcher:requestsClearing…（第 1 次，2 条）
+        …（中间是我的 [尝试]）…
+观测计数: 目的地请求清除=1 / dispatcher 撤回=0 / source 请求清除=1
+[OBS] dispatcher destination:<CSNotificationDispatcher> requestsClearing…（第 2 次，2 条）
+[OBS] source dispatcher:requestsClearing…（第 2 次，2 条）
+```
+
+**① 方向终于对上了。** 这两条 hook **成对触发、条数一模一样（都是 2 条）** ⇒
+它们就是同一次清除的上下游：
+`NCNotificationDispatcher` 收到「目的地请求清除」→ 转给 `NCBulletinNotificationSource`
+→ 由它把 NC 的 request 翻成 bulletin 交给 BBServer。这是我上一版猜的那条链，现在有实测了。
+
+**② 🔴🔴 但 `dispatcher 撤回 = 0`。** 也就是说：系统自己清通知的时候，
+`withdrawNotificationWithRequest:` **一次都不走**。
+
+> 这是本轮最该记住的一句：**方向对了，不等于刀也对了。**
+> v0.0.65 / v0.0.66 我把全部希望押在 `withdrawNotificationWithRequest:` 上，
+> 而系统自己根本不用它 —— 押错的是**这一条**，不是挂点。
+
+### 还有一件被 `[cache]` 揭穿的事：按 id 找 request 是**结构性**无效
+
+```
+[cache] 共 114 条，前 5 个键：
+  key=7700421581079711010 | section=com.ss.iphone.ugc.Aweme nid=7700421581079711010
+  key=7700452016686199290 | section=com.ss.iphone.ugc.Aweme nid=7700452016686199290
+  …
+```
+
+缓存键是**纯数字 nid**。而我们手里，`cid` 是 `135B469A-DCA7-4BF7-9466-1795B02A3BF0`（UUID）、
+`recordID` 是 `f__-XoQCXfP67C4A`。**两套命名体系，永远对不上。**
+
+⇒ 所以 v0.0.65「按 key 精确查」、v0.0.66「按内容扫四个键」全都白做 ——
+不是比法不够多，是**这个方向本身就没有解**。
+
+### v0.0.67 的四条改法
+
+| 改动 | 为什么 |
+|---|---|
+| **按 `sectionIdentifier` 找 request** | 不再按 id。`uuidsToRequests` 的 value 侧扫一遍，命中本 App 的就是**真系统对象**。`sectionIdentifier` 是系统必写、我们必知的字段 —— 两边唯一对得上的那一个 |
+| **照着系统那条路动手** | 在 OBS 里抓住**真的** `destination` 实例（`CSNotificationDispatcher`），调 `[dispatcher destination:dest requestsClearingNotificationRequests:{那条 request}]`。这是系统清通知走的路，第一次照抄 |
+| **读映射不投 NC 队列，借系统的手进去** | OBS hook 本来就跑在 NC 自己的队列上 ⇒ 在那里顺手做映射普查与查找。绕开 v0.0.64「投进去块从没被执行」的死结，也避开了「在错误的队列上读别人的可变字典」 |
+| **一次看清 `NCNotificationRequest` 的构造器** | 按关键字把 5 个类的方法表追加进 diag 文件。造不出 request 是这一路的死结，看清楚下一版才能一次写对 |
+
+顺带删掉旧的 `[GQ]` 通道 —— 它只会调 `withdrawNotificationWithRequest:`，已证不是系统的路。
+
+### 顺手把「映射长什么样」安全地打出来
+
+v0.0.62 / v0.0.63 两次想 dump 映射，都死在 `description`（9/9 卡死）。
+这次改成**只碰 `NSString` / `NSNumber` / 类名**，输出长这样：
+
+```
+[map] bulletinsToUUIDs=1062  uuidsToRequests=N（-1=读不到）
+  b2u #0 k=…  v=…
+  u2r #0 k=…  v=<NCNotificationRequest> section=… nid=…
+```
+
+`1062` 这个数是 v0.0.62 量到的（`bulletinsToUUIDs`），但 `uuidsToRequests` 的条数
+**从来没读到过**（v0.0.63 之后就再没进过 NC 块）。这次一并给出来。
+
+### 包内对拍（v0.0.66 → v0.0.67，CI #129）
+
+```
+deb 1,099,874 B  md5 7ff543686f1a5fc8b23785af6dbba786  control Version: 0.0.67
+① 新增锚点（旧=0 且 新>0）  20/20
+   [map] bulletinsToUUIDs=… uuidsToRequests=… / u2r #%lu k=%@ v=<%@> section=%@ nid=%@
+   [拿] 已捕获 destination 实例 / uuidsToRequests 扫 %lu 条 ⇒ **命中本 App 的真 request**
+   [清] 将要调用 destination:<%@> requestsClearing…（1 条） / [清] 完成 ok=%@ want=%@
+   [api] 方法表已追加 %lu 行 / v0.0.67 方法表（关键字筛 …
+② 共有锚点（两版都有，只证"包是我们编的"）  6/6
+   ⓪ withdrawBulletinRequestsWithRecordID: / destination:requestsClearing… /
+   dispatcher:requestsClearing… / observer:removeBulletin: / withdrawNotificationWithRequest:
+③ 反向对照（旧>0 且 新=0）  5/5
+   [GQ] 将要投全局队列 / [GQ] 跳过：缓存 %lu 条里没找到本条 / NotifyBox v0.0.66 / …
+不合格 0
+```
+
+🔴 对拍第一次跑是 `不合格 1`：`v0.0.67 捕获 NC source` 报「新版没有」。
+查源码发现字符串是 `@"=== [v0.0.67] 捕获 NC source，…"` —— **中间隔着 `]`**，
+是我期望表里多写了一个空格。又一次「判据没绿先怀疑自己的期望表」。
+
+顺带记一条工具坑：这个 deb 的成员是 `control.tar.gz` + **`data.tar.lzma`**（不是 `.xz`），
+我第一次的校验脚本写死了 `.xz`，直接 KeyError。**别把压缩格式当常量。**
+
+### 这一轮请这样做
+
+1. 装好后**删一条盒子记录**（触发一次 `[尝试]`）
+2. 立刻去通知中心看**那一条**还在不在（这次真的会去动界面了）
+3. 回传 `nc_diag.txt`
+
+这次文件里会多两段以前没有的内容：
+
+- `# ---- v0.0.67 方法表（关键字筛…）----` 开头的方法表（几十行）
+- `[map]` / `u2r #0 …` 开头的映射形态样本
+
+### 三层判据（缺一层都不算成）
+
+```
+① [找] … 命中本 App 的真 request            ← 说明按 section 找这条路通了
+② [清] destination:requestsClearing… 已返回  ← 说明刀发得出去
+③ 人眼：通知中心那条消失                      ← 只有这个才算数
+```
+
+**前两层绿了第三层没绿，就是又一种假绿。** 前两层也绿不了，日志会明确说是哪一种：
+`扫 N 条没找到 section=…`（映射里没有这个 App）、
+`跳过 destination（实例=(nil)）`（没抓到 destination）、
+或者 `[api]` 里那些行告诉我们构造器叫什么 —— 换成自己造。
+
+### 风险与回退
+
+这一版第一次**从主队列**调 NC 的派发器（v0.0.61 那次卡屏是在 **BB 队列**上同步调 NC，
+锁序环；主队列上我们手里不持任何锁，形不成环）。
+护栏沿用原来那套：调之前写 `.nc_pending`、返回后删掉；万一真卡住了，
+手机自己会写下 `.nc_off`，下次开桌面不再重复。
+
+真出现卡屏/注销 ⇒ 装回 v0.0.66（`⓪` 仍然会把账本清干净，只是界面不动）。
