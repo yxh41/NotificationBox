@@ -1,32 +1,35 @@
-// Tweak.x —— v0.0.68（当前）：**request 找到了，但「发送那一刀」没发出去 —— 补上 destination** ——
-//   ✅ v0.0.67 真机（`nc_diag(9).txt`）三件事，一好一坏一新：
-//      【1】✅ **按 section 找 request 成功了**：扫 176 条 `uuidsToRequests` 命中
-//            `NCNotificationRequest section=com.apple.mobilephone nid=E18CDC81-…`
-//            —— 真系统对象到手，不再是"捞不到 request"。
-//      【2】🔴🔴 但 `[清] 跳过 destination（实例=(nil) 方法=有）`：
-//            destination 实例全靠 OBS hook 抓，而那一轮 **OBS 触发 0 次**
-//            （`观测计数: 目的地请求清除=0 / dispatcher 撤回=0 / source 请求清除=0`）
-//            ⇒ **唯一能驱动界面的那一刀从来没发出去过**，最后只落到兜底 withdraw（已知无效）。
-//      【3】🔴 方法表摊开后发现两把还没用过的钥匙：
-//            `NCNotificationRequest - bulletin`（`@@:`，直接给 BBBulletin ⇒ **精确匹配**）
-//            `NCNotificationDispatcher - destinationsRegistry`（`@@:` ⇒ **同步拿 destination**）
-//            `CSNotificationDispatcher - withdrawNotificationRequest:`（**界面层**的那一刀）
-//            `NCNotificationRequest - requestDestinations`（request 自己知道投给了谁）
-//   ⇒ v0.0.68 四条：
-//      ① **精确锁定本条**：section 只用来缩小范围，定案靠 `request.bulletin` 的 bulletinID /
-//         recordID / publisherBulletinID 与我们的比。上一版只按 section 取第一条 ——
-//         而实测三个 id 全不一样，同一个 App 在 NC 里可以有多条 ⇒ 那一刀很可能撤错了别人那条。
-//      ② **同步补抓 destination**（`NBProbeDestinations`）：先 `destinationsRegistry`，
-//         再 `requestDestinations`，两条路找 `CSNotificationDispatcher`。**不再依赖 OBS 触发。**
-//      ③ **多打一把真正对着界面的刀**：`[CSNotificationDispatcher withdrawNotificationRequest:]`
-//         排第一，`[dispatcher destination:dest requestsClearing…]` 第二，`withdraw` 只做兜底。
-//      ④ 删掉 `NBFindCachedRequest`：缓存键实测是「纯数字 nid / App 自造串」，
-//         拿 BB 的 UUID 去里面找**结构性无解**，留着只会把下一轮又骗一次。
-//   🔴 判据（四层，缺一层都不算成）：
-//      `[找] … 匹配=精确` → `[dest] ✅ 拿到 CSNotificationDispatcher`
-//      → `[清] ① withdrawNotificationRequest 已返回` → **人眼确认那条消失**。
-//      前三层绿了第四层没绿，就是又一种假绿。
-//   ---- 以下是 v0.0.67 / v0.0.66 / v0.0.65 / v0.0.64 的内容，仍然成立，保留 ----
+// Tweak.x —— v0.0.69（当前）：**顺序反了 —— 我先把 NC 要用的那块砖自己拆了** ——
+//   ✅ v0.0.68 真机（`nc_diag(10).txt`）四层判据**全部变绿**，界面**还是不动**：
+//      `匹配=精确（request.bulletin 命中）` → `[dest] ✅ 已有实例 <CSNotificationDispatcher>（来源：注册期 hook）`
+//      → `[清] ① withdrawNotificationRequest 已返回` → `[清] ② destination:requestsClearing… 已返回`
+//      → `[OBS-src] #0 <NCNotificationRequest> section=… nid=…`（系统自己收到了我们这条）
+//      ⇒ 链条上**每一环都通了**。那界面为什么不变？只剩一种解释：**顺序**。
+//   🔴🔴 定案：NC 那条驱动界面的清除，要靠 `NCBulletinNotificationSource` 把 request 翻回
+//      **BBBulletin** 再让 BB 撤一次（`_bulletinsToClearPerSectionIdForNotificationRequests:removingDestinations:`）。
+//      而我们把 ⓪（`withdrawBulletinRequestsWithRecordID:`）和 ③（`_removeBulletin:`）
+//      **排在了 NC 之前** ⇒ 调 NC 时 `BB live` 早就 `含本条=否` ⇒ 它翻不出东西 ⇒
+//      **静默什么都不做** ⇒ 界面永远收不到「移除」信号。
+//      ⇒ 这就是「账本每次都清干净、界面十几版纹丝不动」的唯一自洽解释。
+//   ⚠️ 更该记住的：这条教训 v0.0.61 就写在文件头里（"先 NC 两步、再删 BB 账本"），
+//      而 v0.0.65 重写流程时被我**亲手推翻**了（把 ⓪ 提到最前，理由写着"不跨子系统、最安全"）。
+//      ⇒ **写下来的教训没人守着，就会在下一次重构里静悄悄失效。**
+//   ⇒ v0.0.69 三条：
+//      ① **反转顺序**：`⓪ + ③` 打包成 `bbCleanup` 块，**只定义不执行**；
+//         由 `NBForwardClearAsync` 的 `done` 完成回调在 NC 那一刀真的返回之后调用
+//         （再 `dispatch_async` 回 BBServer 队列，不做跨队列同步调用）。
+//      ② **新增唯一一条读回判据**（`[验] 清后 NC：还能找到本条=是/否`，纯只读）：
+//         · 还能扫到 ⇒ 系统只是"收到通知"、**没真删** ⇒ 刀还不够狠（换刀）
+//         · 扫不到   ⇒ NC 模型真的删了 ⇒ 界面没变就是**视图层没刷新**（下一版补刷 UI）
+//         上一版全绿却界面不动，就是因为缺这一条读回 —— 分不清上面两种。
+//      ③ 没拿到 NC dispatcher/bulletin 时**退回老路**就地清账本（界面可能不变，但账本要干净）。
+//   🔴 判据（五层，第 5 层才算数）：
+//      `[序] v0.0.69：先走 NC 清除` → `匹配=精确` → `[dest] ✅` → `[清] ②… 已返回`
+//      → `[验] 清后 NC：还能找到本条=否` → **人眼确认那条消失**。
+//      若第 5 层是「是」⇒ 问题不在顺序，在"刀不够狠"，下一版换 `CSNotificationDispatcher`
+//      `destination:clearNotificationRequestsInSections:` / `_clearNotificationRequestsFromIncomingSection:`。
+//   ---- 以下是 v0.0.68 / v0.0.67 / v0.0.66 / v0.0.65 / v0.0.64 的内容，仍然成立，保留 ----
+//      v0.0.68 四条：`request.bulletin` 精确锁定 / `destinationsRegistry` 同步补抓 destination /
+//      `registerDestination:` 注册期接住实例 / 三把刀按"离界面由近到远"排 / 删 `NBFindCachedRequest`。
 //      成对触发（dispatcher+source）、系统自己不走 withdraw、⓪ 官方撤回稳定生效、
 //      不投 NC 队列（投了不跑）、闸门带超时、绝不对未知类调 description（`NBStringish`）、
 //      写前日志、`_requestUUIDForBulletinPublisherMatchID:`。
@@ -441,7 +444,7 @@ static NSString *const kNBGuardPending = @"/var/mobile/Library/NotifyBox/.nc_pen
 static NSString *const kNBGuardOff     = @"/var/mobile/Library/NotifyBox/.nc_off";
 // 🔴 版本号写进护栏文件：**每个新版本自动获得一次重试机会**。
 //    否则 v0.0.62 那次卡死留下的 `.nc_off` 会一直压着，新版明明修好了也测不到。
-#define NB_VER_STR @"0.0.68"
+#define NB_VER_STR @"0.0.69"
 static BOOL gNCSuppressed = NO;   // YES ⇒ 本进程不碰 NC 路径
 static BOOL gNCBusy = NO;         // YES ⇒ 上一次 NC 尝试还没回来（同进程内不再赌第二次）
 static NSTimeInterval gNCBusyAt = 0;   // 🔴 v0.0.65：闸门加上时间戳，超时自动放行
@@ -482,7 +485,13 @@ static NSArray  *gWantIDs    = nil;  // v0.0.68：本条的 cid / recordID / pub
 static __strong id gCSDestination = nil;  // 真 destination（CSNotificationDispatcher 实例）
 static BOOL gCSDestFromHook = NO;          // 它是「注册期 hook」接住的（不是靠 OBS 撞上的）
 static __strong id gFoundNCReq = nil;     // 找到的**真** request（系统对象，不是我造的）
-static int  gActClearTried = 0;      // 正向清除尝试次数（全进程 ≤2）
+// 🔴🔴 v0.0.69：这两个计数**必须每次删除重新归零**。
+//    原来它们是"全进程 ≤2 / 全进程 ≤4"，而 `gActClearTried` 只增不减、`tries` 是函数内 static
+//    ⇒ **第 3 次删除之后 NC 那条路永远不再尝试**（且日志看起来像"什么都没发生"）。
+//    这和 `.nc_off` / `gNCBusy` 是同一个设计缺陷（护栏没有解除条件）—— 我第三次犯。
+//    判据：**上限要按"每次操作"算，不能按"每个进程"算**。
+static int  gActClearTried = 0;      // 正向清除尝试次数（**本次删除内** ≤2）
+static int  gFindTries     = 0;      // 「找 request」尝试次数（**本次删除内** ≤4）
 
 // KVC 读一个字段，读不到就返回 nil。
 // 🔴 必须逐次 @try：类没有这个键时 valueForKey: 会抛 NSUnknownKeyException，
@@ -1004,7 +1013,7 @@ static void NBDiagAppendAPIOnce(void) {
     gAPIDumped = YES;
     @try {
         NSMutableString *buf = [NSMutableString stringWithCapacity:(1 << 14)];
-        [buf appendFormat:@"\n# ---- v0.0.68 方法表（关键字筛：bulletin/request/clear/remov/withdraw/dismiss/destination）----\n"];
+        [buf appendFormat:@"\n# ---- v0.0.69 方法表（关键字筛：bulletin/request/clear/remov/withdraw/dismiss/destination）----\n"];
         NSArray *kw = @[@"ulletin", @"equest", @"lear", @"emov", @"ithdraw", @"ismiss", @"estination"];
         NSArray *classes = @[@"NCNotificationRequest", @"NCNotificationDispatcher",
                              @"NCBulletinNotificationSource", @"CSNotificationDispatcher", @"BBServer"];
@@ -1159,7 +1168,10 @@ static void NBProbeDestinations(id req) {
 //    自然队列；而 v0.0.64 那次投进 `NCBulletinNotificationSource` 自己的 queue，**块从没被执行**。
 //    主队列是唯一有保证会被服务的队列。
 // 🔴 为什么不在 hook 里就地调：那等于在系统自己的清除调用里再发起一次清除 ⇒ 重入。
-static void NBForwardClearAsync(id req, NSString *how) {
+// 🔴 v0.0.69：加了 `done` 完成回调。理由（nc_diag(10).txt 定案）见文件头与
+//    `NBBBCleanupDeferred` 那一段 —— **账本清理必须等这一刀真的返回之后再做**，
+//    否则等于提前把 NC 要用的 BBBulletin 抽掉。
+static void NBForwardClearAsync(id req, NSString *how, void (^done)(void)) {
     if (!req || !gNCDispatcher) return;
     if (gNCSuppressed) {
         NBDiagStep(@"  [清] 跳过（上次卡死过 ⇒ gNCSuppressed，删 %@ 可恢复）\n", kNBGuardOff);
@@ -1234,19 +1246,39 @@ static void NBForwardClearAsync(id req, NSString *how) {
         }
         NBDiagStep(@"  [清] 完成 ok=%@ want=%@ ⇒ **这时去看通知中心那条还在不在**\n",
                    ok ? @"是" : @"否", want ?: @"(无)");
+        // ---------- v0.0.69 读回：这一刀到底把 NC 模型改了没有 ----------
+        // 🔴 这是本版唯一新增的判据，而且它**只读**（不调任何清除方法）——
+        //    目的就是把「界面没变」拆成两种完全相反的原因：
+        //      · 还能扫到本条 ⇒ 系统只是"收到通知"、**没真删** ⇒ 刀还不够狠（换刀）
+        //      · 扫不到本条 ⇒ NC 模型真的删了 ⇒ 界面没变就是**视图层没刷新**（补刷 UI）
+        //    上一版所有日志全绿却界面不动，就是因为缺这一条读回。
+        @try {
+            NSUInteger sc2 = 0; int sh2 = 0; NSString *how2 = nil;
+            id still = NBFindOurRequest(gNCSource, gWantBundle, gWantIDs, &how2, &sc2, &sh2);
+            NBDiagStep(@"  [验] 清后 NC：扫 %lu 条，还能找到本条=%@\n",
+                       (unsigned long)sc2,
+                       still ? @"是 ⇒ 系统没真删（只是收到通知）" : @"否 ⇒ NC 模型已删");
+        } @catch (NSException *e) {
+            NBDiagStep(@"  [验] NC 读回抛: %@\n", e.reason);
+        }
         [[NSFileManager defaultManager] removeItemAtPath:kNBGuardPending error:nil];
+        // 🔴 必须放在最后：调用方要在这一刻之后才允许清 BB 账本。
+        if (done) { @try { done(); } @catch (__unused NSException *e) { } }
     });
 }
 
 // 「找 request + 动手」的统一入口：谁先跑到（主队列 / OBS hook）就由谁做，只做一次。
 // 🔴 全进程最多试 4 次：OBS 可能反复触发，而每次都要遍历近千条映射 —— 不能让它变成常态开销。
-static void NBFindAndForwardClear(NSString *why) {
-    static int tries = 0;
-    if (gFoundNCReq) return;
-    if (gActClearTried >= 2) return;
-    if (tries >= 4) return;
-    if (!gWantBundle.length || !gNCSource) return;
-    tries++;
+static void NBFindAndForwardClear(NSString *why, void (^done)(void)) {
+    // 🔴 v0.0.69：`tries` 从函数内 static 改成全局 `gFindTries` —— 函数内 static 没法在
+    //    每次删除时归零 ⇒ 全进程只有前 4 次能找，之后永久静默（见全局变量处的说明）。
+    // 🔴 所有早退分支都必须把 done 交回去，否则调用方的「清完再清账本」永远等不到
+    //    ⇒ 账本一次都不清 ⇒ 下一次删除会看到"通知还在"。这就是 v0.0.65 的 gNCBusy 那类坑。
+    if (gFoundNCReq) { if (done) done(); return; }
+    if (gActClearTried >= 2) { if (done) done(); return; }
+    if (gFindTries >= 4) { if (done) done(); return; }
+    if (!gWantBundle.length || !gNCSource) { if (done) done(); return; }
+    gFindTries++;
     NSUInteger scanned = 0;
     int secHits = 0;
     NSString *how = nil;
@@ -1265,10 +1297,12 @@ static void NBFindAndForwardClear(NSString *why) {
                        NBSafeClip(NBKVCStr(b, @"bulletinID"), 40),
                        NBSafeClip(NBKVCStr(b, @"recordID"), 40));
         } @catch (__unused NSException *e) { }
-        NBForwardClearAsync(r, how);
+        NBForwardClearAsync(r, how, done);
     } else {
         NBDiagStep(@"  [找] %@：扫 %lu 条 request，没有 section=%@ 的（同段 0 条）\n",
                    why, (unsigned long)scanned, gWantBundle);
+        // 没找到 request ⇒ 这一刀打不出去 ⇒ 立刻把控制权交回去，让调用方去清账本
+        if (done) done();
     }
 }
 
@@ -1319,12 +1353,12 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             NBLog(@"!!! [NC-CLEAR] 尚未捕获 BBServer 实例/队列，跳过");
             return;
         }
-        NBLog(@"=== [NC-CLEAR] v0.0.68 请求 sysId=%@ bundle=%@", sysId, bundle);
+        NBLog(@"=== [NC-CLEAR] v0.0.69 请求 sysId=%@ bundle=%@", sysId, bundle);
         // 方法表是静态信息，只在文件不存在时写一次
         if (![[NSFileManager defaultManager] fileExistsAtPath:NOTIFYBOX_NC_DIAG_PATH]) {
             NBDiagWriteFile(sysId, bundle);
         }
-        NBDiagStep(@"\n=== [尝试 %@ @%@] v0.0.68 async sysId=%@ bundle=%@\n",
+        NBDiagStep(@"\n=== [尝试 %@ @%@] v0.0.69 async sysId=%@ bundle=%@\n",
                    [NSDate date], NBProc(), sysId, bundle);
 
         NSArray  *cands   = [sysId componentsSeparatedByString:@"|"];
@@ -1333,6 +1367,11 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         //    也要用它去 `uuidsToRequests` 里按 section 找 request。
         gWantBundle = bundleC;
         gFoundNCReq = nil;
+        // 🔴🔴 v0.0.69：每次删除都把两个上限计数**归零**。不归零的后果不是"少清一条"，
+        //    而是「从第 3 条起 NC 那条路永远不再尝试」—— 用户测到第 3、4 条时会以为
+        //    修复没生效，而其实根本没跑。护栏的上限必须按"每次操作"算。
+        gActClearTried = 0;
+        gFindTries     = 0;
         // 🔴 v0.0.68：三个候选 id 也记到全局。上一版只按 section 匹配就动手，而同一个 App
         //    在 NC 里可以有好几条通知（实测命中 nid 与我们的 bulletinID/recordID 三个全不一样）
         //    ⇒ 必须用 `request.bulletin` 的 bulletinID 做精确比对，否则可能撤错条。
@@ -1495,12 +1534,15 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 }
             }
 
-            // ---------- ⓪ BB 自己的官方撤回（真机**从未执行过**这条路，见文件头说明）----------
-            // 🔴 为什么排在最前面：它跑在 BBServer **自己的队列**上（我们本来就在这条队列上），
-            //    不跨子系统 ⇒ 没有 v0.0.61 那种锁序死锁风险；而且「withdraw」这个动词
-            //    正是 iOS 16 里驱动界面撤掉通知的那个语义。
-            // 🔴 它从没被执行过（v0.0.57 死在 NSSet、v0.0.58 早停、v0.0.61 重写时漏了），
-            //    所以本版把它放第一步，并且**每调一个立刻量一次 BB**。
+            // ---------- ⓪ BB 官方撤回 + ③ _removeBulletin：**打包成块，等 NC 那一刀返回后再跑** ----------
+            // 🔴🔴 v0.0.69 定案（`nc_diag(10).txt`）：这两个动作原来跑在最前面，是整条链失败的真因。
+            //    NC 那条驱动界面的清除，要靠 `NCBulletinNotificationSource` 把 request 翻回
+            //    **BBBulletin** 再让 BB 撤一次（`_bulletinsToClearPerSectionIdForNotificationRequests:removingDestinations:`）。
+            //    我们先清账本 ⇒ 它翻不出东西 ⇒ **静默什么都不做** ⇒ 界面永远收不到「移除」信号。
+            //    实测证据：v0.0.68 日志里 ①②③ 全绿、`[OBS-src]` 也收到了我们的 request，
+            //    但 `BB live` 在调 NC **之前**就已经 `含本条=否` —— 砖是我自己先拆掉的。
+            //    ⇒ 所以这里**不再执行**，只定义；由 `[账本]` 那一跳在 NC 返回后调用。
+            void (^bbCleanup)(void) = ^{
             if (bullet && bbIn) {
                 NSString *rID = recID.length ? recID : cid;
                 if (rID.length
@@ -1540,21 +1582,22 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             } else {
                 NBDiagStep(@"  ⓪ 跳过（BB 里本来就没有对象）\n");
             }
+            // 清完账本后打结论（bbRemove 内部会做 ③ / ④ / 读回 / verdict）
+            bbRemove();
+            };   // ← bbCleanup 结束，**这里只是定义，没有被调用**
 
-            // ---------- 🔴 v0.0.67：找真 request，然后走**系统自己那条**正向清除 ----------
+            // ---------- 🔴 v0.0.69：**先**走 NC 清除（此时 BB 里本条还活着），走完再清账本 ----------
             // v0.0.66 真机 `nc_diag(8).txt` 定案（两条都是实测，不是推断）：
             //   ① 手动清通知时系统成对走 `destination:requestsClearing…` + `dispatcher:requestsClearing…`，
             //      条数一致；而 `withdrawNotificationWithRequest:` **0 次** ⇒ 系统根本不用 withdraw。
-            //      ⇒ 原来这条 [GQ]（只会调 withdraw）押错了方向，撤掉。
             //   ② 缓存键是纯数字 nid，我们手里是 UUID / `f__-XoQ…` ⇒ 按 id 找**结构性无效**。
-            //      ⇒ 改成在 `uuidsToRequests` 里**按 sectionIdentifier 找**（系统必写、我们必知）。
             // 🔴 v0.0.68 补：section 只用来**缩小范围**，真正定案靠 `request.bulletin` 的 bulletinID。
-            // 🔴 读映射必须在正确的队列上（NC 自己的队列或主队列），否则可能和写操作撞车。
-            //    这里先投**主队列**（有保证会被服务），OBS hook 里那条在 NC 队列上、谁先到谁做。
-            if (gNCDispatcher && bullet && !gFoundNCReq) {
-                // 🔴 v0.0.68：缓存这条路对老通知天然无效（缓存在 SpringBoard 起来后才开始攒）。
-                //    不再先查缓存再兜底 —— 直接走「扫映射 + 精确比对」，少一层无关分支。
-                NBDiagStep(@"  [找] 缓存 %lu 条对本条无效（键是纯数字 nid / App 自造串，与我们的 cid 不同命名体系）⇒ 投主队列扫映射\n",
+            // 🔴 v0.0.69 补：**顺序**。这一刀要能驱动界面，必须让 source 把 request 翻回 BBBulletin；
+            //    所以它必须跑在 `bbCleanup`（⓪ + ③）**之前**。原来反着，等于先拆砖再砌墙。
+            BOOL ncPathTaken = NO;
+            if (gNCDispatcher && bullet) {
+                ncPathTaken = YES;
+                NBDiagStep(@"  [序] v0.0.69：先走 NC 清除（BB 里本条仍活着）⇒ 等它返回再清账本（缓存 %lu 条对本条无效）\n",
                            (unsigned long)gNCRequestByID.count);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     NBDiagStep(@"  [找] 进入主队列\n");
@@ -1562,16 +1605,31 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         gMapDumped = YES;
                         NBMapCensus(gNCSource);
                     }
-                    NBFindAndForwardClear(@"主队列");
+                    // 🔴 done 回调 = ①②③ 真的返回了。**只有到这一刻**才允许清账本。
+                    NBFindAndForwardClear(@"主队列", ^{
+                        dispatch_async(gBBServerQueue ?: dispatch_get_main_queue(), ^{
+                            NBDiagStep(@"  [账本] NC 那一刀已返回 ⇒ 现在补 ⓪ / ③（顺序反了就是 v0.0.68 的死因）\n");
+                            bbCleanup();
+                        });
+                    });
                 });
             }
 
-            // ---------- 🔴 v0.0.65：⓪ 之后**直接**删账本，不再把动作投到 NC 队列 ----------
+            // ---------- 🔴 v0.0.65：不再把动作投到 NC 队列 ----------
             // v0.0.64 真机：投了、`dispatch_async` 也返回了，但块的第一行从没打印
             // （30 秒内 4 次后续尝试全被 gNCBusy 挡）。既然投了不跑，就不投。
             if (!gNCUseQueuePath) {
-                NBDiagStep(@"  [NC] 本版不投 NC 队列（v0.0.64 真机：投了但块从没被执行）⇒ 直接删 BB 账本\n");
-                bbRemove();
+                NBDiagStep(@"  [NC] 本版不投 NC 队列（v0.0.64 真机：投了但块从没被执行）\n");
+                if (!ncPathTaken) {
+                    // 没有 NC dispatcher / bulletin ⇒ 退回老路：就地清账本。
+                    // 界面多半不会变（这正是历史遗留问题），但至少账本要干净。
+                    NBDiagStep(@"  [序] 没有 NC dispatcher/bulletin ⇒ 就地清账本（界面可能不变）\n");
+                    bbCleanup();
+                }
+                // 🔴 v0.0.69：这里原来还有一句 `bbRemove();` —— **必须删掉**。
+                //    `bbCleanup` 内部最后就是 `bbRemove()`，留着会清两遍；更致命的是：
+                //    NC 路已把 bbCleanup 交给完成回调 ⇒ 这一句会抢在 NC 之前把账本清了，
+                //    等于把本版刚修好的顺序又改回去（自己拆砖）。
                 return;
             }
 
@@ -2169,7 +2227,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         // 🔴 v0.0.64：这条 queue 是关键 —— 系统平时就在它上面回调 source。
         //    NC 的删除动作必须回到这条队列上执行（v0.0.61 在 BB 队列上调用 ⇒ 卡死注销）。
         gNCSourceQueue = (dispatch_queue_t)queue;
-        NBLog(@"=== [v0.0.68] 捕获 NC source，dispatcher=%@ queue=%@",
+        NBLog(@"=== [v0.0.69] 捕获 NC source，dispatcher=%@ queue=%@",
               dispatcher ? NSStringFromClass([dispatcher class]) : @"(nil)",
               queue ? @"有" : @"(nil)");
     }
@@ -2213,7 +2271,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         NBMapCensus(self);
     }
     if (!gFoundNCReq && gWantBundle.length && self) {
-        NBFindAndForwardClear(@"NC 队列(OBS)");
+        NBFindAndForwardClear(@"NC 队列(OBS)", nil);
     }
     %orig;
 }
@@ -2448,7 +2506,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.68 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.69 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -2487,7 +2545,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.68 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.69 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     // v0.0.55：删掉 v0.0.53 在这里（%ctor）打的那行方法清单。
@@ -2556,7 +2614,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.68 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.69 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
