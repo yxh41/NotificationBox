@@ -220,6 +220,17 @@ static NSString *NBProc(void) {
 //    够不着它。复制一份日志函数是最差解 —— 两份轮转逻辑迟早走岔。
 #define NBLog NBSharedLog
 
+// 🔴🔴 v0.0.71：**版本串必须在「第一次被引用之前」定义**。
+//   原来它躺在第 ~452 行的护栏常量堆里（上下文是"版本号写进护栏文件、每个新版本
+//   自动获得一次重试机会"），而 v0.0.71 把第 ~424 行那句 `[v0.0.70]` 也换成了它
+//   ⇒ **引用在定义之前** ⇒ 编译期直接
+//        error: use of undeclared identifier 'NB_VER_STR'
+//   教训（源码级自检抓不到）：括号配平 / `_NonNull` / 版本四处一致 / 行尾这几条
+//   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
+//   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
+//   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
+#define NB_VER_STR @"0.0.71"
+
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
 // 🔴🔴 为什么这一版把"自愈"整个换掉 —— v0.0.16~v0.0.18 的自愈会**骗人**：
@@ -449,7 +460,9 @@ static NSString *const kNBGuardPending = @"/var/mobile/Library/NotifyBox/.nc_pen
 static NSString *const kNBGuardOff     = @"/var/mobile/Library/NotifyBox/.nc_off";
 // 🔴 版本号写进护栏文件：**每个新版本自动获得一次重试机会**。
 //    否则 v0.0.62 那次卡死留下的 `.nc_off` 会一直压着，新版明明修好了也测不到。
-#define NB_VER_STR @"0.0.71"
+// 🔴 v0.0.71：`#define NB_VER_STR` **已上移到 `#define NBLog` 那一区**（文件最前面的宏区）。
+//    原来它就在这个位置，而第 ~424 行也要用 ⇒ 引用在定义之前 ⇒ 编译失败。
+//    这里只留说明，不再放定义。
 static BOOL gNCSuppressed = NO;   // YES ⇒ 本进程不碰 NC 路径
 static BOOL gNCBusy = NO;         // YES ⇒ 上一次 NC 尝试还没回来（同进程内不再赌第二次）
 static NSTimeInterval gNCBusyAt = 0;   // 🔴 v0.0.65：闸门加上时间戳，超时自动放行
