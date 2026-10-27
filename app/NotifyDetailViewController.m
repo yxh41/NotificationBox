@@ -41,7 +41,12 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"通知详情";
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    // 🔴 v0.0.70：和列表页、设置页统一到**分组灰底 + 白卡片**。
+    //    以前这里是纯白底，而 `headerBox` / `bodyView` 用的是 `secondarySystemBackground` ——
+    //    浅色模式下它正好也是 #F2F2F7 那种浅灰 ⇒ 白底上两块浅灰块，看着像"没加载完"。
+    //    换成分组灰底之后，卡片必须跟着换成 `secondarySystemGroupedBackground`（白），
+    //    **一对要一起换**：只换底不换卡片 = 浅灰压浅灰，卡片直接消失。
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
 
     UIBarButtonItem *copy = [[UIBarButtonItem alloc] initWithTitle:@"复制"
                                                             style:UIBarButtonItemStylePlain
@@ -56,7 +61,7 @@
     NSString *bid = [self str:@"bundle"];
 
     self.headerBox = [[UIView alloc] init];
-    self.headerBox.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    self.headerBox.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.headerBox.layer.cornerRadius = 10;
     [self.view addSubview:self.headerBox];
 
@@ -105,7 +110,7 @@
     self.bodyView.alwaysBounceVertical = YES;
     self.bodyView.font = [UIFont systemFontOfSize:15];
     self.bodyView.textColor = [UIColor labelColor];
-    self.bodyView.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    self.bodyView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.bodyView.layer.cornerRadius = 10;
     self.bodyView.textContainerInset = UIEdgeInsetsMake(12, 10, 12, 10);
     NSString *msg = [self str:@"message"];

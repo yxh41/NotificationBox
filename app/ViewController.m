@@ -15,6 +15,17 @@
 // 两处各写一个数字的话，改了其中一个就会出现"按钮压住分段控件"。
 static const CGFloat kNBMarkAllWidth = 88;
 
+// 🔴🔴 v0.0.70：顶部控件的**统一规格**。
+//    以前每个控件各写各的数字：分段 30、按钮 30、圆角 7、上下间距 6、左右边距 12。
+//    改一个尺寸就得记住另外四处，漏一处就是"某一排比别的排高 2pt"——
+//    这种 2pt 的错位肉眼说不出来，但整屏就是不整齐。
+//    ⇒ 现在高度 / 圆角 / 间距 / 边距各自只有**一处**定义，`viewDidLayoutSubviews` 全用它。
+static const CGFloat kNBTopMargin = 12;   // 左右边距
+static const CGFloat kNBTopH      = 32;   // 分段 / 按钮 / 标星 的统一高度
+static const CGFloat kNBTopGap    = 8;    // 行与行之间的竖向间距
+static const CGFloat kNBTopRadius = 8;    // 按钮圆角（与卡片 12 形成层级：小的更小）
+static const CGFloat kNBHintH     = 20;   // 两条小字提示的统一高度
+
 // v0.0.42：搜索防抖窗口。
 // 250ms 的依据：真人连续打字的间隔通常在 100~200ms，250ms 能吃掉整串输入；
 // 再长（比如 500ms）用户会觉得"我打完了它还没反应"。
@@ -218,7 +229,10 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"消息盒子";
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    // v0.0.70：卡片化之后，底色必须是**分组灰**（不是 systemBackground 的白）。
+    //    卡片用 secondarySystemBackground（浅色模式下是纯白）压在灰底上 ⇒ 才有层次；
+    //    两者都用 systemBackground 的话卡片会"消失"，只剩一点圆角阴影。
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
     // 在同一日志里打一条「App 活着」，用来和 tweak 的日志对照（见 NotifyStore.h 注释）
     [NotifyStore markAppAlive];
     // 诊断入口：把 tweak.log 尾部搬进 App，免去用 Filza 翻文件
@@ -799,6 +813,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.searchBar = [[UISearchBar alloc] init];
     self.searchBar.delegate = self;
     self.searchBar.placeholder = @"搜索标题或正文";
+    // 🔴 v0.0.70：底色已经是分组灰，搜索框还用默认样式的话会叠出一块**同色灰**，
+    //    整条搜索栏看起来像"糊在背景上"、边界不清。Minimal 样式只画里面那个圆角输入框，
+    //    和外层的灰底有明确的层次。
+    self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
+    self.searchBar.backgroundImage = [[UIImage alloc] init];   // 去掉那条 1px 分隔线
     [self.view addSubview:self.searchBar];
 
     // v0.0.37：全部 / 只看未读。
@@ -818,7 +837,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.starBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.starBtn setTitle:@"★ 标星" forState:UIControlStateNormal];
     self.starBtn.titleLabel.font = [UIFont systemFontOfSize:14];
-    self.starBtn.layer.cornerRadius = 7;
+    self.starBtn.layer.cornerRadius = kNBTopRadius;
     self.starBtn.backgroundColor = [UIColor secondarySystemFillColor];
     [self.starBtn setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
     [self.starBtn setTitleColor:[UIColor systemOrangeColor] forState:UIControlStateSelected];
@@ -833,7 +852,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.markAllBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.markAllBtn setTitle:@"全标已读" forState:UIControlStateNormal];
     self.markAllBtn.titleLabel.font = [UIFont systemFontOfSize:14];
-    self.markAllBtn.layer.cornerRadius = 7;
+    self.markAllBtn.layer.cornerRadius = kNBTopRadius;
     self.markAllBtn.backgroundColor = [UIColor secondarySystemFillColor];
     [self.markAllBtn addTarget:self action:@selector(onMarkAllRead:)
               forControlEvents:UIControlEventTouchUpInside];
@@ -881,6 +900,14 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     self.table.delegate = self;
     self.table.dataSource = self;
+    // 🔴 v0.0.70 卡片化：分行靠**留白**，不再靠分隔线。
+    //    留着分隔线会出现"卡片里还画了一条线"的双线效果，比不做卡片更难看。
+    self.table.separatorStyle = UITableViewCellSeparatorStyleNone;
+    // 🔴 灰色大底必须由 tableView 出（cell 和卡片都是透明的/半透的）：
+    //    这是"分层"的唯一来源。少了这一句，卡片和背景同色 ⇒ 看起来只是"行高变大了"。
+    self.table.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    // 自重算高度会关闭行高缓存，本表行高是常量 ⇒ 明确关掉，省掉一次没必要的测量
+    self.table.estimatedRowHeight = 0;
     // 🔴 自定义 cell：Default 样式的 UITableViewCell **不显示 detailTextLabel**，
     //    以前正文全写在那上面 ⇒ 只有标题、没有正文。见 NotifyCell.h 注释。
     [self.table registerClass:[NotifyCell class] forCellReuseIdentifier:@"c"];
@@ -897,14 +924,14 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     CGFloat safeBottom = self.view.safeAreaInsets.bottom;
     CGFloat y = top + 6;
 
-    self.timeSeg.frame = CGRectMake(12, y, w - 24, 30);
-    y += 30 + 6;
+    self.timeSeg.frame = CGRectMake(kNBTopMargin, y, w - kNBTopMargin * 2, kNBTopH);
+    y += kNBTopH + kNBTopGap;
 
     // v0.0.37：搜索框回到固定 44 —— 不再有 scope bar 要挤进来。
     // 🔴 别用 `sizeThatFits:` / `intrinsicContentSize` 去"自动算"：
     //    UISearchBar 是普通 UIView，未布局时回 (0,0) ⇒ 搜索框直接消失。
     self.searchBar.frame = CGRectMake(0, y, w, 44);
-    y += 44 + 4;
+    y += 44 + 2;
 
     // v0.0.37：全部 / 只看未读，自己的一段（原来这里是系统的 scope bar，不显示）
     // v0.0.38：「只看未读」模式下右侧腾出 `kNBMarkAllWidth` 给「全标已读」，
@@ -916,14 +943,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    但它常驻、全标已读按需出现，所以两者不抢右边那个位置。
     // 🔴 320pt 窄屏验算：12+64+6 + 132(分段最小值) + 6 + 88(全标) = 308 ≤ 320 ✓。
     CGFloat starW = 64;
-    CGFloat unreadW = w - 24 - starW - 6;
+    CGFloat unreadW = w - kNBTopMargin * 2 - starW - kNBTopGap;
     self.markAllBtn.hidden = !self.unreadOnly;
-    if (self.unreadOnly) unreadW -= (kNBMarkAllWidth + 6);
+    if (self.unreadOnly) unreadW -= (kNBMarkAllWidth + kNBTopGap);
     CGFloat segW = MAX(120, unreadW);
-    self.starBtn.frame = CGRectMake(12, y, starW, 30);
-    self.unreadSeg.frame = CGRectMake(12 + starW + 6, y, segW, 30);
-    self.markAllBtn.frame = CGRectMake(12 + starW + 6 + segW + 6, y, kNBMarkAllWidth, 30);
-    y += 30 + 6;
+    self.starBtn.frame = CGRectMake(kNBTopMargin, y, starW, kNBTopH);
+    self.unreadSeg.frame = CGRectMake(kNBTopMargin + starW + kNBTopGap, y, segW, kNBTopH);
+    self.markAllBtn.frame = CGRectMake(kNBTopMargin + starW + kNBTopGap + segW + kNBTopGap,
+                                       y, kNBMarkAllWidth, kNBTopH);
+    y += kNBTopH + kNBTopGap;
 
     // v0.0.40：筛选之外还有未读的常驻提示。
     // 🔴 不显示时高度必须是 **0**，而且要把 frame 也清零 ——
@@ -938,8 +966,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     BOOL showHint = (self.hiddenUnread > 0 && self.items.count > 0);
     self.hiddenHint.hidden = !showHint;
     if (showHint) {
-        self.hiddenHint.frame = CGRectMake(12, y, w - 24, 20);
-        y += 20 + 4;
+        self.hiddenHint.frame = CGRectMake(kNBTopMargin, y, w - kNBTopMargin * 2, kNBHintH);
+        y += kNBHintH + 2;
     } else {
         self.hiddenHint.frame = CGRectZero;
     }
@@ -951,14 +979,17 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     BOOL showFoldedHint = (self.foldedCount > 0);
     self.foldedHint.hidden = !showFoldedHint;
     if (showFoldedHint) {
-        self.foldedHint.frame = CGRectMake(12, y, w - 24, 20);
-        y += 20 + 4;
+        self.foldedHint.frame = CGRectMake(kNBTopMargin, y, w - kNBTopMargin * 2, kNBHintH);
+        y += kNBHintH + 2;
     } else {
         self.foldedHint.frame = CGRectZero;
     }
 
+    // v0.0.70：图标栏上下各留 6pt，让它和列表之间也有一条"呼吸缝"——
+    //    以前是紧贴着的，卡片圆角一出现就显得挤。
+    y += 6;
     self.iconBar.frame = CGRectMake(0, y, w, 56);
-    y += 56;
+    y += 56 + 2;
 
     self.table.frame = CGRectMake(0, y, w, h - y - safeBottom);
 }

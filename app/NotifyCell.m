@@ -1,6 +1,12 @@
 #import "NotifyCell.h"
 
 @interface NotifyCell ()
+// 🔴 v0.0.70：卡片容器。以前所有子视图直接挂在 `contentView` 上、靠系统分隔线区分行，
+//    整屏是一块连续的灰白。现在改成「灰色大底 + 一张张圆角卡片」：
+//    · 卡片之间靠**留白**分行，不再需要分隔线（`separatorStyle = None`）
+//    · 卡片比 cell 窄 12pt/侧 ⇒ 视觉上有"内缩"，更像现代列表
+//    · 所有内部布局都改成**相对卡片**算，这样横竖屏/分屏宽度变了也不用改常量
+@property (nonatomic, strong) UIView *cardView;
 @property (nonatomic, strong) UIView *iconBox;
 @property (nonatomic, strong) UIImageView *iconView;
 @property (nonatomic, strong) UILabel *letterLabel;
@@ -75,18 +81,38 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
 //    ③ iOS 自己的通知就是这样排的：App 名一行小字在最上面。用户不需要学。
 // 🔴 行高是 **常量**（`tableView.rowHeight` 直接用它），所以某个 App 名字取不到时
 //    也不能让那一行变矮 —— 否则整屏行高参差不齐，比空一行难看得多。
-+ (CGFloat)height { return 98.0; }
+// 🔴🔴 v0.0.70：98 → 106。加的 8pt **不是给内容的**，是给卡片上下的留白（各 4pt）。
+//    卡片内部可用高度仍是 98 ⇒ 下面 layoutSubviews 里所有 y 坐标**一个都不用改**
+//    （只是整体平移卡片原点）。改行高时必须同步这里的 8，否则卡片会被压扁或架空。
+static const CGFloat kNBCardInsetX = 12.0;   // 卡片左右内缩
+static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
++ (CGFloat)height { return 98.0 + kNBCardInsetY * 2; }
 
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
     self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
     if (!self) return nil;
+
+    // v0.0.70 卡片化（见类扩展里 cardView 的注释）
+    // 🔴 cell 自身必须透明：卡片背后的"灰色大底"要由 tableView.backgroundColor 透出来，
+    //    否则每张卡片周围还是白底，等于只加了圆角、没做出分层。
+    self.backgroundColor = [UIColor clearColor];
+    self.contentView.backgroundColor = [UIColor clearColor];
+    // 🔴 关掉系统选中态：它会盖一层灰在整个 cell 上（含卡片外的留白），
+    //    看起来像"整行被框住了"。选中反馈改在 setHighlighted: 里只染卡片自己。
+    self.selectionStyle = UITableViewCellSelectionStyleNone;
+    self.cardView = [[UIView alloc] init];
+    self.cardView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    self.cardView.layer.cornerRadius = 12;
+    self.cardView.layer.cornerCurve = kCACornerCurveContinuous;   // 和系统卡片同一个曲率
+    self.cardView.clipsToBounds = YES;
+    [self.contentView addSubview:self.cardView];
 
     // 图标容器：真图标和首字母共用一块底
     self.iconBox = [[UIView alloc] init];
     self.iconBox.backgroundColor = [UIColor secondarySystemFillColor];
     self.iconBox.layer.cornerRadius = 9;
     self.iconBox.clipsToBounds = YES;
-    [self.contentView addSubview:self.iconBox];
+    [self.cardView addSubview:self.iconBox];
 
     // v0.0.35：未读点。放在图标左边（见 layoutSubviews 里的 DOT_X/ICON_X）。
     // 默认 hidden —— 万一某处忘了调 setUnread:，宁可少一个点，也不要给所有行都点上。
@@ -94,7 +120,7 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     self.dotView.backgroundColor = [UIColor systemBlueColor];
     // 圆的半径在 layoutSubviews 里按 dotD / 2 算（改尺寸不会忘同步）
     self.dotView.hidden = YES;
-    [self.contentView addSubview:self.dotView];
+    [self.cardView addSubview:self.dotView];
 
     self.iconView = [[UIImageView alloc] init];
     self.iconView.contentMode = UIViewContentModeScaleAspectFit;
@@ -113,19 +139,19 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     self.appLabel.font = [UIFont systemFontOfSize:11];
     self.appLabel.textColor = [UIColor secondaryLabelColor];
     self.appLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    [self.contentView addSubview:self.appLabel];
+    [self.cardView addSubview:self.appLabel];
 
     self.titleLabel2 = [[UILabel alloc] init];
     self.titleLabel2.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     self.titleLabel2.textColor = [UIColor labelColor];
     self.titleLabel2.lineBreakMode = NSLineBreakByTruncatingTail;
-    [self.contentView addSubview:self.titleLabel2];
+    [self.cardView addSubview:self.titleLabel2];
 
     self.timeLabel = [[UILabel alloc] init];
     self.timeLabel.font = [UIFont systemFontOfSize:11];
     self.timeLabel.textColor = [UIColor tertiaryLabelColor];
     self.timeLabel.textAlignment = NSTextAlignmentRight;
-    [self.contentView addSubview:self.timeLabel];
+    [self.cardView addSubview:self.timeLabel];
 
     // v0.0.45：subtitle 单独一行。
     // 🔴 为什么以前根本看不到它：旧逻辑是"**正文为空**才拿 subtitle 顶替正文"，
@@ -143,14 +169,14 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     self.subLabel.textColor = [UIColor secondaryLabelColor];
     self.subLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     self.subLabel.hidden = YES;                      // 默认藏：没给值时宁可少一行
-    [self.contentView addSubview:self.subLabel];
+    [self.cardView addSubview:self.subLabel];
 
     self.msgLabel = [[UILabel alloc] init];
     self.msgLabel.font = [UIFont systemFontOfSize:13];
     self.msgLabel.textColor = [UIColor secondaryLabelColor];
     self.msgLabel.numberOfLines = 2;                 // 正文最多两行，超了截断
     self.msgLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    [self.contentView addSubview:self.msgLabel];
+    [self.cardView addSubview:self.msgLabel];
 
     // v0.0.48：右上角 ★（关键词"标星"动作）。默认藏 —— 和未读点一样，
     // 万一某处忘了调 setStarred:，宁可少一颗星，也不要给所有行都点上。
@@ -161,29 +187,38 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     self.starLabel.textColor = [UIColor systemOrangeColor];
     self.starLabel.textAlignment = NSTextAlignmentRight;
     self.starLabel.hidden = YES;
-    [self.contentView addSubview:self.starLabel];
+    [self.cardView addSubview:self.starLabel];
 
     return self;
 }
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    CGFloat w = self.contentView.bounds.size.width;
-    CGFloat h = self.contentView.bounds.size.height;
+    // v0.0.70：先摆卡片，再把**所有**内部坐标改成相对卡片。
+    // 🔴 关键：卡片内高度 = cell 高 - 上下留白 = 98，和 v0.0.69 之前的 contentView 高**完全相同**
+    //    ⇒ 下面那一整套 y 坐标（10/25/47/63）一个都不用重算，只换原点。
+    //    这也是为什么行高只加 8：加的是卡片外的留白，不是内容空间。
+    CGRect card = CGRectInset(self.contentView.bounds, kNBCardInsetX, kNBCardInsetY);
+    self.cardView.frame = card;
+    CGFloat w = card.size.width;
+    CGFloat h = card.size.height;
+    CGFloat ox = card.origin.x;      // 卡片原点：后面每个 frame 都要带上
+    CGFloat oy = card.origin.y;
     CGFloat pad = 14;
     CGFloat side = 46;
 
     // v0.0.35：左侧让出 8pt 给未读点。
     // 🔴 未读/已读两态**共用同一个 iconX**（不是"只有未读才右移"）：
     //    否则同一屏里图标左缘会参差不齐，比没有点更乱。
+    // v0.0.70：12 → 10（卡片自己已经内缩了 12，再留 12 会显得太空）
     CGFloat dotD = 8;
-    CGFloat dotX = 12;
+    CGFloat dotX = 10;
     CGFloat iconX = dotX + dotD + 2;
-    self.dotView.frame = CGRectMake(dotX, (h - dotD) / 2, dotD, dotD);
+    self.dotView.frame = CGRectMake(ox + dotX, oy + (h - dotD) / 2, dotD, dotD);
     // 半径按 dotD 算，改尺寸时不用记得同步 cornerRadius
     self.dotView.layer.cornerRadius = dotD / 2;
 
-    self.iconBox.frame = CGRectMake(iconX, (h - side) / 2, side, side);
+    self.iconBox.frame = CGRectMake(ox + iconX, oy + (h - side) / 2, side, side);
     self.iconView.frame = self.iconBox.bounds;
     self.letterLabel.frame = self.iconBox.bounds;
 
@@ -197,19 +232,30 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
     // v0.0.48：右上角 ★。标星时给 App 名那一行**收宽**，避免 ★ 和 App 名尾字重叠。
     // 🔴 判据用原始 `self.starred`，不用 starLabel.hidden（见属性注释）。
     CGFloat starW = self.starred ? 20 : 0;
-    self.starLabel.frame = CGRectMake(w - pad - 18, 8, 18, 18);
-    self.appLabel.frame     = CGRectMake(textX, 10, w - textX - pad - starW, 14);
-    self.titleLabel2.frame  = CGRectMake(textX, 25, w - textX - timeW - pad, 20);
-    self.timeLabel.frame    = CGRectMake(w - pad - timeW, 26, timeW, 16);
+    self.starLabel.frame = CGRectMake(ox + w - pad - 18, oy + 8, 18, 18);
+    self.appLabel.frame     = CGRectMake(ox + textX, oy + 10, w - textX - pad - starW, 14);
+    self.titleLabel2.frame  = CGRectMake(ox + textX, oy + 25, w - textX - timeW - pad, 20);
+    self.timeLabel.frame    = CGRectMake(ox + w - pad - timeW, oy + 26, timeW, 16);
     // v0.0.45：有副标题时正文下移一行；没有就完全回到原来的 47/40。
     // 🔴 判据用 `rawSubtitle`（原始串），**不用** `subLabel.text` ——
     //    `attributedText` 赋值之后 `.text` 的取值时机不保证早于本方法，
     //    拿视图状态反推数据状态这种事在本项目已经栽过（观测者把被观测量改了）。
     BOOL hasSub = (self.rawSubtitle.length > 0);
     self.subLabel.hidden    = !hasSub;
-    self.subLabel.frame     = CGRectMake(textX, 47, w - textX - pad, 16);
-    self.msgLabel.frame     = CGRectMake(textX, hasSub ? 63 : 47,
+    self.subLabel.frame     = CGRectMake(ox + textX, oy + 47, w - textX - pad, 16);
+    self.msgLabel.frame     = CGRectMake(ox + textX, oy + (hasSub ? 63 : 47),
                                          w - textX - pad, hasSub ? 34 : 40);
+}
+
+// v0.0.70：按下时只染**卡片**，不染整行。
+// 🔴 为什么不用系统选中态：`selectionStyle` 的高亮是把整块 cell 盖一层灰，
+//    卡片外的留白也会变灰 ⇒ 看起来像"上下两行连成一片"，卡片化就白做了。
+//    这里自己换 cardView 的底色，留白保持透明（透出 tableView 的灰底），分层才成立。
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    [super setHighlighted:highlighted animated:animated];
+    self.cardView.backgroundColor = highlighted
+        ? [UIColor tertiarySystemFillColor]
+        : [UIColor secondarySystemGroupedBackgroundColor];
 }
 
 - (void)setIcon:(UIImage *)icon letter:(NSString *)letter {
@@ -307,6 +353,11 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
 
 - (void)prepareForReuse {
     [super prepareForReuse];
+    // 🔴 v0.0.70：卡片底色必须复位。
+    //    复用池里如果留着一次"按下时的高亮色"（`setHighlighted:` 换的 tertiarySystemFill），
+    //    下一行滚进来就会是一片浅灰卡片 —— 症状是"某几行底色不对，滚动一下又变了"，
+    //    极难复现也极难归因。**凡是 setter 改过的外观，prepareForReuse 必须改回去。**
+    self.cardView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.iconView.image = nil;
     self.iconView.hidden = YES;
     self.letterLabel.hidden = NO;
