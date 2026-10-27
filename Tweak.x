@@ -480,6 +480,7 @@ static BOOL      gAPIDumped  = NO;   // 方法表只追加一次
 static NSString *gWantBundle = nil;  // 最近一次要删的 App（给「按 section 找 request」用）
 static NSArray  *gWantIDs    = nil;  // v0.0.68：本条的 cid / recordID / publisherID（精确匹配用）
 static __strong id gCSDestination = nil;  // 真 destination（CSNotificationDispatcher 实例）
+static BOOL gCSDestFromHook = NO;          // 它是「注册期 hook」接住的（不是靠 OBS 撞上的）
 static __strong id gFoundNCReq = nil;     // 找到的**真** request（系统对象，不是我造的）
 static int  gActClearTried = 0;      // 正向清除尝试次数（全进程 ≤2）
 
@@ -1094,7 +1095,12 @@ static id NBFindCSDestIn(id v, int depth) {
 // 两条来源依次试：① dispatcher 的 destinationsRegistry ② request 自己的 requestDestinations
 // （后者如果直接给对象，那就最省事：request 自己知道它被投给了谁）。
 static void NBProbeDestinations(id req) {
-    if (gCSDestination) return;
+    if (gCSDestination) {
+        NBDiagStep(@"  [dest] ✅ 已有实例 <%@>（来源：%@）\n",
+                   NBClassName(gCSDestination),
+                   gCSDestFromHook ? @"注册期 hook" : @"OBS");
+        return;
+    }
     if (!gNCDispatcher) return;
     @try {
         id reg = nil;
@@ -2216,6 +2222,27 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 - (void)postNotificationWithRequest:(id)request {
     gNCDispatcher = self;
     NBStashNCRequest(request);   // 存「通知标识 → 真 request 对象」，删除时直接拿来撤回
+    %orig;
+}
+// ---------- 🔴🔴 v0.0.68：注册 destination 时**顺手接住实例** ----------
+// 为什么非要这条：v0.0.67 的 destination 实例只能靠 `destination:requestsClearing…` 那条 OBS 抓，
+// 而那一轮 OBS **触发 0 次** ⇒ `[清] 跳过 destination（实例=(nil)）` ⇒ 唯一能驱动界面的那一刀
+// 从来没发出去过。注册动作在 SpringBoard 起来时就发生，**比任何一次删除都早、且一定会走**。
+// 🔴 这里**不写日志**（这个时点 diag 文件可能还不该存在，早写会让方法表那段被跳过），
+//    只静静接住；由 `NBProbeDestinations` 在真要动手时打一行说明来源。
+// 🔴 只接 `CSNotificationDispatcher`（CoverSheet = 通知中心界面本身），别的一概不碰。
+- (void)registerDestination:(id)destination {
+    if (destination && NBIsCSDest(destination)) {
+        gCSDestination = destination;
+        gCSDestFromHook = YES;
+    }
+    %orig;
+}
+- (void)_registerDestination:(id)destination {
+    if (destination && NBIsCSDest(destination)) {
+        gCSDestination = destination;
+        gCSDestFromHook = YES;
+    }
     %orig;
 }
 // ---------- 🔴🔴 v0.0.66：**纯观测**——系统自己"清掉通知"到底走哪条路 ----------
