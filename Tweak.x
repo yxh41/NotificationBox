@@ -1,11 +1,11 @@
-// Tweak.x —— v0.0.60（当前）：**分两层量、分两层动手，取消早停** ——
+// Tweak.x —— v0.0.61（当前）：**分两层量、分两层动手，取消早停** ——
 //   🔴 用户实测 v0.0.58/v0.0.59：「没有消失，是不是没真正删除啊啊」。
 //      日志里 BB 的 live 确实 50→49、含本条 是→否 —— 但界面不动。
 //      根因两条，都是我自己的错：
 //        ① **只量了 BB 账本**（`_allBulletinsForSectionID:`）。BB 是账本，NC 才是界面。
 //        ② 第 ① 步让 BB 计数变了 ⇒ `still=NO` ⇒ **早停** ⇒ 后面「NC 原生撤回」
 //           （唯一驱动界面的那步）**一次都没执行**。
-//   ⇒ v0.0.60 改成：BB 层与 NC 层**分别量**（`NBLiveScan` + `NBScanNC`）、**分别动手**、
+//   ⇒ v0.0.61 改成：BB 层与 NC 层**分别量**（`NBLiveScan` + `NBScanNC`）、**分别动手**、
 //      **不许早停**。NC 侧三条路：`observer:removeBulletin:`（BB 撤回广播的 NC 入口）、
 //      `withdrawNotificationWithRequest:`（用 source 自己缓存的**真 request**，不是我造的）、
 //      以及 `_clearBulletinIDs:` 补刀。
@@ -337,7 +337,7 @@ static BOOL NBClaimKey(NSString *key) {
 - (void)withdrawNotificationWithRequest:(id)request;                     // v@:@  NCNotificationDispatcher
 - (id)notificationRequestWithSectionId:(NSString *)sectionID
                         notificationId:(NSString *)notificationId;       // 类方法，用 (id)cls 发
-// ---- v0.0.60：NCBulletinNotificationSource（BB 与 NC 之间的桥）----
+// ---- v0.0.61：NCBulletinNotificationSource（BB 与 NC 之间的桥）----
 - (id)dispatcher;                                                        // @@:  拿 dispatcher
 - (id)observer;                                                          // @@:  拿 BBObserver
 - (void)observer:(id)observer removeBulletin:(id)bulletin;               // v@:@@ BB 撤回时 NC 侧真正的入口
@@ -556,7 +556,7 @@ static void NBDiagAppend(NSString *text) {
     } @catch (__unused NSException *e) { }
 }
 
-// ---------- v0.0.60：NC 层的读与取 ----------
+// ---------- v0.0.61：NC 层的读与取 ----------
 // 🔴 为什么必须有这一层：`_allBulletinsForSectionID:` 量的是 **BB 账本**，
 //    而用户眼睛看的是 **NC 界面**。v0.0.58 只量了 BB，一看"数变了"就宣布成功，
 //    结果界面上那条还在 ⇒ 判据的量根本不对层。
@@ -643,7 +643,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         #pragma clang diagnostic pop
             NSMutableString *rec = [NSMutableString string];
             [rec appendFormat:@"\n=== [尝试 %@] sysId=%@ bundle=%@\n", [NSDate date], sysId, bundle];
-            NBLog(@"=== [NC-CLEAR] v0.0.60 请求 sysId=%@ bundle=%@", sysId, bundle);
+            NBLog(@"=== [NC-CLEAR] v0.0.61 请求 sysId=%@ bundle=%@", sysId, bundle);
             NBLog(@"[NC-DIAG] 捕获对象类=%@", NSStringFromClass([gBBServer class]));
             // 方法表是静态信息，只在文件不存在时写一次；之后只追加「本次尝试记录」
             if (![[NSFileManager defaultManager] fileExistsAtPath:NOTIFYBOX_NC_DIAG_PATH]) {
@@ -655,7 +655,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 if (!cid.length) continue;
                 [rec appendFormat:@"cid=%@\n", cid];
 
-                // ===== v0.0.60：分两层量、分两层动手，**取消早停** =====
+                // ===== v0.0.61：分两层量、分两层动手，**取消早停** =====
                 // 🔴 v0.0.58 的错（用户实测「没消失」后才看清）：
                 //    ① 只量了 BB 账本（`_allBulletinsForSectionID:`），一看总数变了就 still=NO 停手
                 //    ② 于是第 ⑥ 步「NC 原生撤回」——**唯一驱动界面的那步**——一次都没执行
@@ -691,12 +691,18 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 //      传进去的就是已失效对象 —— 要么抛、要么静默无效（v0.0.58 把它排在删账本之后，
                 //      大概率就是这个原因一次都没生效）。
                 //   这一步不需要 dispatcher/request，只要有 source + observer + bulletin。
-                if (bullet && ncIn && gNCSource
+                //   🔴 真机 nc_diag 已确认这三个都在：
+                //      `- observer  @@:` / `- setObserver: v@:@` / `- observer:removeBulletin:  v@:@@`
+                //      ⇒ 签名就是 BBObserverDelegate 那条，第一个参数是 BBObserver。
+                //   ⚠️ 进入条件**不要求 ncIn**：只要拿得到有效 bulletin 就值得试一次
+                //      （映射的 key 形态不确定，用 ncIn 当门会把唯一可能生效的一步挡掉）。
+                if (bullet && gNCSource
                     && [gNCSource respondsToSelector:@selector(observer:removeBulletin:)]) {
                     id obs = nil;
                     @try {
                         if ([gNCSource respondsToSelector:@selector(observer)]) obs = [gNCSource observer];
                     } @catch (__unused NSException *e) { }
+                    [rec appendFormat:@"  observer=%@\n", obs ? NSStringFromClass([obs class]) : @"(nil)"];
                     if (!obs) {
                         [rec appendString:@"  ① 跳过（source.observer 为 nil）\n"];
                     } else {
@@ -713,8 +719,8 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     }
                 } else if (!gNCSource) {
                     [rec appendString:@"  ① 跳过（没抓到 NC source）\n"];
-                } else if (!ncIn) {
-                    [rec appendString:@"  ① 跳过（NC 映射里本来就没有）\n"];
+                } else if (!bullet) {
+                    [rec appendString:@"  ① 跳过（没取到有效 bulletin 对象）\n"];
                 }
 
                 // ---------- 第 2 步：NC 原生撤回（用 source 自己缓存的**真 request**）----------
@@ -1335,7 +1341,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     //    用户是靠这一行判断功能状态的；功能没了却还在说"已启用"，就是 v0.0.18 那种假现场。
     // 🔴 banner 必须如实：用户是靠这一行判断"我改的功能到底有没有上线"。
     //    换提示音是实验功能，所以这里写「实验」，不写「已启用」。
-    NBLog(@"=== [%@] NotifyBox v0.0.60 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.61 · %@ · 朗读自愈%@ · 换提示音自愈%@ · 免打扰时段%@ · 换提示音%@ · 同步清通知中心%@ · 延迟推送已移除 ===",
           NBProc(), [NotifySpeaker diagnosticLine],
           recovered ? @"已触发" : @"无异常",
           soundRecovered ? @"已触发" : @"无异常",
@@ -1374,7 +1380,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     BOOL h2 = [names containsObject:@"publishBulletinRequest:destinations:"];
     BOOL h3 = [names containsObject:@"_publishBulletinRequest:forSectionID:forDestinations:"];
 
-    NBLog(@"=== [%@] NotifyBox v0.0.60 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v0.0.61 · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ ===",
           NBProc(), cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO");
 
     // v0.0.55：删掉 v0.0.53 在这里（%ctor）打的那行方法清单。
@@ -1443,7 +1449,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               [[hits sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" , "]);
     }
 
-    NBLog(@"=== [%@] v0.0.60 %@ ===", NBProc(),
+    NBLog(@"=== [%@] v0.0.61 %@ ===", NBProc(),
           (h1 || h2 || h3) ? @"已挂发布入口，等通知（看 PB/PBR/PBRS 开头的命中行）"
                            : @"没挂上任何入口");
 }
