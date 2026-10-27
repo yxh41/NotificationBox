@@ -6689,3 +6689,95 @@ if (!gNCUseQueuePath) { … return; }   // 编译器证明它恒为 true ⇒ 门
 `winStep = 1`（① 撤回广播跑过）以前**从来没被赋值过**，那个结论分支是死的。
 本版 ① 成功即置 1，② 改成**无条件覆盖**为 2 —— 原来写的是 `if (!winStep) winStep = 2`，
 而 ① 已经把 winStep 置成 1 ⇒ **永远进不了 2**。死分支从「不可达」变成「可达且正确」。
+
+
+---
+
+## v0.0.66 —— 我盯错了方向：`observer:removeBulletin:` 是反向广播
+
+### 一个非常有价值的对照实验
+
+用户这轮做了一件关键的事：**手动从通知中心滑掉一条**，专门用来对照。
+
+结果两边都没触发：
+
+| 观测点 | 期望 | 实际 |
+|---|---|---|
+| ⓪ 之后 BB 账本 | 清掉 | ✅ 4/4 清掉（5→4 / 13→12 / 100→99 / 14→13） |
+| 通知中心里那条 | 消失 | ❌ **还在**（用户实测） |
+| `observer:removeBulletin:` | 应该响 | ❌ **0 次**（连手动滑都没响） |
+
+### 🔴 结论：方向反了
+
+`NCBulletinNotificationSource - observer:removeBulletin:` 是 **BBServer → NC 的反向广播**
+——“BB 那边删掉了，通知你一声”。它不是“谁把这条清掉”的入口。
+
+盯反向广播的代价是：**整整一轮真机实验什么都没看到**（4 次尝试、0 次触发）。
+这和前面「名字像 ≠ 会被调用」是同一条纪律的又一次验证。
+
+### 真正的入口在另一侧（这次不是猜，是从真机方法清单里读出来的）
+
+`### NCNotificationDispatcher -方法 67 个` 里和“清掉”直接相关的只有这几条：
+
+| 选择器 | 方向 | 含义 |
+|---|---|---|
+| `destination:requestsClearingNotificationRequests:` | 目的地 → dispatcher | **NC 界面“请求清除”** |
+| `withdrawNotificationWithRequest:` | dispatcher | 真正执行撤回 |
+| `_clearUnsafeNotification:` / `_didRemoveNotificationRequest:` | dispatcher 内部 | 清掉 / 清完回调 |
+| `dispatcher:requestsClearingNotificationRequests:` | dispatcher → source | 把 NC request 翻成 bulletin 交给 BBServer |
+
+> 🔴 判断方向的方法：**看谁是参数**。`observer:removeBulletin:` 的第一个参数是 `observer`——
+> 是“BBServer 在通知它的观察者”；`destination:requestsClearing…` 的第一个参数是 `destination`——
+> 是“某个目的地（NC 界面）在请求 dispatcher 清东西”。
+> **参数名就是调用方向的路牌**，比方法名里的动词可靠。
+
+### v0.0.66 的四条改动
+
+| 改动 | 为什么 |
+|---|---|
+| 观测改挂“请求清除”这一侧（3 条） | 上一版挂的是反向广播，0 次触发 |
+| 取 request 加**按内容扫** | 上一版只按 key 精确 ⇒ 缓存 43~100 条**一条都没中** |
+| [GQ] 不再空烧机会 | 上一版无条件置 `gNCGlobalTried = YES`，没 request 也照样烧掉 |
+| 一次性 dump 缓存键形态 | 缓存键到底是什么，下一版不用再猜 |
+
+**为什么"按内容扫"重要**：日志里 `缓存=43 / 63 / 69 / 100` 一直在长，
+说明 `postNotificationWithRequest:` 那条路一直在正常缓存，但 `cid` 一条都匹配不上
+⇒ **缓存键不是 cid**。现在再按 request 自己的
+`notificationIdentifier` / `bulletinID` / `recordID` / `publisherBulletinID` 比一遍
+（只读 KVC、每键单独 `@try`，缺键会抛）。
+
+### 包内对拍（v0.0.65 → v0.0.66，CI #127）
+
+```
+deb 1,096,616 B  md5 853894603e5dc6afc801655b1d7459f8  control Version: 0.0.66
+① 新增锚点（旧=0 且 新>0）  11/11
+② 共有锚点  4/4
+③ 反向对照  5/5   [GQ] 两条旧措辞 / v0.0.65 三条版本串
+不合格 0
+```
+
+🔴 dylib **211,984 → 212,000，只差 16 字节**，而源码改了 4 KB 多（新增一个函数 + 3 个 hook）。
+体积这条指标又一次被证伪 —— 判「编进去没」只认串 / 选择器 / md5。
+
+🔴 顺带记一笔：第一次跑对拍报 `内容键 %@` 不合格，原因是**我写锚点时多打了一个前导空格**
+（源码里是 `@"内容键 %@"`，没有前导空格）。又一次「判据没绿先怀疑自己的期望表」。
+
+### 这一轮请这样做（很重要）
+
+1. 装好后**先删一条盒子记录**（触发一次 [尝试]）
+2. 然后**手动从通知中心滑掉一条别的通知**
+3. 回传 `nc_diag.txt`
+
+看这一行：
+
+```
+观测计数: 目的地请求清除=N / dispatcher 撤回=M / source 请求清除=K
+```
+
+- 手动滑一条之后 **这三个数有任何一个变大** ⇒ 那就是系统真正走的路，
+  下一版直接照着它调（`withdrawNotificationWithRequest:` 已经有真 request 了就差这一步）；
+- 三个数**全都不动** ⇒ 手动清除根本不经过这三条，得往
+  `_clearUnsafeNotification:` / `_didRemoveNotificationRequest:` / 目的地注册表 那一层再挖。
+
+另外会多出一段 `[cache] 共 N 条，前 5 个键：…`，这段直接告诉我们缓存键长什么样，
+不用再靠猜。
