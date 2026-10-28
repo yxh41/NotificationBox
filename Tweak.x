@@ -396,11 +396,10 @@ static BOOL NBClaimKey(NSString *key) {
 //    v0.0.72 就是这么炸的（四道文本自检全绿，因为括号/宏/行尾都没问题）：
 //    调用一个未声明的选择器在 C 里根本不是"运行时会不会崩"的问题，而是**编译期就过不去**。
 //    这一条已补进源码自检第 ⑨ 道（见 tools/check_selectors.py）。
-- (void)removeBulletinID:(NSString *)bulletinID
-      fromNoticesSection:(NSString *)sectionID;                          // v@:@@  从"通知区段"摘
-- (void)removeBulletinID:(NSString *)bulletinID
-             fromSection:(NSString *)sectionID
-                  inFeed:(unsigned long long)inFeed;                     // v@:@@Q 第 3 参是**位掩码**不是 BOOL
+// ---- v0.0.74：两条 `removeBulletinID:*` 的声明已删 ----
+// 🔴 ⑤ 三条刀整体删除后，整份 TU 里**再没有地方发这两个选择器**。
+//    留着声明的坏处：它们会进 `__objc_methname` ⇒ 包级反向判据
+//    「旧选择器必须消失」永远过不了，下一轮看包里还有这名字会误判成"还在用"。
 - (void)_sendRemoveBulletin:(id)bulletin
                     toFeeds:(unsigned long long)feeds
                  shouldSync:(BOOL)shouldSync;                            // v@:@QB 广播给 observer（只观测）
@@ -1584,7 +1583,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 //   `_sendRemove` 涨了 ⇒ 刀走到了"广播给 observer"那一跳；
                 //   `BB→NC` 也涨了  ⇒ NC 真的收到了 ⇒ 界面该变；
                 //   两个都不涨 ⇒ 这把刀和 ⓪ 一样，只改账本。
-                verdict = @"✅ ⑤ 新刀 removeBulletinID 摘掉了本条（读回确认）⇒ 界面看 _sendRemove / BB→NC 两个观测计数";
+                verdict = @"✅ ⑤ 新刀摘掉了本条（本分支自本版起已不可达，留着只为不改动旧判定链）";
             } else if (bbWithdrew && winStep == 2) {
                 verdict = @"✅ ⓪ 官方撤回清掉 BB + ② NC withdraw 也跑了 ⇒ 界面应会变（本轮最强态）";
             } else if (bbWithdrew) {
@@ -2908,8 +2907,6 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     // 🔴 为什么要在这里就把结果打出来：这三条名字来自 dump（静态），
     //    而"dump 里有 ≠ 这台机器上跑得通"是本项目反复踩到的（手册有、本机没有的类已经四个）。
     //    开机日志能留下的信息有限，所以把结果编进那一行 NBLog 里，不额外占行。
-    BOOL h4 = [names containsObject:@"removeBulletinID:fromNoticesSection:"];
-    BOOL h5 = [names containsObject:@"removeBulletinID:fromSection:inFeed:"];
     BOOL h6 = [names containsObject:@"_sendRemoveBulletin:toFeeds:shouldSync:"];
 
     // ---------- v0.0.73：CoverSheet 目的地侧（观测 + ⑥ 动作）----------
@@ -2945,9 +2942,9 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         }
     }
 
-    NBLog(@"=== [%@] NotifyBox v%@ · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ · 新刀K1=%@ K2=%@ 广播观测=%@ ===",
+    NBLog(@"=== [%@] NotifyBox v%@ · BBServer %u 个方法 · PB=%@ PBR=%@ PBRS=%@ · 广播观测=%@ ===",
           NBProc(), NB_VER_STR, cnt, h1 ? @"YES" : @"NO", h2 ? @"YES" : @"NO", h3 ? @"YES" : @"NO",
-          h4 ? @"YES" : @"NO", h5 ? @"YES" : @"NO", h6 ? @"YES" : @"NO");
+          h6 ? @"YES" : @"NO");
 
     // v0.0.55：删掉 v0.0.53 在这里（%ctor）打的那行方法清单。
     //   🔴 理由：%ctor 是**开机**那一刻，日志窗口（≈最后 50 行）早就把它滚掉了 ——
