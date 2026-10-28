@@ -7660,3 +7660,90 @@ v0.0.72 的 ② 把 destination 填进去，那一跳的语义是"目的地**请
 **下一轮要看的四个数**（装 v0.0.73 后）：
 ① `⑥a/⑥b` 之后 `还能找到本条=?`，② `⑥` 结束那行的 CS 观测计数，
 ③ 用户**手动清一条**之后这六条计数涨哪几个，④ 人眼。
+
+## v0.0.74 —— ⑤ 判死整块删除；界面侧改押「系统自己那条路」；按段清加闸门
+
+> 依据 `nc_diag(13).txt`（v0.0.73 装完两轮实测）。这一版仍然**不做"已经修好了"的断言**：
+> 它把上一版的 4 把刀收回 3 把，只把"系统自己真在用"的那把提到第一位，并给唯一确认有效的
+> 那把加了**连带保护闸门**。
+
+### 1. `nc_diag(13).txt` 的三个新事实
+
+| # | 实测（原文数字） | 结论 |
+|---|---|---|
+| ① | ⑤ K1 / K2(inFeed:0) / K2b(inFeed:1) 三条各广播一次 `_sendRemoveBulletin`（feeds=1/0/1，sync 全 0），读回 `BB live` **一个没少**、`含本条=是`，`⑤新刀成功=0` | `removeBulletinID:*` 家族**只广播、不删账本** ⇒ 整族作废 |
+| ② | ⑥a `withdrawNotificationRequest:` 已返回，`⑥ 读回：扫 1421 条，还能找到本条=是` | CS 自己的撤回**空转** |
+| ③ | ⑥b `destination:gNCDispatcher clearNotificationRequests:`（1 条）→ `[OBS] dispatcher destination:<CSNotificationDispatcher> requestsClearing…` + `[OBS-dst] #0` 就是本条 → 仍 `还能找到本条=是` | 请求**到了**、模型**没动** ⇒ **首参填 dispatcher 是错的** |
+
+### 2. 本轮最重要的新线索：系统自己清一条，走的是「多个 With」那一把
+
+上一版按段清之后，同一秒内出现了 **9 条真删除**，每一条都是这个组合：
+
+```
+[OBS] dispatcher withdrawNotificationWithRequest:（第 N 次）nid=…
+[BB→NC] 系统自己调用 observer:removeBulletin: 第 N 次 … recordID=…
+[OBS-rem] _sendRemoveBulletin 第 N 次 feeds=15871 sync=1 …
+```
+
+也就是说：**真删除**走的是 `NCNotificationDispatcher -withdrawNotificationWithRequest:`
+（多个 `With`），而不是我们一直在试的 `CSNotificationDispatcher -withdrawNotificationRequest:`。
+
+> 🔴 这条同时**推翻**了 v0.0.66 写死的「系统根本不走 withdraw」——
+> 那个 0 次只对「用户手动清一条」成立。源码里 5 处旧注释已就地标注被推翻
+> （原文保留，只补边界），因为**留一条与实测矛盾的注释，比留一段死代码更贵**。
+
+### 3. 这一版的 ⑦：三把刀 + 三步读回，按段清加闸门
+
+```
+⓪ 账本清干净（withdrawBulletinRequestsWithRecordID:forSectionID:，实测稳定生效）
+   ↓ 投主队列
+⑦a [gNCDispatcher withdrawNotificationWithRequest:req]      ← 系统自己那条路
+   ↓ 读回（扫 N 条 / 同段 M 条 ⇒ 还能找到本条=?）
+⑦b [gCSDestination destination:gCSDestination clearNotificationRequests:{1 条}]   ← 首参纠正
+   ↓ 读回
+⑦c destination:clearNotificationRequestsInSections:{bundle}  ← 仅当「同段 M <= 1」
+   ↓ 读回
+```
+
+**⑦c 的闸门是本版唯一的新判据**：它确认**有效**（两次独立实测都清掉了整段），
+但用户实测「**有些通知没了，但不是我要删的那条**」⇒ 它就是一把整段清的刀。
+把「同段还剩几条」这个**已经量到的数**当开关：只剩 1 条时，「清整段」和「清这一条」
+是同一件事，零连带；剩 2 条以上就**跳过**，日志明写「会连带清掉别人的通知」。
+
+### 4. 顺手收回的东西
+
+- ⑤ 三条刀**整块删除**（连带 `%ctor` 里的 h4/h5 探测、启动日志的 `新刀K1/K2` 两栏、
+  以及 `@interface` 里两条 `removeBulletinID:*` 死声明）。
+  > 死声明的害处不是"多几字节"：它留在 `__objc_methname` 里，会让
+  > 包级反向判据「旧选择器必须消失」**永远过不了**，下一轮看包里还有这名字会误判成"还在用"。
+- verdict 里「✅ ⑤ 新刀摘掉了本条」那条分支就地标注**本版起已不可达**（假绿第 ⑧ 型）。
+- 日志上限放宽，免得数据被截断：`_sendRemove` 20→40、`BB→NC` 40→60、
+  `dispatcher withdraw` 15→40、`dispatcher requestsClearing` 6→12。
+
+### 5. 交付与对拍
+
+| 项 | 值 |
+|---|---|
+| CI | #148（首轮，反向判据命中 1 次）+ **#149**（收尾，成功） |
+| deb | `com.yxh41.notifybox_0.0.74_iphoneos-arm64e.deb`，1,110,666 B |
+| md5 | `cb35b78211edaa919e7aeda20d581976` |
+| dylib | 245,296 → 245,296（**+0**），而 `__text` −776 / `__ustring` −1096 / `__cfstring` −320 / `__methname` −74 |
+| App | 487,632 → 487,632，**区外零差异**（只差 `LC_UUID[2968,2984)` + `LC_CODE_SIGNATURE[480960,487632)`） |
+
+包级对拍 19 条全过：A 正向 7（⑦a/⑦b/⑦c 的调用与三处读回都在包里）/
+B 反向 9（⑤K1/K2/K2b、⑥a/⑥b/⑥c 日志 + 两条 `removeBulletinID:*` 选择器，全部 0）/
+C 版本 3 / D 段级 + 元数据白名单。
+
+> 🔴 这一版的 `+0` 又是一次活标本：**总大小一模一样，四个段各减几百字节**。
+> 「大小没变」不能当"没改动"的证据。
+
+### 6. 下一轮要看的数
+
+装 v0.0.74 后删一条，看 ⑦ 那几行：
+
+1. `⑦a 读回：扫 N 条 / 同段 M 条 ⇒ 还能找到本条=?` —— 系统自己那条路奏不奏效
+2. 若 ⑦a 没奏效，`⑦b 读回` 是否变了（首参从 dispatcher 改成 CS 自己，是这一版唯一的变量）
+3. `⑦c 同段只剩 M 条` 或 `⑦c 跳过（同段还有 M 条 > 1）` —— 闸门开没开
+4. 人眼：这一条掉了没有？旁边同 App 的通知有没有被带走？
+
+判据口径：**只认 ⑦ 的三次读回**，不认"已返回"。
