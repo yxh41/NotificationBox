@@ -7578,3 +7578,85 @@ clang **编译期**就报错 —— 这不是"运行时会不会崩"，是根本
   仍然是**一条记录一张卡片**。分组是另一个量级的需求（数量契约、段内布局全要重做）。
 - 新刀**只在 `bbCleanup` 里**（即"用户删记录 → 清通知中心"那条链），**没有**用在别处。
 - `inFeed:` 的位掩码仍然是试出来的（0 → 1），不是查到的文档。下一轮靠日志定。
+
+## v0.0.73 —— 链路被切成三段，每段都有实测数；换顺序 + 让系统自己说出答案
+
+> 用户反馈：装 v0.0.72 后回传 `nc_diag(12).txt` —— **「没有消失」**。
+> 这一版不含"我已经修好了"的断言：它是**一次实验**，判据写在下面。
+
+### 1. `nc_diag(12).txt` 把链路切成三段，每段都能单独判死
+
+| 段 | 实测（原文数字） | 结论 |
+|---|---|---|
+| ⑤ 新刀 | `_sendRemoveBulletin` 计数 1→2→3→4，`⑤新刀成功=0`，`BB live` 恒 =2 | **广播发出去了，账本没动** |
+| ⓪ 官方撤回 | `BB live 2→1`、`含本条=否`；`_sendRemoveBulletin` feeds=**15871** sync=1 | 账本**清干净了** |
+| BB→NC | `系统自己传给 NC 共 0 次` | **账本→界面这一跳不走 observer 广播** |
+| NC 侧 ①② | `[验] 清后 NC：扫 502 条，还能找到本条=是` | NC 模型**仍持有**，界面自然不掉 |
+
+三个数一起看，只有一个结论：**`NCBulletinNotificationSource - observer:removeBulletin:`
+这条路在这台机器上根本不会因为 BB 账本变化而被调用**。之前所有"把 BB 侧弄干净"的努力
+（32 条候选）注定只改账本 —— 这解释了为什么每一版日志都"全绿"而界面不动。
+
+### 2. 这一版的第一个改动：**顺序**（同一个 API，方向相反）
+
+v0.0.69 定的顺序是「NC 的**请求清除**要在账本之前」，因为 source 要把 request 翻回
+`BBBulletin`，账本先空了它就翻不出东西。
+
+但 `withdrawNotificationRequest:` 是**界面侧**的刀，不是数据侧的：
+账本里那条还活着时叫它，CoverSheet 完全可以照账本**立刻把它重新显示出来**。
+v0.0.72 恰好在账本还活着时调的它 —— 日志里「① 已返回、界面纹丝不动」。
+
+⇒ ⑥ 挪到 ⓪ 之后（那一刻 `BB live=1`、`含本条=否`），并且**只在 `bbIn == NO` 时才动手**：
+
+| 步 | 调用 | 说明 |
+|---|---|---|
+| ⑥a | `[CS withdrawNotificationRequest:req]` | 同一把刀，换时机 |
+| ⑥b | `[CS destination:<dispatcher> clearNotificationRequests:{req}]` | CS 侧第一次试 |
+| ⑥c | `[CS destination:<dispatcher> clearNotificationRequestsInSections:{bundle}]` | 最后手段，会清掉同 App 全部，日志明写 |
+
+🔴 ⑥b 的首参给**发送方 dispatcher**，不是 destination 自己 ——
+v0.0.72 的 ② 把 destination 填进去，那一跳的语义是"目的地**请求**清除"，
+和这里"派发器**让**目的地清"不是一回事。
+🔴 每步之后都用 `NBFindOurRequest` **读回 NC 模型**：判据是模型里还有没有它，
+不是"方法返回了没"（这个教训 v0.0.65 就有：返回 void 的删方法，"没抛"不等于"删掉了"）。
+
+### 3. 这一版的第二个改动：让系统自己说出答案（GCSD，6 条只读观测）
+
+`CSNotificationDispatcher` 的方法表在这一轮才第一次被看见（52 个），里面有现成的 clear 语义。
+但**"看起来对"已经骗过我很多次**，所以这一版不押它，而是先量：
+
+| 观测点 | 它回答什么 |
+|---|---|
+| `postNotificationRequest:` | **存活对照**：它一定频繁触发，计数涨 = 这组 hook 真的挂上了（不是"没触发"） |
+| `withdrawNotificationRequest:` | 手动清一条时系统会不会调它 |
+| `destination:clearNotificationRequests:` | 同上（最像"清一条"的那把） |
+| `destination:clearNotificationRequestsInSections:` | 同上（按段清） |
+| `destination:clearNotificationRequestsFromDate:toDate:inSections:` | 同上（按时间段清） |
+| `_clearNotificationRequestsFromIncomingSection:` | 同上（来件段清） |
+| `dismissNotificationInLongLookAnimated:` | 同上（长按预览里的清）。ENC 是 `B@:B` ⇒ **返回 BOOL**，声明别写成 void |
+
+全部只读：计数 + 有限行日志，`%orig` 原样透传。
+⇒ 用户**手动在通知中心清掉一条**之后，哪几条计数涨，就说明系统真路是哪一把 ——
+下一版直接抄它。（本项目铁律：判据 = 系统自己走的时候调了哪一把。）
+
+### 4. 顺手补的两个坑
+
+1. 🔴🔴 **观测日志会把方法表永久弄丢**：`NBDiagAppend` 在文件不存在时会**自己新建**它，
+   而「方法表只写一次」的判据正是 `!fileExists`。系统级观测 hook（用户划掉任何通知都可能触发）
+   完全可能在**首次删除之前**把文件建出来 ⇒ 之后那次删除认为"已经写过" ⇒ **整份方法表丢失**，
+   而且表现成"这次文件里没有方法表"，根本不会联想到是几行观测日志干的。
+   ⇒ 新增 `NBDiagReady()`，所有观测日志先问文件在不在（**计数照常累加**，日志没了数还在）。
+2. `CSNotificationDispatcher` **全量**方法表（52 个）单独 dump 一份：
+   v0.0.72 的关键发现是在**关键字筛**结果里看到的，而筛子是按上一版猜的关键字织的 ⇒
+   漏掉哪条取决于我猜得对不对。52 个方法全量打出来，下一轮不再碰运气。
+
+### 5. 交付与判据
+
+- CI #146 成功；deb `com.yxh41.notifybox_0.0.73_iphoneos-arm64e.deb`（1,111,284 B）。
+- 包级对拍 13 条全过（含反向：旧版本串 `0.0.72` 已 0 次）。
+- 🔴 段级字节数：dylib 228,688 → 245,296（`__text` +4,324 / `__ustring` +2,638 /
+  `__objc_methname` +297），**App 一个字节没变**（这一版没动 App）—— 两边都对得上。
+
+**下一轮要看的四个数**（装 v0.0.73 后）：
+① `⑥a/⑥b` 之后 `还能找到本条=?`，② `⑥` 结束那行的 CS 观测计数，
+③ 用户**手动清一条**之后这六条计数涨哪几个，④ 人眼。
