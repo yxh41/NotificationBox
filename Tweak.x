@@ -35,7 +35,7 @@
 //   ---- 以下是 v0.0.68 / v0.0.67 / v0.0.66 / v0.0.65 / v0.0.64 的内容，仍然成立，保留 ----
 //      v0.0.68 四条：`request.bulletin` 精确锁定 / `destinationsRegistry` 同步补抓 destination /
 //      `registerDestination:` 注册期接住实例 / 三把刀按"离界面由近到远"排 / 删 `NBFindCachedRequest`。
-//      成对触发（dispatcher+source）、系统自己不走 withdraw、⓪ 官方撤回稳定生效、
+//      成对触发（dispatcher+source）、⓪ 官方撤回稳定生效、
 //      不投 NC 队列（投了不跑）、闸门带超时、绝不对未知类调 description（`NBStringish`）、
 //      写前日志、`_requestUUIDForBulletinPublisherMatchID:`。
 //   🔴 用户实测 v0.0.58/v0.0.59：「没有消失，是不是没真正删除啊啊」。
@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.73"
+#define NB_VER_STR @"0.0.74"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -520,7 +520,9 @@ static int  gBBRemoveByIDOk = 0;  // 新刀返回且**读回确认已删**的次
 static int  gBBSendRemoveSeen = 0; // 观测：BBServer - _sendRemoveBulletin:toFeeds:shouldSync: 被调次数
 // ⛔ v0.0.67：`gNCGlobalTried` / `gGQWithdrawOk` 已随旧 [GQ] 通道一起删除 ——
 //    那条通道只会调 `withdrawNotificationWithRequest:`，而 v0.0.66 真机证明
-//    系统自己清通知时 **withdraw 一次都不走**（观测计数 = 0）。
+//    用户手动清一条时 **withdraw 一次都不走**（观测计数 = 0）。
+//    🔴 v0.0.74 修正：这只对"手动清一条"成立。**真删除**（段清 / BB 撤回驱动的那一批）
+//    每条都配一次 `withdrawNotificationWithRequest:` —— 见 v0.0.73 真机 9 条一一对应。
 //    留着它只会继续骗自己"还差一步"。
 // ---------- v0.0.66：观测计数器（只为了回答"系统自己怎么删的"）----------
 static BOOL gCacheDumped   = NO;  // 缓存键形态只 dump 一次
@@ -546,7 +548,9 @@ static NSMutableDictionary *gNCRequestByID = nil;  // notificationIdentifier →
 //   ① 用户手动清通知时，系统**成对**走这两跳，条数一模一样（各 2 条）：
 //        NCNotificationDispatcher      - destination:CSNotificationDispatcher requestsClearingNotificationRequests:
 //        NCBulletinNotificationSource  - dispatcher:requestsClearingNotificationRequests:
-//      而 `withdrawNotificationWithRequest:` **0 次** ⇒ **系统的清除根本不走 withdraw**。
+//      而 `withdrawNotificationWithRequest:` **0 次** ⇒ 「手动清一条」这一路不走 withdraw。
+//    🔴 v0.0.74 修正边界：**"真删除"那一批是逐条走 withdraw 的**（v0.0.73 真机 15 次 /
+//    9 条真删除）。所以这条路不是"不存在"，是"只在真删除时才出现"。
 //      上一版把希望押在 withdraw 上，押错了方向。
 //   ② `[cache]` 里键是**纯数字 nid**（7700421581079711010），而我们的 cid 是 UUID、
 //      recordID 是 `f__-XoQCXfP67C4A` ⇒ **永远对不上**。所以「按 id 找 request」结构性无效，
@@ -1284,6 +1288,7 @@ static void NBProbeDestinations(id req) {
 // 照着**系统自己那条路**走一次：destination 请求清除。
 // 依据（nc_diag(8).txt）：手动清通知 = dispatcher `destination:requestsClearing…`
 // + source `dispatcher:requestsClearing…`，**成对、条数一致**、且 `withdraw` 0 次。
+// 🔴 v0.0.74：那个"0 次"只描述了**手动清一条**；真删除是逐条 withdraw（见 ⑦a 的注释）。
 // 🔴 为什么投**主队列**：`CSNotificationDispatcher` 是 CoverSheet 的 UI 派发器，主线程是它的
 //    自然队列；而 v0.0.64 那次投进 `NCBulletinNotificationSource` 自己的 queue，**块从没被执行**。
 //    主队列是唯一有保证会被服务的队列。
@@ -1604,7 +1609,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                        (long)ncCnt2, (long)ncReqCnt2,
                        ncHadUUID ? @"有" : @"无", ncHadReq ? @"有" : @"无",
                        gBBToNCSeen);
-            NBDiagStep(@"  观测计数: 目的地请求清除=%d / dispatcher 撤回=%d / source 请求清除=%d / ⑤新刀成功=%d / _sendRemove=%d\n  ⇒ %@\n",
+            NBDiagStep(@"  观测计数: 目的地请求清除=%d / dispatcher 撤回=%d / source 请求清除=%d / ⑤新刀成功=%d(本版起已删,恒0) / _sendRemove=%d\n  ⇒ %@\n",
                        gObsDispatcherClear, gObsDispatcherWithdraw, gObsSrcClear,
                        gBBRemoveByIDOk, gBBSendRemoveSeen, verdict);
             NBLog(@"=== [NC-CLEAR] 删后 BB含=%@ ⇒ %@", bbAfter ? @"是" : @"否", verdict);
@@ -1673,69 +1678,17 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             //    但 `BB live` 在调 NC **之前**就已经 `含本条=否` —— 砖是我自己先拆掉的。
             //    ⇒ 所以这里**不再执行**，只定义；由 `[账本]` 那一跳在 NC 返回后调用。
             void (^bbCleanup)(void) = ^{
-            // ---------- ⑤ v0.0.72 新刀：按 **bulletinID** 直接摘（⓪ 之前先试）----------
-            // 🔴 为什么排在 ⓪ 之前：⓪ 是"官方撤回"，它只改账本、不广播（v0.0.65 已证
-            //    `BB→NC` 计数不涨）。新刀如果真能驱动界面，就**不该**先被 ⓪ 把场面弄乱；
-            //    而且它有**读回确认**，摘不掉也不会误导后面的步骤（bbIn 保持真值）。
-            // 🔴 两条候选的差别只有一个：K2 多一个 `inFeed:` 参数（ENC 是 `Q`，
-            //    也就是 unsigned long long 的**位掩码**，不是 BOOL）。
-            //    我们不知道该给哪一位 ⇒ 先给 0（"不在任何 feed"），摘不掉再试 1。
-            //    ⛔ 这不算"同轮押两个新挂点"：两条都是**同族、同一个锚点（cid）**，
-            //    而且每条都立刻读回 BB 账本，日志里能一眼看出是哪一条起了作用。
-            if (bullet && bbIn && cid.length) {
-                if ([gBBServer respondsToSelector:@selector(removeBulletinID:fromNoticesSection:)]) {
-                    NBDiagStep(@"  ⑤K1 将要调用 removeBulletinID:%@ fromNoticesSection:%@\n", cid, bundleC);
-                    @try {
-                        [gBBServer removeBulletinID:cid fromNoticesSection:bundleC];
-                        BOOL f = NO;
-                        NSInteger n = NBLiveScan(gBBServer, bundleC, cid, &f);
-                        NBDiagStep(@"  ⑤K1 已返回 ⇒ BB live=%ld 含本条=%@（此刻 _sendRemove 累计 %d 次）\n",
-                                   (long)n, f ? @"是" : @"否", gBBSendRemoveSeen);
-                        if (!f) { bbIn = NO; bbRemovedByID = YES; gBBRemoveByIDOk++; }
-                    } @catch (NSException *e) {
-                        NBDiagStep(@"  ⑤K1 抛: %@\n", e.reason);
-                    }
-                } else {
-                    NBDiagStep(@"  ⑤K1 跳过（removeBulletinID:fromNoticesSection: 不存在）\n");
-                }
-            }
-            if (bullet && bbIn && cid.length) {
-                if ([gBBServer respondsToSelector:@selector(removeBulletinID:fromSection:inFeed:)]) {
-                    NBDiagStep(@"  ⑤K2 将要调用 removeBulletinID:%@ fromSection:%@ inFeed:0\n", cid, bundleC);
-                    @try {
-                        [gBBServer removeBulletinID:cid fromSection:bundleC inFeed:0];
-                        BOOL f = NO;
-                        NSInteger n = NBLiveScan(gBBServer, bundleC, cid, &f);
-                        NBDiagStep(@"  ⑤K2(inFeed:0) 已返回 ⇒ BB live=%ld 含本条=%@（此刻 _sendRemove 累计 %d 次）\n",
-                                   (long)n, f ? @"是" : @"否", gBBSendRemoveSeen);
-                        if (!f) { bbIn = NO; bbRemovedByID = YES; gBBRemoveByIDOk++; }
-                    } @catch (NSException *e) {
-                        NBDiagStep(@"  ⑤K2 抛: %@\n", e.reason);
-                    }
-                } else {
-                    NBDiagStep(@"  ⑤K2 跳过（removeBulletinID:fromSection:inFeed: 不存在）\n");
-                }
-            }
-            if (bullet && bbIn && cid.length
-                && [gBBServer respondsToSelector:@selector(removeBulletinID:fromSection:inFeed:)]) {
-                NBDiagStep(@"  ⑤K2b 将要调用 removeBulletinID:%@ fromSection:%@ inFeed:1（前两种都没摘掉）\n",
-                           cid, bundleC);
-                @try {
-                    [gBBServer removeBulletinID:cid fromSection:bundleC inFeed:1];
-                    BOOL f = NO;
-                    NSInteger n = NBLiveScan(gBBServer, bundleC, cid, &f);
-                    NBDiagStep(@"  ⑤K2b(inFeed:1) 已返回 ⇒ BB live=%ld 含本条=%@（此刻 _sendRemove 累计 %d 次）\n",
-                               (long)n, f ? @"是" : @"否", gBBSendRemoveSeen);
-                    if (!f) { bbIn = NO; bbRemovedByID = YES; gBBRemoveByIDOk++; }
-                } @catch (NSException *e) {
-                    NBDiagStep(@"  ⑤K2b 抛: %@\n", e.reason);
-                }
-            }
-            if (bbRemovedByID) {
-                NBDiagStep(@"  ⑤ 小结：新刀已把本条从 BB 账本摘掉 ⇒ 后面的 ⓪/③ 会自动跳过\n");
-            } else if (bullet && bbHadAtStart) {
-                NBDiagStep(@"  ⑤ 小结：新刀**没摘掉**（三条候选都试过）⇒ 退回 ⓪ 官方撤回\n");
-            }
+            // ---------- ⑤ v0.0.74：**整块删除**（三条候选已被真机判死）----------
+            // 🔴 v0.0.72 加的三条「按 bulletinID 直接摘」—— fromNoticesSection: /
+            //    fromSection:inFeed:0 / fromSection:inFeed:1 —— 在 v0.0.73 真机
+            //    （`nc_diag(13).txt`）里**全部判死**：
+            //      三条各广播一次 `_sendRemoveBulletin`（feeds = 1 / 0 / 1，sync 全是 0），
+            //      而每次读回账本都是 `BB live` **一个没少**、`含本条=是`、`⑤ 新刀成功=0`。
+            // 🔴 更糟的是它们会**先把 NC 惊动一遍**：每条都引发一次 `[BB→NC]`，
+            //    K1 还额外触发了一次 `withdrawNotificationWithRequest:` ——
+            //    凭空多出来的动作让后面的读回更难判，也白烧掉日志行数预算。
+            // 🔴 定案，别再回来试：`removeBulletinID:*` 家族**只广播、不删账本**。
+            //    要删账本只有 ⓪ `withdrawBulletinRequestsWithRecordID:forSectionID:`。
             if (bullet && bbIn) {
                 NSString *rID = recID.length ? recID : cid;
                 if (rID.length
@@ -1782,77 +1735,93 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             // 清完账本后打结论（bbRemove 内部会做 ③ / ④ / 读回 / verdict）
             bbRemove();
 
-            // ---------- ⑥ v0.0.73：**账本已经清干净之后**，再让 CoverSheet 掉这一条 ----------
-            // 🔴🔴 为什么顺序必须是「先账本、后 CS」（和 v0.0.69 那条教训正好相反，要说清楚）：
-            //    v0.0.69 定的是「NC 的**请求清除**要在账本之前」——因为 source 要把 request
-            //    翻回 BBBulletin，账本先空了它就翻不出东西。
-            //    但 ① `withdrawNotificationRequest:` 是另一种刀：它是**界面侧**的撤回，
-            //    如果 BB 账本里那条还活着，界面完全可能立刻按账本**重新把它显示出来**
-            //    ⇒ v0.0.72 就是在账本还活着时调 ① 的（日志里 ① 已返回、界面纹丝不动）。
-            //    ⇒ 这一版把「界面侧清一刀」挪到 ⓪ 之后：那一刻 BB live 已 =1、含本条=否。
-            // 🔴 只在这一刻真的"账本干净"时才动手（`bbIn == NO`）——
-            //    账本没清掉却先把界面抽掉，用户会看到"界面没了、过一会儿又冒出来"。
-            // 🔴 异步投主队列：CSNotificationDispatcher 是 CoverSheet 的 UI 派发器，
-            //    在 BB 队列上直接碰它违反"谁的对象在哪条队列上碰"这条纪律。
+            // ---------- ⑦ v0.0.74：账本清干净之后，界面侧三把刀，**每一把都读回** ----------
+            // 🔴 为什么必须排在 ⓪ 之后：⓪ 只改账本、不驱动界面（v0.0.65 起反复实测），
+            //    而账本还活着的时候，任何界面侧的刀都可能被账本"重新显示"回来。
+            // 🔴 v0.0.73 真机（`nc_diag(13).txt`）把上一版的 ⑥ 判掉两条：
+            //    ⑥a `withdrawNotificationRequest:`（CS 自己的）—— 已返回、模型仍有本条；
+            //    ⑥b `destination:gNCDispatcher clearNotificationRequests:`（1 条）——
+            //       请求确实到了 NC 的 `destination:requestsClearing…`（日志里 #0 就是本条），
+            //       但模型仍有本条 ⇒ 空转。**首参填 dispatcher 是错的**，这一版改成填 CS 自己。
+            // 🔴 本轮最重要的新线索：系统自己清一条时，走的**不是** `withdrawNotificationRequest:`，
+            //    而是 `NCNotificationDispatcher -withdrawNotificationWithRequest:`（多个 With）。
+            //    证据：按段清之后同一秒内 9 条真删除（BB→NC 回调 + `_sendRemoveBulletin
+            //    feeds=15871 sync=1`），每一条都配一次 `[OBS] dispatcher
+            //    withdrawNotificationWithRequest:` ⇒ ⑦a 直接调它。
+            // 🔴 ⑦c（按段清）**确认有效但会连带**：用户实测"有些通知没了，但不是我要删的那条"。
+            //    ⇒ 加闸门：只有「该段在 NC 里**只剩这 1 条**」时才允许按段清
+            //    （那一刻"清整段"和"清这一条"是同一件事，零连带）。
             if (!bbIn && gFoundNCReq && gCSDestination) {
-                id req6 = gFoundNCReq;
-                NSString *want6 = [gWantBundle copy];
+                id req7 = gFoundNCReq;
+                NSString *want7 = [gWantBundle copy];
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    NBDiagStep(@"  ⑥ 进入主队列：账本已清 ⇒ 现在让 CoverSheet 侧掉这一条（本版的新顺序）\n");
-                    // ⑥a：CS 自己的撤回（同一个方法，但这次是在**账本已空**之后）
-                    if ([gCSDestination respondsToSelector:@selector(withdrawNotificationRequest:)]) {
+                    NBDiagStep(@"  ⑦ 进入主队列：账本已清 ⇒ 界面侧开始（系统自己那条路优先）\n");
+                    NSUInteger sc7 = 0; int sh7 = 999;   // 999 = 还没量到，别让 ⑦c 误判
+                    NSString *how7x = nil;               // "怎么找到的"（精确/同段/缓存），只给日志
+                    BOOL still = YES;
+
+                    // ⑦a：**系统自己用的那一把**（多个 With，挂在 NCNotificationDispatcher 上）
+                    if ([gNCDispatcher respondsToSelector:@selector(withdrawNotificationWithRequest:)]) {
                         @try {
-                            [gCSDestination withdrawNotificationRequest:req6];
-                            NBDiagStep(@"  ⑥a withdrawNotificationRequest: 已返回\n");
+                            [gNCDispatcher withdrawNotificationWithRequest:req7];
+                            NBDiagStep(@"  ⑦a dispatcher withdrawNotificationWithRequest: 已返回\n");
                         } @catch (NSException *e) {
-                            NBDiagStep(@"  ⑥a withdraw 抛: %@\n", e.reason);
-                        }
-                    }
-                    // ⑥b：destination:clearNotificationRequests:（CS 侧第一次试）
-                    // 🔴 首参给 dispatcher（**发送方**），不是给 destination 自己 ——
-                    //    v0.0.72 的 ② 把 destination 自己填进去，那一跳的语义等于
-                    //    "目的地请求清除"，而这里是"派发器让目的地清"，两者不是一回事。
-                    NSSet *one = [NSSet setWithObject:req6];
-                    if ([gCSDestination respondsToSelector:@selector(destination:clearNotificationRequests:)]) {
-                        @try {
-                            // 🔴 首参给 dispatcher（发送方）；它可能是 nil，
-                            //    那就等于"无发送方"——日志里记下来，别猜。
-                            NBDiagStep(@"  ⑥b 将要调用 destination:<%@> clearNotificationRequests:（1 条）\n",
-                                       gNCDispatcher ? NBClassName(gNCDispatcher) : @"(nil)");
-                            [gCSDestination destination:gNCDispatcher clearNotificationRequests:one];
-                            NBDiagStep(@"  ⑥b destination:clearNotificationRequests: 已返回\n");
-                        } @catch (NSException *e) {
-                            NBDiagStep(@"  ⑥b clear 抛: %@\n", e.reason);
+                            NBDiagStep(@"  ⑦a 抛: %@\n", e.reason);
                         }
                     } else {
-                        NBDiagStep(@"  ⑥b 跳过（CS 没有 destination:clearNotificationRequests:）\n");
+                        NBDiagStep(@"  ⑦a 跳过（dispatcher 没有 withdrawNotificationWithRequest:）\n");
                     }
-                    // 读回：NC 模型里那条还在不在
                     @try {
-                        NSUInteger sc6 = 0; int sh6 = 0; NSString *how6 = nil;
-                        id still6 = NBFindOurRequest(gNCSource, want6, gWantIDs, &how6, &sc6, &sh6);
-                        NBDiagStep(@"  ⑥ 读回：扫 %lu 条，还能找到本条=%@\n",
-                                   (unsigned long)sc6,
-                                   still6 ? @"是（NC 模型仍持有）" : @"否（NC 模型已删 ⇒ 界面该掉）");
+                        still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
+                        NBDiagStep(@"  ⑦a 读回：扫 %lu 条 / 同段 %d 条 ⇒ 还能找到本条=%@\n",
+                                   (unsigned long)sc7, sh7, still ? @"是" : @"否（NC 模型已删 ⇒ 界面该掉）");
                     } @catch (NSException *e) {
-                        NBDiagStep(@"  ⑥ 读回抛: %@\n", e.reason);
+                        NBDiagStep(@"  ⑦a 读回抛: %@\n", e.reason);
                     }
-                    // ⑥c：按 section 整段清（**最后手段**，会把同 App 的其它通知一起清掉，
-                    //      所以只在 ⑥a/⑥b 之后、模型里还有它时才用，并且日志里明写）。
-                    @try {
-                        NSUInteger sc7 = 0; int sh7 = 0; NSString *how7 = nil;
-                        BOOL still7 = (NBFindOurRequest(gNCSource, want6, gWantIDs, &how7, &sc7, &sh7) != nil);
-                        if (still7 && want6.length
-                            && [gCSDestination respondsToSelector:@selector(destination:clearNotificationRequestsInSections:)]) {
-                            NBDiagStep(@"  ⑥c 模型里还有它 ⇒ 试 destination:clearNotificationRequestsInSections:{%@}（会清掉同 App 全部，注意）\n", want6);
-                            [gCSDestination destination:gNCDispatcher
-                              clearNotificationRequestsInSections:[NSSet setWithObject:want6]];
-                            NBDiagStep(@"  ⑥c 已返回\n");
+
+                    // ⑦b：destination 视角的单条清，**首参给 CS 自己**（v0.0.73 填 dispatcher 是错的）
+                    if (still && [gCSDestination respondsToSelector:@selector(destination:clearNotificationRequests:)]) {
+                        @try {
+                            NBDiagStep(@"  ⑦b 将要调用 destination:<%@> clearNotificationRequests:（1 条，首参=CS 自己）\n",
+                                       NBClassName(gCSDestination));
+                            [gCSDestination destination:gCSDestination
+                                  clearNotificationRequests:[NSSet setWithObject:req7]];
+                            NBDiagStep(@"  ⑦b 已返回\n");
+                        } @catch (NSException *e) {
+                            NBDiagStep(@"  ⑦b 抛: %@\n", e.reason);
                         }
-                    } @catch (NSException *e) {
-                        NBDiagStep(@"  ⑥c 抛: %@\n", e.reason);
+                        @try {
+                            still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
+                            NBDiagStep(@"  ⑦b 读回：扫 %lu 条 / 同段 %d 条 ⇒ 还能找到本条=%@\n",
+                                       (unsigned long)sc7, sh7, still ? @"是" : @"否（NC 模型已删 ⇒ 界面该掉）");
+                        } @catch (NSException *e) {
+                            NBDiagStep(@"  ⑦b 读回抛: %@\n", e.reason);
+                        }
                     }
-                    // ⑥ 顺带把真 UI 目的地对象看一眼（只读，一次）
+
+                    // ⑦c：按段清 —— **仅当同段只剩这一条**（那时零连带）
+                    if (still && want7.length && sh7 <= 1
+                        && [gCSDestination respondsToSelector:@selector(destination:clearNotificationRequestsInSections:)]) {
+                        @try {
+                            NBDiagStep(@"  ⑦c 同段只剩 %d 条 ⇒ 按段清等价于单条清，允许\n", sh7);
+                            [gCSDestination destination:gCSDestination
+                              clearNotificationRequestsInSections:[NSSet setWithObject:want7]];
+                            NBDiagStep(@"  ⑦c 已返回\n");
+                        } @catch (NSException *e) {
+                            NBDiagStep(@"  ⑦c 抛: %@\n", e.reason);
+                        }
+                        @try {
+                            still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
+                            NBDiagStep(@"  ⑦c 读回：扫 %lu 条 / 同段 %d 条 ⇒ 还能找到本条=%@\n",
+                                       (unsigned long)sc7, sh7, still ? @"是" : @"否（NC 模型已删 ⇒ 界面该掉）");
+                        } @catch (NSException *e) {
+                            NBDiagStep(@"  ⑦c 读回抛: %@\n", e.reason);
+                        }
+                    } else if (still) {
+                        NBDiagStep(@"  ⑦c 跳过（同段还有 %d 条 > 1 ⇒ 按段清会连带清掉别人的通知）\n", sh7);
+                    }
+
+                    // 顺带把真 UI 目的地对象看一眼（只读，一次）
                     if (!gCSDDestsDumped) {
                         gCSDDestsDumped = YES;
                         @try {
@@ -1860,12 +1829,13 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                     ? [gCSDestination listDestination] : nil;
                             id md = [gCSDestination respondsToSelector:@selector(modalDestination)]
                                     ? [gCSDestination modalDestination] : nil;
-                            NBDiagStep(@"  ⑥ 目的地：list=<%@> modal=<%@>\n", NBClassName(ld), NBClassName(md));
+                            NBDiagStep(@"  ⑦ 目的地：list=<%@> modal=<%@>\n", NBClassName(ld), NBClassName(md));
                         } @catch (NSException *e) {
-                            NBDiagStep(@"  ⑥ 目的地探测抛: %@\n", e.reason);
+                            NBDiagStep(@"  ⑦ 目的地探测抛: %@\n", e.reason);
                         }
                     }
-                    NBDiagStep(@"  ⑥ 结束：CS 侧观测计数 撤回=%d 清=%d 段清=%d 段范围清=%d incoming=%d 长按=%d（投递=%d 存活对照）\n",
+                    NBDiagStep(@"  ⑦ 结束：本条还在=%@ ｜ CS 侧观测计数 撤回=%d 清=%d 段清=%d 段范围清=%d incoming=%d 长按=%d（投递=%d 存活对照）\n",
+                               still ? @"是（三把刀都没奏效）" : @"否",
                                gCSDWithdraw, gCSDClear, gCSDClearSec, gCSDClearRng,
                                gCSDIncoming, gCSDDismiss, gCSDPost);
                 });
@@ -1875,7 +1845,8 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             // ---------- 🔴 v0.0.69：**先**走 NC 清除（此时 BB 里本条还活着），走完再清账本 ----------
             // v0.0.66 真机 `nc_diag(8).txt` 定案（两条都是实测，不是推断）：
             //   ① 手动清通知时系统成对走 `destination:requestsClearing…` + `dispatcher:requestsClearing…`，
-            //      条数一致；而 `withdrawNotificationWithRequest:` **0 次** ⇒ 系统根本不用 withdraw。
+            //      条数一致；而 `withdrawNotificationWithRequest:` **0 次**（**仅**"手动清一条"成立）。
+//    🔴 v0.0.74：真删除那一批是**逐条** withdraw 的 ⇒ ⑦a 就是照它抄的。
             //   ② 缓存键是纯数字 nid，我们手里是 UUID / `f__-XoQ…` ⇒ 按 id 找**结构性无效**。
             // 🔴 v0.0.68 补：section 只用来**缩小范围**，真正定案靠 `request.bulletin` 的 bulletinID。
             // 🔴 v0.0.69 补：**顺序**。这一刀要能驱动界面，必须让 source 把 request 翻回 BBBulletin；
@@ -2418,7 +2389,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 %hook BBServer
 - (void)_sendRemoveBulletin:(id)bulletin toFeeds:(unsigned long long)feeds shouldSync:(BOOL)sync {
     gBBSendRemoveSeen++;
-    if (gBBSendRemoveSeen <= 20 && NBDiagReady()) {
+    if (gBBSendRemoveSeen <= 40 && NBDiagReady()) {
         // 🔴 只读**已知安全**的 KVC 键。⛔ 绝不对 bulletin 调 description
         //    （v0.0.63 真机 9/9 全灭就是因为它会摸内部锁）。
         NBDiagStep(@"  [OBS-rem] _sendRemoveBulletin 第 %d 次 feeds=%llu sync=%d section=%@ recordID=%@ bulletinID=%@（此时 ⑤ 新刀成功 %d 次）\n",
@@ -2630,7 +2601,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 //    如果 ⓪ 成功了很多次而这里一条都没有，就说明**BB 的撤回根本没到 NC**，得换路。
 - (void)observer:(id)observer removeBulletin:(id)bulletin {
     gBBToNCSeen++;
-    if (gBBToNCSeen <= 40) {
+    if (gBBToNCSeen <= 60) {
         NBDiagStep(@"  [BB→NC] 系统自己调用 observer:removeBulletin: 第 %d 次 @%@ recordID=%@（此时⓪已成功 %d 次）\n",
                    gBBToNCSeen, [NSDate date], NBKVCStr(bulletin, @"recordID"), gBBWithdrawOk);
     }
@@ -2709,7 +2680,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
         gCSDestination = destination;
         NBDiagStep(@"  [拿] 已捕获 destination 实例 <%@>\n", NBClassName(destination));
     }
-    if (gObsDispatcherClear <= 6) {
+    if (gObsDispatcherClear <= 12) {
         NBDiagStep(@"  [OBS] dispatcher destination:<%@> requestsClearing…（第 %d 次，%ld 条）\n",
                    NBClassName(destination), gObsDispatcherClear, (long)NBCollectionCount(requests));
         NBLogRequests(@"OBS-dst", requests, 4);
@@ -2718,7 +2689,7 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 }
 - (void)withdrawNotificationWithRequest:(id)request {
     gObsDispatcherWithdraw++;
-    if (gObsDispatcherWithdraw <= 15) {
+    if (gObsDispatcherWithdraw <= 40) {
         NBDiagStep(@"  [OBS] dispatcher withdrawNotificationWithRequest:（第 %d 次）nid=%@\n",
                    gObsDispatcherWithdraw, NBClip(NBKVCStr(request, @"notificationIdentifier"), 50));
     }
