@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.74"
+#define NB_VER_STR @"0.0.75"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -403,6 +403,14 @@ static BOOL NBClaimKey(NSString *key) {
 - (void)_sendRemoveBulletin:(id)bulletin
                     toFeeds:(unsigned long long)feeds
                  shouldSync:(BOOL)shouldSync;                            // v@:@QB 广播给 observer（只观测）
+// ---- v0.0.75：⑦d 用的两条（`gFoundNCReq` / `gCSDestination` 都是 `id`，不声明就是编译期硬错）----
+- (id)clearAction;                                                      // @@:  request 自带的清除动作
+- (void)destination:(id)destination
+      performAction:(id)action
+forNotificationRequest:(id)request
+requestAuthentication:(BOOL)auth
+     withParameters:(id)params
+         completion:(void (^)(BOOL))completion;                         // v@:@@@B@@?
 // ---- v0.0.73：CoverSheet 目的地自己那几条「清除」----
 // 🔴 为什么换到这一层：v0.0.72 真机（`nc_diag(12).txt`）定案 —— ⑤ 新刀三条候选
 //    都**广播出去了**（`_sendRemoveBulletin` 计数 1→4）却**没动账本**（BB live 一直=2）；
@@ -1038,8 +1046,9 @@ static BOOL NBReqIsOurs(id req, NSArray *ids) {
 }
 
 // 在 `uuidsToRequests` 里找本条 request。
-//   优先返回**精确命中**（NBReqIsOurs）；一个都没精确命中时退回「section 命中的第一条」，
-//   并把 howOut 写清楚 —— 日志里能一眼看出这一刀是稳的还是碰运气的。
+//   **只返回精确命中**（NBReqIsOurs）。v0.0.75 起不再退回「section 命中的第一条」：
+//   那个兜底会撤错条、还会把读回变成恒真的假判据（详见函数末尾）。
+//   找不到就返回 nil，调用方一律不动手。
 static id NBFindOurRequest(id source, NSString *bundle, NSArray *ids,
                            NSString **howOut, NSUInteger *scannedOut, int *secHitsOut) {
     if (howOut) *howOut = @"(无)";
@@ -1067,9 +1076,14 @@ static id NBFindOurRequest(id source, NSString *bundle, NSArray *ids,
             if (!loose) loose = req;
         }
         if (secHitsOut) *secHitsOut = secHits;
+        // 🔴🔴🔴 v0.0.75：**删掉 loose 兜底**（原来精确匹配不到就退回「同段第一条」）。
+        //   后果两个，都是致命的：
+        //     ① **撤错条** —— 用户看到的是"有些通知没了，但不是我要删的那条"；
+        //     ② **读回变成假判据** —— 只要这个 App 在 NC 里还有任何一条，读回永远是
+        //        「还能找到本条=是」。v0.0.74 真机 19 次读回全「是」、0 次「否」，就是被这一条兜住的。
+        //   ⇒ 现在：匹配不到就返回 nil，调用方**一律不动手**。
         if (loose) {
-            if (howOut) *howOut = @"仅 section 命中（**可能撤错条**）";
-            return loose;
+            if (howOut) *howOut = @"无精确命中（同段有它条 → 不动手）";
         }
         return nil;
     } @catch (__unused NSException *e) { return nil; }
@@ -1379,9 +1393,10 @@ static void NBForwardClearAsync(id req, NSString *how, void (^done)(void)) {
         @try {
             NSUInteger sc2 = 0; int sh2 = 0; NSString *how2 = nil;
             id still = NBFindOurRequest(gNCSource, gWantBundle, gWantIDs, &how2, &sc2, &sh2);
-            NBDiagStep(@"  [验] 清后 NC：扫 %lu 条，还能找到本条=%@\n",
-                       (unsigned long)sc2,
-                       still ? @"是 ⇒ 系统没真删（只是收到通知）" : @"否 ⇒ NC 模型已删");
+            NBDiagStep(@"  [验] 清后 NC：扫 %lu 条 / 同段 %d 条，还能找到本条=%@（匹配=%@）\n",
+                       (unsigned long)sc2, sh2,
+                       still ? @"是 ⇒ 系统没真删（只是收到通知）" : @"否 ⇒ NC 模型已删",
+                       how2 ?: @"?");
         } @catch (NSException *e) {
             NBDiagStep(@"  [验] NC 读回抛: %@\n", e.reason);
         }
@@ -1423,8 +1438,12 @@ static void NBFindAndForwardClear(NSString *why, void (^done)(void)) {
         } @catch (__unused NSException *e) { }
         NBForwardClearAsync(r, how, done);
     } else {
-        NBDiagStep(@"  [找] %@：扫 %lu 条 request，没有 section=%@ 的（同段 0 条）\n",
-                   why, (unsigned long)scanned, gWantBundle);
+        // 🔴 v0.0.75：区分两种"没找到" —— 同段 0 条（NC 里本来没有）
+        //    与 同段 N 条但不是目标（**目标已经不在**）。后者以前会被 loose 兜底吃掉。
+        NBDiagStep(@"  [找] %@：扫 %lu 条 request，section=%@ 同段 %d 条 ⇒ %@\n",
+                   why, (unsigned long)scanned, gWantBundle, secHits,
+                   secHits > 0 ? @"都不是目标（目标已不在 NC）⇒ 不动手"
+                               : @"该段在 NC 里一条都没有");
         // 没找到 request ⇒ 这一刀打不出去 ⇒ 立刻把控制权交回去，让调用方去清账本
         if (done) done();
     }
@@ -1734,76 +1753,52 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             // 清完账本后打结论（bbRemove 内部会做 ③ / ④ / 读回 / verdict）
             bbRemove();
 
-            // ---------- ⑦ v0.0.74：账本清干净之后，界面侧三把刀，**每一把都读回** ----------
-            // 🔴 为什么必须排在 ⓪ 之后：⓪ 只改账本、不驱动界面（v0.0.65 起反复实测），
-            //    而账本还活着的时候，任何界面侧的刀都可能被账本"重新显示"回来。
-            // 🔴 v0.0.73 真机（`nc_diag(13).txt`）把上一版的 ⑥ 判掉两条：
-            //    ⑥a `withdrawNotificationRequest:`（CS 自己的）—— 已返回、模型仍有本条；
-            //    ⑥b `destination:gNCDispatcher clearNotificationRequests:`（1 条）——
-            //       请求确实到了 NC 的 `destination:requestsClearing…`（日志里 #0 就是本条），
-            //       但模型仍有本条 ⇒ 空转。**首参填 dispatcher 是错的**，这一版改成填 CS 自己。
-            // 🔴 本轮最重要的新线索：系统自己清一条时，走的**不是** `withdrawNotificationRequest:`，
-            //    而是 `NCNotificationDispatcher -withdrawNotificationWithRequest:`（多个 With）。
-            //    证据：按段清之后同一秒内 9 条真删除（BB→NC 回调 + `_sendRemoveBulletin
-            //    feeds=15871 sync=1`），每一条都配一次 `[OBS] dispatcher
-            //    withdrawNotificationWithRequest:` ⇒ ⑦a 直接调它。
-            // 🔴 ⑦c（按段清）**确认有效但会连带**：用户实测"有些通知没了，但不是我要删的那条"。
-            //    ⇒ 加闸门：只有「该段在 NC 里**只剩这 1 条**」时才允许按段清
-            //    （那一刻"清整段"和"清这一条"是同一件事，零连带）。
+            // ---------- ⑦ v0.0.75：只留两把可能有戏的刀，**匹配不到就不动手** ----------
+            // 🔴🔴 v0.0.74 真机（`nc_diag(14).txt`，23 次尝试）先判掉两条，次数够：
+            //     ⑦a `NCNotificationDispatcher -withdrawNotificationWithRequest:` —— 4 次尝试，
+            //        每次「已返回」、每次读回目标还在 ⇒ 空转（这把在 v0.0.73 只是被系统自己调过，
+            //        不是我们调它就有效）。
+            //     ⑦b `destination:<CS 自己> clearNotificationRequests:` —— 同样 4 次全空。
+            //     ⇒ 两条都删掉。留着不只烧日志行数，还会把读回的判读搅乱。
+            // 🔴🔴🔴 但本轮最关键的发现不是"又少两把刀"，而是**我们的读回一直是个假判据**：
+            //    `NBFindOurRequest` 精确匹配不到时会退回「同段第一条」⇒ 只要这个 App 在 NC 里
+            //    还有任何一条通知，读回永远是「还能找到本条=是」。19 次读回全「是」、0 次「否」，
+            //    而同一份文件里 `BB live` 已经 `含本条=否`、系统自己还打了
+            //    `_sendRemoveBulletin feeds=15871 sync=1`、`[BB→NC]` 回调也有 ——
+            //    该发生的都发生了，读回却雷打不动。
+            //    ⇒ 这一版把 loose 兜底**整个删掉**（见 NBFindOurRequest 的注释）：
+            //      匹配不到精确的就一律不动手，读回也不许兜底。
+            //      顺带修掉一个**真·副作用**：loose 兜底会去撤**别人的**通知 ——
+            //      用户那句"有些通知没了，但不是我要删的那条"就是这么来的。
             if (!bbIn && gFoundNCReq && gCSDestination) {
                 id req7 = gFoundNCReq;
                 NSString *want7 = [gWantBundle copy];
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    NBDiagStep(@"  ⑦ 进入主队列：账本已清 ⇒ 界面侧开始（系统自己那条路优先）\n");
-                    NSUInteger sc7 = 0; int sh7 = 999;   // 999 = 还没量到，别让 ⑦c 误判
-                    NSString *how7x = nil;               // "怎么找到的"（精确/同段/缓存），只给日志
+                    NBDiagStep(@"  ⑦ 进入主队列：账本已清 ⇒ 界面侧开始（严格匹配，匹配不到就不动手）\n");
+                    NSUInteger sc7 = 0; int sh7 = 0;
+                    NSString *how7x = nil;
+                    NSString *nid7 = NBSafeClip(NBKVCStr(req7, @"notificationIdentifier"), 56);
                     BOOL still = YES;
 
-                    // ⑦a：**系统自己用的那一把**（多个 With，挂在 NCNotificationDispatcher 上）
-                    if ([gNCDispatcher respondsToSelector:@selector(withdrawNotificationWithRequest:)]) {
-                        @try {
-                            [gNCDispatcher withdrawNotificationWithRequest:req7];
-                            NBDiagStep(@"  ⑦a dispatcher withdrawNotificationWithRequest: 已返回\n");
-                        } @catch (NSException *e) {
-                            NBDiagStep(@"  ⑦a 抛: %@\n", e.reason);
-                        }
-                    } else {
-                        NBDiagStep(@"  ⑦a 跳过（dispatcher 没有 withdrawNotificationWithRequest:）\n");
-                    }
+                    // ---- 基线：先量一次，让后面每一刀都有同一个起点 ----
                     @try {
                         still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
-                        NBDiagStep(@"  ⑦a 读回：扫 %lu 条 / 同段 %d 条 ⇒ 还能找到本条=%@\n",
-                                   (unsigned long)sc7, sh7, still ? @"是" : @"否（NC 模型已删 ⇒ 界面该掉）");
+                        NBDiagStep(@"  ⑦ 基线：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@ nid=%@（匹配=%@）\n",
+                                   (unsigned long)sc7, sh7, still ? @"是" : @"否", nid7, how7x ?: @"?");
                     } @catch (NSException *e) {
-                        NBDiagStep(@"  ⑦a 读回抛: %@\n", e.reason);
+                        NBDiagStep(@"  ⑦ 基线抛: %@\n", e.reason);
                     }
 
-                    // ⑦b：destination 视角的单条清，**首参给 CS 自己**（v0.0.73 填 dispatcher 是错的）
-                    if (still && [gCSDestination respondsToSelector:@selector(destination:clearNotificationRequests:)]) {
-                        @try {
-                            NBDiagStep(@"  ⑦b 将要调用 destination:<%@> clearNotificationRequests:（1 条，首参=CS 自己）\n",
-                                       NBClassName(gCSDestination));
-                            [gCSDestination destination:gCSDestination
-                                  clearNotificationRequests:[NSSet setWithObject:req7]];
-                            NBDiagStep(@"  ⑦b 已返回\n");
-                        } @catch (NSException *e) {
-                            NBDiagStep(@"  ⑦b 抛: %@\n", e.reason);
-                        }
-                        @try {
-                            still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
-                            NBDiagStep(@"  ⑦b 读回：扫 %lu 条 / 同段 %d 条 ⇒ 还能找到本条=%@\n",
-                                       (unsigned long)sc7, sh7, still ? @"是" : @"否（NC 模型已删 ⇒ 界面该掉）");
-                        } @catch (NSException *e) {
-                            NBDiagStep(@"  ⑦b 读回抛: %@\n", e.reason);
-                        }
-                    }
-
-                    // ⑦c：按段清 —— **仅当同段只剩这一条**（那时零连带）
+                    // ---- ⑦c（**提到第一位**）：按段清，首参必须是 dispatcher ----
+                    // 依据：v0.0.73 用 dispatcher 作首参时，同一秒内 9 条 BB→NC 回调 +
+                    //       `_sendRemoveBulletin feeds=15871 sync=1` ⇒ **系统真的逐条删了**；
+                    //       v0.0.74 把首参改成 CS 自己之后**一点动静都没有** ⇒ 那一处是我改坏的。
+                    // 闸门保留：只有「该段在 NC 里只剩这 1 条」时才允许（那一刻整段清 ≡ 单条清）。
                     if (still && want7.length && sh7 <= 1
                         && [gCSDestination respondsToSelector:@selector(destination:clearNotificationRequestsInSections:)]) {
                         @try {
-                            NBDiagStep(@"  ⑦c 同段只剩 %d 条 ⇒ 按段清等价于单条清，允许\n", sh7);
-                            [gCSDestination destination:gCSDestination
+                            NBDiagStep(@"  ⑦c 同段只剩 %d 条 ⇒ 按段清等价于单条清，允许（首参=dispatcher）\n", sh7);
+                            [gCSDestination destination:gNCDispatcher
                               clearNotificationRequestsInSections:[NSSet setWithObject:want7]];
                             NBDiagStep(@"  ⑦c 已返回\n");
                         } @catch (NSException *e) {
@@ -1811,30 +1806,70 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         }
                         @try {
                             still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
-                            NBDiagStep(@"  ⑦c 读回：扫 %lu 条 / 同段 %d 条 ⇒ 还能找到本条=%@\n",
-                                       (unsigned long)sc7, sh7, still ? @"是" : @"否（NC 模型已删 ⇒ 界面该掉）");
+                            NBDiagStep(@"  ⑦c 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@\n",
+                                       (unsigned long)sc7, sh7, still ? @"是" : @"否（已删）");
                         } @catch (NSException *e) {
                             NBDiagStep(@"  ⑦c 读回抛: %@\n", e.reason);
                         }
                     } else if (still) {
-                        NBDiagStep(@"  ⑦c 跳过（同段还有 %d 条 > 1 ⇒ 按段清会连带清掉别人的通知）\n", sh7);
+                        NBDiagStep(@"  ⑦c 跳过（同段 %d 条 > 1 ⇒ 按段清会连带清掉别人的通知）\n", sh7);
+                    }
+
+                    // ---- ⑦d：让**列表目的地**执行这条 request 自带的 clearAction ----
+                    // 这是「用户点清除」在 UI 上真正走的那条：动作对象直接从 request 上取
+                    // （`NCNotificationRequest - clearAction`，见本版方法表），不自己造。
+                    if (still && req7) {
+                        @try {
+                            id act = [req7 respondsToSelector:@selector(clearAction)] ? [req7 clearAction] : nil;
+                            id ld = [gCSDestination respondsToSelector:@selector(listDestination)]
+                                    ? [gCSDestination listDestination] : nil;
+                            BOOL hasAPI = [gCSDestination respondsToSelector:
+                                           @selector(destination:performAction:forNotificationRequest:requestAuthentication:withParameters:completion:)];
+                            NBDiagStep(@"  ⑦d clearAction=<%@> 列表目的地=<%@> 方法=%@\n",
+                                       NBClassName(act), NBClassName(ld), hasAPI ? @"有" : @"无");
+                            if (act && hasAPI) {
+                                [gCSDestination destination:(ld ?: gCSDestination)
+                                               performAction:act
+                                        forNotificationRequest:req7
+                                       requestAuthentication:NO
+                                             withParameters:nil
+                                                 completion:^(BOOL ok7) {
+                                    // 🔴 给**真 block**而不是 nil：如果实现体无条件回调这个 block，
+                                    //    传 nil 就是崩；多一个参数最多是被忽略。
+                                    NBDiagStep(@"  ⑦d 完成回调 ok=%@\n", ok7 ? @"是" : @"否");
+                                }];
+                                NBDiagStep(@"  ⑦d 已返回\n");
+                            } else {
+                                NBDiagStep(@"  ⑦d 跳过（clearAction=%@ 方法=%@）\n",
+                                           act ? @"有" : @"无", hasAPI ? @"有" : @"无");
+                            }
+                        } @catch (NSException *e) {
+                            NBDiagStep(@"  ⑦d 抛: %@\n", e.reason);
+                        }
+                        @try {
+                            still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
+                            NBDiagStep(@"  ⑦d 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@\n",
+                                       (unsigned long)sc7, sh7, still ? @"是" : @"否（已删）");
+                        } @catch (NSException *e) {
+                            NBDiagStep(@"  ⑦d 读回抛: %@\n", e.reason);
+                        }
                     }
 
                     // 顺带把真 UI 目的地对象看一眼（只读，一次）
                     if (!gCSDDestsDumped) {
                         gCSDDestsDumped = YES;
                         @try {
-                            id ld = [gCSDestination respondsToSelector:@selector(listDestination)]
-                                    ? [gCSDestination listDestination] : nil;
-                            id md = [gCSDestination respondsToSelector:@selector(modalDestination)]
-                                    ? [gCSDestination modalDestination] : nil;
-                            NBDiagStep(@"  ⑦ 目的地：list=<%@> modal=<%@>\n", NBClassName(ld), NBClassName(md));
+                            id ld2 = [gCSDestination respondsToSelector:@selector(listDestination)]
+                                     ? [gCSDestination listDestination] : nil;
+                            id md2 = [gCSDestination respondsToSelector:@selector(modalDestination)]
+                                     ? [gCSDestination modalDestination] : nil;
+                            NBDiagStep(@"  ⑦ 目的地：list=<%@> modal=<%@>\n", NBClassName(ld2), NBClassName(md2));
                         } @catch (NSException *e) {
                             NBDiagStep(@"  ⑦ 目的地探测抛: %@\n", e.reason);
                         }
                     }
-                    NBDiagStep(@"  ⑦ 结束：本条还在=%@ ｜ CS 侧观测计数 撤回=%d 清=%d 段清=%d 段范围清=%d incoming=%d 长按=%d（投递=%d 存活对照）\n",
-                               still ? @"是（三把刀都没奏效）" : @"否",
+                    NBDiagStep(@"  ⑦ 结束：本条还在=%@ nid=%@ ｜ CS 侧观测计数 撤回=%d 清=%d 段清=%d 段范围清=%d incoming=%d 长按=%d（投递=%d 存活对照）\n",
+                               still ? @"是" : @"否", nid7,
                                gCSDWithdraw, gCSDClear, gCSDClearSec, gCSDClearRng,
                                gCSDIncoming, gCSDDismiss, gCSDPost);
                 });
