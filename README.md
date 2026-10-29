@@ -7747,3 +7747,116 @@ C 版本 3 / D 段级 + 元数据白名单。
 4. 人眼：这一条掉了没有？旁边同 App 的通知有没有被带走？
 
 判据口径：**只认 ⑦ 的三次读回**，不认"已返回"。
+
+## v0.0.75 —— 判据是假的：删掉 loose 兜底（不再撤错条）；⑦c 首参回滚；新增 ⑦d clearAction
+
+> 依据 `nc_diag(14).txt`（v0.0.74 装完 23 次尝试）。
+> 这一版不是"又换一把刀"，而是**先承认我们的量法错了**，再修两个真 bug。
+
+### 1. 头号问题：读回是个恒真的假判据
+
+`nb_diag(14)` 里 **19 次读回全「是」、0 次「否」**。而同一份文件里同时存在：
+
+```
+⓪ 之后 BB live=1 含本条=否
+[OBS-rem] _sendRemoveBulletin 第 1 次 feeds=15871 sync=1 …recordID=本条
+[BB→NC] 系统自己调用 observer:removeBulletin: …recordID=本条
+```
+
+该发生的都发生了，读回却雷打不动 ⇒ 问题不在刀，在**判据**。
+
+根因在 `NBFindOurRequest`：精确匹配不到时它会退回「**同段第一条**」。于是只要这个 App
+在 NC 里还有任何一条通知，读回永远是「还能找到本条=是」。
+
+> 🔴 这是「判据绿的原因 ≠ 它本来要证的那件事」的又一例。判据读的不是"目标在不在"，
+> 而是"这个 App 还有没有别的通知"。
+
+**修法**：把 loose 兜底整个删掉 —— 匹配不到精确的就返回 `nil`，调用方一律不动手。
+
+### 2. 同一个 bug 还有个用户能看见的后果：撤错条
+
+`nc_diag(14)` 里确实出现过一次 `选中 匹配=仅 section 命中（**可能撤错条**）`
+（`com.jd.jingmai`，同段 82 条，一条都没精确命中 ⇒ 拿了同段第一条去撤）。
+
+这正好解释用户那句「**有些通知没了，但不是我要删的那条**」——
+不是"删不干净"，是**删了别人的**。
+
+现在 `[找]` 的 else 分支把两种"没找到"分开写：
+
+```
+[找] …：扫 N 条 request，section=X 同段 M 条 ⇒ 都不是目标（目标已不在 NC）⇒ 不动手
+[找] …：扫 N 条 request，section=X 同段 0 条 ⇒ 该段在 NC 里一条都没有
+```
+
+### 3. ⑦a / ⑦b 判死（各 4 次全空）
+
+| 刀 | 实测 | 处置 |
+|---|---|---|
+| ⑦a `NCNotificationDispatcher -withdrawNotificationWithRequest:` | 4 次「已返回」，4 次读回目标还在 | 删 |
+| ⑦b `destination:<CS 自己> clearNotificationRequests:` | 4 次全空 | 删 |
+
+> 🔴 ⑦a 在 v0.0.73 里看着"有戏"，其实那是**系统自己**调的（14 次），不是我们调它就有效。
+> 「观测到某个 API 被调用」≠「我调它也会有效」—— 这一条又撞了一次。
+
+### 4. ⑦c 首参回滚：那处是我改坏的
+
+v0.0.73 用 `destination:gNCDispatcher clearNotificationRequestsInSections:` 时，
+同一秒内出现 **9 条 BB→NC 回调 + 9 次 `_sendRemoveBulletin feeds=15871 sync=1`**
+⇒ 系统真的逐条删了。
+
+v0.0.74 把首参"纠正"成 CS 自己之后 —— `nc_diag(14)` 里这次调用**一点动静都没有**
+（`[OBS-cs] …InSections:` 之后没有任何后续）。
+
+⇒ 回滚成 dispatcher。闸门保留：只有「该段在 NC 里只剩这 1 条」时才允许按段清
+（那一刻整段清 ≡ 单条清）。
+
+### 5. 新增 ⑦d：让列表目的地执行 request 自带的 clearAction
+
+这是「用户点清除」在 UI 上真正走的那条：
+
+```objc
+[gCSDestination destination:<listDestination>
+               performAction:<request.clearAction>
+        forNotificationRequest:request
+       requestAuthentication:NO
+             withParameters:nil
+                 completion:^(BOOL ok){ … }];
+```
+
+动作对象**直接从 request 上取**（方法表里 `NCNotificationRequest - clearAction`，`@@:`），
+不自己造 —— 造动作对象这条路一次都没走通过。
+
+> `completion` 给**真 block**而不是 `nil`：若实现体无条件回调这个 block，传 nil 就是崩；
+> 多一个参数最多被忽略。
+
+`listDestination` 在 v0.0.73 就已经探出来了：`CSMainPageContentViewController`。
+
+### 6. 读回全部带上"读到的是哪一条"
+
+以后每一处读回都打 `同段 N 条` + `匹配方式`，⑦ 结束行带 `nid=` ——
+一眼能看出读到的是不是同一条，不用再猜。
+
+### 7. 交付与对拍
+
+| 项 | 值 |
+|---|---|
+| CI | **#151**（首轮成功） |
+| deb | `com.yxh41.notifybox_0.0.75_iphoneos-arm64e.deb`，1,110,948 B |
+| md5 | `519a9c22073744a43b4f58469e86b325` |
+| dylib | 245,296 → 245,232（**−64**），`__text` +308 / `__ustring` −100 / `__methname` +110（新增两条声明） |
+| App | 487,632 → 487,632，**区外零差异** |
+
+包级对拍 14 条全过：A 正向 7（⑦d 探针 / 完成回调 / 读回 / 基线 / 严格匹配文案）/
+B 反向 4（⑦a、⑦b、loose 兜底文案、旧 ⑦ 标题）/ C 版本 3。
+
+> 🔴 顺手删掉了两条**恒绿判据**：`removeBulletinID:*` 的反向判据在 74→75 两侧都是 0，
+> 留着只会在结果里恒绿 —— 它们在 73→74 那一版已经把该证的证完了。
+
+### 8. 下一轮看什么
+
+1. `[找]` 那行：是不是经常出现「都不是目标（目标已不在 NC）⇒ 不动手」
+   —— 如果是，说明**这些通知本来就已经不在 NC 模型里**，问题在别处（不是我们没删掉）
+2. `⑦ 基线 … 本条还在=? nid=?` —— 终于是一个可信的起点
+3. `⑦d clearAction=<…> 列表目的地=<…> 方法=…` —— `clearAction` 到底有没有值
+4. `⑦d 完成回调 ok=?` 与 `⑦d 读回`
+5. 人眼：这一条掉了没有？**有没有别的通知被误删**（这条最重要）
