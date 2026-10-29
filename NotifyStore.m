@@ -819,7 +819,14 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
 //    但这里保持和 queryWithBundle 同一口径 —— 一处拼串、一处绑参，
 //    以后有人把某个参数换成字符串时就会在拼串那处出事。
 + (BOOL)deleteRow:(NSInteger)rowId {
-    return [self deleteRow:rowId outcome:NULL];
+    // 🔴🔴 v0.0.84：**不许传 NULL**。`NotifyStore.h` 处在 `NS_ASSUME_NONNULL` 范围内，
+    //    `NBSyncClearOutcome *outcome` 因此是隐式 `_Nonnull` —— 传 `NULL` 会被
+    //    `-Werror,-Wnonnull` 当场判死（CI 首轮就是这么炸的：
+    //    `NotifyStore.m:822:18: error: null passed to a callee that requires a non-null argument`）。
+    //    用栈上的局部变量接住即可：既满足非空约定，也不必给形参加 `nullable` 注解
+    //    （本项目自检第 10 道明令禁止 `_Nonnull`/`_Nullable` 出现在源码里）。
+    NBSyncClearOutcome ignored = NBSyncClearDeleteFail;
+    return [self deleteRow:rowId outcome:&ignored];
 }
 
 + (BOOL)deleteRow:(NSInteger)rowId outcome:(NBSyncClearOutcome *)outcome {
