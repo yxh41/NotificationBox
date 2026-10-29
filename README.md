@@ -9098,12 +9098,12 @@ INSERT …
 
 | 项 | 结果 |
 | --- | --- |
-| CI | run `{{CI_ID}}` |
-| deb | `{{DEB}}` |
-| dylib | {{DYLIBSIZE}} |
-| 包级正向 | {{POS}} |
-| 包级反向 | {{NEG}} |
-| App 二进制 | {{APP}} |
+| CI | run `40947673834`（首轮 `40947300945` 编译失败：`null passed to a callee that requires a non-null argument`，`NotifyStore.m:822` —— `NS_ASSUME_NONNULL` 范围内不许传 NULL；修复后重跑） |
+| deb | `com.yxh41.notifybox_0.0.84_iphoneos-arm64e.deb`，`1,120,118` B / md5 `ff32e966bf7ff2fc80fde2a94a99b5e8` |
+| dylib | 262,000 → `262,016` B（**+16 B**）；四个 segment `vmsize` 全 ±0（吃进页内余量），增长在节内：`__text` +1,700 / `__cstring` +895 / `__cfstring` +256 / `__ustring` +192 / `__objc_methname` +42 / `__DATA,__objc_selrefs` +24 |
+| 包级正向 | **8/8 全过**（旧=0 新=1）—— dylib 2 条：`[重] 盒子 … sysId 重复 G 组`、`合并重复：期望 %ld 行，实际删掉 %ld 行`；盒子 App 6 条：`通知中心不会变`、两句「没有系统通知 ID」完整文案、`已删除（通知中心未同步）`、`已删除（未同步通知中心）`、「同步清通知中心是关的」|
+| 包级反向 | 3/3 过 + 1 条跳过（UTF-8 口径：`⑦u`/`⑦s`/`⑦t` 的 C 串字面量在 v0.0.83 各 1 次、v0.0.84 归零；`段重载` 两版都是 0 —— 它只以 UTF-16 的 NSString 字面量存在，不能当判据，按纪律跳过而不是留一条恒绿）|
+| App 二进制 | 487,632 → `487,648` B（**+16 B = `LC_UUID`**）；四个 segment `vmsize` 全 ±0；增长在节内：`__text` +1,680 / `__cstring` +894 / `__ustring` +474 / `__cfstring` +448 —— 本版确实改了 4 个 App 源文件，所以**不再用「区外零」这条判据**（节一旦前移，整文件都会不同），改用「段 ±0 + 节级增量可解释」|
 | 源码自检 | 22 道全绿 |
 
 ### 7. 下轮看什么
