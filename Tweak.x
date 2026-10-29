@@ -1203,15 +1203,20 @@ static void NBRingPush(NSString *sec) {
     }
 }
 // center = 参照时刻；win = 前后窗口秒数。只打窗口内的，最多 12 行。
-static void NBRingDump(double center, double win, const char *why) {
+// 🔴 v0.0.83：`why` 用 **NSString *** 而不是 `const char *`。
+//    CI 第一轮就是这么炸的：调用点传 `@"段重载"`（NSString*）给 `const char *` 形参 ——
+//    文本自检 14 道全绿也挡不住，**只有编译期能抓**（§7.6）。改成 NSString* 后
+//    调用点怎么传中文都不会错，转换只在函数内做一次。
+static void NBRingDump(double center, double win, NSString *why) {
     int shown = 0;
+    const char *whyC = (why.length ? [why UTF8String] : "");
     @synchronized(@"nbRlRing") {
         for (int k = 0; k < NB_RL_RING; k++) {
             int idx = ((gRlNext - 1 - k) % NB_RL_RING + NB_RL_RING) % NB_RL_RING;
             if (gRlTs[idx] <= 0) continue;
             double d = gRlTs[idx] - center;
             if (d < -win || d > win) continue;
-            NBDiagStep(@"  [RL] %+.0fs section=%.47s（%s）\n", d, gRlSec[idx], why);
+            NBDiagStep(@"  [RL] %+.0fs section=%.47s（%s）\n", d, gRlSec[idx], whyC ? whyC : "");
             if (++shown >= 12) break;
         }
     }
