@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.77"
+#define NB_VER_STR @"0.0.78"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -481,16 +481,12 @@ static void NBCaptureServerIfNeeded(id server) {
 //    ⇒ 「数据层删掉了、眼睛还看得见」这种半成品必须靠这条路兜住。
 static __strong id gNCSource = nil;         // NCBulletinNotificationSource 实例
 static __strong id gNCDispatcher = nil;     // NCNotificationDispatcher 实例
-// ---- v0.0.76：⑧ 需要的两个现场 ----
-// gBBObserver：系统自己调 `observer:removeBulletin:` 时递给 source 的那个 BBObserver。
-//   ⑧ 要给 source 递一个**真的** observer（`[gNCSource observer]` 取不到时的退路）。
-//   ⛔ 不自己造：v0.0.62 造过假 request，代价是整条队列被堵死。
-static __strong id gBBObserver = nil;
-// gSelfPostingRemove：⑧ 调用期间置位。
-// 🔴 为什么要它：`NCBulletinNotificationSource - observer:removeBulletin:` 上挂着我们的观测 hook，
-//   日志里那句是「**系统自己**调用」—— 我们不置位就无法分辨「系统终于转过来」和「我们自己投的」，
-//   而这正是本版要判的第一件事。假绿的经典来源就是这种"日志写着 A、其实是 B"。
-static BOOL gSelfPostingRemove = NO;
+// ---- v0.0.78：⑧ 的两件现场（`gBBObserver` / `gSelfPostingRemove`）已删 ----
+// 🔴 删的理由是**整把刀没了**，不是"换名字"：`nc_diag(18).txt` 实测 ⑧ 只投递到 1 次，
+//    块进了 `observer:removeBulletin:` 就**再也没返回**（`.nc_pending` 从 08:05:18 留到
+//    08:07:15，近 2 分钟；后面 29 次尝试全被那道闸门挡在原地）。
+//    它既没卡屏注销（后台队列生效了），也**一次都没成功** —— 留着只会继续废掉后面的尝试。
+// 🔴 按 §1.13③：刀删了，只给它用的变量一起删；否则留着会被下一轮读成"还在用"。
 // 🔴🔴 v0.0.62：**必须**也抓住这条队列 —— 系统平时就是在这条队列上回调 source 的
 //    （`initWithDispatcher:observer:queue:` 的第 3 个参数）。NC 的动作只在它上面跑，
 //    不在 BB 队列上跑 —— v0.0.61 就是因为在 BB 队列里同步调 NC 而把 SpringBoard 卡死。
@@ -504,27 +500,36 @@ static dispatch_queue_t gNCSourceQueue = nil;
 //    这就是「朗读自愈」那套思路的复用：先保证手机能用，再谈功能。
 static NSString *const kNBGuardPending = @"/var/mobile/Library/NotifyBox/.nc_pending";
 static NSString *const kNBGuardOff     = @"/var/mobile/Library/NotifyBox/.nc_off";
+// ---------- v0.0.78：⑦r（CS 侧带时间窗的单条清除）护栏 ----------
+// 🔴 为什么这把刀也要护栏：它在**主队列**上同步调一个从没调过的 NC/CS 方法。
+//    v0.0.76 的「卡屏后注销」就是主队列上同步调未知 NC 方法造成的自死锁。
+//    CS 侧方法理论上就该在主队列跑（v0.0.75 的 ⑦c 在主队列上跑过、没卡），
+//    但"理论上"不是证据 ⇒ 按 §1.11 给它一个**带版本戳的熔断标记**：
+//      调用前写 `.cs_ws` → 返回立刻删；留到下次开机 = 这把刀把主队列卡死过
+//      ⇒ 写 `.nc_off` 永久压制（和 NC 路径共用同一个"关掉界面侧"开关）。
+static NSString *const kNBGuardCSWs   = @"/var/mobile/Library/NotifyBox/.cs_ws";
+static BOOL gCsWsSuppressed = NO;   // YES ⇒ 本进程不用 ⑦r（但账本照清）
+// ---------- v0.0.78：[寿] 旧删台账 ----------
+// 🔴 它要回答的是**比"这一刀成不成"更根本的问题**：
+//    「⓪ 把 BB 账本清了之后，NC 里那条到底会不会自己消失？多久消失？」
+//    这一版之前所有读回都是「删完同秒读回」，等于默认"立即生效" —— 而宿主实测
+//    BB→NC 传播是 **65 秒 ~ 4.5 分钟**（`nc_diag(17).txt`：07:41 撤、07:45:56 才到 NC）
+//    ⇒ 同秒读回**必然**读到"还在"，它不是判据，是噪声。
+//    做法：⓪ 成功那条记进台账；每次进 NC 侧时扫一遍比对 ⇒ 一行就能看出"几分钟后消失"。
+static NSString *const kNBDeletedLog = @"/var/mobile/Library/NotifyBox/.nb_deleted";
+#define NB_DEL_KEEP 24            // 台账最多留 24 条（更老的没有诊断价值，且让扫描变贵）
 // 🔴 版本号写进护栏文件：**每个新版本自动获得一次重试机会**。
 //    否则 v0.0.62 那次卡死留下的 `.nc_off` 会一直压着，新版明明修好了也测不到。
 // 🔴 v0.0.71：`#define NB_VER_STR` **已上移到 `#define NBLog` 那一区**（文件最前面的宏区）。
 //    原来它就在这个位置，而第 ~424 行也要用 ⇒ 引用在定义之前 ⇒ 编译失败。
 //    这里只留说明，不再放定义。
 static BOOL gNCSuppressed = NO;   // YES ⇒ 本进程不碰界面侧（⑧），但**账本照清**
-// ---------- v0.0.77：⑧ 专用后台队列 ----------
-// 🔴🔴 为什么非要自建：v0.0.76 的 ⑧ 在主队列上同步调 `observer:removeBulletin:`，
-//    真机**卡屏后注销两次**（用户：「刚开始滑了菜鸟两次就卡屏注销了」）。
-//    主队列卡住 = 主线程卡住 = 看门狗杀进程。系统自己调这个方法时是在
-//    `NCBulletinNotificationSource` 自己的 queue（后台）上 ⇒ 我们照它的队列走才对。
-// ⛔ 不直接投 `gNCSourceQueue`：v0.0.64 投进去**块从没被执行**（那一轮整条路径因此被关掉），
-//    不能拿它当唯一通路。用自己创建的串行队列，块一定被执行，且永不占主线程。
-static dispatch_queue_t gNC8Queue = NULL;
-static BOOL gTry8Busy = NO;       // 上一次 ⑧ 还没回来 ⇒ 不叠加
-static void NBEnsure8Queue(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        gNC8Queue = dispatch_queue_create("com.yxh41.notifybox.nc8", DISPATCH_QUEUE_SERIAL);
-    });
-}
+// ---------- v0.0.78：⑧ 的后台队列（`gNC8Queue` / `gTry8Busy` / `NBEnsure8Queue`）已删 ----------
+// 🔴 v0.0.77 自建这条串行队列**是对的**（它确实把「卡屏注销」治好了：v0.0.78 这份
+//    `nc_diag(18).txt` 里 30 次尝试、无一卡屏），**错的是块里的那一刀**：
+//    块进了 `observer:removeBulletin:` 就没再回来 ⇒ 队列本身没卡（进程还能正常写日志），
+//    但那把刀在**方法内部**等一个永远不来的东西。⇒ 换队列救不了它，只能换刀。
+// 🔴 教训写在这里，不要下次又"自建一条队列试试"：**队列选对了 ≠ 刀选对了**。
 static BOOL gNCBusy = NO;         // YES ⇒ 上一次 NC 尝试还没回来（同进程内不再赌第二次）
 static NSTimeInterval gNCBusyAt = 0;   // 🔴 v0.0.65：闸门加上时间戳，超时自动放行
 // 🔴🔴 v0.0.65：**默认不再把动作投到 NC 队列**。
@@ -1113,6 +1118,134 @@ static id NBFindOurRequest(id source, NSString *bundle, NSArray *ids,
     } @catch (__unused NSException *e) { return nil; }
 }
 
+// ---------- v0.0.78：⑦r 的闸门量 + [寿] 旧删台账 ----------
+// 数「同段 + timestamp 落在 ts±win 秒内」的 request 条数。
+// 🔴 只返回**数**，不返回对象 —— 它唯一的用途是给 ⑦r 当闸门。
+//    返回 -1 = 读不到（调用方必须当成"不许动刀"处理，不是"0 条"）。
+static int NBCountInWindow(id source, NSString *bundle, NSDate *ts, NSTimeInterval win) {
+    if (!source || !bundle.length || !ts) return -1;
+    @try {
+        id m = [source uuidsToRequests];
+        if (![m isKindOfClass:[NSDictionary class]]) return -1;
+        NSDictionary *d = (NSDictionary *)m;
+        NSMutableArray *all = [NSMutableArray arrayWithCapacity:d.count];
+        for (id k in d) NBCollectRequestsIn(d[k], all, 0);
+        int n = 0;
+        for (id req in all) {
+            NSString *sid = NBKVCStr(req, @"sectionIdentifier");
+            if (!sid.length || ![sid isEqualToString:bundle]) continue;
+            id v = NBSafeValue(req, @"timestamp");
+            if (![v isKindOfClass:[NSDate class]]) continue;
+            NSTimeInterval dt = [(NSDate *)v timeIntervalSinceDate:ts];
+            if (dt >= -win && dt <= win) n++;
+        }
+        return n;
+    } @catch (__unused NSException *e) { return -1; }
+}
+
+// 把「刚刚被 ⓪ 清掉的那条」记进台账（一行：时间戳|bundle|cid）。
+static void NBDeletedRemember(NSString *cid, NSString *bundle) {
+    if (!cid.length || !bundle.length) return;
+    @try {
+        NSString *old = [NSString stringWithContentsOfFile:kNBDeletedLog
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        NSMutableArray *keep = [NSMutableArray array];
+        if (old.length) {
+            for (NSString *ln in [old componentsSeparatedByString:@"\n"]) {
+                if (!ln.length) continue;
+                NSArray *p = [ln componentsSeparatedByString:@"|"];
+                if (p.count >= 3 && [p[2] isEqualToString:cid]) continue;   // 同一个 cid 只留最新那次
+                [keep addObject:ln];
+            }
+        }
+        [keep addObject:[NSString stringWithFormat:@"%.0f|%@|%@",
+                         [[NSDate date] timeIntervalSince1970], bundle, cid]];
+        while (keep.count > NB_DEL_KEEP) [keep removeObjectAtIndex:0];
+        [[keep componentsJoinedByString:@"\n"] writeToFile:kNBDeletedLog atomically:YES
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+    } @catch (__unused NSException *e) { }
+}
+
+// 🔴 一次扫描、多条比对：把台账里的旧 cid 拿到 NC 当前快照里查一遍。
+//    比「每条旧记录各扫一遍 ~600 条」便宜一个数量级（§"重型只读观测要省"）。
+//    它打出来的那两行直接回答本轮的根本问题：
+//      「删掉的那条，NC 里到底会不会自己消失？多久消失？」
+static void NBCheckDeletedAlive(void) {
+    @try {
+        NSString *old = [NSString stringWithContentsOfFile:kNBDeletedLog
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        if (!old.length) { NBDiagStep(@"  [寿] 台账为空（本版起才开始记）\n"); return; }
+        NSMutableArray *recs = [NSMutableArray array];
+        NSMutableSet  *allIDs = [NSMutableSet set];
+        for (NSString *ln in [old componentsSeparatedByString:@"\n"]) {
+            if (!ln.length) continue;
+            NSArray *p = [ln componentsSeparatedByString:@"|"];
+            if (p.count < 3 || ![(NSString *)p[2] length]) continue;
+            [recs addObject:[@{@"ts": p[0], @"bundle": p[1], @"cid": p[2],
+                               @"alive": @YES} mutableCopy]];
+            [allIDs addObject:p[2]];
+        }
+        if (!recs.count) { NBDiagStep(@"  [寿] 台账 0 条可解析\n"); return; }
+        id m = [gNCSource uuidsToRequests];
+        if (![m isKindOfClass:[NSDictionary class]]) {
+            NBDiagStep(@"  [寿] 读不到 uuidsToRequests ⇒ 本次不判\n"); return;
+        }
+        NSDictionary *d = (NSDictionary *)m;
+        NSMutableArray *all = [NSMutableArray arrayWithCapacity:d.count];
+        for (id k in d) NBCollectRequestsIn([d objectForKey:k], all, 0);
+        // 🔴 比对口径 = 与 NBReqIsOurs 完全一致（5 个键），否则「还在/已消」会跟精确匹配打架
+        for (id req in all) {
+            NSMutableSet *hit = [NSMutableSet set];
+            for (NSString *key in @[@"notificationIdentifier", @"uuid"]) {
+                NSString *v = NBKVCStr(req, key);
+                if (v.length && [allIDs containsObject:v]) [hit addObject:v];
+            }
+            id b = NBSafeValue(req, @"bulletin");
+            if (b) {
+                for (NSString *key in @[@"bulletinID", @"recordID", @"publisherBulletinID"]) {
+                    NSString *v = NBKVCStr(b, key);
+                    if (v.length && [allIDs containsObject:v]) [hit addObject:v];
+                }
+            }
+            if (!hit.count) continue;
+            for (NSMutableDictionary *rec in recs) {
+                if ([hit containsObject:rec[@"cid"]]) rec[@"alive"] = @NO;
+            }
+        }
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        int goneN = 0, liveN = 0;
+        NSTimeInterval gOld = 0, gNew = 0, lOld = 0, lNew = 0;
+        for (NSDictionary *rec in recs) {
+            NSTimeInterval age = now - [rec[@"ts"] doubleValue];
+            if ([rec[@"alive"] boolValue]) {
+                liveN++;
+                if (!lOld || age > lOld) lOld = age;
+                if (!lNew || age < lNew) lNew = age;
+            } else {
+                goneN++;
+                if (!gOld || age > gOld) gOld = age;
+                if (!gNew || age < gNew) gNew = age;
+            }
+        }
+        NBDiagStep(@"  [寿] 台账 %lu 条 × 扫 NC %lu 条 ⇒ NC 里已消失 %d / 仍在 %d\n",
+                   (unsigned long)recs.count, (unsigned long)all.count, goneN, liveN);
+        if (goneN) NBDiagStep(@"  [寿]   已消失：最老 %.0fs 最新 %.0fs\n", gOld, gNew);
+        if (liveN) NBDiagStep(@"  [寿]   仍在  ：最老 %.0fs 最新 %.0fs%@\n", lOld, lNew,
+                              (lOld > 600 ? @"  ← 最老已 >10 分钟仍在 ⇒ **不会自己消失**" : @""));
+        int shown = 0;
+        for (NSDictionary *rec in [recs reverseObjectEnumerator]) {
+            if (shown >= 3) break;
+            NBDiagStep(@"  [寿]   %@ %@ %@（%.0fs 前）\n",
+                       [rec[@"alive"] boolValue] ? @"仍在" : @"已消",
+                       NBSafeClip(rec[@"bundle"], 32), NBSafeClip(rec[@"cid"], 28),
+                       now - [rec[@"ts"] doubleValue]);
+            shown++;
+        }
+    } @catch (NSException *e) {
+        NBDiagStep(@"  [寿] 抛: %@\n", e.reason);
+    }
+}
+
 // 把一批 request 的 section/nid 打出来（最多 max 条）。只读 KVC，不碰 description。
 static void NBLogRequests(NSString *tag, id requests, int max) {
     NSArray *arr = nil;
@@ -1331,7 +1464,8 @@ static void NBProbeDestinations(id req) {
 // 🔴🔴 更要紧的是**它们都在主队列上调用未知的 NC 方法**。v0.0.76 真机两次「卡屏后注销」
 //    最可疑的就是这一类：主队列上同步调一个内部可能 `dispatch_sync(main)` 的方法 ⇒ 自死锁。
 //    ⇒ 本版起，**主队列上不再有任何未知 NC 调用**（⑦c/⑦d 也一起删）。
-//    界面侧只剩 ⑧，而且 ⑧ 在后台队列上跑。
+//    🔴 v0.0.78：⑧ 也删了（实测块进方法就再不返回，把后面 29 次尝试全废掉）。
+//    界面侧现在只剩 ⑦r 一把，见 ⑦ 段。
 static void NBForwardClearAsync(id req, NSString *how, void (^done)(void)) {
     (void)how;                       // v0.0.77：只保留调用点的签名，参数不再用
     if (req) {
@@ -1683,7 +1817,13 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 BOOL f0 = NO;
                 NSInteger n0 = NBLiveScan(gBBServer, bundleC, cid, &f0);
                 bbIn = f0;                 // ⓪ 之后 BB 里还在不在，交给后面的 ③ 用真实状态
-                if (!f0) { bbWithdrew = YES; gBBWithdrawOk++; }
+                if (!f0) {
+                    bbWithdrew = YES;
+                    gBBWithdrawOk++;
+                    // v0.0.78：⓪ 真的把账本清掉了 ⇒ 记进 [寿] 台账，后面才能量
+                    //   「这条从 NC 消失用了多久」。只记真撤掉的（f0==NO），不记"本来就没有"。
+                    NBDeletedRemember(cid, bundleC);
+                }
                 NBDiagStep(@"  ⓪ 之后 BB live=%ld 含本条=%@\n", (long)n0, f0 ? @"是" : @"否");
             } else {
                 // 🔴 v0.0.72：这句话原来只写"本来就没有"。新刀插在前面之后，
@@ -1717,9 +1857,8 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             if (!bbIn && gFoundNCReq && gNCSource) {
                 id req7 = gFoundNCReq;
                 NSString *want7 = [gWantBundle copy];
-                // v0.0.76：⑧ 要给 source 递**这条 bulletin 对象本身**（它不是 ID，是对象）。
-                //   ⚠️ 必须在这里就抓下来：⓪ 之后 BB 里已经没有它了，`_bulletinsForIDs:` 取不回来。
-                id bullet8 = bullet;
+                // v0.0.78：`bullet8` 已删 —— ⑧ 没了，⑦ 侧不再需要 BB 的 bulletin 对象
+                //   （精确匹配走 `req.bulletin`，那是 NC request 自己带的，跟 BB 账本无关）。
                 dispatch_async(dispatch_get_main_queue(), ^{
                     NBDiagStep(@"  ⑦ 进入主队列：账本已清 ⇒ 界面侧开始（严格匹配，匹配不到就不动手）\n");
                     NSUInteger sc7 = 0; int sh7 = 0;
@@ -1736,7 +1875,20 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         NBDiagStep(@"  ⑦ 基线抛: %@\n", e.reason);
                     }
 
-                    // ---- ⑧ v0.0.77：**冒充系统投递**，但从主队列搬到后台队列 ----
+                    // ---- 🔴🔴 ⑧ 已整段删除（v0.0.78）----
+                    // 下面这几行保留**只作为"为什么不再走这条路"的记录**，代码已经不在了。
+                    // 真机判据（`nc_diag(18).txt`）：30 次尝试里 ⑧ 只投递到 **1 次**，
+                    // 块进去后打出 `⑧ observer=<BBObserver> 方法=有` 就**再没返回** ——
+                    // `.nc_pending` 从 08:05:18 一直留到 08:07:15（近 2 分钟），
+                    // 后面 **29 次尝试全被那道闸门挡在原地**（`⑧ 跳过（上一次投递没回来…）`）。
+                    // 🔴 两个结论，都要记住：
+                    //   ① **队列选对了 ≠ 刀选对了** —— v0.0.77 自建后台队列确实治好了
+                    //      「卡屏注销」（本份日志 30 次尝试无一卡屏），但刀本身在方法内部
+                    //      等一个永远不来的东西 ⇒ 换成什么队列都救不了。
+                    //   ② **熔断闸门会把"一刀失败"放大成"整条路径全废"** —— 一次没回来，
+                    //      后面 29 次连试都不试。这就是用户那句"好像没效果了"的全部原因。
+                    // ---- 以下是 v0.0.77 当年的原文（保留作依据）----
+                    // ⑧ v0.0.77：**冒充系统投递**，但从主队列搬到后台队列
                     // 🔴🔴 依据（`nc_diag(17).txt` + 用户口述）：v0.0.76 的 ⑧ 在主队列上同步调
                     //   `observer:removeBulletin:` ⇒ **卡屏后注销两次**（「滑了菜鸟两次就卡屏注销了」）。
                     //   卡屏 = 主线程被拖住 = 看门狗杀进程。系统自己调这个方法时是在
@@ -1749,78 +1901,89 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     //   ② `.nc_pending` 从"护栏"升级成**投递闸门**：投之前先看它还在不在，
                     //      在 ⇒ 上一次投递没回来 ⇒ 本次不投（不再往已经卡住的队列里堆）。
                     //   ③ `.nc_off` 压制时只跳过 ⑧，账本照清（见 NBForwardClearAsync）。
-                    if (still && gNCSource) {
-                        NSString *bid8 = bullet8 ? NBKVCStr(bullet8, @"bulletinID") : nil;
-                        if (gNCSuppressed) {
-                            NBDiagStep(@"  ⑧ 跳过（界面侧被 .nc_off 压制，删 %@ 可恢复）—— 账本已清，界面等系统自己跟\n",
-                                       kNBGuardOff);
-                        } else if (!bullet8) {
-                            NBDiagStep(@"  ⑧ 跳过（没抓到 BBBulletin 对象）\n");
-                        } else if ([[NSFileManager defaultManager] fileExistsAtPath:kNBGuardPending]) {
-                            NBDiagStep(@"  ⑧ 跳过（上一次投递没回来 ⇒ %@ 还在 ⇒ 不再往卡住的队列里堆）\n",
-                                       kNBGuardPending);
-                        } else if (gTry8Busy) {
-                            NBDiagStep(@"  ⑧ 跳过（上一次 ⑧ 还没回来）\n");
+                    // ---------- v0.0.78：⑦r —— ⑦c 的「带时间窗」版，精确到单条 ----------
+                    // 🔴🔴 为什么是这一把（`nc_diag(18).txt` 之后重读方法表定的）：
+                    //    CS 侧 `- destination:clearNotificationRequestsFromDate:toDate:inSections:` `v@:@@@@`
+                    //    与 ⑦c 的 `…InSections:` `v@:@@` 是**同一族**（只多两个 NSDate），
+                    //    而 ⑦c 是唯一被真机证实「系统自己清一条时就是这么走」的那把
+                    //    （v0.0.66 实测：手动清一条 ⇒ `destination:…requestsClearing…` 与
+                    //     `dispatcher:…requestsClearing…` **成对**出现、条数一致）。
+                    //    NC 侧还有它的孪生 `- destination:requestsClearingNotificationRequestsFromDate:
+                    //    toDate:inSections:` —— 名字只差一个词，是**另一把刀、另一个类**，本版先只打 CS 侧。
+                    // 🔴🔴 ⑦c 当年的死结：闸门写的是「同段 ≤ 1 条」，而真机实测同段条数
+                    //    9 / 19 / 30 / 37 / 39 / 45 / 99 —— **一次都不满足** ⇒ 那把刀等于没装。
+                    //    时间窗正好把这个死结解开：精度从「整个段」收窄到「±0.4 秒内的那一条」。
+                    // 🔴 两道闸门，都基于**当场量出来的真实数**（不是估）：
+                    //    ① `req.timestamp` 必须真是 NSDate。传 nil 给这个 API 极可能等价于
+                    //       「不限时间」⇒ 退化成整段清 ⇒ 连带清掉同段几十条别人的通知。宁可不打。
+                    //    ② 同段里 timestamp 落在窗口内的**只能有 1 条**（就是本条）。
+                    //       这一量同时也是「方法万一忽略时间参数」的兜底：窗口内=1 而段内>1 时
+                    //       我们仍然要打（否则永不触发），所以窗口取窄（±0.4s）来压低概率。
+                    if (still && gCSDestination && req7) {
+                        NSString *nid7r = nid7;
+                        NSDate *ts7 = nil;
+                        @try {
+                            id v = NBSafeValue(req7, @"timestamp");
+                            if ([v isKindOfClass:[NSDate class]]) ts7 = (NSDate *)v;
+                        } @catch (__unused NSException *e) { }
+                        BOOL hasRng = [gCSDestination respondsToSelector:
+                                       @selector(destination:clearNotificationRequestsFromDate:toDate:inSections:)];
+                        int winHits = (ts7 ? NBCountInWindow(gNCSource, want7, ts7, 0.4) : -1);
+                        NBDiagStep(@"  ⑦r 闸门：timestamp=%@ 窗口(±0.4s)内同段=%d 段内总=%d 方法=%@ 压制=%@\n",
+                                   ts7 ? [NSString stringWithFormat:@"%.3f", [ts7 timeIntervalSince1970]]
+                                       : @"(取不到/不是 NSDate)",
+                                   winHits, sh7, hasRng ? @"有" : @"无",
+                                   gCsWsSuppressed ? @"是" : @"否");
+                        if (gCsWsSuppressed) {
+                            NBDiagStep(@"  ⑦r 跳过（主队列上卡死过 ⇒ %@ 压制；删它可恢复）\n", kNBGuardOff);
+                        } else if (!ts7) {
+                            NBDiagStep(@"  ⑦r 跳过（timestamp 不可用 ⇒ 不传 nil 时间窗）\n");
+                        } else if (!hasRng) {
+                            NBDiagStep(@"  ⑦r 跳过（clearNotificationRequestsFromDate:toDate:inSections: 不在方法表）\n");
+                        } else if (winHits != 1) {
+                            NBDiagStep(@"  ⑦r 跳过（窗口内 %d 条 ≠ 1 ⇒ 要么打不中、要么连带）\n", winHits);
                         } else {
-                            gTry8Busy = YES;
-                            NBEnsure8Queue();
-                            [[[NSString stringWithFormat:@"%@ ⑧ %@ %@", NB_VER_STR, [NSDate date], nid7 ?: @"?"]
-                              dataUsingEncoding:NSUTF8StringEncoding] writeToFile:kNBGuardPending atomically:YES];
-                            NBDiagStep(@"  ⑧ 投递到后台队列（不占主线程）bulletinID=%@\n", bid8 ?: @"(无)");
-                            id wantQ = want7;
-                            dispatch_async(gNC8Queue, ^{
-                                NBDiagStep(@"  ⑧ 进入后台队列\n");
-                                id obs8 = nil;
-                                BOOL has8 = [gNCSource respondsToSelector:@selector(observer:removeBulletin:)];
-                                @try {
-                                    if ([gNCSource respondsToSelector:@selector(observer)]) obs8 = [gNCSource observer];
-                                } @catch (__unused NSException *e) { }
-                                if (!obs8) obs8 = gBBObserver;   // 退路：系统自己调那条 hook 时接住的真 observer
-                                NBDiagStep(@"  ⑧ observer=<%@> 方法=%@\n", NBClassName(obs8), has8 ? @"有" : @"无");
-                                if (obs8 && has8) {
-                                    gSelfPostingRemove = YES;
-                                    @try {
-                                        [gNCSource observer:obs8 removeBulletin:bullet8];
-                                        NBDiagStep(@"  ⑧ 已返回\n");
-                                    } @catch (NSException *e) {
-                                        NBDiagStep(@"  ⑧ 抛: %@\n", e.reason);
-                                    }
-                                    gSelfPostingRemove = NO;
-                                }
-                                [[NSFileManager defaultManager] removeItemAtPath:kNBGuardPending error:NULL];
-                                gTry8Busy = NO;
-                                // 读回（域A / 域B）—— 与调用同队列，读的才是它刚改的那一份
-                                @try {
-                                    NSUInteger sc8 = 0; int sh8 = 0; NSString *how8 = nil;
-                                    BOOL still8 = (NBFindOurRequest(gNCSource, wantQ, gWantIDs, &how8, &sc8, &sh8) != nil);
-                                    NBDiagStep(@"  ⑧ 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（域A=uuidsToRequests，匹配=%@）\n",
-                                               (unsigned long)sc8, sh8, still8 ? @"是" : @"否（已删）", how8 ?: @"?");
-                                } @catch (NSException *e) {
-                                    NBDiagStep(@"  ⑧ 读回抛: %@\n", e.reason);
-                                }
-                                @try {
-                                    id b2u = [gNCSource bulletinsToUUIDs];
-                                    if ([b2u isKindOfClass:[NSDictionary class]] && bid8.length) {
-                                        BOOL key8 = ([(NSDictionary *)b2u objectForKey:bid8] != nil);
-                                        NBDiagStep(@"  ⑧ 域B：bulletinsToUUIDs 共 %lu 条，本条 bulletinID 的键=%@\n",
-                                                   (unsigned long)[(NSDictionary *)b2u count], key8 ? @"还在" : @"已消失");
-                                    }
-                                } @catch (NSException *e) {
-                                    NBDiagStep(@"  ⑧ 域B 抛: %@\n", e.reason);
-                                }
-                                // 🔴 +3s 延迟复量：系统的 BB→NC 传播是**分钟级**的
-                                //   （`nc_diag(17).txt` 实测同一条 07:41 撤、07:45:56 才到 NC）。
-                                //   同秒读回等于默认"立即生效"，这个默认本身就是假判据。
-                                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                                               dispatch_get_main_queue(), ^{
-                                    NSUInteger sc9 = 0; int sh9 = 0; NSString *how9 = nil;
-                                    BOOL st9 = (NBFindOurRequest(gNCSource, wantQ, gWantIDs, &how9, &sc9, &sh9) != nil);
-                                    NBDiagStep(@"  ⑧ +3s 复量：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@\n",
-                                               (unsigned long)sc9, sh9, st9 ? @"是" : @"否（已删）");
-                                });
+                            // 🔴 护栏先写、后调用、返回立刻删 —— 顺序不能反
+                            [[[NSString stringWithFormat:@"%@ ⑦r %@ %@", NB_VER_STR, [NSDate date], nid7r ?: @"?"]
+                              dataUsingEncoding:NSUTF8StringEncoding] writeToFile:kNBGuardCSWs atomically:YES];
+                            NBDiagStep(@"  ⑦r 将要调用 destination:clearNotificationRequestsFromDate:toDate:inSections:\n"
+                                       @"       首参=dispatcher(%@) 段=%@ from=%.3f to=%.3f\n",
+                                       NBClassName(gNCDispatcher), want7,
+                                       [ts7 timeIntervalSince1970] - 0.4,
+                                       [ts7 timeIntervalSince1970] + 0.4);
+                            @try {
+                                [gCSDestination destination:gNCDispatcher
+                             clearNotificationRequestsFromDate:[ts7 dateByAddingTimeInterval:-0.4]
+                                                      toDate:[ts7 dateByAddingTimeInterval:0.4]
+                                                   inSections:[NSSet setWithObject:want7]];
+                                NBDiagStep(@"  ⑦r 已返回\n");
+                            } @catch (NSException *e) {
+                                NBDiagStep(@"  ⑦r 抛: %@\n", e.reason);
+                            }
+                            [[NSFileManager defaultManager] removeItemAtPath:kNBGuardCSWs error:NULL];
+                            @try {
+                                still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
+                                NBDiagStep(@"  ⑦r 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@\n",
+                                           (unsigned long)sc7, sh7, still ? @"是" : @"否（已删）");
+                            } @catch (NSException *e) {
+                                NBDiagStep(@"  ⑦r 读回抛: %@\n", e.reason);
+                            }
+                            // 🔴 再等 20 秒复量一次：这里量的是 **NC 自己的 destination 有没有生效**，
+                            //    不是 BB→NC 传播（那要分钟级）。如果 ⑦r 真的驱动了界面，20 秒足够。
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+                                           dispatch_get_main_queue(), ^{
+                                NSUInteger scq = 0; int shq = 0; NSString *howq = nil;
+                                BOOL stq = (NBFindOurRequest(gNCSource, want7, gWantIDs, &howq, &scq, &shq) != nil);
+                                NBDiagStep(@"  ⑦r +20s 复量：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
+                                           (unsigned long)scq, shq, stq ? @"是" : @"否（已删）", howq ?: @"?");
                             });
                         }
                     }
+
+                    // ---------- v0.0.78：[寿] 旧删台账（本轮的核心取证）----------
+                    // 🔴 放在 ⑦rs 之后、同一个主队列块里：省一次调度，且此刻 NC 的映射是热的。
+                    //    它一次扫描比对多条旧 cid，比"每条旧记录各扫一遍"便宜一个数量级。
+                    NBCheckDeletedAlive();
 
                     // ---------- v0.0.77：⑦c / ⑦d 一并删除 ----------
                     // ⑦c `destination:dispatcher clearNotificationRequestsInSections:` ——
@@ -1862,12 +2025,21 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             // 🔴 v0.0.69 补：**顺序**。这一刀要能驱动界面，必须让 source 把 request 翻回 BBBulletin；
             //    所以它必须跑在 `bbCleanup`（⓪ + ③）**之前**。原来反着，等于先拆砖再砌墙。
             BOOL ncPathTaken = NO;
-            if (gNCDispatcher && bullet) {
+            // 🔴🔴🔴 v0.0.78：原来这里是 `if (gNCDispatcher && bullet)` —— 一个 `&& bullet`
+            //    让 **23/30 次删除（77%）根本没碰 NC 侧**（`nc_diag(18).txt`：那些尝试的
+            //    `BB live=… 含本条=否 对象=(没取到)`，然后直接落到下面的
+            //    `[序] 没有 NC dispatcher/bulletin ⇒ 就地清账本`，界面一个字都没动）。
+            //    🔴 而 `bullet` 是 **BB 账本里**的对象 —— 账本里没有，不等于 NC 里没有：
+            //    NC 的 request 自带一份 `bulletin`（日志里 `[找] req.bulletin=<BBBulletin>`），
+            //    那才是精确匹配真正用的东西（`NBReqIsOurs` 读的就是它）。
+            //    ⇒ 判据从「BB 里有对象」改成「有 dispatcher」（dispatcher 是常驻的）。
+            //    这条改动的量级比换刀大得多：它把 77% 的空转变成真尝试。
+            if (gNCDispatcher) {
                 ncPathTaken = YES;
                 // 🔴 v0.0.77：这句原来的措辞是「先走 NC 清除 ⇒ 等它返回再清账本」。
                 //   [清] 整段删除后，主队列上这一步**只找 request、不动手**，
                 //   真正的界面侧动作是 ⑧，而且它在**账本清完之后**、在后台队列上跑。
-                NBDiagStep(@"  [序] 本版：主队列只找 request（不动手）⇒ 回 BB 队列清账本 ⇒ 再 ⑧（缓存 %lu 条对本条无效）\n",
+                NBDiagStep(@"  [序] 本版顺序：主队列只找 request ⇒ 回 BB 队列清账本（⓪）⇒ 再回主队列 ⑦r 动一刀（缓存 %lu 条对本条无效）\n",
                            (unsigned long)gNCRequestByID.count);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     NBDiagStep(@"  [找] 进入主队列\n");
@@ -2626,13 +2798,10 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 //    如果 ⓪ 成功了很多次而这里一条都没有，就说明**BB 的撤回根本没到 NC**，得换路。
 - (void)observer:(id)observer removeBulletin:(id)bulletin {
     gBBToNCSeen++;
-    if (observer && !gBBObserver) gBBObserver = observer;   // v0.0.76：留下真 observer 给 ⑧ 当退路
-    if (gSelfPostingRemove) {
-        // 🔴 v0.0.76：这一条是**我们自己**投的（⑧），不是系统自己转过来的。
-        //   不分开写，下一轮就会把"我们终于调通了"读成"系统终于转过来了"。
-        NBDiagStep(@"  [BB→NC] ← **我方 ⑧ 投递** recordID=%@\n",
-                   NBKVCStr(bulletin, @"recordID"));
-    } else if (gBBToNCSeen <= 60) {
+    // 🔴 v0.0.78：⑧ 删掉之后，这条 hook 上**只可能**是系统自己调的 ⇒ 那两行区分
+    //   「我方投递 / 系统自己」的分支（`gSelfPostingRemove`）一起删。
+    //   留着不删的坏处：下一轮看到「我方投递」会以为 ⑧ 还在（死分支恒假 = 假绿的 ⑧ 型）。
+    if (gBBToNCSeen <= 60) {
         NBDiagStep(@"  [BB→NC] 系统自己调用 observer:removeBulletin: 第 %d 次 @%@ recordID=%@（此时⓪已成功 %d 次）\n",
                    gBBToNCSeen, [NSDate date], NBKVCStr(bulletin, @"recordID"), gBBWithdrawOk);
     }
@@ -2813,6 +2982,31 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
                     }
                     NBLog(@"--> NC 路径护栏：干净，本次允许尝试 NC（版本 %@）", NB_VER_STR);
                 }
+            }
+        }
+        // ---- v0.0.78：⑦r 的护栏（主队列上同步调一个从没调过的 CS 方法）----
+        // 🔴 判据和 `.nc_pending` 同一套：**文件还在 + 版本号是本版** ⇒ 上次这把刀把主队列
+        //    卡死过 ⇒ 写 `.nc_off` 永久压制（界面侧退回「只清账本」）。
+        //    换新版本号就自动获得一次重试机会（否则一次意外会把后面所有版本锁死）。
+        {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *wsBody = [NSString stringWithContentsOfFile:kNBGuardCSWs
+                                                        encoding:NSUTF8StringEncoding error:nil];
+            if (wsBody && [wsBody containsString:NB_VER_STR]) {
+                gCsWsSuppressed = YES;
+                gNCSuppressed = YES;
+                [fm removeItemAtPath:kNBGuardCSWs error:nil];
+                [[[NSString stringWithFormat:@"%@ disabled ⑦r %@ —— ⑦r 调用没返回，主队列被卡住过。\n"
+                    "删掉本文件并 respring 即可重新尝试。", NB_VER_STR, [NSDate date]]
+                  dataUsingEncoding:NSUTF8StringEncoding] writeToFile:kNBGuardOff atomically:YES];
+                NBLog(@"!!! 本版上次 ⑦r 调用没返回 ⇒ 已禁用界面侧，并写下 %@", kNBGuardOff);
+            } else {
+                if (wsBody) {
+                    [fm removeItemAtPath:kNBGuardCSWs error:nil];
+                    NBLog(@"--> %@ 是旧版本留下的（内容=%@）⇒ 已删除，本版重新试一次",
+                          kNBGuardCSWs, NBClip(wsBody, 60));
+                }
+                NBLog(@"--> ⑦r 护栏：干净，本次允许（版本 %@）", NB_VER_STR);
             }
         }
         // v0.0.58：挂上 NC 派发器捕获（NCNotificationDispatcher 无类方法，只能靠 hook 拿实例）
