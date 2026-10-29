@@ -1890,7 +1890,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                             title:@"删除"
                           handler:^(UIContextualAction *action, UIView *src, void (^done)(BOOL)) {
         NSInteger rowId = [d[@"id"] integerValue];
-        BOOL ok = (rowId > 0) && [NotifyStore deleteRow:rowId];
+        NBSyncClearOutcome outc = NBSyncClearDeleteFail;
+        BOOL ok = (rowId > 0) && [NotifyStore deleteRow:rowId outcome:&outc];
         // 先重查（数据源变了），再告诉系统动作完成 —— 顺序反了会"删完还留着"。
         [weakSelf loadData];
         done(YES);
@@ -1899,6 +1900,17 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
             // 而列表还显示着。静默失败会让人以为删除按钮坏了。
             [weakSelf alertTitle:@"没删掉"
                             text:@"这条记录已经不在了（可能被「记录上限」自动清掉了）。列表已刷新。"];
+        } else if (outc == NBSyncClearNoSysId) {
+            // 🔴 v0.0.84：这是「有些能删、有些不行」最常见的那一半 ——
+            //    老记录（v0.0.52 之前记的）库里没有 sys_id，删它**没有任何东西可匹配**，
+            //    通知中心当然纹丝不动。以前这里是静默的，用户只会说"删了没反应"。
+            [weakSelf alertTitle:@"通知中心不会变"
+                            text:@"这条记录没有系统通知 ID（是旧版本记下的），"
+                                  "无法定位通知中心里的那一条，所以只能删掉盒子里的记录。"];
+        } else if (outc == NBSyncClearOff) {
+            [weakSelf alertTitle:@"已删除（未同步通知中心）"
+                            text:@"设置里「删除时同步清通知中心」是关的。"
+                                  "打开后删记录才会把通知中心里那一条也一起清掉。"];
         }
     }];
     del.backgroundColor = [UIColor systemRedColor];

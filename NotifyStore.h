@@ -17,6 +17,10 @@ typedef NS_OPTIONS(NSUInteger, NBKeywordAction) {
 // 录制（tweak 调用）。date 传 nil 时自动用当前时间。
 // v0.0.52：sysId = 系统 bulletin ID（BBBulletin.bulletinID / notificationIdentifier），
 //   用于"盒子删记录时同步清系统通知中心"的精确 1:1 匹配；读不到传 nil，功能自动失效。
+// v0.0.84：盒子侧重复量（只读）。返回 rows / noSys / sysGroups / sysExtra /
+//   txtGroups / txtExtra 六个键，语义见 .m 里 dupStats 的注释。
++ (NSDictionary *)dupStats;
+
 + (void)recordWithBundle:(NSString *)bundle
                    title:(nullable NSString *)title
                  message:(nullable NSString *)message
@@ -134,6 +138,34 @@ typedef NS_OPTIONS(NSUInteger, NBKeywordAction) {
 //    在「搜索 / 顶部 App 筛选 / 时间段」这三种状态下，内存下标和数据库根本对不上，
 //    只改内存就等于"只改账本的读数、不改账本"（本项目数量契约三问的第 2 问）。
 //    症状具体是：删完那一行仍然在（重进又有），或者删了 A 却少了一条 B。
+// ---------- v0.0.84：删除后「到底会不会去清通知中心」交给界面 ----------
+// 🔴 为什么要有这个出参：用户反馈「有些能删、有些不行」。查下来不是刀坏了，而是
+//    **删除这一侧本来就有三道闸**，任何一道不过就静默什么都不做：
+//      ① 记录没有 `sys_id`（v0.0.52 才加这一列 ⇒ 更早记下的老记录全是 NULL）；
+//      ② 设置里「删除时同步清通知中心」是关的；
+//      ③ 记录里缺 `bundle`（sectionID 必须和 bulletinID 成对，不然清除 API 无效）。
+//    静默的后果是用户只会说"删了没反应"，而日志里连一行都没有。
+//    ⇒ 把结论交出去，由界面用一句人话讲清楚。
+typedef NS_ENUM(NSInteger, NBSyncClearOutcome) {
+    NBSyncClearRequested  =  1,   // 已写请求文件 + post，tweak 会去尝试清 NC
+    NBSyncClearNoSysId    =  0,   // 记录没有 sys_id（老记录）⇒ 无从精确匹配
+    NBSyncClearOff        = -1,   // 设置里这一项是关的
+    NBSyncClearNoBundle   = -2,   // 缺 bundle
+    NBSyncClearDeleteFail = -3,   // 记录根本没删掉（id 不存在）
+};
+
+// 带 outcome 的版本。`outcome` 可为 NULL。
+// 🔴 保留 `deleteRow:` 作为薄封装：已有两处调用点不必改语义，
+//    但**同一个语义不许有两份实现**（所以它只是转调，不复制 DELETE 逻辑）。
++ (BOOL)deleteRow:(NSInteger)rowId outcome:(NBSyncClearOutcome *)outcome;
+
+// ---------- v0.0.84：历史重复一次性合并 ----------
+// 🔴 只合并「`sys_id` 非空且完全相同」的行 —— 同一个系统通知标识 = 同一条通知，
+//    多留几行没有信息量。**sys_id 为空的行一律不碰**（空串相同 ≠ 同一条通知，
+//    拿空串当键会把整个库合并成一条）。
+// 返回值 = 被删掉的多余行数（0 表示库里本来就干净）。
++ (NSInteger)dedupeBySysId;
+
 + (BOOL)deleteRow:(NSInteger)rowId;
 // v0.0.45：**批量删除**（真账本级）。四个条件都是"可空 = 不限"，独立叠加。
 //   bundle     nil = 所有 App

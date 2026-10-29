@@ -222,11 +222,32 @@
 - (void)doDelete {
     id idv = self.item[@"id"];
     NSInteger rowId = [idv respondsToSelector:@selector(integerValue)] ? [idv integerValue] : 0;
-    BOOL ok = (rowId > 0) && [NotifyStore deleteRow:rowId];
+    NBSyncClearOutcome outc = NBSyncClearDeleteFail;
+    BOOL ok = (rowId > 0) && [NotifyStore deleteRow:rowId outcome:&outc];
     // 无论删到没删到，都让列表重查一次：
     //   删到了 ⇒ 那一行要消失；没删到 ⇒ 它其实已经不在了（被上限裁剪），列表也该跟着变。
     if (self.onDeleted) self.onDeleted();
     if (ok) {
+        // 🔴 v0.0.84：删掉 ≠ 通知中心也会变。这里必须说清楚，否则用户只会说"删了没反应"。
+        // 🔴 为什么不用本文件的 `toast:`：它把 label 加在 `self.view` 上，而这里马上要
+        //    `popViewControllerAnimated:` ⇒ label 跟着视图一起没了，用户什么也看不见。
+        //    （"验收要用视图层的量"——提示到底有没有被看见，也是视图层的事。）
+        if (outc == NBSyncClearNoSysId || outc == NBSyncClearOff) {
+            NSString *msg = (outc == NBSyncClearNoSysId)
+                ? @"这条记录没有系统通知 ID（是旧版本记下的），无法定位通知中心里的那一条，"
+                   "所以只删掉了盒子里的记录。"
+                : @"设置里「删除时同步清通知中心」是关的，所以只删掉了盒子里的记录。";
+            UIAlertController *al = [UIAlertController
+                alertControllerWithTitle:@"已删除（通知中心未同步）"
+                                 message:msg
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [al addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *a) {
+                [self.navigationController popViewControllerAnimated:YES];
+            }]];
+            [self presentViewController:al animated:YES completion:nil];
+            return;
+        }
         [self.navigationController popViewControllerAnimated:YES];
         return;
     }

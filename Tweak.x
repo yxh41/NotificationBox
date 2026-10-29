@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.83"
+#define NB_VER_STR @"0.0.84"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -1156,21 +1156,33 @@ static id NBFindOurRequest(id source, NSString *bundle, NSArray *ids,
         NSMutableArray *all = [NSMutableArray arrayWithCapacity:d.count];
         for (id k in d) NBCollectRequestsIn(d[k], all, 0);
         if (scannedOut) *scannedOut = all.count;
+        // 🔴🔴🔴 v0.0.84：**命中之后不许立刻 return**。
+        //   上一版就是在这里提前 return、顺手把 `*secHitsOut = secHits` 写成了
+        //   「扫到匹配为止的部分计数」。而 ⑦u 量前/量后两处传的是空数组 `@[]`
+        //   （`NBReqMatchKey` 第一行 `if (!ids.count) return nil;` ⇒ 永不匹配 ⇒ 扫完
+        //   ⇒ 全量计数）。两处口径不同，相减就恒为正 ⇒ `NBReportSectionJump` 报
+        //   「同段 3 → 8 ⇒ 该段刚被重载」，可真机 `[RL]` 里**那个段一次都没重载过**。
+        //   `nc_diag(23).txt` 的 5 次「跳升」全部满足 `量前 == ⓪ 之后 BB live`
+        //   （8/7/6/5/100 一一对上）⇒ 跳升是假的，是部分 vs 全量。
+        //   ⇒ 现在：找到之后继续扫完，只数数不再判，`secHits` **永远是全量**。
         int secHits = 0;
         id loose = nil;
+        id found = nil;
+        NSString *foundHow = nil;
         for (id req in all) {
             NSString *sid = NBKVCStr(req, @"sectionIdentifier");
             if (!sid.length || ![sid isEqualToString:bundle]) continue;
             secHits++;
+            if (found) continue;               // 已命中 ⇒ 这一段只为把 secHits 数完
             NSString *mk = NBReqMatchKey(req, ids);
-            if (mk) {
-                if (howOut) *howOut = mk;
-                if (secHitsOut) *secHitsOut = secHits;
-                return req;
-            }
+            if (mk) { found = req; foundHow = mk; continue; }
             if (!loose) loose = req;
         }
-        if (secHitsOut) *secHitsOut = secHits;
+        if (secHitsOut) *secHitsOut = secHits;   // 🔴 唯一出口，全量口径
+        if (found) {
+            if (howOut) *howOut = foundHow;
+            return found;
+        }
         // 🔴🔴🔴 v0.0.75：**删掉 loose 兜底**（原来精确匹配不到就退回「同段第一条」）。
         //   后果两个，都是致命的：
         //     ① **撤错条** —— 用户看到的是"有些通知没了，但不是我要删的那条"；
@@ -1473,6 +1485,19 @@ static void NBCheckDeletedAlive(void) {
                        NBSafeClip(bundleNow, 32),
                        [secCount[bundleNow ?: @""] intValue],
                        (unsigned long)dupTs.count);
+            // ---- v0.0.84：[重] 盒子自己的重复（只读聚合，不改数据）----
+            // 🔴 用户报「消息盒子里部份信息有重复」。可能的来源两类，必须分开量：
+            //    ① 同一条系统通知被记了两遍（`sys_id` 相同）⇒ 真 bug，本版靠写入侧去重治；
+            //    ② 真的是多条内容相同的通知（`sys_id` 不同）⇒ 如实记录，不算 bug。
+            //    ⇒ 一行同时给出两个数，下次日志就能判断到底是哪一种。
+            NSDictionary *ds = [NotifyStore dupStats];
+            if (ds) {
+                NBDiagStep(@"  [重] 盒子 %@ 行 ⇒ sysId 重复 %@ 组(多 %@ 行) / "
+                           @"无 sysId %@ 行 ｜ 同内容重复 %@ 组(多 %@ 行)\n",
+                           ds[@"rows"] ?: @"?", ds[@"sysGroups"] ?: @"?",
+                           ds[@"sysExtra"] ?: @"?", ds[@"noSys"] ?: @"?",
+                           ds[@"txtGroups"] ?: @"?", ds[@"txtExtra"] ?: @"?");
+            }
             int shownG = 0;
             for (NSArray *pair in dupTs) {
                 if (shownG >= 2) break;
@@ -2223,7 +2248,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                     NBDiagStep(@"  ⑦s 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
                                                (unsigned long)sc7, sh7,
                                                still ? @"是" : @"否（已删）", how7x ?: @"?");
-                                    NBReportSectionJump("⑦s", shBase, sh7);
+                                    NBReportSectionJump("7s", shBase, sh7);
                                 } @catch (NSException *e) {
                                     NBDiagStep(@"  ⑦s 读回抛: %@\n", e.reason);
                                 }
@@ -2255,7 +2280,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                     NBDiagStep(@"  ⑦t 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
                                                (unsigned long)sc7, sh7,
                                                still ? @"是" : @"否（已删）", how7x ?: @"?");
-                                    NBReportSectionJump("⑦t", shBase, sh7);
+                                    NBReportSectionJump("7t", shBase, sh7);
                                 } @catch (NSException *e) {
                                     NBDiagStep(@"  ⑦t 读回抛: %@\n", e.reason);
                                 }
@@ -2364,7 +2389,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                                @" ｜ 同段=%d（基线 %d）扫 %lu 条\n",
                                                (unsigned long)afterN, (long)b2uAfter, shA, shBase,
                                                (unsigned long)scA);
-                                    NBReportSectionJump("⑦u", shBase, shA);
+                                    NBReportSectionJump("7u", shBase, shA);
                                 }
                                 still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
                                 NBDiagStep(@"  ⑦u 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
@@ -2535,7 +2560,10 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     // v0.0.83：把「删除前后 ±300 秒内的段重载」补打出来 ——
                     // 这些重载绝大多数发生在诊断窗口之外，只有靠常驻环形缓冲才看得见。
                     @try {
-                        NBRingDump([[NSDate date] timeIntervalSince1970], 300, @"段重载");
+                        // 🔴 v0.0.84：这里传 ASCII `@"reload"`，不传中文。
+                                   //   `%s` 收 UTF-8 中文在 NSString 格式化里会被按 8-bit
+                                   //   字符集解码 ⇒ 真机打出 `（ÊÆµÈáçËΩΩ）`，grep 不到。
+                                   NBRingDump([[NSDate date] timeIntervalSince1970], 300, @"reload");
                     } @catch (__unused NSException *e) { }
                 });
             }

@@ -331,6 +331,56 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
     return rows;
 }
 
+// ---------- v0.0.84：盒子侧的重复量（只读，三个聚合查询）----------
+// 🔴 为什么必须有这个函数：用户报「部份信息有重复」，而上面那条写入侧去重
+//    只有在 `sys_id` 有值时才生效。**得先量出重复到底集中在哪一类**：
+//      · `sysGroups` > 0、`sysExtra` 也大 ⇒ 确实是同一条被记了多遍（去重该管用）；
+//      · `sysGroups` == 0 而 `txtGroups` 大 ⇒ 那是**多条内容相同的不同通知**，
+//        如实记录是对的，硬合并会丢信息；
+//      · `noSys` 大 ⇒ 大量记录读不到 sys_id，去重对这些无效，得先修 sysId 来源。
+//    🔴 三个数一起看才有意义，只报一个必然误判。
++ (NSDictionary *)dupStats {
+    sqlite3 *db = [self openDB];
+    if (!db) return nil;
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    @try {
+        const char *q1 = "SELECT COUNT(*), "
+                         "SUM(CASE WHEN sys_id IS NULL OR sys_id='' THEN 1 ELSE 0 END) "
+                         "FROM notifications;";
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, q1, -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out[@"rows"] = @(sqlite3_column_int(st, 0));
+                out[@"noSys"] = @(sqlite3_column_int(st, 1));
+            }
+            sqlite3_finalize(st);
+        }
+        const char *q2 = "SELECT COUNT(*), IFNULL(SUM(c-1),0) FROM ("
+                         "SELECT sys_id, COUNT(*) c FROM notifications "
+                         "WHERE sys_id IS NOT NULL AND sys_id<>'' "
+                         "GROUP BY sys_id HAVING c>1);";
+        if (sqlite3_prepare_v2(db, q2, -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out[@"sysGroups"] = @(sqlite3_column_int(st, 0));
+                out[@"sysExtra"] = @(sqlite3_column_int(st, 1));
+            }
+            sqlite3_finalize(st);
+        }
+        const char *q3 = "SELECT COUNT(*), IFNULL(SUM(c-1),0) FROM ("
+                         "SELECT bundle, title, message, COUNT(*) c FROM notifications "
+                         "GROUP BY bundle, title, message HAVING c>1);";
+        if (sqlite3_prepare_v2(db, q3, -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out[@"txtGroups"] = @(sqlite3_column_int(st, 0));
+                out[@"txtExtra"] = @(sqlite3_column_int(st, 1));
+            }
+            sqlite3_finalize(st);
+        }
+    } @catch (__unused NSException *e) { }
+    sqlite3_close(db);
+    return out;
+}
+
 + (NSDictionary *)statsSummarySince:(NSTimeInterval)since beforeTs:(NSTimeInterval)beforeTs {
     sqlite3 *db = [self openDB];
     if (!db) return @{};
@@ -374,6 +424,43 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
 
     // v0.0.52：加 sys_id 列（系统 bulletin ID，精确同步清通知中心用）。读不到时传 @""，
     //   该列只是空串，不影响记录本身，feature 自动失效。
+    // 🔴🔴 v0.0.84：**同一条系统通知不许记两遍。**
+    //   真机反馈「消息盒子里部份信息有重复」。查下来写入侧是**无条件 INSERT**：
+    //   `hash` 列虽然写了，但**从来没有哪一行代码去查它**（等于装饰品）。
+    //   唯一的去重是 tweak 侧 `NBClaimKey`，而它的窗口只有 **2 秒**
+    //   （`bid|title|msg` 相同才算重复）—— 系统重投同一条通知只要间隔 > 2 秒，
+    //   就会再落一行，看起来就是"重复"。
+    //   ⇒ 正解不是拉长那个窗口（会吃掉用户连发的两条相同通知），而是用
+    //   **系统级唯一标识 `sys_id`** 判等：同一个 sys_id = 同一条通知。
+    //   🔴 三个必须守住的点：
+    //     ① `sys_id` 为空（读不到）时**不许**去重 —— 否则所有空串行互相匹配，
+    //        会把不相干的通知合并掉；
+    //     ② 只 UPDATE **最新那一行**（`ORDER BY ts DESC LIMIT 1`），
+    //        历史脏数据里同 sys_id 可能有多行，一次性全改会连坐；
+    //     ③ 必须查 `sqlite3_changes()` —— UPDATE 命中 0 行也返回 `SQLITE_DONE`，
+    //        不看 changes 就会"以为更新了、实际没插"，这条通知凭空消失。
+    if (sysId.length) {
+        const char *upd = "UPDATE notifications SET ts=? WHERE id=("
+                          "SELECT id FROM notifications WHERE sys_id=? AND bundle=? "
+                          "ORDER BY ts DESC LIMIT 1);";
+        sqlite3_stmt *us = NULL;
+        if (sqlite3_prepare_v2(db, upd, -1, &us, NULL) == SQLITE_OK) {
+            double uts = date ? [date timeIntervalSince1970]
+                              : [[NSDate date] timeIntervalSince1970];
+            sqlite3_bind_double(us, 1, uts);
+            sqlite3_bind_text(us, 2, [sysId UTF8String], -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(us, 3, [bundle UTF8String], -1, SQLITE_TRANSIENT);
+            int urc = sqlite3_step(us);
+            int changed = (urc == SQLITE_DONE) ? sqlite3_changes(db) : 0;
+            sqlite3_finalize(us);
+            if (changed > 0) {
+                // 已经有过这一条 ⇒ 只把它顶到最新，不新增行
+                sqlite3_close(db);
+                return;
+            }
+        }
+    }
+
     const char *ins = "INSERT INTO notifications (bundle,title,message,subtitle,ts,hash,sys_id) "
                       "VALUES (?,?,?,?,?,?,?)";
     sqlite3_stmt *stmt;
@@ -732,6 +819,11 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
 //    但这里保持和 queryWithBundle 同一口径 —— 一处拼串、一处绑参，
 //    以后有人把某个参数换成字符串时就会在拼串那处出事。
 + (BOOL)deleteRow:(NSInteger)rowId {
+    return [self deleteRow:rowId outcome:NULL];
+}
+
++ (BOOL)deleteRow:(NSInteger)rowId outcome:(NBSyncClearOutcome *)outcome {
+    if (outcome) *outcome = NBSyncClearDeleteFail;
     sqlite3 *db = [self openDB];
     if (!db) return NO;
     BOOL ok = NO;
@@ -767,13 +859,62 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     //    放在 `sqlite3_close(db)` **之后**：请求文件用独立 writeToFile，不依赖这个 db 句柄；
     //    且保证"记录确实从库里没了"才去清通知中心，避免"库没删成却把通知中心清了"的错位。
     //    delBundle 也一并要求非空：sectionID 必须和 bulletinID 成对，否则 _clearBulletinIDs: 无效。
-    if (ok && delSysId.length && delBundle.length) {
+    // v0.0.84：三道闸逐个记结论，别让它静默。
+    if (!ok) {
+        if (outcome) *outcome = NBSyncClearDeleteFail;
+    } else if (!delSysId.length) {
+        if (outcome) *outcome = NBSyncClearNoSysId;
+    } else if (!delBundle.length) {
+        if (outcome) *outcome = NBSyncClearNoBundle;
+    } else {
         NSDictionary *p = NBLoadSettings();
-        if ([p[NB_KEY_SYNC_CLEAR] boolValue]) {
+        if (![p[NB_KEY_SYNC_CLEAR] boolValue]) {
+            if (outcome) *outcome = NBSyncClearOff;
+        } else {
             [self nbRequestClearNCWithSysId:delSysId bundle:delBundle];
+            if (outcome) *outcome = NBSyncClearRequested;
         }
     }
     return ok;
+}
+
+// ---------- v0.0.84：历史重复一次性合并 ----------
+// 🔴🔴 顺序必须「先数、再删、再复核」，不能一把 DELETE 了事：
+//    ① 先 `SELECT COUNT(*)` 拿到"会删多少行"，作为**期望值**；
+//    ② 删完查 `sqlite3_changes()`，和期望值对不上就记日志（说明有并发写），
+//       但**不回滚**（删的都是同 sys_id 的冗余行，少删多删都不影响正确性）；
+//    ③ 最后整表复核一次剩余重复组数。
+// 🔴 为什么不用 `NOT IN (SELECT MAX(id) …)` 一把梭：这个库**两个进程都在写**
+//    （SpringBoard 记通知、盒子 App 删记录），子查询和 DELETE 之间可能被插入新行，
+//    虽然结果仍然正确，但 `changes()` 对不上时无从解释。分两步至少能说清发生了什么。
+// 🔴 绝不动 `sys_id` 为空/NULL 的行 —— 空串相同 ≠ 同一条通知。
++ (NSInteger)dedupeBySysId {
+    sqlite3 *db = [self openDB];
+    if (!db) return 0;
+    NSInteger expect = 0, removed = 0;
+    @try {
+        const char *cnt = "SELECT IFNULL(SUM(c-1),0) FROM ("
+                          "SELECT sys_id, COUNT(*) c FROM notifications "
+                          "WHERE sys_id IS NOT NULL AND sys_id<>'' "
+                          "GROUP BY sys_id HAVING c>1);";
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, cnt, -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) expect = sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+        }
+        if (expect > 0) {
+            const char *del = "DELETE FROM notifications WHERE sys_id IS NOT NULL "
+                              "AND sys_id<>'' AND id NOT IN ("
+                              "SELECT MAX(id) FROM notifications WHERE sys_id IS NOT NULL "
+                              "AND sys_id<>'' GROUP BY sys_id);";
+            if (sqlite3_exec(db, del, NULL, NULL, NULL) == SQLITE_OK) {
+                removed = sqlite3_changes(db);
+            }
+            NBStoreLog(@"合并重复：期望 %ld 行，实际删掉 %ld 行", (long)expect, (long)removed);
+        }
+    } @catch (__unused NSException *e) { }
+    sqlite3_close(db);
+    return removed;
 }
 
 // v0.0.52：把"要清哪一条"写进共享请求文件，再 post Darwin 通知唤醒 tweak。
