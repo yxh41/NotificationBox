@@ -7860,3 +7860,140 @@ B 反向 4（⑦a、⑦b、loose 兜底文案、旧 ⑦ 标题）/ C 版本 3。
 3. `⑦d clearAction=<…> 列表目的地=<…> 方法=…` —— `clearAction` 到底有没有值
 4. `⑦d 完成回调 ok=?` 与 `⑦d 读回`
 5. 人眼：这一条掉了没有？**有没有别的通知被误删**（这条最重要）
+## v0.0.76 —— 找到了真删除链路的第一跳：⑧ 冒充系统投递 `observer:removeBulletin:`
+
+> 依据 `nc_diag(15).txt`（v0.0.75 装完，6 次尝试 / 4 段 ⑦）。
+> 这一版的结论**不是推断**，是同一份日志里"系统自己走了一遍"的全过程记录。
+
+### 1. 本轮唯一的新事实：系统在 07:02:43 自己走完了整条链路
+
+```
+07:01:28  ⓪ withdrawBulletinRequestsWithRecordID:6ae2ea2d_…   ← 我们撤回第 1 条
+07:01:38  ⓪ withdrawBulletinRequestsWithRecordID:6ae2e85e_…   ← 我们撤回第 2 条
+          … 中间 65 秒，NC 侧一点动静都没有 …
+07:02:43  [BB→NC] observer:removeBulletin: × 8 条（同一秒，含上面两条 + 一条陌生的 6ae1ca5e）
+07:02:43  [OBS] dispatcher withdrawNotificationWithRequest: 第 2/3/4/5 次
+07:02:43  [OBS-cs] withdrawNotificationRequest: 第 4/5/6 次
+```
+
+⇒ 真删除的链路顺序是：
+
+```
+BB 账本（_sendRemoveBulletin）
+  → NCBulletinNotificationSource - observer:removeBulletin:      ← 第一跳，我们从来没走过
+  → NCNotificationDispatcher - withdrawNotificationWithRequest:  ← ⑦a 试过，空转
+  → CSNotificationDispatcher - withdrawNotificationRequest:      ← [清]① 试过，空转
+```
+
+**后面两把我们各自单独试过（⑦a 在 v0.0.74 试 4 次、[清]① 在 v0.0.75 试 4 次），
+一律「已返回 + 读回不变」**。缺的不是刀，是**第一跳**。
+
+### 2. 第一跳为什么以前没走：投错了队列
+
+v0.0.64 的代码里其实已经有这一句，但它被投进了 `gNCSourceQueue`：
+
+```objc
+dispatch_async(ncq, ^{
+    [gNCSource observer:obs removeBulletin:bullet];   // 块从没被执行过
+});
+```
+
+日志里 9 条「进入 NC 队列」的块全部有去无回 ⇒ 那一版之后整条 NC 队列路径被关掉，
+这句也跟着休眠了两个版本。
+
+**本版改投主队列**（⑦ 本来就在主队列上，这一段实测每次都跑得到），并且：
+
+- 顺序必须是 **⓪ 之后** —— 系统的回调本来就在 BB 撤完之后才到，source 的处理体也按
+  「BB 里已经没有了」设计；
+- `bullet` 必须**在 ⓪ 之前抓下来**存好：⓪ 之后 BB 里已经没有它，`_bulletinsForIDs:` 取不回来；
+- 调用前置位 `.nc_pending` 护栏、返回后立刻删除（带版本号，留到下次开机就是这一步卡死的）。
+
+### 3. 区分「我方投递」和「系统自己转过来」
+
+⑧ 调用的正是我们挂着观测 hook 的那个方法。不区分的话，日志里那句
+`[BB→NC] 系统自己调用 …` 会把「我们自己调通了」写成「系统终于转过来了」——
+这正是本项目吃过好几次的假绿。
+
+```objc
+if (gSelfPostingRemove) {
+    NBDiagStep(@"  [BB→NC] ← **我方 ⑧ 投递** recordID=%@\n", …);
+} else if (gBBToNCSeen <= 60) {
+    NBDiagStep(@"  [BB→NC] 系统自己调用 observer:removeBulletin: 第 %d 次 …\n", …);
+}
+```
+
+顺带在 hook 里接住系统递过来的那个**真** `BBObserver`（`gBBObserver`），
+作 ⑧ 在 `[gNCSource observer]` 取不到时的退路。⛔ 绝不自己造 observer ——
+v0.0.62 造过假 request，代价是整条队列被堵死。
+
+### 4. 读回跨两域 + 延迟复量
+
+| 域 | 读什么 | 它证明什么 |
+|---|---|---|
+| 域A | `source.uuidsToRequests`（原有 `NBFindOurRequest`） | request 还在不在 source 的账上 |
+| 域B | `source.bulletinsToUUIDs` 里这条 `bulletinID` 的键 | 第一跳的**第一步**有没有发生 |
+
+域B 是给下一轮留的定位：**键消失但 request 还在** ⇒ ⑧ 确实跑进去了，断点在下游
+（dispatcher / destination），下一轮就不用再怀疑第一跳。
+
+另外补一个 **+3s 延迟复量**。理由是硬的：系统的传播本身就有延迟（本轮铁证 8 条挤在
+65 秒后同一秒到达），而我们**所有**读回都在同一秒内做完 —— 这等于默认「立即生效」，
+这个默认本身可能就是继 loose 兜底之后的**第二个假判据**。
+
+### 5. 就地补一条「域」说明：⑦c / ⑦d 的读回不能当它们失败的证据
+
+⑦c（按段清）和 ⑦d（`performAction:` 执行 `clearAction`）作用在
+**destination（CoverSheet 列表）** 这一层，而我们的读回量的是
+**source 的 `uuidsToRequests`**。两者不是同一个存储。
+
+> 🔴 判据域必须等于变异域。`⑦c 读回：本条还在=是` 只能说明"source 的账上还有它"，
+> 不能说明"界面上还看得见"。本版**不动**这两把刀的逻辑，只把这句写在代码里，
+> 免得下一轮又拿同一个读回把它们判死（或者反过来判活）。
+
+### 6. 新增一条只读观测：复数版 `_sendRemoveBulletins:toFeeds:shouldSync:`
+
+用来回答「那 8 条为什么挤在同一秒」。若复数版被调 ⇒ BB 把多个 removal 攒成一批再投；
+全程 0 次 ⇒ 是别的节流。两种结果都能把下一步钉死。只读、限 10 行、`%orig` 原样透传。
+
+### 7. 交付校验（机器对拍，非目测）
+
+| 项 | 结果 |
+|---|---|
+| CI | run `40833866671` **首轮 success** |
+| deb | `com.yxh41.notifybox_0.0.76_iphoneos-arm64e.deb` |
+| deb 大小 / md5 | 1,112,136 B / `003c570f8d9559e0e9371880647492af` |
+| dylib 大小 / md5 | 245,232 → 245,248（**+16**）/ `10cc5e4a85cadcfd923a27326edd37e1` |
+| 包级串级对拍 | 14 条全过（11 条正向 ⑧ 相关 + 2 条存活对照 + 1 条负向对照） |
+| 选择器 | `_sendRemoveBulletins:toFeeds:shouldSync:` 旧=0 新=1；`observer:removeBulletin:` 旧=1 新=1 |
+| 版本 | Info.plist 两处 = 0.0.76；dylib 内 `0.0.75` 残留 **0** |
+| App 二进制 | 487,632 → 487,632，**区外零差异**（只差 `LC_UUID[2968,2984)` + `LC_CODE_SIGNATURE[480960,487632)`） |
+
+段级体积（大小与改动量脱钩，只看内容）：
+
+```
+__text      96244 -> 98100  (+1856)
+__ustring   22256 -> 23102  (+846)
+__cfstring  21280 -> 21760  (+480)
+__methname   6197 ->  6238  (+41)
+__cstring    6593 ->  6593  (+0)      ← 新增串全含中文/⑧ ⇒ 都进 __ustring
+总大小     245232 -> 245248 (+16)     ← 又撞一次「+7.5KB 源码只长 16 字节」
+```
+
+### 8. 本版没有做的事（别当 bug 报）
+
+- ⑦c / ⑦d 逻辑一字未改（域说明只是注释 + 日志措辞）。
+- 没有新增第二把刀 —— 本项目纪律：**两个以上"没跑过"的新挂点不能同轮**。
+- 没有碰盒子 App 的界面。
+
+### 9. 下一轮看什么（只要三个数）
+
+1. `⑧ 入口 observer=<…> 方法=有 bulletin=<BBBulletin>` —— 三样齐了它才发得出去
+2. `⑧ 读回：… 本条还在=否（已删）` —— **这是本版成败的唯一判据**；配合 `⑧ 域B … 键=已消失`
+   一起看：域B 消失而域A 还在 = ⑧ 跑进去了、断点在下游（dispatcher / destination），
+   下一轮直接往下游走，不用再怀疑第一跳
+3. `⑧ +3s 复量：… 本条还在=?` —— 同秒读回是「是」、3 秒后变「否」也**算成功**
+   （系统的传播本来就是延迟的，这正是本版要量清的东西）
+
+若 `⑧ 跳过（observer=nil …）` ⇒ 两条取 observer 的路都没通：`[gNCSource observer]` 返回 nil，
+且本次进程里系统还没调过一次 `observer:removeBulletin:`（`gBBObserver` 也是 nil）。
+那种情况下一轮改成"从 `initWithDispatcher:observer:queue:` 那一跳接住 observer"。
