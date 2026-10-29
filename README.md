@@ -8970,13 +8970,13 @@ v0.0.82 我当时把它归因成「setter 之后 getter 换了一份从 BB 重�
 
 | 项 | 结果 |
 | --- | --- |
-| CI | run `{{CI_ID}}` |
-| deb | `{{DEB_NAME}}`，`{{DEB_SIZE}}` B / md5 `{{DEB_MD5}}` |
-| dylib | `{{DYLIBSIZE}}` |
-| 包级正向 | {{POS}} |
-| 包级反向 | {{NEG}} |
-| App 二进制 | {{APP}} |
-| 源码自检 | 14 道全绿（纯 LF / 括号配平 / `%hook`+`%group` 与 `%end` 配平 / 版本串唯一 / 5 个选择器全部有声明 / **addBulletin 选择器在代码与声明里都已消失** / `NBSectionTop`、`gAddSeen`、`gReAddSeen` 零残留 / 环形缓冲有 47 字节截断与补 `\0` / 211 个日志调用格式符逐个相等 / 无 `description` / 无 `_Nonnull` / 3 个新函数都在定义之后引用 / ⑦u 在 ⑦r 之前、⑦T 最后 / `gUseR` 默认 NO 且条件里真带它）|
+| CI | run `40943717569`（首轮 `40943427376` 编译失败：`NBRingDump` 的 `const char *why` 收到 `@"段重载"`，修复后重跑） |
+| deb | `com.yxh41.notifybox_0.0.83_iphoneos-arm64e.deb`，`1,118,402` B / md5 `958cf2cdec11147d7479bf4206348b80` |
+| dylib | 261,968 → `262,000` B（**+32 B**）；六段 `vmsize` 全 ±0，伸缩全在节内：`__bss` +1,360 / `__ustring` +34 / `__cstring` +15 / `__text` −412 / `__objc_methname` −45 / `__cfstring` −32 |
+| 包级正向 | 7/7 全过（旧=0 新=1）—— `[RL] %+.0fs section=%.47s` / `[RL] ±%.0fs 内没有段重载记录` / `🔴 [%s] 同段 %d → %d…该段刚被重载` / `｜ 同段=%d（基线 %d）扫 %lu 条` / `[RP] ⚠️ 复投第 %d 次` / 逐刀计数行两条 |
+| 包级反向 | 4/4 全过（旧=1 新=0）—— 两条 `[RE]` 日志串 / `observer:addBulletin:forFeed:\0` / `｜ 组成 top3: %@` |
+| App 二进制 | 487,632 B **不变**；4 区 / 67 B 全在 `LC_UUID`(2968..2984) + `LC_CODE_SIGNATURE`(481155/483846/483868 ⊂ `__LINKEDIT` 458752..487632) ⇒ **区外零** |
+| 源码自检 | 15 道全绿（纯 LF / 括号配平 / `%hook`+`%group` 与 `%end` 配平 / 版本串唯一 / 5 个选择器全部有声明 / **addBulletin 选择器在代码与声明里都已消失** / `NBSectionTop`、`gAddSeen`、`gReAddSeen` 零残留 / 环形缓冲有 47 字节截断与补 `\0` / 211 个日志调用格式符逐个相等 / 无 `description` / 无 `_Nonnull` / 3 个新函数都在定义之后引用 / ⑦u 在 ⑦r 之前、⑦T 最后 / `gUseR` 默认 NO 且条件里真带它 / **`const char *` 形参不许收到 `@"…"`**（首轮 CI 就死在这条上，14 道文本自检全绿也挡不住））|
 
 ### 8. 下轮看什么
 
