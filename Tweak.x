@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.79"
+#define NB_VER_STR @"0.0.80"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -508,7 +508,10 @@ static NSString *const kNBGuardOff     = @"/var/mobile/Library/NotifyBox/.nc_off
 //      调用前写 `.cs_ws` → 返回立刻删；留到下次开机 = 这把刀把主队列卡死过
 //      ⇒ 写 `.nc_off` 永久压制（和 NC 路径共用同一个"关掉界面侧"开关）。
 static NSString *const kNBGuardCSWs   = @"/var/mobile/Library/NotifyBox/.cs_ws";
-static BOOL gCsWsSuppressed = NO;   // YES ⇒ 本进程不用 ⑦r（但账本照清）
+static BOOL gCsWsSuppressed = NO;   // YES ⇒ 本进程不用 ⑦s/⑦t/⑦r（但账本照清）
+// 🔴 v0.0.80：⑦s/⑦t 与 ⑦r **共用同一个护栏文件**，靠文件正文里的标记（⑦s/⑦t/⑦r）
+//    区分是哪一把刀没返回。三把都是「主队列上同步调未知 NC/CS 方法」，失败模式同一类，
+//    分开建文件只会让启动检查变长，不会多出任何信息。
 // ---------- v0.0.78：[寿] 旧删台账 ----------
 // 🔴 它要回答的是**比"这一刀成不成"更根本的问题**：
 //    「⓪ 把 BB 账本清了之后，NC 里那条到底会不会自己消失？多久消失？」
@@ -566,7 +569,10 @@ static int  gBBSendRemoveManySeen = 0;
 // ---------- v0.0.66：观测计数器（只为了回答"系统自己怎么删的"）----------
 static BOOL gCacheDumped   = NO;  // 缓存键形态只 dump 一次
 static int  gObsDispatcherClear = 0;  // dispatcher - destination:requestsClearingNotificationRequests:
-static int  gObsDispatcherWithdraw = 0;  // dispatcher - withdrawNotificationWithRequest:
+static int  gObsDispatcherWithdraw = 0;  // dispatcher - withdrawNotificationWithRequest:（系统+我方，混计）
+// 🔴 v0.0.80：**我方**调用计数单独记 —— 混计会把「系统自己调了 N 次」读成「我的刀跑了 N 次」。
+static int  gNCDirectWithdraw = 0;       // ⑦s：我方调 NCNotificationDispatcher -withdrawNotificationWithRequest:
+static int  gCSDirectWithdraw = 0;       // ⑦t：我方调 CSNotificationDispatcher -withdrawNotificationRequest:
 static int  gObsSrcClear   = 0;   // source - dispatcher:requestsClearingNotificationRequests:
 // ---------- v0.0.73：CoverSheet 目的地（CSNotificationDispatcher）侧的观测计数 ----------
 // 🔴 这一组存在的唯一目的：回答「**用户手动清一条通知时，系统到底调了哪一把**」。
@@ -2015,6 +2021,93 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     //    ② 同段里 timestamp 落在窗口内的**只能有 1 条**（就是本条）。
                     //       这一量同时也是「方法万一忽略时间参数」的兜底：窗口内=1 而段内>1 时
                     //       我们仍然要打（否则永不触发），所以窗口取窄（±0.4s）来压低概率。
+                    // ================= v0.0.80：⑦s / ⑦t —— 不再等 BB→NC 自己传播 =================
+                    // 🔴🔴🔴 本版存在的**全部理由**（`nc_diag(20).txt`，27 次尝试）：
+                    //    ⓪ 撤回 BB 之后，BB→NC 的传播是**成批 + 延迟 13~99 秒**的。
+                    //    同一份日志里 4 次删除的 `[BB→NC] observer:removeBulletin:` 全堆到
+                    //    09:56:47~48 才一起到达：
+                    //      ⓪@09:55:08 → 09:56:47（99s）  ⓪@09:55:20 → 09:56:47（87s）
+                    //      ⓪@09:56:03 → 09:56:48（45s）  ⓪@09:56:35 → 09:56:48（13s）
+                    //    ⇒ 用户删完立刻划开通知中心，看到的就是**还在** ⇒ 「好像没效果」。
+                    //    🔴 决定性对照：同一批里 NC 的 request 数从 651 跳到 1381（整份重载），
+                    //       **重载之后**每一次 ⓪ 都在同一轮就到达 NC（`⑦r 不需要` × 5）。
+                    //       ⇒ 传播速度取决于 NC 那边 observer 客户端的**装载状态**，
+                    //         那个状态我们控制不了 ⇒ 唯一出路是**自己走 NC 侧那两刀**。
+                    //    🔴 另一条更要紧的账：上一版「能用了」是**碰巧**，不是修好了 ——
+                    //       那一次 ⓪ 的传播恰好没排队。判据不能建立在别人的队列上。
+                    // 🔴 为什么现在敢打这两把（**旧结论作废**，不是"再试一次"）：
+                    //    ⑦a / [清]① / [清]③ 当年被判「4 次全空转」用的读回，是
+                    //    `NBFindOurRequest` 的 **loose 兜底**（精确匹配不到就退回「同段第一条」）
+                    //    ⇒ 只要该段还有任何一条通知，读回**永远**是「还在=是」，
+                    //    结构上不可能出现「否」。v0.0.75 已把兜底整个删掉（见函数注释），
+                    //    判据到这里才第一次可信。
+                    //    而且现在手里是 `[找]` 出来的**真 request**（`req.bulletin` 命中），
+                    //    不是 v0.0.62 那种工厂造的空壳 —— 前提条件也换了。
+                    if (still && req7) {
+                        // ---- ⑦s：NC 侧派发器。系统自己撤一条时走的就是这一步 ----
+                        // 依据：09:56:47 那批 `[OBS] dispatcher withdrawNotificationWithRequest:`
+                        //       紧跟着 `[OBS-cs] withdrawNotificationRequest:` **成对**出现。
+                        if (gNCDispatcher
+                            && [gNCDispatcher respondsToSelector:@selector(withdrawNotificationWithRequest:)]) {
+                            if (gCsWsSuppressed) {
+                                NBDiagStep(@"  ⑦s 跳过（%@ 压制；删它并 respring 可恢复）\n", kNBGuardOff);
+                            } else {
+                                [[[NSString stringWithFormat:@"%@ ⑦s %@ %@", NB_VER_STR, [NSDate date], nid7 ?: @"?"]
+                                  dataUsingEncoding:NSUTF8StringEncoding] writeToFile:kNBGuardCSWs atomically:YES];
+                                NBDiagStep(@"  ⑦s 将要调用 NCNotificationDispatcher -withdrawNotificationWithRequest:"
+                                           @"（真 request nid=%@）\n", nid7);
+                                gNCDirectWithdraw++;
+                                @try {
+                                    [gNCDispatcher withdrawNotificationWithRequest:req7];
+                                    NBDiagStep(@"  ⑦s 已返回\n");
+                                } @catch (NSException *e) {
+                                    NBDiagStep(@"  ⑦s 抛: %@\n", e.reason);
+                                }
+                                [[NSFileManager defaultManager] removeItemAtPath:kNBGuardCSWs error:NULL];
+                                @try {
+                                    still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
+                                    NBDiagStep(@"  ⑦s 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
+                                               (unsigned long)sc7, sh7,
+                                               still ? @"是" : @"否（已删）", how7x ?: @"?");
+                                } @catch (NSException *e) {
+                                    NBDiagStep(@"  ⑦s 读回抛: %@\n", e.reason);
+                                }
+                            }
+                        } else {
+                            NBDiagStep(@"  ⑦s 跳过（没有 dispatcher，或方法不在表里）\n");
+                        }
+                        // ---- ⑦t：CS 侧（界面层）那一刀 —— 系统那条链的最后一步 ----
+                        // 🔴 只在 ⑦s 没撤掉时才打：⑦s 生效时它内部本来就会走到 CS，
+                        //    重复打没有收益，只会让「谁起的作用」变糊。
+                        if (still && gCSDestination
+                            && [gCSDestination respondsToSelector:@selector(withdrawNotificationRequest:)]) {
+                            if (gCsWsSuppressed) {
+                                NBDiagStep(@"  ⑦t 跳过（%@ 压制；删它并 respring 可恢复）\n", kNBGuardOff);
+                            } else {
+                                [[[NSString stringWithFormat:@"%@ ⑦t %@ %@", NB_VER_STR, [NSDate date], nid7 ?: @"?"]
+                                  dataUsingEncoding:NSUTF8StringEncoding] writeToFile:kNBGuardCSWs atomically:YES];
+                                NBDiagStep(@"  ⑦t 将要调用 CSNotificationDispatcher -withdrawNotificationRequest:\n");
+                                gCSDirectWithdraw++;
+                                @try {
+                                    [gCSDestination withdrawNotificationRequest:req7];
+                                    NBDiagStep(@"  ⑦t 已返回\n");
+                                } @catch (NSException *e) {
+                                    NBDiagStep(@"  ⑦t 抛: %@\n", e.reason);
+                                }
+                                [[NSFileManager defaultManager] removeItemAtPath:kNBGuardCSWs error:NULL];
+                                @try {
+                                    still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
+                                    NBDiagStep(@"  ⑦t 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
+                                               (unsigned long)sc7, sh7,
+                                               still ? @"是" : @"否（已删）", how7x ?: @"?");
+                                } @catch (NSException *e) {
+                                    NBDiagStep(@"  ⑦t 读回抛: %@\n", e.reason);
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- ⑦r：前两把都没撤掉才用（带 ±0.4s 时间窗，唯一有连带风险的那把）----
                     if (still && gCSDestination && req7) {
                         NSString *nid7r = nid7;
                         NSDate *ts7 = nil;
@@ -2064,15 +2157,10 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                             } @catch (NSException *e) {
                                 NBDiagStep(@"  ⑦r 读回抛: %@\n", e.reason);
                             }
-                            // 🔴 再等 20 秒复量一次：这里量的是 **NC 自己的 destination 有没有生效**，
-                            //    不是 BB→NC 传播（那要分钟级）。如果 ⑦r 真的驱动了界面，20 秒足够。
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
-                                           dispatch_get_main_queue(), ^{
-                                NSUInteger scq = 0; int shq = 0; NSString *howq = nil;
-                                BOOL stq = (NBFindOurRequest(gNCSource, want7, gWantIDs, &howq, &scq, &shq) != nil);
-                                NBDiagStep(@"  ⑦r +20s 复量：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
-                                           (unsigned long)scq, shq, stq ? @"是" : @"否（已删）", howq ?: @"?");
-                            });
+                            // 🔴 v0.0.80：这里原来有个 ⑦r 专属的 +20s 复量，已**上移**成统一的 ⑦T
+                            //    （+5s / +30s，见 NBCheckDeletedAlive 之后那段）。
+                            //    原因：20 秒这个数本身就选错了 —— `nc_diag(20).txt` 证明 BB→NC 的
+                            //    传播能拖到 99 秒，而延迟的长短**不由我们这把刀决定**。
                         }
                     } else if (!still) {
                         // 🔴🔴 v0.0.79：这一分支是 `nc_diag(19).txt` 里**每一次都走到的那个** ——
@@ -2084,13 +2172,38 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         //    ⇒ 这时候再打 ⑦r 是多余的，而且 ⑦r 是唯一一把有连带风险的刀。
                         //    🔴 必须显式打这一行：否则日志里 ⑦r 一次都不出现，
                         //       下一轮会读成"⑦r 没跑"，而事实是"根本不需要跑"（假绿的 ⑧ 型反过来）。
-                        NBDiagStep(@"  ⑦r 不需要（⓪ 之后本条已不在 NC ⇒ 系统自己把界面侧撤掉了）\n");
+                        NBDiagStep(@"  ⑦r 不需要（此刻本条已不在 NC —— 要么 ⓪ 之后系统自己撤了，"
+                                   @"要么 ⑦s/⑦t 刚刚撤掉了；看上面的逐刀读回是哪一种）\n");
                     }
 
                     // ---------- v0.0.78：[寿] 旧删台账（本轮的核心取证）----------
                     // 🔴 放在 ⑦rs 之后、同一个主队列块里：省一次调度，且此刻 NC 的映射是热的。
                     //    它一次扫描比对多条旧 cid，比"每条旧记录各扫一遍"便宜一个数量级。
                     NBCheckDeletedAlive();
+
+                    // ---------- v0.0.80：⑦T 统一延迟复量（+5s / +30s）----------
+                    // 🔴 为什么同秒读回不够用：本版已知 BB→NC 的传播能拖到 99 秒（见 ⑦s 注释），
+                    //    ⇒ 「同秒还在」不等于刀无效；反过来「同秒已删」也可能是撞上了那一批传播，
+                    //    把功劳记在刀头上。两个方向都要有延迟量才能定性。
+                    // 🔴 顺带把 `gObsDispatcherWithdraw` 一起打出来 —— 它是「有没有人到过 NC」
+                    //    唯一的旁证，且**混计系统与我方**，正好用来交叉验证 ⑦s 到底发没发出去。
+                    {
+                        NSString *nidT = [nid7 copy];
+                        for (NSNumber *secN in @[ @5, @30 ]) {
+                            const double sec = [secN doubleValue];
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)),
+                                           dispatch_get_main_queue(), ^{
+                                NSUInteger scT = 0; int shT = 0; NSString *howT = nil;
+                                BOOL stT = (NBFindOurRequest(gNCSource, want7, gWantIDs, &howT, &scT, &shT) != nil);
+                                NBDiagStep(@"  ⑦T +%.0fs 复量 nid=%@：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@"
+                                           @"（匹配=%@ ｜ dispatcher 撤回总计=%d，其中我方 ⑦s=%d/⑦t=%d/⑦r=%d）\n",
+                                           sec, nidT,
+                                           (unsigned long)scT, shT, stT ? @"是" : @"否（已删）", howT ?: @"?",
+                                           gObsDispatcherWithdraw, gNCDirectWithdraw,
+                                           gCSDirectWithdraw, gCSDClearRng);
+                            });
+                        }
+                    }
 
                     // ---------- v0.0.77：⑦c / ⑦d 一并删除 ----------
                     // ⑦c `destination:dispatcher clearNotificationRequestsInSections:` ——
@@ -2118,6 +2231,8 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                still ? @"是" : @"否", nid7,
                                gCSDWithdraw, gCSDClear, gCSDClearSec, gCSDClearRng,
                                gCSDIncoming, gCSDDismiss, gCSDPost);
+                    NBDiagStep(@"  ⑦ 逐刀计数：我方 ⑦s=%d ⑦t=%d ⑦r(段范围清)=%d ｜ dispatcher 撤回总计(系统+我方)=%d\n",
+                               gNCDirectWithdraw, gCSDirectWithdraw, gCSDClearRng, gObsDispatcherWithdraw);
                 });
             }
             };   // ← bbCleanup 结束，**这里只是定义，没有被调用**
@@ -2147,7 +2262,8 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 //   [清] 整段删除后，主队列上这一步**只找 request、不动手**，
                 //   真正的界面侧动作是 ⑧，而且它在**账本清完之后**、在后台队列上跑。
                 NBDiagStep(@"  [序] 本版顺序：主队列只找 request ⇒ 回 BB 队列清账本（⓪）⇒ 再回主队列复量，"
-                           @"还在才补 ⑦r（缓存 %lu 条对本条无效）\n",
+                           @"还在就依次 ⑦s(NC 直撤) ⇒ ⑦t(CS 直撤) ⇒ ⑦r(时间窗)，都不再等 BB→NC 传播"
+                           @"（缓存 %lu 条对本条无效）\n",
                            (unsigned long)gNCRequestByID.count);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     NBDiagStep(@"  [找] 进入主队列\n");
