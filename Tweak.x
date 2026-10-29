@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.80"
+#define NB_VER_STR @"0.0.81"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -436,6 +436,15 @@ static BOOL NBClaimKey(NSString *key) {
 - (void)observer:(id)observer removeBulletin:(id)bulletin;               // v@:@@ BB 撤回时 NC 侧真正的入口
 - (id)bulletinsToUUIDs;                                                  // @@:  bulletin → NC uuid
 - (id)uuidsToRequests;                                                   // @@:  NC uuid → 真 request
+// 🔴🔴 v0.0.81：这两个 **setter 必须声明**。`gNCSource` 的类型是 `id`，
+//    往 `id` 上发一个没在可见 @interface 里声明过的选择器 = **编译期硬错**
+//    （"no visible @interface declares the selector"），八道文本自检全绿也挡不住。
+//    真机方法表里它们是 `setUuidsToRequests: v@:@` / `setBulletinsToUUIDs: v@:@`。
+- (void)setUuidsToRequests:(id)m;                                        // v@:@ ⑦u 摘映射用
+- (void)setBulletinsToUUIDs:(id)m;                                       // v@:@ ⑦u 同步摘悬空键
+// 🔴 v0.0.81：[RE] 加回观测。签名从真机方法表逐字抄：`observer:addBulletin:forFeed: v@:@@Q`
+//    （第三参是 `Q` = unsigned long long 的 feed 位掩码，不是 BOOL —— 看 ENC 不看名字）。
+- (void)observer:(id)observer addBulletin:(id)bulletin forFeed:(unsigned long long)feed;
 // ---- v0.0.64：一次性换 uuid（不遍历、不 description）----
 - (id)_requestUUIDForBulletinPublisherMatchID:(NSString *)matchID;        // @@:@  publisherMatchID → uuid
 - (id)dispatcher:(id)dispatcher notificationRequestForUUID:(NSString *)uuid; // @@:@@ 后备取真 request
@@ -573,6 +582,13 @@ static int  gObsDispatcherWithdraw = 0;  // dispatcher - withdrawNotificationWit
 // 🔴 v0.0.80：**我方**调用计数单独记 —— 混计会把「系统自己调了 N 次」读成「我的刀跑了 N 次」。
 static int  gNCDirectWithdraw = 0;       // ⑦s：我方调 NCNotificationDispatcher -withdrawNotificationWithRequest:
 static int  gCSDirectWithdraw = 0;       // ⑦t：我方调 CSNotificationDispatcher -withdrawNotificationRequest:
+static int  gNCDirectMapKill  = 0;       // ⑦u：我方从 NC source 映射里摘掉的**键**数
+static int  gReAddSeen        = 0;       // [RE]：命中「最近删过」的 addBulletin 次数（谁把它加回来）
+// 🔴 v0.0.81：⑦r 默认**关闭**。依据：`nc_diag(21).txt` 26 次尝试里，⑦r 的「已返回」和
+//    「读回还在」都可以被 ⑦s/⑦t 完全解释 —— 它从来没有过一次**独立生效**的证据，
+//    而它是三把刀里唯一有连带风险的（时间窗一旦被忽略就是整段清）。
+//    要看它就把它改成 YES，别默认开着烧轮次。
+static BOOL gUseR = NO;
 static int  gObsSrcClear   = 0;   // source - dispatcher:requestsClearingNotificationRequests:
 // ---------- v0.0.73：CoverSheet 目的地（CSNotificationDispatcher）侧的观测计数 ----------
 // 🔴 这一组存在的唯一目的：回答「**用户手动清一条通知时，系统到底调了哪一把**」。
@@ -1066,20 +1082,30 @@ static void NBCollectRequestsIn(id v, NSMutableArray *out, int depth) {
 //   🔴 为什么非加这一层：v0.0.67 只按 section 匹配就动手，而实测命中的
 //      nid=E18CDC81… 与我们的 bulletinID=D29F20AB… / recordID=F5C756A8… **三个全不一样**
 //      ⇒ 同一个 App 在 NC 里可以有多条通知，只按 section 取第一条**很可能撤错了别人那条**。
-static BOOL NBReqIsOurs(id req, NSArray *ids) {
-    if (!req || !ids.count) return NO;
+// 🔴 v0.0.81：原来只有 BOOL，调用方**一律**打印「精确（request.bulletin 命中）」——
+//    不管实际是按 `notificationIdentifier`、按 `uuid`，还是按 bulletin 的三个键命中的。
+//    日志因此会骗人：`[寿]` 与 `⑦ 读回` 看上去"打架"，其中一种可能就是**命中的键根本不同**。
+//    ⇒ 改成返回命中的那个键（带前缀），调用方照原样打出来。
+static NSString *NBReqMatchKey(id req, NSArray *ids) {
+    if (!req || !ids.count) return nil;
     for (NSString *k in @[@"notificationIdentifier", @"uuid"]) {
         NSString *v = NBKVCStr(req, k);
-        if (v.length && [ids containsObject:v]) return YES;
+        if (v.length && [ids containsObject:v])
+            return [NSString stringWithFormat:@"%@=%@", k, v];
     }
     id b = NBSafeValue(req, @"bulletin");       // 🔴 关键：request 自带 BB bulletin
     if (b) {
         for (NSString *k in @[@"bulletinID", @"recordID", @"publisherBulletinID"]) {
             NSString *v = NBKVCStr(b, k);
-            if (v.length && [ids containsObject:v]) return YES;
+            if (v.length && [ids containsObject:v])
+                return [NSString stringWithFormat:@"bulletin.%@=%@", k, v];
         }
     }
-    return NO;
+    return nil;
+}
+
+static BOOL NBReqIsOurs(id req, NSArray *ids) {
+    return NBReqMatchKey(req, ids) != nil;
 }
 
 // 在 `uuidsToRequests` 里找本条 request。
@@ -1105,8 +1131,9 @@ static id NBFindOurRequest(id source, NSString *bundle, NSArray *ids,
             NSString *sid = NBKVCStr(req, @"sectionIdentifier");
             if (!sid.length || ![sid isEqualToString:bundle]) continue;
             secHits++;
-            if (NBReqIsOurs(req, ids)) {
-                if (howOut) *howOut = @"精确（request.bulletin 命中）";
+            NSString *mk = NBReqMatchKey(req, ids);
+            if (mk) {
+                if (howOut) *howOut = mk;
                 if (secHitsOut) *secHitsOut = secHits;
                 return req;
             }
@@ -1124,6 +1151,34 @@ static id NBFindOurRequest(id source, NSString *bundle, NSArray *ids,
         }
         return nil;
     } @catch (__unused NSException *e) { return nil; }
+}
+
+// ---------- v0.0.81：[RE] 「谁把它加回来」的时间戳查询 ----------
+// 返回 -1 = 没命中；否则返回「这条删除距今多少秒」。
+// 🔴 只读台账文件（≤64 行），不改任何状态，可以在 NC 队列上安全调用。
+static double NBDeletedAgeFor(NSString *a, NSString *b, NSString *c) {
+    if (!a.length && !b.length && !c.length) return -1;
+    @try {
+        NSString *old = [NSString stringWithContentsOfFile:kNBDeletedLog
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        if (!old.length) return -1;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        for (NSString *ln in [old componentsSeparatedByString:@"\n"]) {
+            if (!ln.length) continue;
+            NSArray *p = [ln componentsSeparatedByString:@"|"];
+            if (p.count < 3) continue;
+            BOOL hit = NO;
+            for (NSUInteger i = 2; i < p.count && i < 5; i++) {
+                NSString *v = p[i];
+                if (!v.length) continue;
+                if ((a.length && [v isEqualToString:a])
+                    || (b.length && [v isEqualToString:b])
+                    || (c.length && [v isEqualToString:c])) { hit = YES; break; }
+            }
+            if (hit) return now - [p[0] doubleValue];
+        }
+    } @catch (__unused NSException *e) { }
+    return -1;
 }
 
 // ---------- v0.0.78：⑦r 的闸门量 + [寿] 旧删台账 ----------
@@ -1208,7 +1263,7 @@ static void NBCheckDeletedAlive(void) {
                 if (p.count >= 4 && [(NSString *)p[3] length]) [keys addObject:p[3]];
                 if (p.count >= 5 && [(NSString *)p[4] length]) [keys addObject:p[4]];
                 [recs addObject:[@{@"ts": p[0], @"bundle": (p.count >= 2 ? p[1] : @""),
-                                   @"cid": p[2], @"keys": keys, @"gone": @NO} mutableCopy]];
+                                   @"cid": p[2], @"keys": keys, @"hitNC": @NO} mutableCopy]];
                 [allIDs unionSet:keys];
             }
         }
@@ -1248,7 +1303,7 @@ static void NBCheckDeletedAlive(void) {
             }
             if (hit.count) {
                 for (NSMutableDictionary *rec in recs) {
-                    if ([rec[@"keys"] intersectsSet:hit]) rec[@"gone"] = @YES;
+                    if ([rec[@"keys"] intersectsSet:hit]) rec[@"hitNC"] = @YES;
                 }
             }
 
@@ -1266,33 +1321,42 @@ static void NBCheckDeletedAlive(void) {
         }
 
         // ---- 4. [寿] 汇总 ----
+        // 🔴🔴🔴 v0.0.81：**同一个语义反转，我犯了第二次。**
+        //   v0.0.79 只是把字段名从 `alive` 改成 `gone`、默认值从 YES 改成 NO，
+        //   **却把输出映射原样留着**：`hit`（在 NC 里找到了）⇒ 置 YES ⇒ 输出「已消」。
+        //   找到 = 它还在 ⇒ 应该输出「仍在」。改名没改映射，等于没修。
+        //   现场后果（`nc_diag(21).txt`）：`⑦s/⑦t/⑦r 读回` 全说「本条还在=是」，
+        //   而 `[寿]` 同时说「已消 D5C64897（0s 前）」—— 两个判据"打架"，
+        //   真相是它们**本来就同义**，是我把其中一个的标签写反了。
+        //   ⇒ 这一版字段直接叫 `hitNC`（命中 NC = 还在），输出 `hitNC ? 仍在 : 已消`。
+        //   🔴 教训：改语义先改**输出映射**，别只改变量名 —— 变量名不会让日志变对。
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        int goneN = 0, liveN = 0;
-        NSTimeInterval gOld = 0, gNew = 0, lOld = 0, lNew = 0;
+        int liveN = 0, goneN = 0;
+        NSTimeInterval lOld = 0, lNew = 0, gOld = 0, gNew = 0;
         for (NSDictionary *rec in recs) {
             NSTimeInterval age = now - [rec[@"ts"] doubleValue];
-            if ([rec[@"gone"] boolValue]) {
-                goneN++;
-                if (!gOld || age > gOld) gOld = age;
-                if (!gNew || age < gNew) gNew = age;
-            } else {
+            if ([rec[@"hitNC"] boolValue]) {
                 liveN++;
                 if (!lOld || age > lOld) lOld = age;
                 if (!lNew || age < lNew) lNew = age;
+            } else {
+                goneN++;
+                if (!gOld || age > gOld) gOld = age;
+                if (!gNew || age < gNew) gNew = age;
             }
         }
-        NBDiagStep(@"  [寿] 台账 %lu 条 × 扫 NC %lu 条 ⇒ NC 里已消失 %d / 仍在 %d"
+        NBDiagStep(@"  [寿] 台账 %lu 条 × 扫 NC %lu 条 ⇒ NC 里仍在 %d / 已消失 %d"
                    @"（按 nid/uuid 命中 %d 次、按 bulletin 命中 %d 次、本段 bulletin 读不到 %d 条）\n",
-                   (unsigned long)recs.count, (unsigned long)all.count, goneN, liveN,
+                   (unsigned long)recs.count, (unsigned long)all.count, liveN, goneN,
                    hitById, hitByBulletin, noBulletin);
-        if (goneN) NBDiagStep(@"  [寿]   已消失：最老 %.0fs 最新 %.0fs\n", gOld, gNew);
         if (liveN) NBDiagStep(@"  [寿]   仍在  ：最老 %.0fs 最新 %.0fs%@\n", lOld, lNew,
                               (lOld > 600 ? @"  ← 最老已 >10 分钟仍在 ⇒ **不会自己消失**" : @""));
+        if (goneN) NBDiagStep(@"  [寿]   已消失：最老 %.0fs 最新 %.0fs\n", gOld, gNew);
         int shown = 0;
         for (NSDictionary *rec in [recs reverseObjectEnumerator]) {
             if (shown >= 3) break;
             NBDiagStep(@"  [寿]   %@ %@ %@（%.0fs 前）\n",
-                       [rec[@"gone"] boolValue] ? @"已消" : @"仍在",
+                       [rec[@"hitNC"] boolValue] ? @"仍在" : @"已消",
                        NBSafeClip(rec[@"bundle"], 32), NBSafeClip(rec[@"cid"], 28),
                        now - [rec[@"ts"] doubleValue]);
             shown++;
@@ -2107,8 +2171,95 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         }
                     }
 
-                    // ---- ⑦r：前两把都没撤掉才用（带 ±0.4s 时间窗，唯一有连带风险的那把）----
-                    if (still && gCSDestination && req7) {
+                    // ---- ⑦u：摘掉 NC source 自己的映射（**唯一改模型的一刀**）----
+                    // 🔴🔴🔴 依据（`nc_diag(21).txt`，26 次尝试）：
+                    //    ⑦s / ⑦t / ⑦r 三把刀的读回 **7/7 全是「本条还在=是」**，
+                    //    可用户**眼睛看到那张卡同步删掉了**（原话：「刚好看到通知中心有同步删除了」）。
+                    //    ⇒ 界面侧的刀是有效的；**无效的是我们读的那个模型**：
+                    //      读回走 `NCBulletinNotificationSource.uuidsToRequests`，
+                    //      而这个映射**只有 BB→NC 传播（observer:removeBulletin:）才会动**，
+                    //      界面侧怎么撤它都不动一下。
+                    //    两个后果都是致命的：
+                    //      ① 读回永远是「还在」⇒ 前几版所有「刀空转」的判读都不可信
+                    //         （这也是 ⑦a/[清]①③ 当年被冤枉的同一类错，换个位置又犯了）；
+                    //      ② 那条 request 还躺在映射里 ⇒ NC 一旦重新装载/重新 post，
+                    //         就把它**加回界面** —— 这正是用户说的「删除了，然后又出现」。
+                    //    ⇒ 必须显式把它从 uuidsToRequests / bulletinsToUUIDs 里摘掉。
+                    //    🔴 这一刀和前三把的本质区别：前三把动的是**界面**，这一把动的是**账本**。
+                    //       按 §1 的纪律，改模型的刀要放在最后，且必须有独立的读回。
+                    if (still && gNCSource && want7.length) {
+                        @try {
+                            NSDictionary *m0 = nil;
+                            @try { m0 = [gNCSource uuidsToRequests]; } @catch (__unused NSException *e) { }
+                            if (![m0 isKindOfClass:[NSDictionary class]]) {
+                                NBDiagStep(@"  ⑦u 跳过（uuidsToRequests 读不到 / 不是字典）\n");
+                            } else {
+                                NSUInteger before = m0.count;
+                                NSMutableDictionary *cp = [m0 mutableCopy];
+                                NSMutableArray *killed = [NSMutableArray array];
+                                for (id k in cp) {
+                                    NSMutableArray *arr = [NSMutableArray array];
+                                    NBCollectRequestsIn([cp objectForKey:k], arr, 0);
+                                    for (id r2 in arr) {
+                                        NSString *sid2 = NBKVCStr(r2, @"sectionIdentifier");
+                                        if (!sid2.length || ![sid2 isEqualToString:want7]) continue;
+                                        if (NBReqIsOurs(r2, gWantIDs)) { [killed addObject:k]; break; }
+                                    }
+                                }
+                                if (!killed.count) {
+                                    NBDiagStep(@"  ⑦u 没摘到（映射 %lu 键，本案已不在里面）\n",
+                                               (unsigned long)before);
+                                } else {
+                                    for (id k in killed) [cp removeObjectForKey:k];
+                                    if ([gNCSource respondsToSelector:@selector(setUuidsToRequests:)]) {
+                                        [gNCSource setUuidsToRequests:cp];
+                                    }
+                                    // bulletinsToUUIDs：值是刚摘掉的那些 uuid ⇒ 一起摘，别留悬空键
+                                    @try {
+                                        id b2u = [gNCSource bulletinsToUUIDs];
+                                        if ([b2u isKindOfClass:[NSDictionary class]]) {
+                                            NSMutableDictionary *bc = [b2u mutableCopy];
+                                            NSMutableArray *bk = [NSMutableArray array];
+                                            for (id k2 in bc) {
+                                                id bv = [bc objectForKey:k2];
+                                                if (bv && [killed containsObject:bv]) [bk addObject:k2];
+                                            }
+                                            for (id k2 in bk) [bc removeObjectForKey:k2];
+                                            if (bk.count
+                                                && [gNCSource respondsToSelector:@selector(setBulletinsToUUIDs:)]) {
+                                                [gNCSource setBulletinsToUUIDs:bc];
+                                            }
+                                            NBDiagStep(@"  ⑦u bulletinsToUUIDs 同步摘掉 %lu 键\n",
+                                                       (unsigned long)bk.count);
+                                        }
+                                    } @catch (__unused NSException *e) { }
+                                    gNCDirectMapKill += (int)killed.count;
+                                    NSUInteger afterN = 0;
+                                    @try {
+                                        id m1 = [gNCSource uuidsToRequests];
+                                        if ([m1 isKindOfClass:[NSDictionary class]])
+                                            afterN = ((NSDictionary *)m1).count;
+                                    } @catch (__unused NSException *e) { }
+                                    NBDiagStep(@"  ⑦u 已从 uuidsToRequests 摘掉 %lu 键（%lu → %lu）\n",
+                                               (unsigned long)killed.count,
+                                               (unsigned long)before, (unsigned long)afterN);
+                                }
+                                still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
+                                NBDiagStep(@"  ⑦u 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
+                                           (unsigned long)sc7, sh7,
+                                           still ? @"是" : @"否（已删）", how7x ?: @"?");
+                            }
+                        } @catch (NSException *e) {
+                            NBDiagStep(@"  ⑦u 抛: %@\n", e.reason);
+                        }
+                    }
+
+                    // ---- ⑦r：前三把都没撤掉才用（带 ±0.4s 时间窗，唯一有连带风险的那把）----
+                    if (still && !gUseR) {
+                        NBDiagStep(@"  ⑦r 跳过（本版默认关闭：26 次尝试里它从无独立生效的证据，"
+                                   @"且是唯一有连带风险的刀；要开就改 gUseR）\n");
+                    }
+                    if (still && gCSDestination && req7 && gUseR) {
                         NSString *nid7r = nid7;
                         NSDate *ts7 = nil;
                         @try {
@@ -2196,11 +2347,11 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                 NSUInteger scT = 0; int shT = 0; NSString *howT = nil;
                                 BOOL stT = (NBFindOurRequest(gNCSource, want7, gWantIDs, &howT, &scT, &shT) != nil);
                                 NBDiagStep(@"  ⑦T +%.0fs 复量 nid=%@：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@"
-                                           @"（匹配=%@ ｜ dispatcher 撤回总计=%d，其中我方 ⑦s=%d/⑦t=%d/⑦r=%d）\n",
+                                           @"（匹配=%@ ｜ dispatcher 撤回总计=%d，其中我方 ⑦s=%d/⑦t=%d/⑦u=%d）\n",
                                            sec, nidT,
                                            (unsigned long)scT, shT, stT ? @"是" : @"否（已删）", howT ?: @"?",
                                            gObsDispatcherWithdraw, gNCDirectWithdraw,
-                                           gCSDirectWithdraw, gCSDClearRng);
+                                           gCSDirectWithdraw, gNCDirectMapKill);
                             });
                         }
                     }
@@ -2231,8 +2382,10 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                still ? @"是" : @"否", nid7,
                                gCSDWithdraw, gCSDClear, gCSDClearSec, gCSDClearRng,
                                gCSDIncoming, gCSDDismiss, gCSDPost);
-                    NBDiagStep(@"  ⑦ 逐刀计数：我方 ⑦s=%d ⑦t=%d ⑦r(段范围清)=%d ｜ dispatcher 撤回总计(系统+我方)=%d\n",
-                               gNCDirectWithdraw, gCSDirectWithdraw, gCSDClearRng, gObsDispatcherWithdraw);
+                    NBDiagStep(@"  ⑦ 逐刀计数：我方 ⑦s=%d ⑦t=%d ⑦u(摘键)=%d ⑦r(段范围清)=%d"
+                               @" ｜ dispatcher 撤回总计(系统+我方)=%d ｜ [RE] 加回=%d\n",
+                               gNCDirectWithdraw, gCSDirectWithdraw, gNCDirectMapKill,
+                               gCSDClearRng, gObsDispatcherWithdraw, gReAddSeen);
                 });
             }
             };   // ← bbCleanup 结束，**这里只是定义，没有被调用**
@@ -2262,7 +2415,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 //   [清] 整段删除后，主队列上这一步**只找 request、不动手**，
                 //   真正的界面侧动作是 ⑧，而且它在**账本清完之后**、在后台队列上跑。
                 NBDiagStep(@"  [序] 本版顺序：主队列只找 request ⇒ 回 BB 队列清账本（⓪）⇒ 再回主队列复量，"
-                           @"还在就依次 ⑦s(NC 直撤) ⇒ ⑦t(CS 直撤) ⇒ ⑦r(时间窗)，都不再等 BB→NC 传播"
+                           @"还在就依次 ⑦s(NC 直撤) ⇒ ⑦t(CS 直撤) ⇒ ⑦u(摘 NC 映射)，⑦r 默认关"
                            @"（缓存 %lu 条对本条无效）\n",
                            (unsigned long)gNCRequestByID.count);
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -3010,6 +3163,37 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
               queue ? @"有" : @"(nil)");
     }
     return r;
+}
+// ---------- 🔴🔴 v0.0.81：观测「谁把它加回来」 ----------
+// 用户实测原话：「我删除一个抖音的，刚好看到通知中心有同步删除了，然后又出现，删除又出现」。
+// `nc_diag(21).txt` 里的硬证据：
+//   18:41:01 删完（`BB live=100→99 含本条=否`），NC 侧被撤掉；
+//   18:41:40 同一条 **recordID=7702090365964554639** 换了个**新 bulletinID=DFFAB433**
+//   又出现在 BB 里（`BB live=99→100`），盒子里也多了一条新记录（cid=DFFAB433）。
+//   ⇒ **BB 账本里真的被加了一条新的**，不是界面重绘的错觉。
+// ⇒ 下一步必须回答：这条新的是**谁**加的、在我们动完**多久之后**加的。
+// 这条 hook 只在这个 bulletin 命中「最近删除台账」时才打一行 —— 不会刷屏。
+// 🔴 只读 bulletinID / recordID / publisherBulletinID / sectionID 四个已知字符串键，
+//    **绝不打印 bulletin 的 description**（`BBBulletin` 的 description 会摸内部锁 ⇒ 卡死，v0.0.63 教训）。
+- (void)observer:(id)observer addBulletin:(id)bulletin forFeed:(unsigned long long)feed {
+    @try {
+        if (gNCSource && NBDiagReady()) {
+            NSString *bid = NBKVCStr(bulletin, @"bulletinID");
+            NSString *rid = NBKVCStr(bulletin, @"recordID");
+            NSString *pid = NBKVCStr(bulletin, @"publisherBulletinID");
+            double age = NBDeletedAgeFor(bid, rid, pid);
+            if (age >= 0 && age <= 600) {
+                gReAddSeen++;
+                if (gReAddSeen <= 20) {
+                    NBDiagStep(@"  [RE] ⚠️ NC 收到 addBulletin 第 %d 次 @%@ section=%@ "
+                               @"bulletinID=%@ recordID=%@（命中 %.0fs 前删过的那条）\n",
+                               gReAddSeen, [NSDate date], NBKVCStr(bulletin, @"sectionID"),
+                               NBSafeClip(bid, 40), NBSafeClip(rid, 44), age);
+                }
+            }
+        }
+    } @catch (__unused NSException *e) { }
+    %orig;
 }
 // ---------- 🔴🔴 v0.0.65：观测「系统会不会自己把 BB 撤回传到 NC 侧」 ----------
 // ⓪ 已经证明能把 BB 账本清干净（v0.0.64 真机 5/5）。接下来唯一的问题是：
