@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.81"
+#define NB_VER_STR @"0.0.82"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -445,6 +445,11 @@ static BOOL NBClaimKey(NSString *key) {
 // 🔴 v0.0.81：[RE] 加回观测。签名从真机方法表逐字抄：`observer:addBulletin:forFeed: v@:@@Q`
 //    （第三参是 `Q` = unsigned long long 的 feed 位掩码，不是 BOOL —— 看 ENC 不看名字）。
 - (void)observer:(id)observer addBulletin:(id)bulletin forFeed:(unsigned long long)feed;
+// 🔴 v0.0.82：同样必须声明（往 `id` 上发未声明选择器 = 编译期硬错，§7.6 第 ⑨ 道）。
+//    真机方法表逐字：`observer:modifyBulletin:forFeed: v@:@@Q`（同 addBulletin，第三参是 Q）。
+//    `observer:noteBulletinsLoadedForSectionID:` 方法表里是 `v@:@@`。
+- (void)observer:(id)observer noteBulletinsLoadedForSectionID:(id)sectionID;
+- (void)observer:(id)observer modifyBulletin:(id)bulletin forFeed:(unsigned long long)feed;
 // ---- v0.0.64：一次性换 uuid（不遍历、不 description）----
 - (id)_requestUUIDForBulletinPublisherMatchID:(NSString *)matchID;        // @@:@  publisherMatchID → uuid
 - (id)dispatcher:(id)dispatcher notificationRequestForUUID:(NSString *)uuid; // @@:@@ 后备取真 request
@@ -584,6 +589,14 @@ static int  gNCDirectWithdraw = 0;       // ⑦s：我方调 NCNotificationDispa
 static int  gCSDirectWithdraw = 0;       // ⑦t：我方调 CSNotificationDispatcher -withdrawNotificationRequest:
 static int  gNCDirectMapKill  = 0;       // ⑦u：我方从 NC source 映射里摘掉的**键**数
 static int  gReAddSeen        = 0;       // [RE]：命中「最近删过」的 addBulletin 次数（谁把它加回来）
+// ---------- v0.0.82：纯诊断计数（不加新刀）----------
+// 🔴 缺口一：「[RE] 加回=0」**没有分母**。`投递=%d` 打的是 `gCSDPost`（CS dispatcher 投递），
+//    不是 addBulletin 的次数 ⇒ 现在无法区分「钩子活着但没命中」和「钩子根本没被调用」。
+//    判据绿的原因必须等于它本来要证的那件事 ⇒ 先给分母。
+static int  gAddSeen          = 0;   // [RE] addBulletin 被调用**总次数**（分母，无条件自增）
+static int  gNoteLoadedSeen   = 0;   // [RL] noteBulletinsLoadedForSectionID: 总次数（映射重建入口）
+static int  gModifySeen       = 0;   // [RM] modifyBulletin:forFeed: 总次数
+static int  gModifyHit        = 0;   // [RM] 其中命中「最近删过」的条数
 // 🔴 v0.0.81：⑦r 默认**关闭**。依据：`nc_diag(21).txt` 26 次尝试里，⑦r 的「已返回」和
 //    「读回还在」都可以被 ⑦s/⑦t 完全解释 —— 它从来没有过一次**独立生效**的证据，
 //    而它是三把刀里唯一有连带风险的（时间窗一旦被忽略就是整段清）。
@@ -1151,6 +1164,48 @@ static id NBFindOurRequest(id source, NSString *bundle, NSArray *ids,
         }
         return nil;
     } @catch (__unused NSException *e) { return nil; }
+}
+
+// ---------- v0.0.82：⑦u 的「映射组成」只读直方图 ----------
+// 🔴 为什么要它（`paste_1030.txt` 硬数据）：⑦u 的 setter 前后，**同一个函数**
+//    （`NBFindOurRequest`，同一个 bundle、隔几毫秒）量出两组互斥的数：
+//      基线 / ⑦s 读回 / ⑦t 读回：扫 1413 条 / 同段 68 条
+//      ⑦u     读回：            扫 1412 条 / 同段 99 条   ← 同段 == BB 该段 live（99）
+//    总数只掉了 1（正好是我们摘掉的那个键），同段却涨了 31 —— 同一个字典不可能这样
+//    ⇒ 系统把映射**从 BB 重建**了一遍（重建不走 addBulletin，所以 [RE] 看不见）。
+//    🔴 这直接威胁 ⑦u 读回的可信度：我方的 ⓪ 早已把 BB 清干净，
+//      「从 BB 重建出来的映射」当然不含本条 ⇒ 读回会**恒真**。
+// ⇒ 本函数只做一件事：按 section 分组取前 N 名，让「组成到底变没变」看得见。
+//    纯只读、不返回对象、只返回短串（专为省日志行）。
+static NSString *NBSectionTop(id map, int topN) {
+    if (!map || ![map isKindOfClass:[NSDictionary class]] || topN <= 0) return @"(非字典)";
+    @try {
+        NSDictionary *d = (NSDictionary *)map;
+        NSMutableArray *all = [NSMutableArray array];
+        for (id k in d) NBCollectRequestsIn([d objectForKey:k], all, 0);
+        NSMutableDictionary *cnt = [NSMutableDictionary dictionary];
+        for (id r in all) {
+            NSString *sid = NBKVCStr(r, @"sectionIdentifier");
+            if (!sid.length) sid = @"(无)";
+            NSNumber *n = [cnt objectForKey:sid];
+            [cnt setObject:[NSNumber numberWithInt:(n ? [n intValue] + 1 : 1)] forKey:sid];
+        }
+        NSArray *keys = [cnt allKeys];
+        keys = [keys sortedArrayUsingComparator:^NSComparisonResult(id a, id b) {
+            int ca = [[cnt objectForKey:a] intValue];
+            int cb = [[cnt objectForKey:b] intValue];
+            if (cb > ca) return NSOrderedAscending;
+            if (cb < ca) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        NSMutableArray *parts = [NSMutableArray array];
+        for (NSUInteger i = 0; i < keys.count && (int)i < topN; i++) {
+            NSString *k = [keys objectAtIndex:i];
+            [parts addObject:[NSString stringWithFormat:@"%@=%d",
+                              NBSafeClip(k, 34), [[cnt objectForKey:k] intValue]]];
+        }
+        return parts.count ? [parts componentsJoinedByString:@", "] : @"(空)";
+    } @catch (__unused NSException *e) { return @"(抛)"; }
 }
 
 // ---------- v0.0.81：[RE] 「谁把它加回来」的时间戳查询 ----------
@@ -1783,6 +1838,12 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         __block NSString *recID    = nil;   // recordID（换 uuid 兜底）
         __block NSInteger ncReqCnt  = -1;   // uuidsToRequests 条数（删前）
         __block NSInteger ncReqCnt2 = -1;   // uuidsToRequests 条数（删后）
+        // 🔴 v0.0.82：`ncMeasured` = 「这两个数到底量过没有」。
+        //    真机实测（`paste_1030.txt` 19/19 次尝试）这一行一直打的是 `映射=-1 req数=-1`：
+        //    `ncCnt` 只在「投 NC 队列」那个分支里赋值，而该分支自 v0.0.64 起就是关的
+        //    （日志里那行 `[NC] 本版不投 NC 队列`）⇒ 这两个字段**永远是 -1**。
+        //    一个看着像数据、实际从没采样过的字段比没有更坏 —— 它会被当成"读数"去推理。
+        __block BOOL ncMeasured = NO;
         __block NSString *ncUUID   = nil;   // 本条在 NC 映射里对应的 uuid（可能是 nil）
         __block NSInteger winStep  = 0;
         __block BOOL      bbWithdrew = NO;   // ⓪ 官方撤回之后 BB 里是不是没了
@@ -1864,10 +1925,13 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
             } else {
                 verdict = @"BB 已删；NC 侧状态见上面的 [NC] 行";
             }
-            NBDiagStep(@"  删后 BB: live=%ld 含本条=%@ | NC: 映射=%ld req数=%ld uuid=%@ req=%@ | 系统自己传给 NC 共 %d 次\n",
+            NBDiagStep(@"  删后 BB: live=%ld 含本条=%@ | NC: %@ | 系统自己传给 NC 共 %d 次\n",
                        (long)bbN2, bbAfter ? @"是" : @"否",
-                       (long)ncCnt2, (long)ncReqCnt2,
-                       ncHadUUID ? @"有" : @"无", ncHadReq ? @"有" : @"无",
+                       ncMeasured
+                           ? [NSString stringWithFormat:@"映射=%ld req数=%ld uuid=%@ req=%@",
+                              (long)ncCnt2, (long)ncReqCnt2,
+                              ncHadUUID ? @"有" : @"无", ncHadReq ? @"有" : @"无"]
+                           : @"未量（NC 队列分支本版关闭 ⇒ 本行不读；真实读数见下面的 ⑦ 段）",
                        gBBToNCSeen);
             NBDiagStep(@"  观测计数: 目的地请求清除=%d / dispatcher 撤回=%d / source 请求清除=%d / ⑤新刀成功=%d(本版起已删,恒0) / _sendRemove=%d\n  ⇒ %@\n",
                        gObsDispatcherClear, gObsDispatcherWithdraw, gObsSrcClear,
@@ -2195,6 +2259,15 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                 NBDiagStep(@"  ⑦u 跳过（uuidsToRequests 读不到 / 不是字典）\n");
                             } else {
                                 NSUInteger before = m0.count;
+                                // v0.0.82 量前（只读）：让 setter 前后的「组成」可比
+                                NSInteger b2uBefore = -1;
+                                @try {
+                                    id x0 = [gNCSource bulletinsToUUIDs];
+                                    if ([x0 isKindOfClass:[NSDictionary class]])
+                                        b2uBefore = (NSInteger)((NSDictionary *)x0).count;
+                                } @catch (__unused NSException *e) { }
+                                NBDiagStep(@"  ⑦u 量前：uuidsToRequests=%lu bulletinsToUUIDs=%ld ｜ 组成 top3: %@\n",
+                                           (unsigned long)before, (long)b2uBefore, NBSectionTop(m0, 3));
                                 NSMutableDictionary *cp = [m0 mutableCopy];
                                 NSMutableArray *killed = [NSMutableArray array];
                                 for (id k in cp) {
@@ -2235,19 +2308,45 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                     } @catch (__unused NSException *e) { }
                                     gNCDirectMapKill += (int)killed.count;
                                     NSUInteger afterN = 0;
+                                    NSInteger b2uAfter = -1;
+                                    id m1 = nil;
                                     @try {
-                                        id m1 = [gNCSource uuidsToRequests];
+                                        m1 = [gNCSource uuidsToRequests];
                                         if ([m1 isKindOfClass:[NSDictionary class]])
                                             afterN = ((NSDictionary *)m1).count;
+                                    } @catch (__unused NSException *e) { }
+                                    @try {
+                                        id x1 = [gNCSource bulletinsToUUIDs];
+                                        if ([x1 isKindOfClass:[NSDictionary class]])
+                                            b2uAfter = (NSInteger)((NSDictionary *)x1).count;
                                     } @catch (__unused NSException *e) { }
                                     NBDiagStep(@"  ⑦u 已从 uuidsToRequests 摘掉 %lu 键（%lu → %lu）\n",
                                                (unsigned long)killed.count,
                                                (unsigned long)before, (unsigned long)afterN);
+                                    // v0.0.82 量后（只读）：与「量前」逐字对比 ⇒ 组成变没变一眼可判
+                                    NBDiagStep(@"  ⑦u 量后：uuidsToRequests=%lu bulletinsToUUIDs=%ld ｜ 组成 top3: %@\n",
+                                               (unsigned long)afterN, (long)b2uAfter, NBSectionTop(m1, 3));
                                 }
                                 still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
                                 NBDiagStep(@"  ⑦u 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
                                            (unsigned long)sc7, sh7,
                                            still ? @"是" : @"否（已删）", how7x ?: @"?");
+                                // 🔴 v0.0.82 双读：同一次块里连读两遍。
+                                //   两次不一致 ⇒ 这个判据本身不稳定 ⇒ 之前所有「已删」都不能当证据。
+                                {
+                                    NSUInteger sc8 = 0; int sh8 = 0; NSString *how8 = nil;
+                                    BOOL still2 = (NBFindOurRequest(gNCSource, want7, gWantIDs,
+                                                                    &how8, &sc8, &sh8) != nil);
+                                    if (still2 != still || sc8 != sc7 || sh8 != sh7) {
+                                        NBDiagStep(@"  ⑦u 🔴 读回不稳定：①扫 %lu/同段 %d/还在=%@ ｜ "
+                                                   @"②扫 %lu/同段 %d/还在=%@ ⇒ 两次之间映射变了\n",
+                                                   (unsigned long)sc7, sh7, still ? @"是" : @"否",
+                                                   (unsigned long)sc8, sh8, still2 ? @"是" : @"否");
+                                    } else {
+                                        NBDiagStep(@"  ⑦u 读回稳定（连读两次同结果：扫 %lu 条 / 同段 %d 条 / 还在=%@）\n",
+                                                   (unsigned long)sc8, sh8, still2 ? @"是" : @"否");
+                                    }
+                                }
                             }
                         } @catch (NSException *e) {
                             NBDiagStep(@"  ⑦u 抛: %@\n", e.reason);
@@ -2340,18 +2439,24 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     //    唯一的旁证，且**混计系统与我方**，正好用来交叉验证 ⑦s 到底发没发出去。
                     {
                         NSString *nidT = [nid7 copy];
-                        for (NSNumber *secN in @[ @5, @30 ]) {
+                        // 🔴 v0.0.82：加 +90s —— 已实测 BB→NC 传播能拖到 **99 秒**（nc_diag(20)），
+                        //    +30s 仍在「传播窗口」里面 ⇒ 看不到「晚到又被加回」的那一类。
+                        //    窗口必须盖住传播上界，否则「+30s 已删」证明不了「不会再回来」。
+                        for (NSNumber *secN in @[ @5, @30, @90 ]) {
                             const double sec = [secN doubleValue];
                             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)),
                                            dispatch_get_main_queue(), ^{
                                 NSUInteger scT = 0; int shT = 0; NSString *howT = nil;
                                 BOOL stT = (NBFindOurRequest(gNCSource, want7, gWantIDs, &howT, &scT, &shT) != nil);
                                 NBDiagStep(@"  ⑦T +%.0fs 复量 nid=%@：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@"
-                                           @"（匹配=%@ ｜ dispatcher 撤回总计=%d，其中我方 ⑦s=%d/⑦t=%d/⑦u=%d）\n",
+                                           @"（匹配=%@ ｜ dispatcher 撤回总计=%d，其中我方 ⑦s=%d/⑦t=%d/⑦u=%d"
+                                           @" ｜ addBulletin 累计=%d(命中 %d) 重建入口=%d modify=%d(命中 %d)）\n",
                                            sec, nidT,
                                            (unsigned long)scT, shT, stT ? @"是" : @"否（已删）", howT ?: @"?",
                                            gObsDispatcherWithdraw, gNCDirectWithdraw,
-                                           gCSDirectWithdraw, gNCDirectMapKill);
+                                           gCSDirectWithdraw, gNCDirectMapKill,
+                                           gAddSeen, gReAddSeen, gNoteLoadedSeen,
+                                           gModifySeen, gModifyHit);
                             });
                         }
                     }
@@ -2383,9 +2488,11 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                gCSDWithdraw, gCSDClear, gCSDClearSec, gCSDClearRng,
                                gCSDIncoming, gCSDDismiss, gCSDPost);
                     NBDiagStep(@"  ⑦ 逐刀计数：我方 ⑦s=%d ⑦t=%d ⑦u(摘键)=%d ⑦r(段范围清)=%d"
-                               @" ｜ dispatcher 撤回总计(系统+我方)=%d ｜ [RE] 加回=%d\n",
+                               @" ｜ dispatcher 撤回总计(系统+我方)=%d"
+                               @" ｜ [RE] addBulletin 累计=%d 命中加回=%d ｜ 重建入口=%d modify=%d(命中 %d)\n",
                                gNCDirectWithdraw, gCSDirectWithdraw, gNCDirectMapKill,
-                               gCSDClearRng, gObsDispatcherWithdraw, gReAddSeen);
+                               gCSDClearRng, gObsDispatcherWithdraw,
+                               gAddSeen, gReAddSeen, gNoteLoadedSeen, gModifySeen, gModifyHit);
                 });
             }
             };   // ← bbCleanup 结束，**这里只是定义，没有被调用**
@@ -2523,6 +2630,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     ncCnt     = NBCollectionCount([gNCSource bulletinsToUUIDs]);
                     ncReqCnt  = NBCollectionCount([gNCSource uuidsToRequests]);
                     ncReqCnt2 = ncReqCnt;
+                    ncMeasured = YES;
                     NBDiagStep(@"  [NC] 映射=%ld req数=%ld\n", (long)ncCnt, (long)ncReqCnt);
                 } @catch (NSException *e) {
                     NBDiagStep(@"  [NC] 读映射抛: %@\n", e.reason);
@@ -3176,6 +3284,9 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
 // 🔴 只读 bulletinID / recordID / publisherBulletinID / sectionID 四个已知字符串键，
 //    **绝不打印 bulletin 的 description**（`BBBulletin` 的 description 会摸内部锁 ⇒ 卡死，v0.0.63 教训）。
 - (void)observer:(id)observer addBulletin:(id)bulletin forFeed:(unsigned long long)feed {
+    // 🔴 v0.0.82：**无条件**自增 —— 这是「命中加回=0」唯一的分母。
+    //    放在任何 if / @try 之前，且不碰任何对象（只加一个 int）。
+    gAddSeen++;
     @try {
         if (gNCSource && NBDiagReady()) {
             NSString *bid = NBKVCStr(bulletin, @"bulletinID");
@@ -3188,6 +3299,48 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
                     NBDiagStep(@"  [RE] ⚠️ NC 收到 addBulletin 第 %d 次 @%@ section=%@ "
                                @"bulletinID=%@ recordID=%@（命中 %.0fs 前删过的那条）\n",
                                gReAddSeen, [NSDate date], NBKVCStr(bulletin, @"sectionID"),
+                               NBSafeClip(bid, 40), NBSafeClip(rid, 44), age);
+                }
+            }
+        }
+    } @catch (__unused NSException *e) { }
+    %orig;
+}
+// ---------- 🔴🔴 v0.0.82：映射「重建 / 修改」这两条路（⑦u 摘映射唯一的推翻者）----------
+// 🔴 为什么非查不可（`paste_1030.txt`）：⑦u 摘掉映射之后，同一次块里紧接着量到的「同段」
+//    从 68 跳到 99 —— **正好等于 BB 在该段的 live 条数**，而总数只掉了 1。
+//    ⇒ 系统会把映射**从 BB 重建**一遍，而这条路**不走 `addBulletin`**
+//      ⇒ `[RE] 加回=0` 覆盖不到它。**没看到加回 ≠ 没被加回。**
+// ⇒ 这两条 hook 只做三件事：无条件 ++、命中台账才打一行、原样 %orig。
+// 🔴 只读 bulletinID / recordID / publisherBulletinID / sectionID / sectionIdentifier
+//    这几个已知字符串键 —— **绝不打印对象 description**（BBBulletin 会摸内部锁 ⇒ 卡死）。
+- (void)observer:(id)observer noteBulletinsLoadedForSectionID:(id)sectionID {
+    gNoteLoadedSeen++;
+    @try {
+        if (gNCSource && NBDiagReady() && gNoteLoadedSeen <= 12) {
+            NSString *sec = nil;
+            if ([sectionID isKindOfClass:[NSString class]]) sec = (NSString *)sectionID;
+            else sec = NBKVCStr(sectionID, @"sectionIdentifier");
+            NBDiagStep(@"  [RL] noteBulletinsLoaded 第 %d 次 section=%@（映射重建入口 ⇒ 本条可能被重新装回）\n",
+                       gNoteLoadedSeen, NBSafeClip(sec, 48));
+        }
+    } @catch (__unused NSException *e) { }
+    %orig;
+}
+- (void)observer:(id)observer modifyBulletin:(id)bulletin forFeed:(unsigned long long)feed {
+    gModifySeen++;
+    @try {
+        if (gNCSource && NBDiagReady()) {
+            NSString *bid = NBKVCStr(bulletin, @"bulletinID");
+            NSString *rid = NBKVCStr(bulletin, @"recordID");
+            NSString *pid = NBKVCStr(bulletin, @"publisherBulletinID");
+            double age = NBDeletedAgeFor(bid, rid, pid);
+            if (age >= 0 && age <= 600) {
+                gModifyHit++;
+                if (gModifyHit <= 20) {
+                    NBDiagStep(@"  [RM] ⚠️ modifyBulletin 第 %d 次 @%@ section=%@ bulletinID=%@ recordID=%@"
+                               @"（命中 %.0fs 前删过的那条）\n",
+                               gModifySeen, [NSDate date], NBKVCStr(bulletin, @"sectionID"),
                                NBSafeClip(bid, 40), NBSafeClip(rid, 44), age);
                 }
             }
