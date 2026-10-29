@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.78"
+#define NB_VER_STR @"0.0.79"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -517,6 +517,8 @@ static BOOL gCsWsSuppressed = NO;   // YES ⇒ 本进程不用 ⑦r（但账本�
 //    ⇒ 同秒读回**必然**读到"还在"，它不是判据，是噪声。
 //    做法：⓪ 成功那条记进台账；每次进 NC 侧时扫一遍比对 ⇒ 一行就能看出"几分钟后消失"。
 static NSString *const kNBDeletedLog = @"/var/mobile/Library/NotifyBox/.nb_deleted";
+// v0.0.79：[段] / [重] 的明细每个进程只打一次（日志窗口 ≈ 最后 50 条、全局滚动）
+static BOOL gCensusDumped = NO;
 #define NB_DEL_KEEP 24            // 台账最多留 24 条（更老的没有诊断价值，且让扫描变贵）
 // 🔴 版本号写进护栏文件：**每个新版本自动获得一次重试机会**。
 //    否则 v0.0.62 那次卡死留下的 `.nc_off` 会一直压着，新版明明修好了也测不到。
@@ -1143,8 +1145,16 @@ static int NBCountInWindow(id source, NSString *bundle, NSDate *ts, NSTimeInterv
     } @catch (__unused NSException *e) { return -1; }
 }
 
-// 把「刚刚被 ⓪ 清掉的那条」记进台账（一行：时间戳|bundle|cid）。
-static void NBDeletedRemember(NSString *cid, NSString *bundle) {
+// 把「刚刚被 ⓪ 清掉的那条」记进台账。
+// 行格式：时间戳|bundle|bulletinID|recordID|publisherBulletinID
+// 🔴 v0.0.79：从 1 个键扩到 3 个键。原因是 `nc_diag(19).txt` 暴露的：
+//    读回时如果 `req.bulletin` 变成 nil（BB 对象被 ⓪ 撤掉之后完全可能），
+//    那 `req.bulletin.bulletinID` 就**读不到** ⇒ 判据会报"已消失"，
+//    而 request 其实还躺在 NC 里 ⇒ **假绿**。
+//    ⇒ 必须有一条**不依赖 req.bulletin** 的键：`request.notificationIdentifier`。
+//      本机实测它正好等于 BB 的 recordID（`nid=ae3046702a374c00b6736bc70096b84a`），
+//      所以记下 recordID 就能在 NC 侧独立验证。
+static void NBDeletedRemember(NSString *cid, NSString *recID, NSString *pubID, NSString *bundle) {
     if (!cid.length || !bundle.length) return;
     @try {
         NSString *old = [NSString stringWithContentsOfFile:kNBDeletedLog
@@ -1154,81 +1164,121 @@ static void NBDeletedRemember(NSString *cid, NSString *bundle) {
             for (NSString *ln in [old componentsSeparatedByString:@"\n"]) {
                 if (!ln.length) continue;
                 NSArray *p = [ln componentsSeparatedByString:@"|"];
-                if (p.count >= 3 && [p[2] isEqualToString:cid]) continue;   // 同一个 cid 只留最新那次
+                if (p.count >= 3 && [p[2] isEqualToString:cid]) continue;   // 同一 cid 只留最新那次
                 [keep addObject:ln];
             }
         }
-        [keep addObject:[NSString stringWithFormat:@"%.0f|%@|%@",
-                         [[NSDate date] timeIntervalSince1970], bundle, cid]];
+        [keep addObject:[NSString stringWithFormat:@"%.0f|%@|%@|%@|%@",
+                         [[NSDate date] timeIntervalSince1970], bundle, cid,
+                         recID.length ? recID : @"", pubID.length ? pubID : @""]];
         while (keep.count > NB_DEL_KEEP) [keep removeObjectAtIndex:0];
         [[keep componentsJoinedByString:@"\n"] writeToFile:kNBDeletedLog atomically:YES
                                                   encoding:NSUTF8StringEncoding error:NULL];
     } @catch (__unused NSException *e) { }
 }
 
-// 🔴 一次扫描、多条比对：把台账里的旧 cid 拿到 NC 当前快照里查一遍。
-//    比「每条旧记录各扫一遍 ~600 条」便宜一个数量级（§"重型只读观测要省"）。
-//    它打出来的那两行直接回答本轮的根本问题：
-//      「删掉的那条，NC 里到底会不会自己消失？多久消失？」
+// ---------- v0.0.79：[寿] 台账 + [段] 段级计数 + [重] 重复诊断，一次遍历全出 ----------
+// 🔴🔴 修掉 v0.0.78 的一个**语义反转**（真机当场撞到）：
+//    上一版默认 `alive=@YES`，命中 NC 时置 `@NO`，而输出时 `YES ⇒ 仍在`、`NO ⇒ 已消失`
+//    ⇒ **命中 = 在 NC 里找到 = 它还活着**，却被写成了「已消失」。
+//    `nc_diag(19).txt` 里 5 次尝试全是「已消失 0 / 仍在 5」，真相**正好相反**：
+//    那 5 条全都被系统撤掉了（和 `⑦ 基线：本条还在=否` 完全一致，两个判据本来是同一个答案）。
+//    ⇒ 现在字段直接叫 `gone`：默认 `NO`（没找到过 ⇒ 认为还在），命中才置 `YES`。
 static void NBCheckDeletedAlive(void) {
     @try {
+        NSString *bundleNow = gWantBundle;
+
+        // ---- 1. 台账 ----
         NSString *old = [NSString stringWithContentsOfFile:kNBDeletedLog
                                                   encoding:NSUTF8StringEncoding error:NULL];
-        if (!old.length) { NBDiagStep(@"  [寿] 台账为空（本版起才开始记）\n"); return; }
         NSMutableArray *recs = [NSMutableArray array];
         NSMutableSet  *allIDs = [NSMutableSet set];
-        for (NSString *ln in [old componentsSeparatedByString:@"\n"]) {
-            if (!ln.length) continue;
-            NSArray *p = [ln componentsSeparatedByString:@"|"];
-            if (p.count < 3 || ![(NSString *)p[2] length]) continue;
-            [recs addObject:[@{@"ts": p[0], @"bundle": p[1], @"cid": p[2],
-                               @"alive": @YES} mutableCopy]];
-            [allIDs addObject:p[2]];
+        if (old.length) {
+            for (NSString *ln in [old componentsSeparatedByString:@"\n"]) {
+                if (!ln.length) continue;
+                NSArray *p = [ln componentsSeparatedByString:@"|"];
+                if (p.count < 3 || ![(NSString *)p[2] length]) continue;
+                NSMutableSet *keys = [NSMutableSet setWithObject:p[2]];
+                if (p.count >= 4 && [(NSString *)p[3] length]) [keys addObject:p[3]];
+                if (p.count >= 5 && [(NSString *)p[4] length]) [keys addObject:p[4]];
+                [recs addObject:[@{@"ts": p[0], @"bundle": (p.count >= 2 ? p[1] : @""),
+                                   @"cid": p[2], @"keys": keys, @"gone": @NO} mutableCopy]];
+                [allIDs unionSet:keys];
+            }
         }
-        if (!recs.count) { NBDiagStep(@"  [寿] 台账 0 条可解析\n"); return; }
+
+        // ---- 2. NC 快照 ----
         id m = [gNCSource uuidsToRequests];
         if (![m isKindOfClass:[NSDictionary class]]) {
-            NBDiagStep(@"  [寿] 读不到 uuidsToRequests ⇒ 本次不判\n"); return;
+            NBDiagStep(@"  [寿] 读不到 uuidsToRequests ⇒ 本次不判\n");
+            return;
         }
         NSDictionary *d = (NSDictionary *)m;
         NSMutableArray *all = [NSMutableArray arrayWithCapacity:d.count];
         for (id k in d) NBCollectRequestsIn([d objectForKey:k], all, 0);
-        // 🔴 比对口径 = 与 NBReqIsOurs 完全一致（5 个键），否则「还在/已消」会跟精确匹配打架
+
+        // ---- 3. 一次遍历：存活比对 + 段级计数 + 重复诊断 ----
+        NSMutableDictionary *secCount = [NSMutableDictionary dictionary];
+        NSMutableDictionary *tsGroups = [NSMutableDictionary dictionary];   // 仅 bundleNow 段
+        int noBulletin = 0, hitById = 0, hitByBulletin = 0;
         for (id req in all) {
+            NSString *sid = NBKVCStr(req, @"sectionIdentifier");
+            if (sid.length) secCount[sid] = @([secCount[sid] intValue] + 1);
+
+            // 3a) 台账存活：先按**不依赖 bulletin** 的键（nid / uuid）判，再按 bulletin 的键判
             NSMutableSet *hit = [NSMutableSet set];
             for (NSString *key in @[@"notificationIdentifier", @"uuid"]) {
                 NSString *v = NBKVCStr(req, key);
-                if (v.length && [allIDs containsObject:v]) [hit addObject:v];
+                if (v.length && [allIDs containsObject:v]) { [hit addObject:v]; hitById++; }
             }
             id b = NBSafeValue(req, @"bulletin");
             if (b) {
                 for (NSString *key in @[@"bulletinID", @"recordID", @"publisherBulletinID"]) {
                     NSString *v = NBKVCStr(b, key);
-                    if (v.length && [allIDs containsObject:v]) [hit addObject:v];
+                    if (v.length && [allIDs containsObject:v]) { [hit addObject:v]; hitByBulletin++; }
+                }
+            } else if (sid.length && [sid isEqualToString:bundleNow]) {
+                noBulletin++;
+            }
+            if (hit.count) {
+                for (NSMutableDictionary *rec in recs) {
+                    if ([rec[@"keys"] intersectsSet:hit]) rec[@"gone"] = @YES;
                 }
             }
-            if (!hit.count) continue;
-            for (NSMutableDictionary *rec in recs) {
-                if ([hit containsObject:rec[@"cid"]]) rec[@"alive"] = @NO;
+
+            // 3b) 重复诊断：只在**本段**做，按 timestamp 精确到毫秒分组
+            if (sid.length && bundleNow.length && [sid isEqualToString:bundleNow]) {
+                NSDate *ts = NBSafeDate(req, @"timestamp");
+                if (ts) {
+                    NSString *tk = [NSString stringWithFormat:@"%.3f", [ts timeIntervalSince1970]];
+                    NSMutableArray *g = tsGroups[tk];
+                    if (!g) { g = [NSMutableArray array]; tsGroups[tk] = g; }
+                    NSString *nid = NBKVCStr(req, @"notificationIdentifier");
+                    [g addObject:(nid.length ? nid : @"?")];
+                }
             }
         }
+
+        // ---- 4. [寿] 汇总 ----
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
         int goneN = 0, liveN = 0;
         NSTimeInterval gOld = 0, gNew = 0, lOld = 0, lNew = 0;
         for (NSDictionary *rec in recs) {
             NSTimeInterval age = now - [rec[@"ts"] doubleValue];
-            if ([rec[@"alive"] boolValue]) {
-                liveN++;
-                if (!lOld || age > lOld) lOld = age;
-                if (!lNew || age < lNew) lNew = age;
-            } else {
+            if ([rec[@"gone"] boolValue]) {
                 goneN++;
                 if (!gOld || age > gOld) gOld = age;
                 if (!gNew || age < gNew) gNew = age;
+            } else {
+                liveN++;
+                if (!lOld || age > lOld) lOld = age;
+                if (!lNew || age < lNew) lNew = age;
             }
         }
-        NBDiagStep(@"  [寿] 台账 %lu 条 × 扫 NC %lu 条 ⇒ NC 里已消失 %d / 仍在 %d\n",
-                   (unsigned long)recs.count, (unsigned long)all.count, goneN, liveN);
+        NBDiagStep(@"  [寿] 台账 %lu 条 × 扫 NC %lu 条 ⇒ NC 里已消失 %d / 仍在 %d"
+                   @"（按 nid/uuid 命中 %d 次、按 bulletin 命中 %d 次、本段 bulletin 读不到 %d 条）\n",
+                   (unsigned long)recs.count, (unsigned long)all.count, goneN, liveN,
+                   hitById, hitByBulletin, noBulletin);
         if (goneN) NBDiagStep(@"  [寿]   已消失：最老 %.0fs 最新 %.0fs\n", gOld, gNew);
         if (liveN) NBDiagStep(@"  [寿]   仍在  ：最老 %.0fs 最新 %.0fs%@\n", lOld, lNew,
                               (lOld > 600 ? @"  ← 最老已 >10 分钟仍在 ⇒ **不会自己消失**" : @""));
@@ -1236,10 +1286,56 @@ static void NBCheckDeletedAlive(void) {
         for (NSDictionary *rec in [recs reverseObjectEnumerator]) {
             if (shown >= 3) break;
             NBDiagStep(@"  [寿]   %@ %@ %@（%.0fs 前）\n",
-                       [rec[@"alive"] boolValue] ? @"仍在" : @"已消",
+                       [rec[@"gone"] boolValue] ? @"已消" : @"仍在",
                        NBSafeClip(rec[@"bundle"], 32), NBSafeClip(rec[@"cid"], 28),
                        now - [rec[@"ts"] doubleValue]);
             shown++;
+        }
+
+        // ---- 5. [段] + [重]：回答「同一时间怎么有一模一样的信息」 ----
+        // 🔴 只在**每个进程的头一次**打明细（日志窗口 ≈ 最后 50 条，全局滚动，必须省行数）。
+        if (!gCensusDumped) {
+            gCensusDumped = YES;
+            NSArray *ks = [secCount allKeys];
+            NSArray *sorted = [ks sortedArrayUsingComparator:^NSComparisonResult(id a, id b) {
+                return [secCount[b] compare:secCount[a]];      // 条数多的排前面
+            }];
+            NSUInteger n = sorted.count < 5 ? sorted.count : 5;
+            NSMutableString *sb = [NSMutableString string];
+            for (NSUInteger i = 0; i < n; i++) {
+                NSString *s = sorted[i];
+                [sb appendFormat:@"%@=%d%@", NBSafeClip(s, 30), [secCount[s] intValue],
+                                  (i + 1 < n ? @" " : @"")];
+            }
+            NBDiagStep(@"  [段] NC 共 %lu 条 / %lu 个段；最多的 5 个：%@\n",
+                       (unsigned long)all.count, (unsigned long)secCount.count, sb);
+
+            // 同段 + 同一时刻（毫秒级相同）= 同一条通知被放了多份
+            NSMutableArray *dupTs = [NSMutableArray array];
+            for (NSString *tk in tsGroups) {
+                NSArray *g = tsGroups[tk];
+                if (g.count >= 2) [dupTs addObject:@[tk, g]];
+            }
+            [dupTs sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+                return [(NSArray *)b[1] count] > [(NSArray *)a[1] count] ? NSOrderedDescending
+                                                                        : NSOrderedAscending;
+            }];
+            NBDiagStep(@"  [重] 段 %@ 在 NC 里 %d 条 ⇒ 同一时刻出现 ≥2 次的组 %lu 个\n",
+                       NBSafeClip(bundleNow, 32),
+                       [secCount[bundleNow ?: @""] intValue],
+                       (unsigned long)dupTs.count);
+            int shownG = 0;
+            for (NSArray *pair in dupTs) {
+                if (shownG >= 2) break;
+                NSArray *g = pair[1];
+                NSMutableString *ids = [NSMutableString string];
+                NSUInteger gn = g.count < 3 ? g.count : 3;
+                for (NSUInteger i = 0; i < gn; i++) {
+                    [ids appendFormat:@"%@%@", NBSafeClip(g[i], 40), (i + 1 < gn ? @" / " : @"")];
+                }
+                NBDiagStep(@"  [重]   ts=%@ 共 %lu 份：%@\n", pair[0], (unsigned long)g.count, ids);
+                shownG++;
+            }
         }
     } @catch (NSException *e) {
         NBDiagStep(@"  [寿] 抛: %@\n", e.reason);
@@ -1822,7 +1918,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     gBBWithdrawOk++;
                     // v0.0.78：⓪ 真的把账本清掉了 ⇒ 记进 [寿] 台账，后面才能量
                     //   「这条从 NC 消失用了多久」。只记真撤掉的（f0==NO），不记"本来就没有"。
-                    NBDeletedRemember(cid, bundleC);
+                    NBDeletedRemember(cid, recID, pubID, bundleC);
                 }
                 NBDiagStep(@"  ⓪ 之后 BB live=%ld 含本条=%@\n", (long)n0, f0 ? @"是" : @"否");
             } else {
@@ -1978,6 +2074,17 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                            (unsigned long)scq, shq, stq ? @"是" : @"否（已删）", howq ?: @"?");
                             });
                         }
+                    } else if (!still) {
+                        // 🔴🔴 v0.0.79：这一分支是 `nc_diag(19).txt` 里**每一次都走到的那个** ——
+                        //    ⓪ 撤回 BB 之后，系统自己把整条链跑完了
+                        //    （`_sendRemoveBulletins` → `[BB→NC] observer:removeBulletin:` →
+                        //      `[OBS] dispatcher withdrawNotificationWithRequest:` →
+                        //      `[OBS-cs] withdrawNotificationRequest:`），
+                        //    ⑦ 基线 复量就是「本条还在=否」⇒ 界面侧**已经干净了**。
+                        //    ⇒ 这时候再打 ⑦r 是多余的，而且 ⑦r 是唯一一把有连带风险的刀。
+                        //    🔴 必须显式打这一行：否则日志里 ⑦r 一次都不出现，
+                        //       下一轮会读成"⑦r 没跑"，而事实是"根本不需要跑"（假绿的 ⑧ 型反过来）。
+                        NBDiagStep(@"  ⑦r 不需要（⓪ 之后本条已不在 NC ⇒ 系统自己把界面侧撤掉了）\n");
                     }
 
                     // ---------- v0.0.78：[寿] 旧删台账（本轮的核心取证）----------
@@ -2039,7 +2146,8 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                 // 🔴 v0.0.77：这句原来的措辞是「先走 NC 清除 ⇒ 等它返回再清账本」。
                 //   [清] 整段删除后，主队列上这一步**只找 request、不动手**，
                 //   真正的界面侧动作是 ⑧，而且它在**账本清完之后**、在后台队列上跑。
-                NBDiagStep(@"  [序] 本版顺序：主队列只找 request ⇒ 回 BB 队列清账本（⓪）⇒ 再回主队列 ⑦r 动一刀（缓存 %lu 条对本条无效）\n",
+                NBDiagStep(@"  [序] 本版顺序：主队列只找 request ⇒ 回 BB 队列清账本（⓪）⇒ 再回主队列复量，"
+                           @"还在才补 ⑦r（缓存 %lu 条对本条无效）\n",
                            (unsigned long)gNCRequestByID.count);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     NBDiagStep(@"  [找] 进入主队列\n");

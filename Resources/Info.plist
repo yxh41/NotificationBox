@@ -5,8 +5,8 @@
     <key>CFBundleName</key>               <string>NotifyBox</string>
     <key>CFBundleDisplayName</key>        <string>消息盒子</string>
     <key>CFBundleIdentifier</key>         <string>com.yxh41.notifybox.app</string>
-    <key>CFBundleVersion</key>            <string>0.0.78</string>
-    <key>CFBundleShortVersionString</key> <string>0.0.78</string>
+    <key>CFBundleVersion</key>            <string>0.0.79</string>
+    <key>CFBundleShortVersionString</key> <string>0.0.79</string>
     <key>CFBundleExecutable</key>         <string>NotifyBoxApp</string>
     <key>CFBundlePackageType</key>        <string>APPL</string>
     <key>LSRequiresIPhoneOS</key>         <true/>
