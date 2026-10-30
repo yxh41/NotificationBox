@@ -9115,3 +9115,173 @@ INSERT …
 3. **`🔴 [7s/7t/7u] 同段 A → B`** —— 现在口径统一了，**如果还出现跳升，那才是真的**。
    一次都不出现 ⇒ 这条路径彻底排除。
 4. **`[RP] 命中复投`** —— v0.0.83 全程 `投递=1416 / 命中复投=0`，已基本排除「App 重投」。
+
+## v0.0.85 —— 「删了没反应」的物理原因：系统重投同一条通知会**换一个新 ID**
+
+`nc_diag(24).txt`（v0.0.84 真机，34 次删除尝试）：
+
+| 情况 | 次数 | 日志里的样子 |
+| --- | --- | --- |
+| BB 里有本条 ⇒ `⓪` 真清了账本 | **6** | `BB live=… 含本条=是` → `⓪ withdraw…WithRecordID 已返回` |
+| 同段有 N 条、但 ID 都不是目标 | **28** | `[找] … 同段 N 条 ⇒ 都不是目标（目标已不在 NC）⇒ 不动手` |
+
+这 28 次里有 **24 次** `_bulletinsForIDs:@[cid]` **能按 ID 取到那个 bulletin**，
+而且打印出来的 `bulletinID` 就是我们存进库的那个 `cid`：
+
+```
+  cid=E409066A-6D83-4CE9-A1C3-FA1E4BA736F0
+  BB live=1 含本条=否 对象=BBBulletin
+  bulletinID=E409066A-6D83-4CE9-A1C3-FA1E4BA736F0 recordID=com.huaye.Drinking-2026-10-29-08-30
+  [找] 主队列：扫 13 条 request，section=com.huaye.Drinking 同段 1 条 ⇒ 都不是目标
+```
+
+**对象还在**（按 ID 取得出来），但它**不在该段现役列表里**，NC 里那一条对应的是**另一个 ID**。
+能同时满足这三句的只有一种解释：
+
+> 系统把同一条通知**重投过一次**，重投时分配了**新的 bulletinID**。
+> 盒子里那行的 `sys_id` 记的是**旧的**，于是精确匹配永久落空。
+
+这和 v0.0.80 那条结论是一回事的两面：`⓪` 只清账本，界面靠上游传播；
+**重投**则连 ID 都换了。用户那边的语言就是「有些刚推送的，也有的会提示通知不会变」。
+
+### 1. 🔴🔴 上一版「按 sys_id 去重」只治了三分之一
+
+v0.0.85 第一次拿到的 `[重]` 行（v0.0.84 装上后）：
+
+```
+[重] 盒子 2145 行 ⇒ sysId 重复 0 组(多 0 行) / 无 sysId 221 行 ｜ 同内容重复 204 组(多 1853 行)
+```
+
+三个数各说一件事：
+
+| 数 | 读数 | 含义 |
+| --- | --- | --- |
+| `sysId 重复 0 组` | ✅ | v0.0.84 的 sys_id 判等**确实生效了**，同一条没被记两遍 |
+| `无 sysId 221 行` | ⚠️ | 这批行**永远删不掉通知中心**（三道闸的第一道） |
+| `同内容重复 204 组(多 1853 行)` | ❌ | **86% 的行是"同内容不同 ID"** —— 这才是用户眼里的"重复" |
+
+注意最后一行：1853 / 2145 = **86%**。也就是说 v0.0.84 治的那一半（同 ID）本来就只占很小一块，
+**用户看到的重复几乎全是"同内容、不同 ID"**。而这一半，按 `sys_id` 判等**结构性治不了**。
+
+### 2. 三条改动
+
+#### ① 删除侧：精确 ID 落空时按内容兜底（默认开，设置页可关）
+
+请求文件从 `{sysId, bundle}` 扩到 `{sysId, bundle, title, message}`
+（`NotifyStore` 删前多读两列 → `nbRequestClearNCWithSysId:bundle:title:message:`）。
+tweak 侧在**精确匹配确认落空之后**才走这条路，判据故意收得很紧：
+
+```objc
+// 同段 + 同 title + 同 message，**只命中 1 条**才动手
+if (!NBStrSame(NBKVCStr(b, @"title"), title)) continue;
+if (!NBStrSame(NBKVCStr(b, @"message"), message)) continue;
+hits++;
+if (hits == 1) hit = req;
+else break;                       // ≥2 条 ⇒ 立刻收手，不许挑一条凑合
+return (hits == 1) ? hit : nil;
+```
+
+🔴 **只加在 `NBFindAndForwardClear` 里，绝不动 `NBFindOurRequest`。**
+后者还被 5 处「复量」调用（`本条还在=是/否` 就是它给的）；一旦它也按内容认亲，
+这条验收判据就变成"同内容还在也算还在" ⇒ 又一条假绿判据（本项目踩过两次）。
+
+🔴 另外在走兜底那一刻**显式打一行**：
+
+```
+[找·内容] ⚠️ 本次按内容动手 ⇒ 下面各处的「复量」仍按原 ID 判，读数对本次无意义
+```
+
+因为下游 5 处复量用的还是旧 ID，而旧 ID 在兜底之前就匹配不到 ⇒ 它们必然报「已删」。
+不写这一行，下次我自己会把那个「已删」当成"界面变了"的证据。
+
+#### ② 写入侧：`+backfillSysId` —— 后到的入口把 ID 补写回去
+
+同一条通知会经过三个入口，**谁先到谁记录**（`NBClaimKey` 只放行第一个）：
+
+```
+- publishBulletin:destinations:                                  ← 手里有完整 BBBulletin
+- publishBulletinRequest:destinations:                            ← 只有 request
+- _publishBulletinRequest:forSectionID:forDestinations:           ← 最早，ID 可能还没分配
+```
+
+先到的入口可能还没拿到 `bulletinID`（系统在 publish 过程中才分配）⇒ 那一行 `sys_id` 空着；
+后到的入口手里有 ID，却被 `if (!NBClaimKey(key)) return bid;` **挡在 store 之外** ⇒ 永远补不上。
+
+```objc
+if (!NBClaimKey(key)) {
+    // 「已经被记过」≠「已经记好了」
+    if (sysId.length) [NotifyStore backfillSysId:sysId bundle:bid title:title message:msg];
+    return bid;
+}
+```
+
+三护栏与 v0.0.84 同款：① 只改 `sys_id` 为空/NULL 的行（空串相同 ≠ 同一条通知）；
+② 只改 `ORDER BY ts DESC LIMIT 1` 那一行；③ 必须查 `sqlite3_changes()`。
+窗口 **600 秒**：超出就不补 —— "补错人"比"没补上"更糟。
+
+#### ③ 第二级去重：同内容 + 60 秒窗口
+
+```sql
+SELECT id FROM notifications WHERE bundle=? AND title=? AND message=? AND ts>=?  -- inTs-60
+ORDER BY ts DESC LIMIT 1;
+-- 命中 ⇒ 只 UPDATE，不新增行
+UPDATE notifications SET ts=MAX(ts, ?), sys_id=CASE WHEN ?<>'' THEN ? ELSE sys_id END WHERE id=?;
+```
+
+两个细节都不是可选的：
+
+- `ts=MAX(ts, ?)` —— 系统重投旧通知时带的是**原来的**时间戳，直接写会把行往后挪；
+- `sys_id` **允许覆盖**（这次拿到 ID 就换掉旧的）—— "删得掉"靠的就是**最新**那个 ID。
+  只补空位的话，这一行会永远攥着过期 ID ⇒ 用户点删除永远打不中现役那条，
+  这正是上面那 28/34 的由来。窗口只有 60 秒，能落到这里的必然是同一件事的重投。
+
+### 3. 判决性诊断：`221 行无 sys_id` 到底是老记录还是新记录
+
+上一版在弹窗里写「（是旧版本记下的）」—— 那是**没量过的断言**，而用户明确说
+「有些**刚推送**的，也有的会提示通知不会变」。所以这版把它换成两把尺子：
+
+```
+[重] 无 sysId 的时间分布：24h 内 N 行 / 最新 X 秒前 / 最老 Y 秒前（-1 = 没有这类行）
+[无ID#1] tag=PBRS cls=BBBulletinRequest bundle=… bID=(nil) nID=(nil) title=…
+```
+
+| 读数 | 结论 | 下一步 |
+| --- | --- | --- |
+| `24h 内 > 0` | 新记录也在丢 ID ⇒ **写入侧问题** | 看 `[无ID#n]` 的 `tag`：哪个入口先到、`bID/nID` 是不是 nil |
+| `24h 内 = 0` | 221 行全是 v0.0.52 之前的老记录 | 只能靠新记录慢慢替换，界面讲清楚即可 |
+
+三条纪律照旧：`[无ID#n]` 上限 **8 条/进程**（publish 是热路径，diag 是**无条件追加**的）；
+先问 `NBDiagReady()`（文件存在）再写 —— `NBDiagAppend` 在文件不存在时会**自建**它，
+而"方法表只写一次"的判据正是"文件不存在"（v0.0.73 就是这么把整份方法表弄丢的）。
+
+### 4. 文案：把没量过的话收回来
+
+| 位置 | v0.0.84 | v0.0.85 |
+| --- | --- | --- |
+| 列表左滑 | 「这条记录没有系统通知 ID（**是旧版本记下的**），…」 | 「这条记录没有系统通知 ID，无法定位通知中心里的那一条，…」 |
+| 详情页 | 同上（另一句措辞） | 同上 |
+
+只陈述事实（没有 ID ⇒ 定位不到），不猜原因。原因要靠上面那两把尺子量出来。
+
+### 验收
+
+| 项 | 结果 |
+| --- | --- |
+| CI | run `40978500305`（**首轮就过**，无编译失败） |
+| deb | `com.yxh41.notifybox_0.0.85_iphoneos-arm64e.deb`，`1,122,500` B / md5 `4e13eb9d61faa740f2a32fe444ff9ad6` |
+| dylib | 262,016 → `262,016` B（**总长 ±0**）：四个 segment `vmsize` 全 ±0，增量全落在节内 —— `__text` +3,804 / `__ustring` +732 / `__cstring` +713 / `__cfstring` +480 / `__gcc_except_tab` +308 / `__unwind_info` +48 / `__objc_methname` +50 / `__objc_methtype` +40 / `__objc_stubs` +32 / `__objc_methlist` +12 / `__bss` +24 / `__const` +8 / `__objc_selrefs` +8。🔴 **「大小一样」不是证据**（改动吃进了页内余量，MEMORY §7.6） |
+| 包级正向 | **10/10 全过**（旧=0 且 新≥1）—— dylib 6 条：`[重] 无 sysId 的时间分布`、`[无ID#…] tag=… bID=… nID=…`、`[补ID#…]`、`[找·内容] … 同内容命中 %d 条`、「本次按内容动手 ⇒ 复量读数对本次无意义」、`contentFallbackNC`；盒子 App 4 条：两句中性化后的「没有系统通知 ID」完整文案、`ID 对不上时按内容兜底`、`同 App 同内容只命中 1 条才动手` |
+| 包级反向 | 1/1 过：`是旧版本记下的`（v0.0.84 的两句断言）旧=1 新=**0** —— 「删掉一个断言」也算判据，只要它在旧版里确实存在过 |
+| App 二进制 | 487,648 → `487,648` B（**总长 ±0**）：四个 segment `vmsize` 全 ±0；增量在节内 —— `__text` +1,696 / `__cstring` +734 / `__cfstring` +256 / `__gcc_except_tab` +132 / `__ustring` +100 / `__objc_methname` +50 / `__objc_methtype` +40 / `__unwind_info` +16 / `__objc_selrefs` +8 / `__objc_arraydata` +8 / `__objc_methlist` +8 / `__const` +8 —— 本版改了 3 个 App 源文件，仍用「段 ±0 + 节级增量可解释」而不是「区外零」 |
+| 源码自检 | **29 道全绿**（新增 23~29：内容兜底只认唯一命中 / 请求文件四键齐全 / 新开关进 onSave 白名单 / backfill 三护栏 / `[无ID]` 先问 NBDiagReady / dupStats 新三键 / 内容窗口有限且 sys_id 有 CASE 守卫） |
+
+### 5. 下轮看什么
+
+1. **`[重] 无 sysId 的时间分布`** —— 判 221 行是老记录还是新记录（见 §3 的表）。
+   `24h 内 > 0` 就把 `[无ID#n]` 那几行发我，`tag` + `bID/nID` 直接指认是哪个入口。
+2. **`[找·内容] … ⇒ 同内容命中 N 条`** —— 这是新兜底路径的唯一判据。
+   `1 条 ⇒ 唯一命中` 之后，通知中心那一条**应该当场消失**；`多条 ⇒ 不猜，不动手` 属预期。
+3. **`[重] 同内容重复 … 组(多 M 行)`** —— 装上后先记下 `M`，再收几条通知看它还涨不涨。
+   不涨 ⇒ 60 秒窗口去重生效；`M` 是老存量，不会自己变小。
+4. **`[补ID#n]`** —— 出现即说明"后到的入口补上了 ID"，这类行以后就能正常删。
+5. **`🔴 [7s/7t/7u] 同段 A → B`** —— 口径已统一（v0.0.84），现在还出现才是真的段重载。
