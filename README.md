@@ -9285,3 +9285,154 @@ UPDATE notifications SET ts=MAX(ts, ?), sys_id=CASE WHEN ?<>'' THEN ? ELSE sys_i
    不涨 ⇒ 60 秒窗口去重生效；`M` 是老存量，不会自己变小。
 4. **`[补ID#n]`** —— 出现即说明"后到的入口补上了 ID"，这类行以后就能正常删。
 5. **`🔴 [7s/7t/7u] 同段 A → B`** —— 口径已统一（v0.0.84），现在还出现才是真的段重载。
+
+---
+
+## v0.0.86 —— 「刚推送的也删不掉」的真因：**publish 之前系统根本还没分配 ID**
+
+`nc_diag(25).txt`（v0.0.85 真机，29 次删除尝试）。这一轮第一次把「为什么没 ID」量到了：
+
+| 日志 | 次数 | 说明 |
+| --- | --- | --- |
+| `含本条=是` ⇒ `⓪` 真跑了 | **11** | BB 账本里确实有，`⓪ withdraw…WithRecordID` 已返回 |
+| `含本条=否` ⇒ 走内容兜底 | **18** | 精确 ID 匹配落空 |
+| `[找·内容] … 同内容命中 0 条` | **17** | 全是小米米家 ⇒ **真的不在 NC 里** |
+| `[无ID#n]` | **8** | 记录时 ID 落空的那批 |
+
+三条判决性读数：
+
+```
+[无ID#1] tag=PBRS cls=BBBulletinRequest bundle=com.sina.weibo bID=(nil) nID=(nil) title=@李杰灵
+[补ID#n] ……（全程 0 次）
+[重] 盒子 1224 行 ⇒ sysId 重复 0 组(多 0 行) / 无 sysId 4 行 ｜ 同内容重复 7 组(多 8 行)
+     无 sysId 的时间分布：24h 内 4 行 / 最新 2826 秒前 / 最老 5161 秒前
+```
+
+### 1. 🔴🔴 8 条 `[无ID]` 全是同一个入口、同一个类
+
+`tag=PBRS cls=BBBulletinRequest bID=(nil) nID=(nil)` —— 三个词连起来只有一种解释：
+
+> 最早的那个入口 `_publishBulletinRequest:forSectionID:forDestinations:` 拿到的
+> 是**请求对象**（`BBBulletinRequest`），`bulletinID` 是系统在 **publish 过程中**才分配的。
+> 在 `%orig` **之前**读，**永远读不到**。
+
+这是 MEMORY §4.7 那条「观测时刻」的第二次现形：**早于写入的读 ≡「没有这个量」**。
+上一版我在 `NBRecordItem` 里读 ID，那是在 `%orig` 之前 —— 于是这一类通知的 `sys_id` 从出生起就是空的，
+用户的语言就是「有些**刚推送的**，也有的会提示通知不会变」。
+
+### 2. 三条改动
+
+#### ① `%orig` **之后**复读一次，拿到就补写回去
+
+三个 publish 入口尾部统一加：
+
+```objc
+id keep = bulletin;                 // 🔴 强引用住 —— %orig 之后系统可能已经把对象 consume 掉
+%orig(bulletin, destinations);
+NBPickUpAfterPublish(keep, nil, @"PB", 0);
+```
+
+`NBPickUpAfterPublish` 内部：取 ID（`NBPickIdFrom`）→ 有就调 `+backfillSysId` 按
+`bundle + title + message` 去定位「还没 ID 的那一行」补上 —— **不必知道行号**。
+
+🔴 **补写回去的串必须与写入侧同构**，这是这版最容易写错、而且写错了日志上看不出来的一处：
+
+```objc
+// 写入侧 NBRecordItem：两个键都有且不同 ⇒ 存 bID|nID
+if (bID.length && nID.length && ![bID isEqualToString:nID])
+    sysId = [NSString stringWithFormat:@"%@|%@", bID, nID];
+```
+
+删除侧 `NBClearNCCallback` 是把这个串按 `|` 拆成候选**逐个试**的（v0.0.54「两个候选都留一手」）。
+所以 `NBPickIdFrom` 也**必须**拼成 `bID|nID`，不能写成"返回第一个非空键" ——
+只存 `bID` 会把 `nID` 丢掉，而 `nID` 恰恰可能是清除 API 真正要的那个。
+这种错的表现是「补写成功、有值、有行数」，**但复量仍然不匹配**，跟"没补上"长得一模一样。
+
+🔴 `recordID` / `publisherBulletinID` **只看不存**。本来想拿它们兜底（"PBRS 时刻也许已经有值"），
+想清楚后否掉了：`recordID` 对某些 publisher 是**常量**（真机见过 `recordID=kNetWorkChangeNofi`），
+一旦当 `sys_id` 会同时炸两处 —— 写入侧 sys_id 去重把这个 publisher 的通知**合并成一行**（通知凭空消失）、
+删除侧按它匹配会**撤错条**。这两个键的唯一用途是：在 `[无ID]` 日志里露个脸。
+
+#### ② `[补ID]` 全程 0 次却判不出原因 ⇒ 加两个数
+
+上一版只有 `[补ID#n]`（结果），没有分母。0 次可能是「后到的入口没被调用」，
+也可能是「调用了但取不到 ID」，两种修法完全相反。这版每次尝试多打一行：
+
+```
+  [入口] PB=x/y PBR=x/y PBRS=x/y（orig 后取到ID / 被调用）
+```
+
+🔴 `gEntryTook` 的自增**必须放在 bundle 判定之前**。否则 bundle 取不到的入口会被记成
+「没取到 ID」，下一轮我会照着一个错的分子去换刀 —— 有分母没分子已经够难查，
+分子还是错的那就没救了。
+
+顺手把 `[无ID#n]` 改成四键全打：
+`bID=… nID=… rID=… pubID=… title=…` —— 这一版要证明"这两个键确实没值"，就得让它自己说出来。
+
+#### ③ `NBSafeClip` 转义换行 —— 判据被 message 里的 `\n` 劈成两行
+
+小米米家的 message 自带换行（`烹饪已完成\n【米家智能多功能养生壶-2楼客厅…】`），
+于是 17 条 `[找·内容]` 全部变成两行：
+
+```
+  [找·内容] title= msg=烹饪已完成
+【米家智能多功能养生壶…】 ⇒ 同内容命中 0 条 ⇒ 真的不在      ← 前半句孤零零留在上一行
+```
+
+按行 grep **一条都读不到**。这不是显示问题 —— 判读脚本按行切，等于整段判据消失
+（本项目栽过同类坑好几次）。`NBClip`（非字符串分支）早就做了转义，`NBSafeClip` 漏了。
+
+```objc
+if (s.length > max) s = [[s substringToIndex:max] stringByAppendingString:@"…"];
+s = [s stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"];
+s = [s stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
+```
+
+🔴 顺序不可换：**先截断再转义**。反过来的话截断点可能把一个 `\n` 转义劈成两半。
+
+#### ④ 补写窗口 600 → 1800 秒
+
+`insert` 存的 `ts` 是 `date ?: now` —— 不是插入时刻。系统重投一条通知时，
+`date` 可能是**它原本该发生的时间**，早于插入时刻。于是 `ts >= now-600` 会把
+「刚插进来的那一行」**自己**排除掉 ⇒ 补写恒 0 行，而日志显示「取到 ID、补写 0 行」，
+看着像 ID 不对，其实是时间窗把它筛掉了。放宽到 1800 秒的风险由两条护栏兜住：
+只碰 `sys_id` 为空的行、且取 `ts` 最大的那一条。
+
+### 3. 这版**不**解决的事：小米米家那批删不掉，不是 bug
+
+17 次内容兜底全是「同内容命中 0 条」，随后上游把 request 彻底移除
+（`⑦T +5s 复量 … 本条还在=否`）。也就是说：
+
+> 盒子里那条记录**对应的系统通知早就不在通知中心了**（被系统/用户清掉），
+> 所以"删不掉通知中心那条"不是失败 —— 是**没有那条**。
+
+界面文案已经如实讲了（「无法定位通知中心里的那一条」）。这一轮不需要再动它。
+
+### 验收
+
+| 项 | 结果 |
+| --- | --- |
+| CI | run `40984907052`（**首轮就过**，无编译失败） |
+| deb | `com.yxh41.notifybox_0.0.86_iphoneos-arm64e.deb`，`1,123,748` B / md5 `5c3680702f665fbb7284c186d5300778` |
+| dylib | 262,016 → **278,688** B（**+16,672**，跨页了 —— 这版加的是真代码不是注释）：`__TEXT` vmsize +16,384 / `__LINKEDIT` vmsize +16,384；节内 —— `__text` **+1,892** / `__ustring` +452 / `__cfstring` +192 / `__bss` +24 / `__auth_stubs` +16 / `__auth_got` +8 / `__unwind_info` +8 / `__cstring` +5 / `__gcc_except_tab` +4。🔴 上一版是「总长 ±0 + 吃页内余量」，这一版**必须**涨页 —— 判据要跟着改动量走，不能反过来（MEMORY §7.6） |
+| 包级正向 | **9/9 全过** —— v0.0.86 新增 4 条（`[入口] PB=x/y…`、`[入口…] orig 后取到 ID ⇒ 补写 N 行`、`[入口…] orig 后仍无 ID（bID/rID/pubID/nID）`、`[入口…] 拿到 ID 但认不出 bundle`）+ 四键版 `[无ID#…]`；v0.0.85 回归 5 条（`[找·内容]`、内容兜底警告、`[重]` 时间分布、`contentFallbackNC`）要求「旧≥1 且新≥1」 |
+| 包级反向 | 1/1 过：旧格式 `[无ID#… bID=%@ nID=%@ title=%@]` 旧=1 新=**0**（四键版里 `nID=%@` 后面跟的是 `rID=%@`，前缀对不上，不是子串误判） |
+| App 二进制 | 487,648 → `487,648` B：四个 segment `vmsize` **全 ±0**，**所有节 size 全等**；121 个差异字节 = `LC_UUID` 16 + `LC_CODE_SIGNATURE` 103 + `__TEXT,__const` **2**。那 2 字节算出来是 `-600.0 → -1800.0`（`NotifyStore.m` 被 App 与 tweak **共用**）⇒ 期望改成「差异只许是这个常量」，而不是"零差异" |
+| 源码自检 | **34 道全绿**（新增 30~34：`NBSafeClip` 先截断再转义且两处替换都在 / 三个入口的复读都在 `%orig` 之后且调用数=4 / `NBPickIdFrom` 只认两个唯一键且必须拼 `bID\|nID` 且要看内层 `.bulletin` / `[入口]` 两个数定义在使用之前 / `took` 计数在 bundle 判定之前且兜底键与 `NBRecordItem` 一致） |
+| 负向变异 | **6/6 全被抓**（`NBSafeClip` 顺序对调 / 不拼 `\|` / 拿 `recordID` 当 ID / 删掉 PBR 的复读调用 / `took` 挪到 bundle 之后 / 窗口改回 600）—— 新增判据不是恒绿 |
+
+### 4. 下轮看什么
+
+1. **`[入口] PB=x/y PBR=x/y PBRS=x/y`** —— 这是本版的核心分母。
+   - 三个都 `0/0` ⇒ 入口根本没被 hook 到（回到 v0.0.3 那种钩子问题）；
+   - `PBRS=0/N`（N>0）⇒ 调用了但 orig 之后仍取不到 ID ⇒ 这条路**物理上不通**，得换入口/换键；
+   - `PBRS=k/N`（k>0）⇒ 通了，看下一行的「补写 M 行」。
+2. **`[入口PBRS] orig 后取到 ID=… ⇒ 补写 M 行`** —— `M>=1` 才算真补上。
+   `M=0` 有两个可能：`bundle/title/message` 口径没对上（`NBPickUpAfterPublish` 里已按
+   `NBRecordItem` 逐字兜底），或时间窗还是不够。下轮如果还是 0，就把 `M` 旁边加上
+   「同内容空 ID 行数」当分母，别再靠猜。
+3. **`[找·内容]` 现在一行能读完** —— 直接看 `同内容命中 N 条`：`1 ⇒ 唯一命中` 时通知中心那条应消失；
+   `0 ⇒ 真的不在` 属预期（§3）。
+4. **`[无ID#n]` 的 `rID / pubID`** —— 这轮四键全打就是为了让"这两个键到底有没有值"有个硬答案。
+   两个都 `(nil)` ⇒ 以后彻底不用再考虑拿它们兜底。
+5. **装完先记下 `[重] 同内容重复 … 组(多 M 行)` 的 `M`**：不涨 ⇒ 60 秒窗口去重生效；`M` 是老存量，不会自己变小。
