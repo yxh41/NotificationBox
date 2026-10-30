@@ -62,6 +62,23 @@ NS_ASSUME_NONNULL_BEGIN
 //    调晚了角标会先用着默认蓝、再被刷掉（表现为角标闪一下颜色）。
 - (void)setBrandColor:(nullable UIColor *)brand;
 
+// ================= v0.0.92：自定义左滑删除 =================
+// 🔴 为什么不用系统的 `trailingSwipeActionsConfigurationForRowAtIndexPath:`：
+//    它把**整个 cell**（含 `contentView`）一起左移，而图标就挂在 `contentView` 上
+//    ⇒ 图标必然跟着卡片一起走。用户要的是「卡片动、图标原地缩小渐隐」，
+//    系统 API 做不到这件事 —— 它只给"整行位移 + 一个铺满整行高、直角的红块"。
+//    ⇒ 自己画：卡片单独位移（`cardView.transform`）、图标单独缩放渐隐（`iconBox`）、
+//      红色删除按钮自己做一个与卡片**同高同圆角**的。
+// 🔴 点删除时回调。**捕获的必须是 rowId，不是 indexPath** ——
+//    cell 会被复用，indexPath 随时会变，捕获它就是"删错行"的定时炸弹。
+@property (nonatomic, copy, nullable) void (^nbOnDelete)(void);
+// 开始左滑时通知列表：同一时刻只允许一行是打开的 ⇒ 列表用它关掉别的那行。
+@property (nonatomic, copy, nullable) void (^nbOnSwipeBegin)(void);
+// 当前是否处于"打开"状态（列表在 didSelectRow 里据此判断"该收起还是该进详情"）。
+@property (nonatomic, readonly) BOOL nbIsSwiped;
+// 收起。滚动开始时列表调它（否则一边滚一边有一行歪着，看着像渲染错位）。
+- (void)nbCloseSwipeAnimated:(BOOL)animated;
+
 + (CGFloat)height;
 
 @end

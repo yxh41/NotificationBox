@@ -229,6 +229,18 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (NSString *)selLinesFrom:(NSString *)text;
 - (NSString *)probeLinesFrom:(NSString *)text;
 - (NSString *)soundDiagFileText;
+
+// ================= v0.0.92：左滑删除改成自绘（见 NotifyCell.h 顶部注释） =================
+// 🔴 全列表只允许一行处于"左滑打开"状态，这里记住是哪一行。
+//    用 weak：cell 进了复用池就该自动失效，持有强引用会把整个 cell 焊死在内存里，
+//    而且"已经滚出屏幕的那一行"还会被当成"当前打开的那一行"。
+@property (nonatomic, weak) NotifyCell *nbOpenCell;
+// 关掉除 `keep` 以外的所有左滑（传 nil = 全关）。
+// 判据：传的是**当前正在滑的 cell**，不是 indexPath —— cell 会被复用，indexPath 会变。
+- (void)nbCloseOtherSwipesExcept:(NotifyCell *)keep;
+// 按 rowId 删一条。🔴 参数是 rowId 而不是 indexPath：
+//    删除会改数量 ⇒ 内存下标和行号立刻错位（v0.0.33 栽过），而 rowId 是库里的事实。
+- (void)nbDeleteRowId:(NSInteger)rowId;
 @end
 
 @implementation ViewController
@@ -1815,10 +1827,46 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
            count:[self.nbUnreadByBundle[bid] integerValue]];
     // v0.0.48：关键词"标星"动作（★ 展示时派生，nil ⇒ NO ⇒ 不显示，无规则时走这条）。
     [c setStarred:[d[@"nbStar"] boolValue]];
+
+    // ---------- v0.0.92：左滑删除的两个回调（自绘，见 NotifyCell.h） ----------
+    // 🔴 捕获 **rowId**：不捕获 indexPath（滚动/删除后就失效），也不捕获字典快照
+    //    （删库后整表重查，快照就是旧对象）。rowId 是库里的事实，删错的可能性最小。
+    // 🔴 `weakCell` 必须 weak：cell 持有 block、block 再强引用 cell ⇒ 循环引用，
+    //    整个列表的 cell 一个都释放不掉。
+    NSInteger rowId = [d[@"id"] integerValue];
+    __weak typeof(self) weakSelf = self;
+    __weak NotifyCell *weakCell = c;
+    c.nbOnDelete = ^{ [weakSelf nbDeleteRowId:rowId]; };
+    c.nbOnSwipeBegin = ^{ [weakSelf nbCloseOtherSwipesExcept:weakCell]; };
     return c;
 }
 
+// v0.0.92：滚动一开始就把打开的那行收起。
+// 🔴 不收起的话，一边滚一边有一行歪在左边、右边露着红块，滚回来它还在 ——
+//    用户会以为"这一行的渲染坏了"，其实只是状态没清。
+- (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    [self nbCloseOtherSwipesExcept:nil];
+}
+
+// 关掉除 `keep` 以外的左滑。`keep == nil` ⇒ 全关。
+- (void)nbCloseOtherSwipesExcept:(NotifyCell *)keep {
+    NotifyCell *cur = self.nbOpenCell;
+    if (cur && cur != keep) [cur nbCloseSwipeAnimated:YES];
+    self.nbOpenCell = keep;
+}
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    // 🔴 v0.0.92：左滑打开状态下点这一行 = **先收起，不进详情**。
+    //    这是系统列表的既定行为，也是必须做的：不然"左滑露出删除"和"点一下进详情"
+    //    会同时发生 —— 用户想点删除，手一抖点在卡片上，就跳到详情页去了。
+    NotifyCell *swCell = (NotifyCell *)[tableView cellForRowAtIndexPath:indexPath];
+    if ([swCell isKindOfClass:[NotifyCell class]] && swCell.nbIsSwiped) {
+        [swCell nbCloseSwipeAnimated:YES];
+        // animated:NO —— 这一下点击是"用来收起的"，不该再叠一个取消选中的动画
+        [tableView deselectRowAtIndexPath:indexPath animated:NO];
+        [self nbCloseOtherSwipesExcept:nil];
+        return;
+    }
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     NSDictionary *d = self.items[indexPath.row];
     [NotifyStore markRead:[d[@"id"] integerValue]];
@@ -1880,48 +1928,42 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 }
 
 // v0.0.33：左滑删除。
-// 🔴 刻意**不用** `deleteRowsAtIndexPaths:` —— 它要求"内存数组与即将删的行严格同步"，
+// 🔴 v0.0.92：触发方式改成**自绘**（见 NotifyCell.h 顶部注释）——
+//    系统 `trailingSwipeActionsConfigurationForRowAtIndexPath:` 会把整个 cell
+//    （含 contentView）一起左移，而图标就挂在 contentView 上 ⇒ 图标必然跟着走，
+//    做不到「卡片动、图标原地缩小渐隐」。系统那个红块还是直角、铺满整行高。
+// 🔴🔴 但**删除链路一个字都没改**，改的只是"谁来触发"：
+//    仍然刻意**不用** `deleteRowsAtIndexPaths:` —— 它要求"内存数组与即将删的行严格同步"，
 //    而我们删的是数据库。正确顺序是「先删库 → 整表重查」，让两边从同一个来源重建。
 //    只改内存 = 只改账本的读数（数量契约第 2 问）：症状是删完那一行还在，
 //    或者删了 A 却少了一条 B（搜索/筛选态下标错位）。
-- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
-        trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (indexPath.row >= (NSInteger)self.items.count) return nil;
-    NSDictionary *d = self.items[indexPath.row];
-    __weak typeof(self) weakSelf = self;
-    UIContextualAction *del = [UIContextualAction
-        contextualActionWithStyle:UIContextualActionStyleDestructive
-                            title:@"删除"
-                          handler:^(UIContextualAction *action, UIView *src, void (^done)(BOOL)) {
-        NSInteger rowId = [d[@"id"] integerValue];
-        NBSyncClearOutcome outc = NBSyncClearDeleteFail;
-        BOOL ok = (rowId > 0) && [NotifyStore deleteRow:rowId outcome:&outc];
-        // 先重查（数据源变了），再告诉系统动作完成 —— 顺序反了会"删完还留着"。
-        [weakSelf loadData];
-        done(YES);
-        if (!ok) {
-            // 删不到也要说：最常见的原因是 tweak 按「记录上限」把它裁掉了，
-            // 而列表还显示着。静默失败会让人以为删除按钮坏了。
-            [weakSelf alertTitle:@"没删掉"
-                            text:@"这条记录已经不在了（可能被「记录上限」自动清掉了）。列表已刷新。"];
-        } else if (outc == NBSyncClearNoSysId) {
-            // 🔴 v0.0.84：这是「有些能删、有些不行」最常见的那一半 ——
-            //    记录里没有 sys_id，删它**没有任何东西可匹配**，通知中心当然纹丝不动。
-            //    以前这里是静默的，用户只会说"删了没反应"。
-            // 🔴 v0.0.85 改口径：上一版这里写「（是旧版本记下的）」，那是**没量过的断言**——
-            //    用户明确说「有些**刚推送**的也会这样」（`nc_diag(24).txt`）。
-            //    所以只陈述事实（没有 ID、因此定位不到），不猜原因。
-            [weakSelf alertTitle:@"通知中心不会变"
-                            text:@"这条记录没有系统通知 ID，无法定位通知中心里的那一条，"
-                                  "所以只能删掉盒子里的记录。"];
-        } else if (outc == NBSyncClearOff) {
-            [weakSelf alertTitle:@"已删除（未同步通知中心）"
-                            text:@"设置里「删除时同步清通知中心」是关的。"
-                                  "打开后删记录才会把通知中心里那一条也一起清掉。"];
-        }
-    }];
-    del.backgroundColor = [UIColor systemRedColor];
-    return [UISwipeActionsConfiguration configurationWithActions:@[del]];
+// 🔴 参数是 **rowId** 不是 indexPath：删除会改数量 ⇒ 内存下标立刻全体错位（v0.0.33 栽过）；
+//    rowId 是库里的事实，滚动、筛选、复用都不会让它指向别人。
+- (void)nbDeleteRowId:(NSInteger)rowId {
+    NBSyncClearOutcome outc = NBSyncClearDeleteFail;
+    BOOL ok = (rowId > 0) && [NotifyStore deleteRow:rowId outcome:&outc];
+    // 先重查（数据源变了）—— 顺序反了会"删完还留着"。
+    [self loadData];
+    if (!ok) {
+        // 删不到也要说：最常见的原因是 tweak 按「记录上限」把它裁掉了，
+        // 而列表还显示着。静默失败会让人以为删除按钮坏了。
+        [self alertTitle:@"没删掉"
+                    text:@"这条记录已经不在了（可能被「记录上限」自动清掉了）。列表已刷新。"];
+    } else if (outc == NBSyncClearNoSysId) {
+        // 🔴 v0.0.84：这是「有些能删、有些不行」最常见的那一半 ——
+        //    记录里没有 sys_id，删它**没有任何东西可匹配**，通知中心当然纹丝不动。
+        //    以前这里是静默的，用户只会说"删了没反应"。
+        // 🔴 v0.0.85 改口径：上一版这里写「（是旧版本记下的）」，那是**没量过的断言**——
+        //    用户明确说「有些**刚推送**的也会这样」（`nc_diag(24).txt`）。
+        //    所以只陈述事实（没有 ID、因此定位不到），不猜原因。
+        [self alertTitle:@"通知中心不会变"
+                    text:@"这条记录没有系统通知 ID，无法定位通知中心里的那一条，"
+                          "所以只能删掉盒子里的记录。"];
+    } else if (outc == NBSyncClearOff) {
+        [self alertTitle:@"已删除（未同步通知中心）"
+                    text:@"设置里「删除时同步清通知中心」是关的。"
+                          "打开后删记录才会把通知中心里那一条也一起清掉。"];
+    }
 }
 
 @end

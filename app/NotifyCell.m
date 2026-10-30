@@ -1,7 +1,10 @@
 #import "NotifyCell.h"
 #import "NBTheme.h"
 
-@interface NotifyCell ()
+// 🔴 v0.0.92：cell 自己要当 pan 手势的 delegate —— 判"这次滑动算不算左滑"必须
+//    在手势**开始之前**答（`gestureRecognizerShouldBegin:`），识别之后再判就晚了：
+//    那一刻 tableView 的垂直滚动已经被抢走了，表现为"列表滚不动/滚起来一顿一顿"。
+@interface NotifyCell () <UIGestureRecognizerDelegate>
 // 🔴 v0.0.70：卡片容器。以前所有子视图直接挂在 `contentView` 上、靠系统分隔线区分行，
 //    整屏是一块连续的灰白。现在改成「灰色大底 + 一张张圆角卡片」：
 //    · 卡片之间靠**留白**分行，不再需要分隔线（`separatorStyle = None`）
@@ -64,12 +67,30 @@
 //    不能存"已经淡染过的卡片底"：那样按下态和角标都会在卡片底上再算一层，
 //    颜色会一路变浅直到看不出是这个 App。
 @property (nonatomic, strong) UIColor *brandColor;
-// 🔴 内部方法必须显式声明：项目开 -Werror，靠"定义在前面"来解析选择器太脆
-//    （本项目栽过三次：kAutoChainTrigger / uiscrollerInternalVelocity / forceLayoutVisibleCells）。
+
+// ================= v0.0.92：左滑删除的三个新东西 =================
+// 红色删除按钮。挂在 **contentView**（不是 cardView）：它要留在原地，
+// 让卡片移开才露出来 —— 挂 cardView 就会跟着卡片一起走，永远露不出来。
+@property (nonatomic, strong) UIView *swipeActionView;
+@property (nonatomic, strong) UILabel *swipeLabel;
+@property (nonatomic, strong) UIPanGestureRecognizer *nbPan;
+// 当前位移（0 = 关闭，-kNBSwipeActionW = 全开）。
+// 🔴 存**数值**而不是"从 transform 反推"：本项目反复栽在"拿视图状态反推数据状态"
+//    （attributedText 时序、标星、未读角标各一次）。transform 是它的**输出**。
+@property (nonatomic, assign) CGFloat nbOffset;
+// 手势开始那一刻的位移（跟手要用「起点 + 本次平移」，不能直接用本次平移）
+@property (nonatomic, assign) CGFloat nbOffsetAtBegin;
+
+// 🔴 内部方法必须显式声明（项目开 -Werror，靠"定义在前面"解析选择器太脆）
 - (void)nbRender;
 // v0.0.72：未读书签的唯一入口（数字 + 显隐）。和 nbRender 分开：
 // 书签不参与高亮，混进 nbRender 会让"只翻了一次未读"也重算一遍正文富文本。
 - (void)nbUpdatePin;
+// v0.0.92：左滑三件套 —— 应用位移 / 收放到目标位 / 点删除
+- (void)nbApplyOffset:(CGFloat)offset;
+- (void)nbSettleTo:(CGFloat)target animated:(BOOL)animated;
+- (void)nbPan:(UIPanGestureRecognizer *)g;
+- (void)nbTapDelete:(UITapGestureRecognizer *)g;
 @end
 
 // v0.0.44：把 `query` 在 `text` 里出现的每一处都标出来。
@@ -178,6 +199,22 @@ static const CGFloat NBListIconX = 12.0;     // 槽宽 52 ⇒ (52-28)/2 = 12，�
 //    居中的图标会离它自己那一行的文字 30pt 远，看着像两条不相干的东西。
 static const CGFloat NBListIconY = 5.5;
 
+// ================= v0.0.92：左滑删除的几何 =================
+// 🔴 按钮宽度**刻意等于左侧图标槽宽**（`NBListIconSlot` = 52），不是随手取 76/88：
+//    卡片左移 52 之后，卡片左缘正好停在 contentView 左缘（52 − 52 = 0），
+//    卡片**不会被推出 cell 左边界**。推出去的那一截会被 tableView 的
+//    `clipsToBounds` 切掉，看起来像渲染残缺（左边少一条边）。
+//    同时"让出来的那块"正好是图标槽的宽度 —— 图标又正在原地缩小渐隐，
+//    位置自然空出来，视觉上就是「图标退场、红块补位」。
+//    ⛔ 不要为了让按钮更宽而加大这个数：卡片左缘会变成负数。
+// 🔴 这里是字面量 52.0 而不是 `NBListIconSlot`，因为后者是 extern const（非编译期常量，
+//    不能用于静态初始化）⇒ **自检里有一条判据专门查这两个数相等**，
+//    改了一边另一边就会红。
+static const CGFloat kNBSwipeActionW = 52.0;
+// 图标最多缩到多小。0.55 = "还认得出是这个图标，但显然已经不是主角"；
+// 缩到 0.2 会像个掉出来的点，只缩到 0.9 又看不出"退场"。
+static const CGFloat kNBSwipeIconMinScale = 0.55;
+
 + (CGFloat)height { return kNBCardInteriorH + kNBCardInsetY * 2; }
 
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
@@ -192,6 +229,36 @@ static const CGFloat NBListIconY = 5.5;
     // 🔴 关掉系统选中态：它会盖一层灰在整个 cell 上（含卡片外的留白），
     //    看起来像"整行被框住了"。选中反馈改在 setHighlighted: 里只染卡片自己。
     self.selectionStyle = UITableViewCellSelectionStyleNone;
+
+    // ---------- v0.0.92：红色删除按钮（必须在 cardView **之前** add） ----------
+    // 🔴 视图层级顺序 = z 序。这个按钮要**留在原地让卡片移开才露出来**，
+    //    所以它必须在 cardView 的**下面**（先 add 的在下面）。
+    //    ⛔ 顺序反了的表现是"左滑之后什么都看不见" —— 按钮被卡片盖住了，
+    //    而且不会有任何报错。
+    self.swipeActionView = [[UIView alloc] init];
+    self.swipeActionView.backgroundColor = [UIColor systemRedColor];
+    // 🔴 与卡片**同款**圆角：同一个常量 + 同一个曲率。
+    //    ⛔ 不要写 8 / 12 这种手感值 —— 用户要的就是"和卡片一样"，那就必须是同一个来源。
+    self.swipeActionView.layer.cornerRadius = NBListCardRadius;
+    self.swipeActionView.layer.cornerCurve = kCACornerCurveContinuous;
+    self.swipeActionView.clipsToBounds = YES;
+    self.swipeActionView.hidden = YES;          // 没滑动时彻底不参与显示
+    [self.contentView addSubview:self.swipeActionView];
+
+    self.swipeLabel = [[UILabel alloc] init];
+    self.swipeLabel.text = @"删除";
+    self.swipeLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    self.swipeLabel.textColor = [UIColor whiteColor];
+    self.swipeLabel.textAlignment = NSTextAlignmentCenter;
+    // 按钮只有 52pt 宽，被系统"辅助功能大字体"撑爆时宁可缩字也别截成"删…"
+    self.swipeLabel.adjustsFontSizeToFitWidth = YES;
+    self.swipeLabel.minimumScaleFactor = 0.7;
+    [self.swipeActionView addSubview:self.swipeLabel];
+
+    UITapGestureRecognizer *tap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(nbTapDelete:)];
+    [self.swipeActionView addGestureRecognizer:tap];
+
     self.cardView = [[UIView alloc] init];
     self.cardView.backgroundColor = NBCardBG();
     self.cardView.layer.cornerRadius = NBListCardRadius;   // v0.0.88：12 → 14
@@ -321,6 +388,20 @@ static const CGFloat NBListIconY = 5.5;
     //    视图层级顺序 = z 序，这一条在本项目已经栽过（topCard 必须第一个 add）。
     [self.cardView addSubview:self.pinView];
 
+    // ---------- v0.0.92：左滑手势 ----------
+    // 🔴 `cancelsTouchesInView` 必须**保持 YES**（显式写出来，别留给默认值）。
+    //    它的语义是「**手势识别成功之后**才取消这条 touch」——
+    //    没滑动时照常点击，滑动了就不再把这次抬起当成"点了一下"。
+    //    ⛔ 改成 NO 会得到两个坏症状：滑完手指抬起时 cell 收到 touchesEnded ⇒
+    //       跳进详情页（用户只是想左滑）；或者反过来滑一下就被吞掉点击。
+    //    这条和"`delaysTouchesEnded=NO` 否则点击发涩"是**两件不同的事**，别混。
+    self.nbPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(nbPan:)];
+    self.nbPan.cancelsTouchesInView = YES;
+    // 🔴 不能延迟 touchesBegan：那样列表的按下态会晚上一拍，滚动手感发滞
+    self.nbPan.delaysTouchesBegan = NO;
+    self.nbPan.delegate = self;
+    [self.contentView addGestureRecognizer:self.nbPan];
+
     return self;
 }
 
@@ -355,6 +436,16 @@ static const CGFloat NBListIconY = 5.5;
     self.cardView.frame = card;
     CGFloat w = card.size.width;      // 卡片宽：卡片内一切横坐标都相对它
     CGFloat h = card.size.height;
+
+    // ---------- v0.0.92：红色删除按钮（contentView 坐标，贴卡片右端、与卡片同高） ----------
+    // 🔴 它**不跟随位移**：frame 只由 card 决定，卡片移开它就露出来。
+    //    右端 = 卡片右端 ⇒ 卡片左移 52 之后，露出的那块（宽 52）正好被它填满，
+    //    与卡片右缘严丝合缝，不会出现"卡片走了、红块旁边留一条缝"。
+    self.swipeActionView.frame = CGRectMake(CGRectGetMaxX(card) - kNBSwipeActionW,
+                                            card.origin.y,
+                                            kNBSwipeActionW,
+                                            card.size.height);
+    self.swipeLabel.frame = self.swipeActionView.bounds;
 
     // ---------- 卡片外左侧槽：**只有图标**（contentView 坐标，要带 card.origin.y） ----------
     self.iconBox.frame = CGRectMake(NBListIconX, card.origin.y + NBListIconY,
@@ -413,6 +504,128 @@ static const CGFloat NBListIconY = 5.5;
     // 🔴 这一段必须排在角标判定**之后**：顺序反了会拿上一轮/上一行的 isUnread 算宽度。
     CGFloat msgW = self.isUnread ? MAX(0.0, textW - 26.0) : textW;
     self.msgLabel.frame = CGRectMake(textX, msgY, msgW, msgH);
+}
+
+// ================= v0.0.92：左滑删除 =================
+// 全部位移的**唯一出口**。⛔ 不要在别处直接改 `cardView.transform` / `iconBox.alpha`：
+// 那样"卡片位移"和"图标缩小渐隐"就有了两份真值，改一处漏一处 ——
+// 症状是"滑到一半图标不缩了"或者"收起了但图标还是半透明"，而且两处代码各自看都对。
+- (void)nbApplyOffset:(CGFloat)offset {
+    self.nbOffset = offset;
+    CGFloat p = (kNBSwipeActionW > 0.0) ? (-offset / kNBSwipeActionW) : 0.0;   // 进度 0~1
+    if (p < 0.0) p = 0.0;
+    if (p > 1.0) p = 1.0;
+
+    // ① 只有**卡片**动。图标挂在 contentView 上，天然不跟 —— 这正是自绘的意义所在。
+    self.cardView.transform = CGAffineTransformMakeTranslation(offset, 0.0);
+
+    // ② 图标**原地**缩小 + 渐隐。`anchorPoint` 默认 (0.5, 0.5) ⇒ 缩放以自身中心为锚点。
+    //    ⛔ 别改 anchorPoint 来"调缩放位置"：改了会同时把 frame 挪走，
+    //    图标会先偏一下再缩，看着像抖了一下。
+    CGFloat s = 1.0 - (1.0 - kNBSwipeIconMinScale) * p;
+    self.iconBox.transform = CGAffineTransformMakeScale(s, s);
+    self.iconBox.alpha = 1.0 - p;
+
+    // ③ 按钮：一开始滑就露出来。
+    // 🔴 这里**只负责显示，不负责隐藏**。隐藏必须等收起动画**结束之后**再做
+    //    （见 `nbSettleTo:animated:` 的 completion）——
+    //    `hidden` 不是可动画属性，在动画块里设 YES 会**立刻**生效：
+    //    表现为"红块先啪一下消失，卡片还在回弹路上"，中间那一瞬露出灰底。
+    if (p > 0.001) self.swipeActionView.hidden = NO;
+}
+
+// 收放到目标位置。`animated:NO` 只给 prepareForReuse 用（复用池里不要动画）。
+- (void)nbSettleTo:(CGFloat)target animated:(BOOL)animated {
+    if (!animated) {
+        [self nbApplyOffset:target];
+        if (target >= -0.001) self.swipeActionView.hidden = YES;
+        return;
+    }
+    // 🔴 `BeginFromCurrentState` 不能省：跟手到一半松手时要从**当前**位置接着动画。
+    //    少了它，动画会从"上一次设定值"开始 ⇒ 手指拖到一半停下再松手，卡片先跳一下就弹回去。
+    [UIView animateWithDuration:0.25
+                          delay:0.0
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState)
+                     animations:^{
+        [self nbApplyOffset:target];
+    } completion:^(BOOL finished) {
+        // 收起到位之后才隐藏：提前隐藏会看到"红块先消失、卡片还在路上"
+        if (target >= -0.001) self.swipeActionView.hidden = YES;
+    }];
+}
+
+- (BOOL)nbIsSwiped { return (self.nbOffset < -0.5); }
+
+- (void)nbCloseSwipeAnimated:(BOOL)animated {
+    [self nbSettleTo:0.0 animated:animated];
+}
+
+- (void)nbPan:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:self.contentView];
+    CGPoint v = [g velocityInView:self.contentView];
+    switch (g.state) {
+        case UIGestureRecognizerStateBegan:
+            self.nbOffsetAtBegin = self.nbOffset;
+            // 同一时刻只允许一行打开：通知列表把别的那行收起
+            if (self.nbOnSwipeBegin) self.nbOnSwipeBegin();
+            break;
+
+        case UIGestureRecognizerStateChanged: {
+            // 🔴 用「起点 + 累计平移」，不是只用「累计平移」：
+            //    后者在"已经打开的行走再拖一次"时从 0 起算 ⇒ 卡片瞬间跳回原位再跟手。
+            CGFloat x = self.nbOffsetAtBegin + t.x;
+            if (x > 0.0) {
+                x *= 0.2;                                   // 右滑越界给阻尼，别硬顶
+            } else if (x < -kNBSwipeActionW) {
+                x = -kNBSwipeActionW + (x + kNBSwipeActionW) * 0.2;
+            }
+            [self nbApplyOffset:x];
+            break;
+        }
+
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed: {
+            // 判据 = "速度优先、位置兜底"：快速甩一下不管拖了多远都按方向收/放；
+            // 慢慢拖超过一半才算打开。300pt/s 大致是"明显有甩的动作"。
+            BOOL open;
+            if (v.x < -300.0) {
+                open = YES;
+            } else if (v.x > 300.0) {
+                open = NO;
+            } else {
+                open = (self.nbOffset < -kNBSwipeActionW * 0.5);
+            }
+            [self nbSettleTo:(open ? -kNBSwipeActionW : 0.0) animated:YES];
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+- (void)nbTapDelete:(UITapGestureRecognizer *)g {
+    // 🔴 一次性动作必须判 state：手势 action 在每个状态变化时都会回调，
+    //    不判就可能执行两次（本项目在长按菜单上必现过一件事做两遍）。
+    if (g.state != UIGestureRecognizerStateEnded) return;
+    if (self.nbOnDelete) self.nbOnDelete();
+}
+
+// 🔴 只在"水平主导"时才开始，而且必须在**手势开始之前**答
+//    （`gestureRecognizerShouldBegin:`）。识别之后再判就晚了 ——
+//    那一刻 tableView 的垂直滚动已经被抢走，表现为"列表滚不动 / 滚起来一顿一顿"。
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
+    if (g != self.nbPan) return YES;
+    CGPoint v = [self.nbPan velocityInView:self.contentView];
+    // 不用 fabs：省掉 math.h 依赖，也就省掉"include 有没有排在第一次使用之前"这条判据
+    CGFloat ax = (v.x < 0.0) ? -v.x : v.x;
+    CGFloat ay = (v.y < 0.0) ? -v.y : v.y;
+    if (ax <= ay) return NO;                        // 竖直为主 ⇒ 交给 tableView 滚动
+    // 关闭状态下只认"向左"；已经打开时两个方向都要（右滑收起）
+    if (v.x > 0.0 && self.nbOffset >= -0.5) return NO;
+    return YES;
 }
 
 // v0.0.70：按下时只染**卡片**，不染整行。
@@ -603,6 +816,26 @@ static const CGFloat NBListIconY = 5.5;
     // 🔴 v0.0.48：★ 同理必须复位（否则上一行标了星、这一行规则没命中，星会串过来）。
     self.starred = NO;
     self.starLabel.hidden = YES;
+
+    // 🔴🔴 v0.0.92：左滑状态**三样一起**复位，少一样就是一个"看着像 bug 又找不到"的症状：
+    //   ① `cardView.transform` 不清 ⇒ 滚回来那行卡片还是歪的（缩在左边、右边露着红块）；
+    //   ② `iconBox` 的 `scale` 不清 ⇒ 图标一直小一号；
+    //   ③ `iconBox.alpha` 不清 ⇒ 图标一直是半透明的（**最容易漏的就是这条**：
+    //      卡片正了、按钮也藏了，只有图标发虚，很容易被当成"图标资源本身有问题"）；
+    //   ④ `nbOffset` 不清 ⇒ `nbIsSwiped` 还是 YES，那一行会被判成"打开着"，
+    //      点它不进详情、只是"收起"一下 —— 表现为"某些行点不开"。
+    //    统一走 `nbApplyOffset:0` 而不是逐项赋值：它是位移的唯一出口，四项一次到位。
+    // 🔴 复位前必须先**掐掉还在跑的动画**：松手回弹的 0.25s 动画如果没完就被复用，
+    //    它会在随后的帧里继续改 transform ⇒ 新行一滚进来就带着上一条的位移，
+    //    而且过 0.1 秒又自己变正 —— 这种"闪一下"极难复现。
+    //    `removeAllAnimations` 只清动画、不改属性值，所以下面的复位仍然有效。
+    [self.cardView.layer removeAllAnimations];
+    [self.iconBox.layer removeAllAnimations];
+    [self nbApplyOffset:0.0];
+    // 🔴 block 也要清：不清就会留着上一行捕获的 rowId，
+    //    万一这一行没走到 cellForRow 就被点了删除 ⇒ **删掉上一条**。
+    self.nbOnDelete = nil;
+    self.nbOnSwipeBegin = nil;
 }
 
 @end
