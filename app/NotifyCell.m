@@ -138,8 +138,9 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
 //       这个代价换的是"时间、未读、正文三者不再互相挤"，值得。
 // 🔴🔴 v0.0.88：卡片彻底换成「图标在卡片外 + 每条按 App 淡染」的 HyperOS 排法。
 //    左右内缩不再是同一个值（`kNBCardInsetX` 已删）：
-//    左边 46pt 是**图标槽**（图标在卡片外面），右边只有 10pt。
+//    左边是**图标槽**（图标 + App 名都在卡片外面），右边只有 10pt。
 //    左右不对称是故意的 —— 照着截图量的，不要"顺手改成对称"。
+// 🔴 v0.0.89：槽 46 → 52（App 名搬进槽里，见 NBTheme.m）。
 // 🔴 卡片内部仍用**一个常量**，行高 = 它 + 上下留白：
 //    layoutSubviews 里所有 y 都相对卡片算，改高度只需改这一个数。
 static const CGFloat kNBCardInsetY = 5.0;    // 卡片上下留白（行距 10）
@@ -151,10 +152,10 @@ static const CGFloat kNBCardInteriorH = 118.0;
 // 卡片内部统一内边距。14 → 16：截图量出来是 ~20pt，但我们的卡片比它窄
 // （左边让了 46pt 给图标槽），照抄 20 会把正文挤成 3 个字一行。16 是折中。
 static const CGFloat kNBPad = 16.0;
-// 左侧图标（在卡片**外面**）。24×24 是截图量的 ~22pt 取整。
-static const CGFloat NBListIconSize = 24.0;
-static const CGFloat NBListIconX = 10.0;
-static const CGFloat NBListIconY = 9.0;      // 相对卡片顶（和第一行文字对齐）
+// 左侧图标（在卡片**外面**）。v0.0.89：24 → 28（用户要求"图标再大一些"）。
+static const CGFloat NBListIconSize = 28.0;
+static const CGFloat NBListIconX = 12.0;     // 槽宽 52 ⇒ (52-28)/2 = 12，正好居中
+static const CGFloat NBListIconY = 8.0;      // 相对卡片顶
 
 + (CGFloat)height { return kNBCardInteriorH + kNBCardInsetY * 2; }
 
@@ -199,15 +200,19 @@ static const CGFloat NBListIconY = 9.0;      // 相对卡片顶（和第一行�
     [self.iconBox addSubview:self.letterLabel];
 
     // v0.0.42：App 名。
-    // 🔴 字号 12 / secondaryLabel —— 和时间同一规格。它是"上下文"，不是内容：
-    //    比标题抢眼就等于把最该看的东西挤下去了。
-    //    v0.0.88：11 → 12，因为它现在和"时间"同处第一行、左右对称，
-    //    太小会显得第一行是"脚注"而不是"发信人 + 什么时候"。
+    // 🔴 v0.0.89：从「卡片内第一行左边」搬到**卡片外、图标正下方**（用户要求）。
+    //    搬家的三个连带改动，少一个就错位：
+    //      ① 父视图从 cardView → **contentView**（卡片外了，挂 cardView 会被裁掉）；
+    //      ② 字号 12 → 10（槽只有 52pt 宽，12pt 一行只放得下 4 个字）；
+    //      ③ 对齐方式 → **居中**（它是图标的标签，左对齐会跟图标错开）。
+    // 🔴 它仍然是"上下文"不是内容：比标题抢眼就等于把最该看的东西挤下去了。
     self.appLabel = [[UILabel alloc] init];
-    self.appLabel.font = [UIFont systemFontOfSize:12];
+    self.appLabel.font = [UIFont systemFontOfSize:10];
     self.appLabel.textColor = [UIColor secondaryLabelColor];
+    self.appLabel.numberOfLines = 2;                       // "拼多多商家版"这类要两行
+    self.appLabel.textAlignment = NSTextAlignmentCenter;
     self.appLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    [self.cardView addSubview:self.appLabel];
+    [self.contentView addSubview:self.appLabel];
 
     self.titleLabel2 = [[UILabel alloc] init];
     // v0.0.88：15 → 16。卡片染了色之后底色不再是纯白，同样字号观感会"变小一号"。
@@ -224,6 +229,12 @@ static const CGFloat NBListIconY = 9.0;      // 相对卡片顶（和第一行�
     // v0.0.88：左对齐 → **右对齐**。它从"正文下方一行"搬回了**第一行行尾**（HyperOS 排法），
     // 位置在行尾当然要右对齐，否则时间和卡片右缘之间会空出一大块。
     self.timeLabel.textAlignment = NSTextAlignmentRight;
+    // 🔴 v0.0.89：加一道"缩字兜底"。用户报过「日期后面的时间没了」——
+    //    真因是标签右端被推到卡片外、被 `clipsToBounds` 裁掉（坐标系 bug，已修），
+    //    但这类"就差几个 pt"的截断不该再靠"我把宽度算对了"来保证：
+    //    允许缩到 80%，宁可小一点，也不要悄悄少一半信息。
+    self.timeLabel.adjustsFontSizeToFitWidth = YES;
+    self.timeLabel.minimumScaleFactor = 0.8;
     [self.cardView addSubview:self.timeLabel];
 
     // v0.0.45：subtitle 单独一行。
@@ -254,12 +265,13 @@ static const CGFloat NBListIconY = 9.0;      // 相对卡片顶（和第一行�
     // v0.0.48：★（关键词"标星"动作）。默认藏 —— 和未读角标一样，
     // 万一某处忘了调 setStarred:，宁可少一颗星，也不要给所有行都点上。
     // 🔴 systemOrange：金/橙在浅色底上醒目，又不是"行情红绿"那种会误读成涨跌的颜色。
-    // v0.0.88：13 → 12（跟第一行字号一致）；位置从右下角搬到**第一行右端、时间左边**。
+    // v0.0.89：13 → 12；位置从「第一行右端、时间左边」**再挪到第一行左端** ——
+    //    App 名搬出卡片后第一行左边空了，★ 正好去填；右端留给时间，右下角留给未读角标。
     self.starLabel = [[UILabel alloc] init];
     self.starLabel.text = @"★";
     self.starLabel.font = [UIFont systemFontOfSize:12];
     self.starLabel.textColor = [UIColor systemOrangeColor];
-    self.starLabel.textAlignment = NSTextAlignmentRight;
+    self.starLabel.textAlignment = NSTextAlignmentLeft;
     self.starLabel.hidden = YES;
     [self.cardView addSubview:self.starLabel];
 
@@ -291,70 +303,85 @@ static const CGFloat NBListIconY = 9.0;      // 相对卡片顶（和第一行�
 - (void)layoutSubviews {
     [super layoutSubviews];
     // =================================================================
-    // v0.0.88 布局：图标在卡片**外面**，卡片内四行（App名+时间 / 标题 / 副标题 / 正文）
-    // 🔴 左右内缩不再相等（左 46 给图标槽、右 10），所以**不能再用 CGRectInset**
-    //    —— 它只能等量缩，用它就等于把图标槽那一半也缩到右边去。
+    // 🔴🔴 v0.0.89：坐标系修正 —— 上一版卡片里的文字**整体右移了一个卡片原点**。
+    //
+    // 病根：`appLabel` / `titleLabel2` / `msgLabel` / `timeLabel` / `starLabel` / `pinView`
+    //      全是 **cardView 的子视图**，frame 本来就相对 cardView ⇒ 再写一次 `ox + xxx`
+    //      等于加了两次卡片原点。
+    // 为什么 v0.0.87 没被发现：那版 `ox` 只有 12pt，多 12pt 在一张卡片里"看着差不多"。
+    //      这版 `ox` 变成 46pt（图标槽），一次升级成三个可见症状：
+    //        ① 文字偏右一大截、卡片左边空一片；
+    //        ② 时间标签右端被推到卡片外 —— `cardView` 是 clipsToBounds，
+    //           于是只剩左半截「10-30」，`08:11` 被裁掉（用户原话「日期后面的时间还是要的」）；
+    //        ③ 未读角标整个落在卡片外 ⇒ 彻底看不见（用户原话「未读标签呢」）。
+    //
+    // 🔴🔴 验收口径（这类错以后一律按这个量）：**「文字左缘 − 卡片左缘」必须等于内边距**。
+    //      量绝对坐标量不出这个错 —— 绝对坐标偏了多少，取决于卡片原点是多少。
+    //
+    // 本方法里的两个坐标系，分清楚再写：
+    //   · contentView 坐标：cardView、iconBox、appLabel（左侧槽里的东西）
+    //   · cardView 坐标：标题 / 副标题 / 正文 / 时间 / ★ / 未读角标
     // =================================================================
     CGFloat fullW = self.contentView.bounds.size.width;
     CGRect card = CGRectMake(NBListIconSlot, kNBCardInsetY,
                              MAX(0.0, fullW - NBListIconSlot - NBListCardRight),
                              kNBCardInteriorH);
     self.cardView.frame = card;
-    CGFloat w = card.size.width;
+    CGFloat w = card.size.width;      // 卡片宽：卡片内一切横坐标都相对它
     CGFloat h = card.size.height;
-    CGFloat ox = card.origin.x;      // 卡片原点：卡片内每个 frame 都要带上
-    CGFloat oy = card.origin.y;
 
-    // ---- 卡片外：左侧图标 ----
-    self.iconBox.frame = CGRectMake(NBListIconX, oy + NBListIconY, NBListIconSize, NBListIconSize);
+    // ---------- 卡片外左侧槽：图标 + App 名（contentView 坐标，要带 card.origin.y） ----------
+    self.iconBox.frame = CGRectMake(NBListIconX, card.origin.y + NBListIconY,
+                                    NBListIconSize, NBListIconSize);
     self.iconView.frame = self.iconBox.bounds;
     self.letterLabel.frame = self.iconBox.bounds;
+    // v0.0.89：App 名搬到**卡片外、图标下面**（用户要求）。
+    // 🔴 高度只给两行（10pt x 2 + 行距 2 ≈ 26pt），**不能给"剩余全部高度"**：
+    //    UILabel 在过高的 frame 里会**垂直居中** ⇒ 名字会飘到卡片中间，离图标老远。
+    CGFloat nameY = NBListIconY + NBListIconSize + 3.0;
+    self.appLabel.frame = CGRectMake(2.0, card.origin.y + nameY,
+                                     NBListIconSlot - 4.0, 28.0);
 
-    // ---- 卡片内 ----
+    // ---------- 卡片内（cardView 坐标，⛔ 一个都不许再加卡片原点） ----------
     CGFloat textX = kNBPad;
     CGFloat textW = MAX(0.0, w - kNBPad * 2);
-
-    // 第一行（y=12~27）：App 名（左）… [★] 时间（右）
-    // 🔴 时间宽度写死 80：内容是 "10-30 08:11"（12pt ≈ 64pt），留 16pt 余量够放大一档。
-    //    ⛔ 别按字符串长度/实测宽度算 —— 每次 layout 都量一次文字，滚动时是白掉的帧。
-    CGFloat timeW = MIN(80.0, textW * 0.45);
+    // 时间宽 90：容得下 "10-30 08:11"（12pt ≈ 66pt），并且**永远落在卡片内**
+    // （`w - kNBPad - timeW` 本身就是相对卡片宽算的）。
+    CGFloat timeW = MIN(90.0, textW * 0.5);
     CGFloat starW = 16.0;
-    CGFloat starGap = 6.0;
-    CGFloat appW = MAX(0.0, textW - timeW - starW - starGap - 6.0);
-    self.appLabel.frame    = CGRectMake(ox + textX, oy + 12, appW, 15);
-    self.starLabel.frame   = CGRectMake(ox + w - kNBPad - timeW - starGap - starW, oy + 12, starW, 15);
-    self.timeLabel.frame   = CGRectMake(ox + w - kNBPad - timeW, oy + 12, timeW, 15);
 
-    // 第二行（y=33~53）：标题，**独占整行宽**（时间已经不在这一行了）
-    self.titleLabel2.frame = CGRectMake(ox + textX, oy + 33, textW, 20);
+    // 第一行（y=12~27）：★（左）…… 时间（右）
+    // v0.0.89：App 名搬走后这一行左边空了，把 ★ 挪过来填左端（右下角还是未读角标的）。
+    self.starLabel.frame = CGRectMake(textX, 12.0, starW, 15.0);
+    self.timeLabel.frame = CGRectMake(w - kNBPad - timeW, 12.0, timeW, 15.0);
+
+    // 第二行（y=33~53）：标题，独占整行宽
+    self.titleLabel2.frame = CGRectMake(textX, 33.0, textW, 20.0);
 
     // 第三行（y=54~70）：副标题，有才占位
     // 🔴 判据用 `rawSubtitle`（原始串），**不用** `subLabel.text` ——
-    //    `attributedText` 赋值之后 `.text` 的取值时机不保证早于本方法，
-    //    拿视图状态反推数据状态这种事在本项目已经栽过（观测者把被观测量改了）。
+    //    `attributedText` 赋值之后 `.text` 的取值时机不保证早于本方法。
     BOOL hasSub = (self.rawSubtitle.length > 0);
     self.subLabel.hidden    = !hasSub;
-    self.subLabel.frame     = CGRectMake(ox + textX, oy + 54, textW, 16);
+    self.subLabel.frame     = CGRectMake(textX, 54.0, textW, 16.0);
 
     // 第四块：正文（y=71 有副标题 / 54 没有，到底部留 12）
-    // 🔴 118-12-71 = 35pt，正好装两行 13pt + 行距 2（≈33pt）；
-    //    没有副标题时得到 52pt，但 numberOfLines=2 ⇒ 多余的部分是留白，不是第三行。
+    // 🔴 118-12-71 = 35pt，正好装两行 13pt + 行距 2（≈33pt）。
     CGFloat msgY = hasSub ? 71.0 : 54.0;
     CGFloat msgH = MAX(31.0, h - 12.0 - msgY);
 
-    // 右下角未读圆形角标
+    // 右下角未读圆形角标（贴卡片右下角，⛔ 不许超出卡片宽 —— 超了就被 clipsToBounds 吃掉）
     // 🔴 显隐判据用原始 `self.isUnread`，不用 pinView.hidden。
     if (self.isUnread) {
         CGFloat d = 20.0;
-        self.pinView.frame = CGRectMake(ox + w - kNBPad - d, oy + h - 12.0 - d, d, d);
+        self.pinView.frame = CGRectMake(w - kNBPad - d, h - 12.0 - d, d, d);
         self.pinView.layer.cornerRadius = d / 2.0;
         self.pinLabel.frame = self.pinView.bounds;
     }
-    // 🔴 有角标时正文要让出 26pt：角标 y=86~106，正文最后一行落在 90~106，
-    //    竖向是重叠的 ⇒ 不让位就是"字压在角标上"。
+    // 🔴 有角标时正文要让出 26pt：角标 y=86~106，正文最后一行落在 90~106，竖向是重叠的。
     // 🔴 这一段必须排在角标判定**之后**：顺序反了会拿上一轮/上一行的 isUnread 算宽度。
     CGFloat msgW = self.isUnread ? MAX(0.0, textW - 26.0) : textW;
-    self.msgLabel.frame = CGRectMake(ox + textX, oy + msgY, msgW, msgH);
+    self.msgLabel.frame = CGRectMake(textX, msgY, msgW, msgH);
 }
 
 // v0.0.70：按下时只染**卡片**，不染整行。

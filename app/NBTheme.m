@@ -15,7 +15,9 @@ const CGFloat NBSepInset   = 60.0;   // 16(内边距) + 28(图标) + 12(间距) 
 //    （按截图宽 = 393pt）：图标槽 46 / 右缘 10 / 圆角 14。
 //    ⚠️ 卡片**左缘 46 而右缘只有 10**，左右不对称是**故意的** ——
 //    左边要让出「图标在卡片外」那条槽，右边不需要。
-const CGFloat NBListIconSlot   = 46.0;
+// 🔴 v0.0.89：槽 46 → 52。因为 App 名搬到了图标下面（用户要求），
+//    46pt 宽只放得下 4 个汉字/行；52 能让「拼多多商家版」排成两行还留边。
+const CGFloat NBListIconSlot   = 52.0;
 const CGFloat NBListCardRight  = 10.0;
 const CGFloat NBListCardRadius = 14.0;
 

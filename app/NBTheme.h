@@ -43,7 +43,7 @@ UIFont *NBFontField(void);    // 输入框
 //    （设置页那种"一张白卡片里套若干行"），这一组是「信息流卡片」
 //    （每条记录各自一张、各自染色）。两者的边距/圆角/底色纪律不一样，
 //    混用会让设置页跟着变形 —— 而设置页这次一个字都不该动。
-extern const CGFloat NBListIconSlot;     // 左侧图标槽宽（图标在卡片**外面**）
+extern const CGFloat NBListIconSlot;     // 左侧图标槽宽（图标 + App 名，都在卡片**外面**）
 extern const CGFloat NBListCardRight;    // 卡片右缘到 cell 右缘
 extern const CGFloat NBListCardRadius;   // 卡片圆角（比分组卡片大 2pt）
 
