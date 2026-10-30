@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.85"
+#define NB_VER_STR @"0.0.86"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -657,6 +657,15 @@ static NSArray  *gWantIDs    = nil;  // v0.0.68：本条的 cid / recordID / pub
 //   用户看到的就是「删了没反应」。兜底判据见 NBFindRequestByContent。
 static NSString *gWantTitle  = nil;
 static NSString *gWantMsg    = nil;
+// 🔴 v0.0.86：三个 publish 入口的落地计数（槽位 0=PB / 1=PBR / 2=PBRS）。
+//   为什么必须量：v0.0.85 的 `[无ID#n]` 8 条**全部**是 `tag=PBRS cls=BBBulletinRequest`，
+//   而 `[补ID#n]` 一条都没有 ⇒ 要么后到的入口根本没被调用，要么它拿到的 ID 没补上。
+//   这两种情况的修法完全不同，不能再猜。
+//   口径：`gEntryHit` = 入口被调用次数；`gEntryTook` = 该入口在 `%orig` **之后**读到了 ID 的次数。
+//   🔴 两个数必须成对出现 —— 只有分母没有分子（或反过来）都判不出东西（MEMORY §4.13）。
+static int gEntryHit[3]  = {0, 0, 0};
+static int gEntryTook[3] = {0, 0, 0};
+static int gPickLog      = 0;        // `[入口]` 复读日志的条数上限（热路径，必须封顶）
 static __strong id gCSDestination = nil;  // 真 destination（CSNotificationDispatcher 实例）
 static BOOL gCSDestFromHook = NO;          // 它是「注册期 hook」接住的（不是靠 OBS 撞上的）
 static __strong id gFoundNCReq = nil;     // 找到的**真** request（系统对象，不是我造的）
@@ -1031,7 +1040,16 @@ static id __attribute__((unused)) NBMakeNCRequest(NSString *bundle, NSString *ci
 static NSString *NBSafeClip(id v, NSUInteger max) {
     NSString *s = NBStringish(v);
     if (s) {
-        if (s.length > max) return [[s substringToIndex:max] stringByAppendingString:@"…"];
+        // 🔴🔴 v0.0.86：**必须先把换行转义掉**。
+        //   真机 `nc_diag(25).txt`：17 条 `[找·内容]` 全部被劈成两行，因为小米米家的
+        //   message 本身带换行（`烹饪已完成\n【米家智能多功能养生壶…】`）⇒
+        //   `…⇒ 同内容命中 0 条 ⇒ 真的不在` 全跑到下一行去了，按行 grep **一条都读不到**。
+        //   这不是显示问题：判读脚本按行切，等于整段判据消失（本项目栽过同类坑好几次）。
+        //   `NBClip`（非字符串分支）早就做了转义，这里漏了。
+        // ⚠️ 顺序：**先截断再转义** —— 反过来的话截断点可能把一个 `\n` 转义劈成两半。
+        if (s.length > max) s = [[s substringToIndex:max] stringByAppendingString:@"…"];
+        s = [s stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"];
+        s = [s stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
         return s;
     }
     return NBClip(v, max);   // 非字符串 ⇒ NBClip 只返回 <类名>
@@ -1944,6 +1962,12 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         }
         NBDiagStep(@"\n=== [尝试 %@ @%@] v%@ async sysId=%@ bundle=%@\n",
                    [NSDate date], NBProc(), NB_VER_STR, sysId, bundle);
+        // 🔴 v0.0.86：三个 publish 入口的「取到 ID / 被调用」两个数一次给全（进程累计）。
+        //   上一版 `[无ID#n]` 8 条全是 PBRS，而 `[补ID#n]` 0 次，我却判不出
+        //   「后到的入口没被调用」和「调用了但没 ID」—— 有分母没分子是最难查的一种日志。
+        NBDiagStep(@"  [入口] PB=%d/%d PBR=%d/%d PBRS=%d/%d（orig 后取到ID / 被调用）\n",
+                   gEntryTook[0], gEntryHit[0], gEntryTook[1], gEntryHit[1],
+                   gEntryTook[2], gEntryHit[2]);
 
         NSArray  *cands   = [sysId componentsSeparatedByString:@"|"];
         NSString *bundleC = [bundle copy];
@@ -2968,11 +2992,23 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
     //    两个都非空且不同 ⇒ 存成 "bID|nID"，清除时逐个试（见 NBClearNCCallback）。
     NSString *bID = NBSafeStr(obj, @"bulletinID");
     NSString *nID = NBSafeStr(obj, @"notificationIdentifier");
+    // 🔴🔴 v0.0.86 关键取舍：`recordID` / `publisherBulletinID` **只看不存**。
+    //   一开始我是想把它们也当 sysId 存的（"PBRS 时刻可能已经有值"），想清楚后否掉了：
+    //   `recordID` 对某些 publisher 是**常量**（真机见过 `recordID=kNetWorkChangeNofi`），
+    //   一旦把它当 sys_id，会同时踩两个坑：
+    //     ① 写入侧 sys_id 去重会把这一 publisher 的所有通知**合并成一行**（通知凭空消失）；
+    //     ② 删除侧 `NBReqMatchKey` 按它匹配 ⇒ 命中"第一条 recordID 相同"的 request ⇒ **撤错条**。
+    //   ⇒ 只有真正唯一的键（`bulletinID`，其次 `notificationIdentifier`）才配当 sys_id。
+    //   `recordID/pubID` 的用途只有一个：**在 `[无ID]` 里露个脸**，告诉我们 PBRS 时刻到底哪个键有值。
+    NSString *rID = NBSafeStr(obj, @"recordID");
+    NSString *pID = NBSafeStr(obj, @"publisherBulletinID");
     {
         id inner2 = NBSafeValue(obj, @"bulletin");
         if (inner2 && inner2 != obj) {
             if (!bID.length) bID = NBSafeStr(inner2, @"bulletinID");
             if (!nID.length) nID = NBSafeStr(inner2, @"notificationIdentifier");
+            if (!rID.length) rID = NBSafeStr(inner2, @"recordID");
+            if (!pID.length) pID = NBSafeStr(inner2, @"publisherBulletinID");
         }
     }
     NSString *sysId = nil;
@@ -3043,9 +3079,12 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
         static int gNoIdLog = 0;
         if (gNoIdLog < 8 && NBDiagReady()) {
             gNoIdLog++;
-            NBDiagStep(@"[无ID#%d] tag=%@ cls=%@ bundle=%@ bID=%@ nID=%@ title=%@\n",
+            // v0.0.86：四个键全打。上一版只打 bID/nID，看不到 recordID 有没有值 ——
+            //   而那正是这一版新加的两个候选，必须能自证。
+            NBDiagStep(@"[无ID#%d] tag=%@ cls=%@ bundle=%@ bID=%@ nID=%@ rID=%@ pubID=%@ title=%@\n",
                        gNoIdLog, tag, NBClassName(obj), bid,
-                       NBSafeClip(bID, 40), NBSafeClip(nID, 40), NBSafeClip(title, 30));
+                       NBSafeClip(bID, 40), NBSafeClip(nID, 40),
+                       NBSafeClip(rID, 40), NBSafeClip(pID, 40), NBSafeClip(title, 30));
         }
     }
 
@@ -3206,6 +3245,94 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     return out;
 }
 
+// ---------- v0.0.86：publish **之后**复读 ID，并把它补回到刚记的那一行 ----------
+// 🔴 为什么必须是"之后"：真机 `nc_diag(25).txt` 的 8 条 `[无ID#n]` 全是
+//   `tag=PBRS cls=BBBulletinRequest bID=(nil) nID=(nil)` —— PBRS 拿到的是**请求对象**，
+//   `bulletinID` 是系统在 publish 过程中才分配的。在 `%orig` 之前读，**永远读不到**。
+//   这正是 MEMORY §4.7 那条「观测时刻」：早于写入的读 ≡「没有这个量」。
+// 🔴 补写复用 `+backfillSysId`（按 bundle+title+message+600 秒窗口定位"还没 ID 的那一行"），
+//   所以这里只要把 ID 拿到手就行，不必知道行号。
+// 🔴 顺带把「哪个入口被调用了 / 哪个入口取到了 ID」记成两个数（`gEntryHit` / `gEntryTook`）——
+//   上一版 `[补ID#n]` 全程 0 次，我却无法区分"后到的入口没被调用"和"调用了但没 ID"。
+// 🔴🔴 补写回去的串**必须与写入侧同构**，否则删除侧照旧匹配不上：
+//   写入侧（`NBRecordItem`）的 sysId 规则是「bID 和 nID 都有且不同 ⇒ 存 `bID|nID`」，
+//   删除侧 `NBClearNCCallback` 再按 `|` 拆成候选逐个试（v0.0.54「两个候选都留一手」）。
+//   所以这里也必须拼成 `bID|nID`，**不能只返回第一个非空键** —— 只存 bID 会把 nID 丢掉，
+//   而 nID 恰恰可能是清除 API 真正要的那个。这个错会让「补写成功」变成「补了个用不上的 ID」，
+//   而且日志上完全看不出来（有值、有行数、复量却仍不匹配）。
+static NSString *NBPickIdFrom(id obj) {
+    if (!obj) return nil;
+    // 🔴 只认**唯一**的键。`recordID` / `publisherBulletinID` 对某些 publisher 是常量
+    //   （真机见过 `recordID=kNetWorkChangeNofi`）⇒ 当 sys_id 会同时炸两处：
+    //   写入侧去重把它们合并成一行、删除侧按它匹配会撤错条。
+    //   ⇒ 这两个键只出现在日志里，永远不进库。
+    id inner = NBSafeValue(obj, @"bulletin");
+    if (inner == obj) inner = nil;
+    NSString *bID = NBSafeStr(obj, @"bulletinID");
+    NSString *nID = NBSafeStr(obj, @"notificationIdentifier");
+    if (!bID.length && inner) bID = NBSafeStr(inner, @"bulletinID");
+    if (!nID.length && inner) nID = NBSafeStr(inner, @"notificationIdentifier");
+    if (bID.length && nID.length && ![bID isEqualToString:nID]) {
+        return [NSString stringWithFormat:@"%@|%@", bID, nID];
+    }
+    if (bID.length) return bID;
+    if (nID.length) return nID;
+    return nil;
+}
+
+// `hint` 是调用点已知的 sectionID（PBRS 的第二个参数按 ENC 就是 @，最可靠）。
+// 🔴 bundle / title / message 的兜底顺序必须与 `NBRecordItem` **逐字一致** ——
+//   补写是靠 `bundle + title + message + 600 秒窗口` 去定位「还没 ID 的那一行」，
+//   只要有一处口径不同（比如这里少看了内层 `.bulletin`），就会定位不到、
+//   补写返回 0 行，而日志会显示「取到 ID、补写 0 行」—— 又是一个要查半天才明白的读数。
+static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot) {
+    if (slot >= 0 && slot < 3) gEntryHit[slot]++;
+    if (!obj) return;
+    id inner = NBSafeValue(obj, @"bulletin");
+    if (inner == obj) inner = nil;
+
+    NSString *idAfter = NBPickIdFrom(obj);
+    // 🔴 计数**必须在 bundle 判定之前**。否则 bundle 取不到的入口会被记成
+    //   「取不到 ID」⇒ 下一轮我会照着一个错的分子去换刀。
+    if (slot >= 0 && slot < 3 && idAfter.length) gEntryTook[slot]++;
+
+    NSString *bundle = hint.length ? hint : NBSafeStr(obj, @"sectionID");
+    if (!bundle.length && inner) bundle = NBSafeStr(inner, @"sectionID");
+    NSString *title = NBSafeStr(obj, @"title");
+    NSString *msg   = NBSafeStr(obj, @"message");
+    if (inner) {
+        if (!title.length) title = NBSafeStr(inner, @"title");
+        if (!msg.length)   msg   = NBSafeStr(inner, @"message");
+    }
+
+    BOOL wantLog = (gPickLog < 6 && NBDiagReady());
+    if (!idAfter.length) {
+        if (wantLog) {
+            gPickLog++;
+            NBDiagStep(@"[入口%@] orig 后仍无 ID（bID=%@ rID=%@ pubID=%@ nID=%@）⇒ 这条路取不到\n",
+                       tag, NBSafeClip(NBSafeStr(obj, @"bulletinID"), 32),
+                       NBSafeClip(NBSafeStr(obj, @"recordID"), 32),
+                       NBSafeClip(NBSafeStr(obj, @"publisherBulletinID"), 32),
+                       NBSafeClip(NBSafeStr(obj, @"notificationIdentifier"), 32));
+        }
+        return;
+    }
+    if (!bundle.length) {
+        if (wantLog) {
+            gPickLog++;
+            NBDiagStep(@"[入口%@] orig 后拿到 ID=%@ 但认不出 bundle ⇒ 不补写\n",
+                       tag, NBSafeClip(idAfter, 44));
+        }
+        return;
+    }
+    NSInteger n = [NotifyStore backfillSysId:idAfter bundle:bundle title:title message:msg];
+    if (wantLog) {
+        gPickLog++;
+        NBDiagStep(@"[入口%@] orig 后取到 ID=%@ ⇒ 补写 %ld 行（bundle=%@ title=%@）\n",
+                   tag, NBSafeClip(idAfter, 44), (long)n, bundle, NBSafeClip(title, 24));
+    }
+}
+
 // ---------- 入口 1：- publishBulletin:destinations: ----------
 %group GPB
 %hook BBServer
@@ -3213,10 +3340,14 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     NBCaptureServerIfNeeded(self);   // v0.0.52：捕获 BBServer 实例 + 队列（同步清通知中心用）
     NBDecision d = NBPipeline(bulletin, nil, @"PB", &gHit1);
     if (!d.allow) return;
+    // 🔴 v0.0.86：`keep` 是**强引用**。`%orig` 之后系统可能已经把对象 consume 掉，
+    //    后面还要读它的 4 个 ID 键 ⇒ 必须自己抓一个引用，否则是"读已释放对象"。
+    id keep = bulletin;
     %orig(bulletin, destinations);
     // 🔴 v0.0.22：必须在 orig **之后**读 —— 要看的正是"系统处理完之后 sound 还在不在"。
     //    只在目标 App 输出（内部判），不会刷屏。
     [NBSoundDiag probeAfterPublish:bulletin stage:@"PB"];
+    NBPickUpAfterPublish(keep, nil, @"PB", 0);
 }
 %end
 %end
@@ -3228,8 +3359,10 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     NBCaptureServerIfNeeded(self);   // v0.0.52：捕获 BBServer 实例 + 队列（同步清通知中心用）
     NBDecision d = NBPipeline(request, nil, @"PBR", &gHit2);
     if (!d.allow) return;
+    id keep = request;
     %orig(request, destinations);
     [NBSoundDiag probeAfterPublish:request stage:@"PBR"];
+    NBPickUpAfterPublish(keep, nil, @"PBR", 1);
 }
 %end
 %end
@@ -3246,8 +3379,12 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
     NBCaptureServerIfNeeded(self);   // v0.0.52：捕获 BBServer 实例 + 队列（同步清通知中心用）
     NBDecision d = NBPipeline(request, sid, @"PBRS", &gHit3);
     if (!d.allow) return;
+    id keep = request;
     %orig(request, sectionID, destinations);
     [NBSoundDiag probeAfterPublish:request stage:@"PBRS"];
+    // 🔴 v0.0.86：这一条是**主力**。`[无ID#n]` 8 条全是它 —— 它拿的是 BBBulletinRequest，
+    //    publish 之前没有 bulletinID ⇒ 记录时 sysId 落空。orig 之后再来取一次。
+    NBPickUpAfterPublish(keep, sid, @"PBRS", 2);
 }
 %end
 %end

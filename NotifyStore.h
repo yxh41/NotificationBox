@@ -29,9 +29,13 @@ typedef NS_OPTIONS(NSUInteger, NBKeywordAction) {
 //   先到的那个入口可能还没拿到 bulletinID（系统在 publish 过程中才分配）
 //   ⇒ 那一行 sys_id 为空 ⇒ 以后永远删不掉通知中心里那条。
 //   后到的入口手里有 ID，但它会被 NBClaimKey 挡在 store 之前 ⇒ 在这里补写。
+// 🔴 三个调用点（v0.0.86 补了后两个）：① NBClaimKey 被挡；②③ 三个 publish 入口在 `%orig`
+//   **之后**复读一次 ID（`NBPickUpAfterPublish`）—— 拿到就补，不必知道行号。
 // 🔴 三条护栏（少一条就出事）：① 只改 `sys_id` 为空/NULL 的行；② 只改**最近那一行**
 //   （同内容可能有历史脏行，一把 UPDATE 会连坐）；③ 必须查 `sqlite3_changes()`
-//   （UPDATE 命中 0 行也返回 SQLITE_DONE）。窗口 600 秒，超出就不补（怕补错人）。
+//   （UPDATE 命中 0 行也返回 SQLITE_DONE）。
+// 🔴 v0.0.86 窗口 600 → 1800 秒：`ts` 存的是 `date ?: now`，而重投通知的 `date`
+//   可能早于插入时刻 ⇒ 600 秒会把"刚插进来的那一行"自己筛掉（补写恒 0 行）。
 // 返回补上的行数（0 = 没有可补的）。
 + (NSInteger)backfillSysId:(NSString *)sysId
                     bundle:(NSString *)bundle

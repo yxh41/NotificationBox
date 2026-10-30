@@ -599,6 +599,12 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
     NSInteger changed = 0;
     @try {
         double now = [[NSDate date] timeIntervalSince1970];
+        // 🔴 v0.0.86：窗口 600 → 1800 秒。原来的 600 是基于「补写紧跟在插入之后，秒级」这个
+        //   假设，但 `ts` 存的**不是插入时刻**，而是 `date ?: now`（见 insert 那段）——
+        //   系统重投一条通知时，`date` 可能是它**原本该发生的时间**，早于插入时刻。
+        //   于是 `ts>=now-600` 会把"刚插进来的那一行"自己排除掉 ⇒ 补写恒 0 行，
+        //   而日志显示「取到 ID、补写 0 行」，看着像是 ID 不对，其实是时间窗把它筛掉了。
+        //   放宽到 1800 秒的风险由两条护栏兜住：只碰 `sys_id` 为空的行，且取 ts 最大的那一条。
         const char *upd = "UPDATE notifications SET sys_id=? WHERE id=("
                           "SELECT id FROM notifications WHERE bundle=? AND title=? AND message=? "
                           "AND (sys_id IS NULL OR sys_id='') AND ts>=? "
@@ -609,7 +615,7 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
             sqlite3_bind_text(st, 2, [bundle UTF8String], -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(st, 3, [title ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(st, 4, [message ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
-            sqlite3_bind_double(st, 5, now - 600.0);
+            sqlite3_bind_double(st, 5, now - 1800.0);
             int rc = sqlite3_step(st);
             if (rc == SQLITE_DONE) changed = sqlite3_changes(db);
             else NBStoreLog(@"补写 sys_id 失败 rc=%d err=%s", rc, sqlite3_errmsg(db));
