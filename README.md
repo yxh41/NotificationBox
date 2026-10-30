@@ -9900,3 +9900,147 @@ v0.0.90 只改布局常量，所以能做到「归一化版本串后零差异」
 在 Git Bash 里 `grep -c $'\r$' file` 会把**所有行**都报成 CRLF（本机实测：
 `Tweak.x CRLF=4210 / 总行=4210`），差点以为整个文件被写成 CRLF。
 行尾一律用 Python 数字节：`d.count(b"\r\n")` / `d.count(b"\n")`。
+
+## v0.0.92 —— 左滑删除改成自绘：**就卡片动，图标原地缩小渐隐，红块同款圆角**
+
+用户原话：
+
+> 先更改下信息卡片左滑的删除动画吧，左滑信息卡片的时候，就卡片动，app图标不用移动，就原地缩小渐隐就好，然后右边红色删除直角改同款圆角
+
+一句话结论：**系统的 `trailingSwipeActionsConfigurationForRowAtIndexPath:` 做不到这三件事**，
+不是调参问题，是它的模型里就没有"图标和卡片分开动"这个概念。所以这一版把它整个换成了自绘。
+
+### 1. 🔴🔴 为什么系统 API 一定做不到
+
+系统 swipe 的实现是：**把整个 cell（含 `contentView`）一起左移**，然后把 action 按钮塞进腾出来的空位。
+
+而我们的图标就挂在 `contentView` 上（`iconBox` 是 `contentView` 的子视图）。
+
+| 用户要的 | 系统 API 给的 | 能不能调出来 |
+|---|---|---|
+| 卡片左移、**图标留在原地** | 整个 `contentView` 左移 ⇒ 图标**必然**跟着走 | ❌ 根子上做不到 |
+| 图标**原地缩小渐隐** | 没有任何"图标"概念 | ❌ |
+| 红块**同款圆角** | `UIContextualAction` 的按钮是直角、且铺满整行高 | ❌ 只能拿 `backgroundColor` 染个色 |
+
+⇒ 结论：不是"再试试参数"，是**换实现**。
+
+### 2. 改了什么（`app/NotifyCell.m` 608 → 841 行）
+
+自绘的四个部件：
+
+| 部件 | 做法 |
+|---|---|
+| 红色删除块 | 一个 `UIView` + `cornerRadius = NBListCardRadius` + `kCACornerCurveContinuous`（跟卡片同一套圆角参数） |
+| 「删除」二字 | `UILabel` 14pt semibold / 白 / 居中 / `adjustsFontSizeToFitWidth` |
+| 左滑手势 | `UIPanGestureRecognizer` 挂在 `contentView` 上 |
+| 点红块删除 | `UITapGestureRecognizer` 挂在红块上 |
+
+对外只加四样东西（`app/NotifyCell.h`）：
+
+```objc
+@property (nonatomic, copy, nullable) void (^nbOnDelete)(void);
+@property (nonatomic, copy, nullable) void (^nbOnSwipeBegin)(void);
+@property (nonatomic, readonly) BOOL nbIsSwiped;
+- (void)nbCloseSwipeAnimated:(BOOL)animated;
+```
+
+`app/ViewController.m` 三处接线：`cellForRow` 里挂两个 block、`scrollViewWillBeginDragging:`
+时收起已打开的、`didSelectRow` 开头「打开状态下点卡片 = 先收起，不进详情页」。
+
+**删除链路一个字没改** —— 还是走 `[NotifyStore deleteRow:rowId outcome:&outc]` 那一套，
+三种提示文案（没删掉 / 通知中心不会变 / 已删除未同步）原样复用。
+
+### 3. 五个必须知道的坑（都是"不报错、但不对"）
+
+| # | 坑 | 症状 | 正解 |
+|---|---|---|---|
+| 1 | 🔴🔴 **视图 add 顺序 = z 序** | 左滑之后**什么都看不见**（啥也不报） | 红块必须**先** `addSubview`，卡片移开才露得出来 |
+| 2 | 🔴 **按钮宽必须等于左侧图标槽宽（52）** | 红块边缘被切掉一条 / 与卡片右缘不齐 | 卡片左移 52 后左缘正好落在 `contentView` 左缘（52−52=0），再宽就越出 cell 被 `clipsToBounds` 切 |
+| 3 | 🔴 **`hidden` 不是可动画属性** | 红块"啪"一下消失，卡片还在回弹路上 ⇒ 中间露一瞬灰底 | 位移方法里只**显示**红块，隐藏放到收起动画的 `completion` 里 |
+| 4 | 🔴 **复用前必须 `removeAllAnimations`** | 新行带着上一条的位移、过一会儿自己变正（极难复现） | 松手回弹的 0.25s 动画没完就被复用，会在随后帧继续改 `transform` |
+| 5 | 🔴 **`cancelsTouchesInView` 必须保持 YES** | 滑完抬手**跳进详情页** | 它的语义是"识别成功后才取消这条 touch"；改成 NO 就会在抬手时触发 `touchesEnded` |
+
+另外两条判据性的：
+
+- **判"水平主导"只能在 `gestureRecognizerShouldBegin:` 里做**。识别之后再判就晚了 ——
+  tableView 的垂直滚动已经被抢走，表现为**列表滚动一顿一顿的**。
+- **只有 `MakeScale`（`anchorPoint` 默认 0.5,0.5）才是"原地"缩小**。
+  改 `anchorPoint` 会同时把 frame 挪走 ⇒ 图标先偏一下再缩。
+
+「原地缩小渐隐」的换算写在一个唯一出口里，位移和缩放一起算，避免两处各算一次：
+
+```objc
+CGFloat p = MIN(1.0, MAX(0.0, -offset / kNBSwipeActionW));   // 0 = 没滑，1 = 全开
+self.cardView.transform = CGAffineTransformMakeTranslation(offset, 0.0);
+CGFloat s = 1.0 - (1.0 - kNBSwipeIconMinScale) * p;          // 1.0 → 0.55
+self.iconBox.transform = CGAffineTransformMakeScale(s, s);
+self.iconBox.alpha = 1.0 - p;                                 // 1.0 → 0.0
+```
+
+### 4. 自检 221 道 / 变异 17/17
+
+- 自检 **221 道**（v0.0.91 的 149 道**一条没少**，新增 72 道 N 组）
+- 变异 **17/17**，每条都要求**指定的那一条**判据变红，不是"整体有红"
+- 🔴 这一轮 `segment()` 的起点锚点**栽了两次**：只写 `- (void)nbApplyOffset:` 命中的是
+  类扩展里的**声明**，抽出来的段只有 39 字符 ⇒ 假红。**起点一律写带 ` {` 的定义形式。**
+- 🔴 `before()` 拿的是"b 的首次出现"，`[self loadData];` 这种常见语句在文件别处早就有
+  ⇒ 新加了 `after(label, p, a, b)`（从 a 之后找 b）。
+
+### 5. 二进制对拍：这条判据的**期望**本身写错了
+
+先看硬数（dylib 只改了版本串、App 真改了代码，两侧判据**必须相反**）：
+
+| 项 | 结果 |
+|---|---|
+| dylib | 278624 → 278624 B（+0），归一化后差异 **120 B 全在 UUID(16) + 签名(104)，越界 0 段** |
+| App 主程序 | 488464 → 505520 B（**+17056**） |
+| `__objc_methname` | 28046 → 29251 B（+1205） |
+| 10 个新增选择器 | 全部进包，且**旧包里命中 0**（反向对照成立） |
+| `__objc_classlist` | **192 → 192 B（24 项 → 24 项）** |
+| `__objc_data` | **1920 → 1920 B** |
+| Info.plist | `bplist00`，`0.0.92` 在 / `0.0.91` 不在 |
+
+我原来写的那条是「`__objc_classname` 逐字节相同 ⇒ 没有新增类」，跑出来红了：695 → 726 B。
+
+**是期望错了，不是代码错了**（按纪律：改期望，不许改闸门迁就）。把它按 `\0` 切开、
+只留纯 ASCII 名字后，差集**恰好**是：
+
+```
++ ['UIGestureRecognizerDelegate']
+- []
+```
+
+原因是这一版给 `NotifyCell ()` 加了 `<UIGestureRecognizerDelegate>` ——
+**协议名和类名写在同一段里**，段必然变长。
+
+⇒ 换成四条真正只跟"类的个数"挂钩、且各自可证伪的判据：
+
+| 判据 | 为什么它能证伪 |
+|---|---|
+| `__objc_classlist` 两版项数相同（24 → 24） | 多一个类就必然多 8 B |
+| `__objc_data` 字节数相同（1920 → 1920） | 每个 class_t + metaclass 是 40+40 B，多一个类 +80 B |
+| classname 段新增 ASCII 名**恰好只有** `UIGestureRecognizerDelegate` | 真新增类的话，类名会作为 ASCII 出现在差集里 |
+| classname 段**没丢**任何旧名字 | 删类会在这里露出来 |
+
+四条各做了一条负向变异（`clslist` / `objcdata` / `name` / `gone`），**4/4 精确变红**，
+其余判据保持绿。
+
+🔴 顺带证伪了一条旧注释：`UIContextualAction` **不在** `__objc_classname` 里
+（该段只写本 image 定义的类名 + 遵循的协议名，**外部类的引用不往这里写名字**）。
+原来那句"它仍然在 ⇒ 这条反例不能用"连前提都是错的，已改掉。
+
+### 6. 交付
+
+```
+dist/notifybox-0.0.92.deb   1,127,774 B   md5 c7ff7c693b64e3a0a3225a0d0628000a
+```
+
+CI run `41073137762` 首轮过；推送后逐文件 blob sha 对拍 **67/67 一致**。
+
+### 7. 下轮看什么
+
+- **归并折叠**（已有数据支撑：40 组 / 多 70 行，重复只在盒子数据库、不在通知中心）：
+  同 App + 同 title + 同 message + 同一天合成一条，右侧挂 `×3` 徽章。
+  这是"数量契约"类改动 ⇒ 只许从「加格那一刻」拦，或只改「格的长相」，别去动账本读数。
+- 真机手感：阻尼系数（现在越界 0.2）、开合阈值（`-26pt` 或速度 `300`）。
+  这两处**必须真机调**，纸面算不出来。
