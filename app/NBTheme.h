@@ -38,6 +38,30 @@ UIFont *NBFontValue(void);    // 右侧取值
 UIFont *NBFontHeader(void);   // 分组标题
 UIFont *NBFontField(void);    // 输入框
 
+// ---------- v0.0.88：信息流卡片（首页每条记录一张，HyperOS 风） ----------
+// 🔴 为什么**单独一组**、不并进上面的尺寸 token：上面那一组是「分组卡片」
+//    （设置页那种"一张白卡片里套若干行"），这一组是「信息流卡片」
+//    （每条记录各自一张、各自染色）。两者的边距/圆角/底色纪律不一样，
+//    混用会让设置页跟着变形 —— 而设置页这次一个字都不该动。
+extern const CGFloat NBListIconSlot;     // 左侧图标槽宽（图标在卡片**外面**）
+extern const CGFloat NBListCardRight;    // 卡片右缘到 cell 右缘
+extern const CGFloat NBListCardRadius;   // 卡片圆角（比分组卡片大 2pt）
+
+/// 淡染：品牌色按 20%（浅色）/ 28%（深色）混进卡片底色，返回**动态色**。
+/// 🔴 传 nil ⇒ 退回 `NBCardBG()`：没有品牌色时绝不许染出一张彩色卡
+///    （否则"图标取不到"这个退化态会变成"随机颜色"，比无色更可疑）。
+UIColor *NBCardTint(UIColor * _Nullable brand);
+/// 按下态：淡染底再压一层中性灰。
+/// 🔴 不能直接换 `tertiarySystemFillColor`（v0.0.70 的做法）：那会把品牌色整条抹掉
+///    ⇒ 按下的瞬间卡片"褪色"，在一屏彩色卡片里非常跳。
+UIColor *NBCardTintPressed(UIColor * _Nullable brand);
+/// 未读角标底色：品牌色压暗一档（白字才压得住）。
+UIColor *NBBadgeTint(UIColor * _Nullable brand);
+/// 没有图标时的兜底品牌色：按 bundle **稳定哈希**取调色板（同一 App 永远同一色）。
+/// 🔴 不能用 `[bundleId hash]`：NSString 的 hash 苹果不保证跨进程/跨版本稳定，
+///    那样会出现"重启 App 后微信从绿色变成紫色"。
+UIColor * _Nullable NBBrandFallback(NSString * _Nullable bundleId);
+
 // ---------- 构件 ----------
 /// 白底圆角卡片（分组容器 / 单行卡片共用）
 UIView *NBNewCard(void);

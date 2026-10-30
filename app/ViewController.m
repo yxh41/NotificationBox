@@ -1790,6 +1790,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     });
 
     UIImage *ic = [AppIconLoader iconForBundle:bid];
+    // v0.0.88：每条卡片按 App **品牌色淡染**（颜色从图标主色算出来，见 AppIconLoader）。
+    // 🔴 必须排在 `setIcon:` / `setUnread:` **之前**：这个 setter 会顺手把未读角标底色
+    //    也刷一遍，调晚了角标会先按默认蓝画一次再被刷掉（角标闪一下颜色）。
+    [c setBrandColor:[AppIconLoader brandColorForBundle:bid]];
     [c setIcon:ic letter:[self shortName:bid]];
     // v0.0.42：一行小字报出「这条是哪个 App 的」。
     // 🔴 以前只有图标 —— 图标加载失败就只剩一个首字母，而「b」「m」这种字母

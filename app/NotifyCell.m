@@ -18,20 +18,24 @@
 @property (nonatomic, strong) UILabel *subLabel;
 @property (nonatomic, strong) UILabel *msgLabel;
 @property (nonatomic, strong) UILabel *timeLabel;
-// v0.0.72：未读标记改成**卡片右上角的书签**（带未读数），v0.0.35 的左侧蓝点已删除。
-// 🔴 为什么用 CAShapeLayer 画、不用圆角矩形：书签的样子是**底下有个 V 形缺口**，
-//    圆角矩形做不出来（它只能是"标签"，不是"书签"）。缺口只能靠路径画。
-// 🔴 为什么底色层和数字分开两层：缺口只该裁到**底色**上，
-//    如果把 shape 当 pinView 的 mask，里面的数字 label 也会被一起裁——
-//    虽然这次数字恰好在缺口上方、看不出来，但那种"碰巧没露馅"的写法迟早翻车。
-@property (nonatomic, strong) UIView *pinView;        // 书签容器（右上角）
-@property (nonatomic, strong) CAShapeLayer *pinShape; // 书签底色（带 V 缺口）
-@property (nonatomic, strong) UILabel *pinLabel;      // 未读数
+// v0.0.88：未读标记改成**卡片右下角的圆形角标**（带未读数）。
+// 历史：v0.0.35 左侧蓝点 → v0.0.72 右上角 V 形书签 → v0.0.88 右下角圆形角标。
+// 🔴 为什么书签让位：v0.0.88 起「时间」搬到了**第一行右端**（对齐 HyperOS 的排法），
+//    而右上角正是书签占的位置 —— 两个都要右上角必然打架。
+//    圆形角标挪到右下角后，第一行右端只剩时间，排布才干净。
+// 🔴 为什么改成圆形、不再用 CAShapeLayer 画 V 缺口：书签那套的形状语言是
+//    "系统通知中心的书签"，而这张卡现在是"每条一张的信息流卡片"（HyperOS 风），
+//    圆形角标才是这一套里的东西。顺带把 CAShapeLayer + 手算路径全删掉，
+//    少一层图层、少一份坐标（V 缺口的 5pt 偏移以前是写死的魔数）。
+@property (nonatomic, strong) UIView *pinView;            // 角标（右下角圆形）
+@property (nonatomic, strong) UILabel *pinLabel;          // 未读数
 // 🔴 未读/条数都存**原始量**，不拿 pinView.hidden 反推 —— 布局要按数字位数算宽度，
 //    "看视图状态反推数据状态"在本项目已经栽过（attributedText 时序、标星）。
 @property (nonatomic, assign) BOOL isUnread;
 @property (nonatomic, assign) NSInteger unreadCount;
-// v0.0.48：关键词规则标星（v0.0.72 起在**右下角** ★）。**展示时派生、不落库**。
+// v0.0.48：关键词规则标星。v0.0.72 在右下角；**v0.0.88 起在第一行右端、紧挨时间左边**。
+// 🔴 为什么又挪：右下角这次让给了未读圆形角标（见 pinView 注释）。
+//    放第一行右端是"不占正文空间"的唯一位置 —— 正文最多两行、本来就紧。
 @property (nonatomic, strong) UILabel *starLabel;
 // 🔴 布局判据用这个原始 BOOL，**不拿 starLabel.hidden 反推**：
 //    "拿视图状态反推数据状态"本项目栽过（attributedText 时序），星也必须存一份原始量。
@@ -44,6 +48,11 @@
 @property (nonatomic, copy) NSString *rawBody;
 @property (nonatomic, strong) UIColor *rawBodyColor;
 @property (nonatomic, copy) NSString *hlQuery;
+// v0.0.88：这个 App 的品牌色（由 `AppIconLoader brandColorForBundle:` 给出）。
+// 🔴 卡片底色、按下态、未读角标三处都由它派生 —— 所以它必须是**原始品牌色**，
+//    不能存"已经淡染过的卡片底"：那样按下态和角标都会在卡片底上再算一层，
+//    颜色会一路变浅直到看不出是这个 App。
+@property (nonatomic, strong) UIColor *brandColor;
 // 🔴 内部方法必须显式声明：项目开 -Werror，靠"定义在前面"来解析选择器太脆
 //    （本项目栽过三次：kAutoChainTrigger / uiscrollerInternalVelocity / forceLayoutVisibleCells）。
 - (void)nbRender;
@@ -61,7 +70,25 @@
 static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor *baseColor) {
     NSMutableAttributedString *s = [[NSMutableAttributedString alloc] initWithString:text ?: @""];
     if (!text.length) return s;
-    NSDictionary *base = @{ NSForegroundColorAttributeName: baseColor ?: [UIColor labelColor] };
+    // v0.0.88：行距 2pt —— HyperOS 的正文比 iOS 默认松一档，两行正文之间的缝隙
+    // 是"这张卡看着舒展"的主要来源（只调字号达不到那个效果）。
+    // 🔴 只加行距、**不改字距**：字距一动，同样几个字占的宽度就变了，
+    //    "两行截断到哪里"跟着变 —— v0.0.86 刚为"正文被切成一行半"栽过一次。
+    static NSParagraphStyle *ps = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableParagraphStyle *p = [[NSMutableParagraphStyle alloc] init];
+        p.lineSpacing = 2.0;
+        // 🔴 必须显式写截断方式：**段落样式一旦存在，它的 lineBreakMode 会盖掉
+        //    label 自己的 `lineBreakMode`** ⇒ 不写的话两行正文变成"硬切"，没有省略号，
+        //    用户看不出"还有内容没显示"。
+        p.lineBreakMode = NSLineBreakByTruncatingTail;
+        ps = [p copy];
+    });
+    NSDictionary *base = @{
+        NSForegroundColorAttributeName: baseColor ?: [UIColor labelColor],
+        NSParagraphStyleAttributeName: ps,
+    };
     [s setAttributes:base range:NSMakeRange(0, text.length)];
     if (!query.length) return s;
 
@@ -109,10 +136,26 @@ static NSAttributedString *NBHighlight(NSString *text, NSString *query, UIColor 
 //    🔴 代价讲清楚：行高是常量、被 `tableView.rowHeight` 直接用 ⇒
 //       每屏少看约 1 条（≈700pt 可视区：106 时 6.6 条 → 120 时 5.8 条）。
 //       这个代价换的是"时间、未读、正文三者不再互相挤"，值得。
-static const CGFloat kNBCardInsetX = 12.0;   // 卡片左右内缩
-static const CGFloat kNBCardInsetY = 4.0;    // 卡片上下留白（行距）
-// 卡片内部可用高度（行高 = 它 + 上下留白）。layoutSubviews 里 h 就是这个数。
-static const CGFloat kNBCardInteriorH = 112.0;
+// 🔴🔴 v0.0.88：卡片彻底换成「图标在卡片外 + 每条按 App 淡染」的 HyperOS 排法。
+//    左右内缩不再是同一个值（`kNBCardInsetX` 已删）：
+//    左边 46pt 是**图标槽**（图标在卡片外面），右边只有 10pt。
+//    左右不对称是故意的 —— 照着截图量的，不要"顺手改成对称"。
+// 🔴 卡片内部仍用**一个常量**，行高 = 它 + 上下留白：
+//    layoutSubviews 里所有 y 都相对卡片算，改高度只需改这一个数。
+static const CGFloat kNBCardInsetY = 5.0;    // 卡片上下留白（行距 10）
+// 🔴 v0.0.88：112 → 118。多的 6pt 不是给内容的，是给第一行"时间"和标题之间的呼吸：
+//    v0.0.72 时间在**底部**，和正文之间只需 3pt；搬回第一行后，
+//    第一行（时间/App 名）→ 标题 → 副标题 → 正文 变成四条线，
+//    每条之间都要 1~2pt 才不会糊成一团。正文两行仍是 34pt，没有被压。
+static const CGFloat kNBCardInteriorH = 118.0;
+// 卡片内部统一内边距。14 → 16：截图量出来是 ~20pt，但我们的卡片比它窄
+// （左边让了 46pt 给图标槽），照抄 20 会把正文挤成 3 个字一行。16 是折中。
+static const CGFloat kNBPad = 16.0;
+// 左侧图标（在卡片**外面**）。24×24 是截图量的 ~22pt 取整。
+static const CGFloat NBListIconSize = 24.0;
+static const CGFloat NBListIconX = 10.0;
+static const CGFloat NBListIconY = 9.0;      // 相对卡片顶（和第一行文字对齐）
+
 + (CGFloat)height { return kNBCardInteriorH + kNBCardInsetY * 2; }
 
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
@@ -129,17 +172,21 @@ static const CGFloat kNBCardInteriorH = 112.0;
     self.selectionStyle = UITableViewCellSelectionStyleNone;
     self.cardView = [[UIView alloc] init];
     self.cardView.backgroundColor = NBCardBG();
-    self.cardView.layer.cornerRadius = NBCardRadius;
+    self.cardView.layer.cornerRadius = NBListCardRadius;   // v0.0.88：12 → 14
     self.cardView.layer.cornerCurve = kCACornerCurveContinuous;   // 和系统卡片同一个曲率
     self.cardView.clipsToBounds = YES;
     [self.contentView addSubview:self.cardView];
 
-    // 图标容器：真图标和首字母共用一块底
+    // 图标容器：真图标和首字母共用一块底。
+    // 🔴🔴 v0.0.88：挂到 **contentView** 上，不再挂 cardView —— 图标现在在卡片**外面**
+    //    左侧那条槽里（HyperOS 的排法）。挂错父视图的症状是"图标整个不见"：
+    //    cardView 是 clipsToBounds，卡片左缘之外的子视图会被直接裁掉，而且不报错。
     self.iconBox = [[UIView alloc] init];
     self.iconBox.backgroundColor = [UIColor secondarySystemFillColor];
-    self.iconBox.layer.cornerRadius = 9;
+    self.iconBox.layer.cornerRadius = 6;      // v0.0.88：9 → 6（24pt 的小块配 9 太圆）
+    self.iconBox.layer.cornerCurve = kCACornerCurveContinuous;
     self.iconBox.clipsToBounds = YES;
-    [self.cardView addSubview:self.iconBox];
+    [self.contentView addSubview:self.iconBox];
 
     self.iconView = [[UIImageView alloc] init];
     self.iconView.contentMode = UIViewContentModeScaleAspectFit;
@@ -147,32 +194,36 @@ static const CGFloat kNBCardInteriorH = 112.0;
 
     self.letterLabel = [[UILabel alloc] init];
     self.letterLabel.textAlignment = NSTextAlignmentCenter;
-    self.letterLabel.font = [UIFont boldSystemFontOfSize:18];
+    self.letterLabel.font = [UIFont boldSystemFontOfSize:13];   // v0.0.88：18 → 13（块是 24pt）
     self.letterLabel.textColor = [UIColor secondaryLabelColor];
     [self.iconBox addSubview:self.letterLabel];
 
     // v0.0.42：App 名。
-    // 🔴 字号 11 / secondaryLabel —— 和 `timeLabel` 同一规格。它是"上下文"，不是内容：
+    // 🔴 字号 12 / secondaryLabel —— 和时间同一规格。它是"上下文"，不是内容：
     //    比标题抢眼就等于把最该看的东西挤下去了。
+    //    v0.0.88：11 → 12，因为它现在和"时间"同处第一行、左右对称，
+    //    太小会显得第一行是"脚注"而不是"发信人 + 什么时候"。
     self.appLabel = [[UILabel alloc] init];
-    self.appLabel.font = [UIFont systemFontOfSize:11];
+    self.appLabel.font = [UIFont systemFontOfSize:12];
     self.appLabel.textColor = [UIColor secondaryLabelColor];
     self.appLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     [self.cardView addSubview:self.appLabel];
 
     self.titleLabel2 = [[UILabel alloc] init];
-    self.titleLabel2.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    // v0.0.88：15 → 16。卡片染了色之后底色不再是纯白，同样字号观感会"变小一号"。
+    self.titleLabel2.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     self.titleLabel2.textColor = [UIColor labelColor];
     self.titleLabel2.lineBreakMode = NSLineBreakByTruncatingTail;
     [self.cardView addSubview:self.titleLabel2];
 
     self.timeLabel = [[UILabel alloc] init];
-    self.timeLabel.font = [UIFont systemFontOfSize:11];
-    self.timeLabel.textColor = [UIColor tertiaryLabelColor];
-    // v0.0.72：右对齐 → 左对齐。它从"标题右侧"挪到了"内容正下方"，
-    // 位置从"行尾"变成"行首"，对齐方式必须跟着改 ——
-    // 否则右对齐会让时间贴着卡片右缘，和上一行正文的左缘彻底脱开，看着像另一条记录的时间。
-    self.timeLabel.textAlignment = NSTextAlignmentLeft;
+    self.timeLabel.font = [UIFont systemFontOfSize:12];       // v0.0.88：11 → 12
+    // 🔴 用 secondaryLabel 而不是 tertiary：卡片底色现在是淡染的，不是纯白，
+    //    tertiary（30% alpha）压在彩色底上会糊得几乎看不见。
+    self.timeLabel.textColor = [UIColor secondaryLabelColor];
+    // v0.0.88：左对齐 → **右对齐**。它从"正文下方一行"搬回了**第一行行尾**（HyperOS 排法），
+    // 位置在行尾当然要右对齐，否则时间和卡片右缘之间会空出一大块。
+    self.timeLabel.textAlignment = NSTextAlignmentRight;
     [self.cardView addSubview:self.timeLabel];
 
     // v0.0.45：subtitle 单独一行。
@@ -200,30 +251,35 @@ static const CGFloat kNBCardInteriorH = 112.0;
     self.msgLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     [self.cardView addSubview:self.msgLabel];
 
-    // v0.0.48：右下角 ★（关键词"标星"动作）。默认藏 —— 和未读书签一样，
+    // v0.0.48：★（关键词"标星"动作）。默认藏 —— 和未读角标一样，
     // 万一某处忘了调 setStarred:，宁可少一颗星，也不要给所有行都点上。
     // 🔴 systemOrange：金/橙在浅色底上醒目，又不是"行情红绿"那种会误读成涨跌的颜色。
+    // v0.0.88：13 → 12（跟第一行字号一致）；位置从右下角搬到**第一行右端、时间左边**。
     self.starLabel = [[UILabel alloc] init];
     self.starLabel.text = @"★";
-    self.starLabel.font = [UIFont systemFontOfSize:13];
+    self.starLabel.font = [UIFont systemFontOfSize:12];
     self.starLabel.textColor = [UIColor systemOrangeColor];
     self.starLabel.textAlignment = NSTextAlignmentRight;
     self.starLabel.hidden = YES;
     [self.cardView addSubview:self.starLabel];
 
-    // v0.0.72：右上角**未读书签**（替代 v0.0.35 的左侧蓝点）。
-    // 默认 hidden —— 万一某处忘了调 setUnread:count:，宁可少一个书签，
+    // v0.0.88：右下角**圆形未读角标**（替代 v0.0.72 的右上角 V 形书签）。
+    // 默认 hidden —— 万一某处忘了调 setUnread:count:，宁可少一个角标，
     // 也不要给所有行都挂上（复用池里最容易串的就是这种"默认可见的装饰"）。
+    // 🔴 底色在 `setBrandColor:` 里按品牌色刷，这里只给一个能看的默认值。
     self.pinView = [[UIView alloc] init];
-    self.pinView.backgroundColor = [UIColor clearColor];   // 底色由 pinShape 画（要带缺口）
+    self.pinView.backgroundColor = [UIColor systemBlueColor];
+    self.pinView.clipsToBounds = YES;
     self.pinView.hidden = YES;
-    self.pinShape = [CAShapeLayer layer];
-    self.pinShape.fillColor = [UIColor systemBlueColor].CGColor;
-    [self.pinView.layer addSublayer:self.pinShape];
     self.pinLabel = [[UILabel alloc] init];
     self.pinLabel.font = [UIFont boldSystemFontOfSize:11];
     self.pinLabel.textColor = [UIColor whiteColor];
     self.pinLabel.textAlignment = NSTextAlignmentCenter;
+    // 🔴 v0.0.88：角标是**固定 20pt 的圆**（不再像书签那样按位数变宽），
+    //    而「99+」在 11pt bold 下有 ≈21pt 宽 ⇒ 会溢出圆外。
+    //    用自动缩字收进圈里，⛔ 不要"按位数改圆的直径" —— 一屏里的角标大小就会参差。
+    self.pinLabel.adjustsFontSizeToFitWidth = YES;
+    self.pinLabel.minimumScaleFactor = 0.7;
     [self.pinView addSubview:self.pinLabel];
     // 🔴 最后 add：书签要压在卡片内所有内容的上面（含 ★）。
     //    视图层级顺序 = z 序，这一条在本项目已经栽过（topCard 必须第一个 add）。
@@ -234,89 +290,71 @@ static const CGFloat kNBCardInteriorH = 112.0;
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    // v0.0.70：先摆卡片，再把**所有**内部坐标改成相对卡片。
-    // v0.0.72：卡片内部高 98 → 112（多了「时间」那一行，见 +height 的注释）。
-    CGRect card = CGRectInset(self.contentView.bounds, kNBCardInsetX, kNBCardInsetY);
+    // =================================================================
+    // v0.0.88 布局：图标在卡片**外面**，卡片内四行（App名+时间 / 标题 / 副标题 / 正文）
+    // 🔴 左右内缩不再相等（左 46 给图标槽、右 10），所以**不能再用 CGRectInset**
+    //    —— 它只能等量缩，用它就等于把图标槽那一半也缩到右边去。
+    // =================================================================
+    CGFloat fullW = self.contentView.bounds.size.width;
+    CGRect card = CGRectMake(NBListIconSlot, kNBCardInsetY,
+                             MAX(0.0, fullW - NBListIconSlot - NBListCardRight),
+                             kNBCardInteriorH);
     self.cardView.frame = card;
     CGFloat w = card.size.width;
     CGFloat h = card.size.height;
-    CGFloat ox = card.origin.x;      // 卡片原点：后面每个 frame 都要带上
+    CGFloat ox = card.origin.x;      // 卡片原点：卡片内每个 frame 都要带上
     CGFloat oy = card.origin.y;
-    CGFloat pad = 14;
-    CGFloat side = 46;
 
-    // v0.0.72：**左缘对齐**。v0.0.35~71 这里是 `dotX(10) + dotD(8) + 2 = 20`，
-    // 那 20pt 是给蓝点让位留出来的 ⇒ 图标左缘比卡片的 14pt 内边距多缩进了 6pt，
-    // 而标题/正文又从 78 起 —— 三个左缘互不相等，一屏十几张卡片叠起来边缘就"毛"了。
-    // 蓝点删掉后图标直接回到 `pad`，图标/标题/正文/时间四者的左缘关系变成
-    // 「图标 14，文字一律 72」，左侧一整列彻底齐。
-    CGFloat iconX = pad;
-    self.iconBox.frame = CGRectMake(ox + iconX, oy + (h - side) / 2, side, side);
+    // ---- 卡片外：左侧图标 ----
+    self.iconBox.frame = CGRectMake(NBListIconX, oy + NBListIconY, NBListIconSize, NBListIconSize);
     self.iconView.frame = self.iconBox.bounds;
     self.letterLabel.frame = self.iconBox.bounds;
 
-    CGFloat textX = iconX + side + 12;
-    CGFloat textW = w - textX - pad;
+    // ---- 卡片内 ----
+    CGFloat textX = kNBPad;
+    CGFloat textW = MAX(0.0, w - kNBPad * 2);
 
-    // v0.0.72 竖向排版（卡片内部 112）：
-    //   App 名   y=8~22
-    //   标题     y=23~42   ← 时间挪走后**独占整行宽**（以前要让出 78pt 给时间）
-    //   副标题   y=43~58   （有才占位）
-    //   正文     y=59 或 43，两行 13pt（≈31pt）
-    //   时间     y=h-21~h-6（**贴底**，左对齐）｜ ★ 同一行右端
-    // 🔴 时间用「贴底」而不是「接在正文后面」：接在正文后面的话，
-    //    没有副标题的行和有的行会差 16pt ⇒ 同一屏里的时间**上下错位**，
-    //    滚动时看着像在跳。贴底让所有行的时间落在同一条水平线上。
-    CGFloat timeH = 15;
-    CGFloat timeY = h - 6 - timeH;
-    self.appLabel.frame    = CGRectMake(ox + textX, oy + 8, textW, 14);
-    self.titleLabel2.frame = CGRectMake(ox + textX, oy + 23, textW, 19);
-    // v0.0.45：有副标题时正文下移一行；没有就完全回到原来的位置。
+    // 第一行（y=12~27）：App 名（左）… [★] 时间（右）
+    // 🔴 时间宽度写死 80：内容是 "10-30 08:11"（12pt ≈ 64pt），留 16pt 余量够放大一档。
+    //    ⛔ 别按字符串长度/实测宽度算 —— 每次 layout 都量一次文字，滚动时是白掉的帧。
+    CGFloat timeW = MIN(80.0, textW * 0.45);
+    CGFloat starW = 16.0;
+    CGFloat starGap = 6.0;
+    CGFloat appW = MAX(0.0, textW - timeW - starW - starGap - 6.0);
+    self.appLabel.frame    = CGRectMake(ox + textX, oy + 12, appW, 15);
+    self.starLabel.frame   = CGRectMake(ox + w - kNBPad - timeW - starGap - starW, oy + 12, starW, 15);
+    self.timeLabel.frame   = CGRectMake(ox + w - kNBPad - timeW, oy + 12, timeW, 15);
+
+    // 第二行（y=33~53）：标题，**独占整行宽**（时间已经不在这一行了）
+    self.titleLabel2.frame = CGRectMake(ox + textX, oy + 33, textW, 20);
+
+    // 第三行（y=54~70）：副标题，有才占位
     // 🔴 判据用 `rawSubtitle`（原始串），**不用** `subLabel.text` ——
     //    `attributedText` 赋值之后 `.text` 的取值时机不保证早于本方法，
     //    拿视图状态反推数据状态这种事在本项目已经栽过（观测者把被观测量改了）。
     BOOL hasSub = (self.rawSubtitle.length > 0);
     self.subLabel.hidden    = !hasSub;
-    self.subLabel.frame     = CGRectMake(ox + textX, oy + 43, textW, 15);
-    CGFloat msgY = hasSub ? 59 : 43;
-    // 🔴 正文高度取「到底部时间之间还剩多少」，再兜一个 31pt 下限：
-    //    宁可和上方元素挤 1~2pt，也绝不让正文压到时间上（压上去就是字叠字）。
-    CGFloat msgH = MAX(31.0, timeY - 3 - msgY);
-    self.msgLabel.frame = CGRectMake(ox + textX, oy + msgY, textW, msgH);
+    self.subLabel.frame     = CGRectMake(ox + textX, oy + 54, textW, 16);
 
-    self.timeLabel.frame = CGRectMake(ox + textX, oy + timeY, textW - 24, timeH);
-    // v0.0.48：★ 从右上角挪到**右下角**（右上角让给未读书签），和时间同一行、右对齐。
-    self.starLabel.frame = CGRectMake(ox + w - pad - 18, oy + timeY - 1, 18, 16);
+    // 第四块：正文（y=71 有副标题 / 54 没有，到底部留 12）
+    // 🔴 118-12-71 = 35pt，正好装两行 13pt + 行距 2（≈33pt）；
+    //    没有副标题时得到 52pt，但 numberOfLines=2 ⇒ 多余的部分是留白，不是第三行。
+    CGFloat msgY = hasSub ? 71.0 : 54.0;
+    CGFloat msgH = MAX(31.0, h - 12.0 - msgY);
 
-    // v0.0.72：右上角未读书签。
-    // 🔴 宽度按**数字位数**算，不写死：一位数 18、两位数 24、三位数 30。
-    //    写死一个宽度的话，99 条未读时数字会被挤出书签外（这种"只在少数数据下翻车"
-    //    的 bug 最难被发现 —— 平时测试永远只有 1~2 位）。
+    // 右下角未读圆形角标
     // 🔴 显隐判据用原始 `self.isUnread`，不用 pinView.hidden。
     if (self.isUnread) {
-        NSString *num = self.pinLabel.text ?: @"1";
-        // 🔴 先转成**有符号**整数再减：`num.length` 是 NSUInteger，
-        //    空串时 `length - 1` 会下溢成天文数字 ⇒ 书签被撑到屏幕外。
-        NSInteger digits = (NSInteger)num.length;
-        CGFloat pinW = 18.0 + (CGFloat)MAX((NSInteger)0, digits - 1) * 6.0;
-        CGFloat pinH = 20;
-        // 右缩进 14（比卡片圆角 12 多让 2pt）：卡片是 clipsToBounds，
-        // 贴着圆角切的地方会被削掉一个角，看起来像书签缺了一块。
-        self.pinView.frame = CGRectMake(ox + w - pad - pinW, oy, pinW, pinH);
-        UIBezierPath *p = [UIBezierPath bezierPath];
-        [p moveToPoint:CGPointMake(0, 0)];
-        [p addLineToPoint:CGPointMake(pinW, 0)];
-        [p addLineToPoint:CGPointMake(pinW, pinH)];
-        [p addLineToPoint:CGPointMake(pinW / 2, pinH - 5)];   // 底下的 V 形缺口
-        [p addLineToPoint:CGPointMake(0, pinH)];
-        [p closePath];
-        self.pinShape.frame = self.pinView.bounds;
-        self.pinShape.path = p.CGPath;
-        self.pinLabel.frame = CGRectMake(0, 1, pinW, 14);
-        // 🔴 App 名那一行要给书签让位：书签 y=0~20，App 名 y=8~22，两者**竖向重叠 12pt**
-        //    ⇒ 不让位就会字压在书签上。标题(y=23)在书签下方，不用让。
-        self.appLabel.frame = CGRectMake(ox + textX, oy + 8, MAX(0, textW - pinW - 6), 14);
+        CGFloat d = 20.0;
+        self.pinView.frame = CGRectMake(ox + w - kNBPad - d, oy + h - 12.0 - d, d, d);
+        self.pinView.layer.cornerRadius = d / 2.0;
+        self.pinLabel.frame = self.pinView.bounds;
     }
+    // 🔴 有角标时正文要让出 26pt：角标 y=86~106，正文最后一行落在 90~106，
+    //    竖向是重叠的 ⇒ 不让位就是"字压在角标上"。
+    // 🔴 这一段必须排在角标判定**之后**：顺序反了会拿上一轮/上一行的 isUnread 算宽度。
+    CGFloat msgW = self.isUnread ? MAX(0.0, textW - 26.0) : textW;
+    self.msgLabel.frame = CGRectMake(ox + textX, oy + msgY, msgW, msgH);
 }
 
 // v0.0.70：按下时只染**卡片**，不染整行。
@@ -325,9 +363,24 @@ static const CGFloat kNBCardInteriorH = 112.0;
 //    这里自己换 cardView 的底色，留白保持透明（透出 tableView 的灰底），分层才成立。
 - (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
     [super setHighlighted:highlighted animated:animated];
+    // v0.0.88：卡片底色现在是**按 App 淡染**的，所以按下态不能用固定的
+    // `tertiarySystemFillColor` —— 那会把品牌色整条抹掉，按下的瞬间卡片"褪色"。
+    // 改成同一品牌色的「压暗一档」（`NBCardTintPressed`）。
     self.cardView.backgroundColor = highlighted
-        ? [UIColor tertiarySystemFillColor]
-        : NBCardBG();
+        ? NBCardTintPressed(self.brandColor)
+        : NBCardTint(self.brandColor);
+}
+
+// v0.0.88：品牌色（卡片底色 / 按下态 / 未读角标三处都由它派生）。
+// 🔴 传 nil ⇒ 退回中性卡片底：这是"图标和 bundleId 都拿不到"的退化态，
+//    宁可一张白卡，也不要凭空造一个颜色（那会让人以为"颜色是随机的"）。
+// 🔴 **一个 setter 管到底**：卡片底 + 角标底都在这里刷。
+//    只刷卡片底的话，角标会留着上一次复用的颜色（症状是"角标颜色和卡片不搭，滚一下又变了"）。
+// 🔴 必须直接写 `_brandColor`，⛔ 不许写 `self.brandColor = brand;` —— 无限递归。
+- (void)setBrandColor:(UIColor *)brand {
+    _brandColor = brand;
+    self.cardView.backgroundColor = NBCardTint(brand);
+    self.pinView.backgroundColor = NBBadgeTint(brand);
 }
 
 - (void)setIcon:(UIImage *)icon letter:(NSString *)letter {
@@ -407,14 +460,14 @@ static const CGFloat kNBCardInteriorH = 112.0;
     self.timeLabel.text = text;
 }
 
-// v0.0.72：未读 = 卡片右上角书签（带未读数）。v0.0.35 的蓝点已删除。
+// v0.0.72：未读 = 卡片角标（带未读数）。v0.0.88 起在**右下角**、圆形。
 - (void)setUnread:(BOOL)unread count:(NSInteger)count {
     _isUnread = unread;
     self.unreadCount = count;
     [self nbUpdatePin];
-    // 🔴 必须重排：书签**宽度取决于数字位数**（一位 18 / 两位 24），
-    //    只改 text 不重排的话，从「9 条」变成「12 条」时数字会被挤出书签外。
-    //    这里不用 `hidden` 就够了 —— 书签宽度参与布局计算，和旧蓝点不一样。
+    // 🔴 必须重排：v0.0.88 起角标**会挤压正文宽度**（有角标时正文让出 26pt），
+    //    只改 hidden 不重排的话，从"未读"翻成"已读"之后正文还是窄的
+    //    —— 表现为"这一条读过之后，正文右边莫名空一块"。
     [self setNeedsLayout];
 }
 
@@ -425,13 +478,13 @@ static const CGFloat kNBCardInteriorH = 112.0;
         self.pinLabel.text = nil;
         return;
     }
-    // 99 以上写「99+」：书签是角标，不是计数器，三位数会把宽度撑到盖住 App 名。
+    // 99 以上写「99+」：角标是标记，不是计数器，三位数在 20pt 的圆里放不下。
     NSInteger n = self.unreadCount;
     if (n > 99) {
         self.pinLabel.text = @"99+";
     } else {
         // 🔴 `MAX(1, n)`：未读但调用方没给数（或给了 0）时也要显示 1 ——
-        //    空白书签看着像"漏渲染"，比显示一个偏小的数更让人怀疑功能坏了。
+        //    空白角标看着像"漏渲染"，比显示一个偏小的数更让人怀疑功能坏了。
         self.pinLabel.text = [NSString stringWithFormat:@"%ld", (long)MAX((NSInteger)1, n)];
     }
 }
@@ -452,7 +505,11 @@ static const CGFloat kNBCardInteriorH = 112.0;
     //    复用池里如果留着一次"按下时的高亮色"（`setHighlighted:` 换的 tertiarySystemFill），
     //    下一行滚进来就会是一片浅灰卡片 —— 症状是"某几行底色不对，滚动一下又变了"，
     //    极难复现也极难归因。**凡是 setter 改过的外观，prepareForReuse 必须改回去。**
-    self.cardView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    // 🔴🔴 v0.0.88 加倍重要：底色现在是**按 App 染色**的，不复位就是
+    //    "上一行的微信绿留在这一行的短信卡上"，而且滚回去又变回来 —— 比纯灰更难查。
+    //    走 `setBrandColor:nil` 而不是直接写 backgroundColor：那个 setter 会**同时**
+    //    把角标底色也刷回默认值，一条命令复位两处，不会漏。
+    self.brandColor = nil;
     self.iconView.image = nil;
     self.iconView.hidden = YES;
     self.letterLabel.hidden = NO;

@@ -1,4 +1,6 @@
 #import "AppIconLoader.h"
+#import "NBTheme.h"
+#include <math.h>
 
 // 取 App 图标的三条路（按顺序试，谁能成用谁）：
 //   A. LSApplicationProxy + iconDataForVariant:  ← 正道，但参数宽度/方法名都可能变
@@ -15,6 +17,10 @@
 
 static NSMutableDictionary *gCache = nil;      // bundleId -> UIImage / NSNull
 static NSMutableArray<NSString *> *gTrace = nil;   // 每个 bundle 的尝试记录（最多留 20 条）
+// v0.0.88：bundleId -> 品牌色（UIColor）。和图标缓存分开存：
+// 🔴 图标可以"取不到"（gCache 里记 NSNull），但品牌色**永远有值**
+//    （退化链最后一档是哈希调色板）⇒ 两张表的语义不同，不能并成一张。
+static NSMutableDictionary<NSString *, UIColor *> *gBrandCache = nil;
 
 @implementation AppIconLoader
 
@@ -32,6 +38,9 @@ static NSMutableArray<NSString *> *gTrace = nil;   // 每个 bundle 的尝试记
 + (void)clearCache {
     [gCache removeAllObjects];
     [gTrace removeAllObjects];
+    // v0.0.88：品牌色必须跟着清 —— 它是由图标算出来的，
+    // 图标"重新取"了而颜色还留着旧的，就会出现"换了图标、卡片颜色没变"。
+    [gBrandCache removeAllObjects];
 }
 
 + (UIImage *)iconForBundle:(NSString *)bundleId {
@@ -254,4 +263,107 @@ static NSMutableArray<NSString *> *gTrace = nil;   // 每个 bundle 的尝试记
             @"只要有一个 ✅ 就说明图标能取，列表里应该显示真图标。"];
 }
 
+#pragma mark - v0.0.88 品牌色（首页卡片淡染）
+
+// 从图标封面统计主色。
+// 🔴 为什么在 16×16 缩略图上算、不在原图上扫：图标普遍 180×180（≈3 万像素），
+//    一屏十几张卡片、每次滚动都要算 ⇒ 掉帧。而"主色"是个统计量，
+//    16×16（256 点）已经足够稳定，放大到 512×512 也不会更准。
+// 🔴 为什么先做三重过滤（去黑 / 去灰 / 去白）再取最大簇：
+//    绝大多数 App 图标是"白底 + 彩色图形"。不去白，均值会被白底拉成灰白 ⇒ 染不出颜色；
+//    不去灰，iOS 图标那圈浅灰阴影会把色相拖偏。饱和度加权（s²·v）让"又艳又亮"的
+//    那几个像素说了算，这才是人眼认定的"这个 App 的颜色"。
+static UIColor *NBDominantColor(UIImage *img) {
+    CGImageRef cg = img.CGImage;
+    if (!cg) return nil;
+
+    enum { W = 16, H = 16, kBuckets = 12 };
+    unsigned char buf[W * H * 4];
+    memset(buf, 0, sizeof(buf));
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, W, H, 8, W * 4, cs,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return nil;
+    // 🔴 不处理上下翻转：主色是统计量，和像素的**位置**无关。
+    CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), cg);
+    CGContextRelease(ctx);
+
+    double accR[kBuckets] = {0}, accG[kBuckets] = {0}, accB[kBuckets] = {0}, accW[kBuckets] = {0};
+    for (int i = 0; i < W * H; i++) {
+        double a = buf[i * 4 + 3] / 255.0;
+        if (a < 0.5) continue;                       // 透明区（圆角外）
+        double r = buf[i * 4 + 0] / 255.0;
+        double g = buf[i * 4 + 1] / 255.0;
+        double b = buf[i * 4 + 2] / 255.0;
+        double mx = fmax(r, fmax(g, b));
+        double mn = fmin(r, fmin(g, b));
+        if (mx < 0.15) continue;                     // 近黑：描边/投影
+        double d = mx - mn;
+        double s = (mx > 1e-6) ? (d / mx) : 0.0;
+        if (s < 0.18) continue;                      // 灰 / 白 / 黑（s=0 全覆盖）
+
+        double hue;
+        if (d < 1e-6) {
+            hue = 0.0;
+        } else if (mx == r) {
+            hue = 60.0 * fmod(((g - b) / d), 6.0);
+        } else if (mx == g) {
+            hue = 60.0 * (((b - r) / d) + 2.0);
+        } else {
+            hue = 60.0 * (((r - g) / d) + 4.0);
+        }
+        if (hue < 0.0) hue += 360.0;
+        int k = ((int)(hue / 30.0)) % kBuckets;
+        if (k < 0) k = 0;
+
+        double w = s * s * mx;                       // 又艳又亮的权重高
+        accR[k] += r * w;
+        accG[k] += g * w;
+        accB[k] += b * w;
+        accW[k] += w;
+    }
+
+    int best = -1;
+    double bestW = 0.0;
+    for (int k = 0; k < kBuckets; k++) {
+        if (accW[k] > bestW) {
+            bestW = accW[k];
+            best = k;
+        }
+    }
+    // 🔴 一个彩色像素都没有（纯白/纯灰图标，比如"计算器""备忘录"）⇒ 返回 nil 交给兜底。
+    //    ⛔ 不许返回"最接近灰的那个"：那会给出一个看着像 bug 的浑浊颜色。
+    if (best < 0 || bestW <= 0.0) return nil;
+
+    double r = accR[best] / bestW;
+    double g = accG[best] / bestW;
+    double b = accB[best] / bestW;
+
+    // 把色相留住、把饱和和亮度夹进"能看清又不刺眼"的区间：
+    // 🔴 不夹的话，浅黄/浅青这类图标会算出几乎看不见的颜色；
+    //    而纯饱和的红会算出刺眼的 #FF0000。卡片是背景，不是主视觉。
+    CGFloat hh = 0, ss = 0, vv = 0, aa = 1;
+    UIColor *avg = [UIColor colorWithRed:r green:g blue:b alpha:1.0];
+    if (![avg getHue:&hh saturation:&ss brightness:&vv alpha:&aa]) return avg;
+    ss = MIN(0.95, MAX(0.45, ss));
+    vv = MIN(0.88, MAX(0.58, vv));
+    return [UIColor colorWithHue:hh saturation:ss brightness:vv alpha:1.0];
+}
+
++ (UIColor *)brandColorForBundle:(NSString *)bundleId {
+    if (!bundleId.length) return nil;
+    if (!gBrandCache) gBrandCache = [NSMutableDictionary dictionary];
+    UIColor *hit = gBrandCache[bundleId];
+    if (hit) return hit;
+
+    UIColor *brand = NBDominantColor([self iconForBundle:bundleId]);
+    // 🔴 退化链最后一档：图标取不到、或图标没有彩色 ⇒ 哈希调色板。
+    //    这一档**保证有颜色**，所以"一片卡片全是灰的"这种退化不会发生。
+    if (!brand) brand = NBBrandFallback(bundleId);
+    if (brand) gBrandCache[bundleId] = brand;
+    return brand;
+}
+
 @end
+
