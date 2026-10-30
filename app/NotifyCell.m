@@ -235,10 +235,60 @@ static const CGFloat kNBSwipeIconMinScale = 0.55;
 //
 // 越过 52 之后还要多拖多少显示位移才算"待删"。24pt ≈ 手指再走小半厘米，
 // 太大会让人以为滑不动，太小会误删（滑开的手感和删掉是两件事）。
-static const CGFloat kNBSwipeArmAt = 24.0;
+// v0.0.94：用户要"触发距离调大一点点"⇒ 24 → 32（多拖 8pt，约一指宽的 1/6）。
+// 阻尼 0.35 下，32 对应原始位移 52 + 32/0.35 ≈ 143pt，仍在单手舒适的范围内。
+// ⛔ 别再往上加超过 ~60：那时原始位移要 220pt+，拇指够不到，用户会以为"滑不动"。
+static const CGFloat kNBSwipeArmAt = 32.0;
 // 越过 52 之后的阻尼系数。0.2 太"顶"（继续滑几乎不动，用户以为坏了），
-// 0.35 保留"到头了"的阻力感，又能滑出 24pt 进待删态。
+// 0.35 保留"到头了"的阻力感，又能滑出 32pt 进待删态。
 static const CGFloat kNBSwipeExtraDrag = 0.35;
+
+// ================= v0.0.94：触觉反馈（柔的那种） =================
+// 用户要求「给个震动反馈，比较舒服比较柔的」。选 `UIImpactFeedbackStyleSoft`：
+//   柔和（Soft）< 轻（Light）< 中（Medium）< 重（Heavy）
+// 和 `UISelectionFeedbackGenerator`（那种"哒"一下的滚轮感）比，Soft 是"闷闷的一下"，
+// 放在"已经滑到待删位置"这个时刻更像"到位了"而不是"点了个按钮"。
+//
+// 🔴 三个必踩的坑，都在这里一次性避掉：
+//  ① **不许每次 `new` 一个 generator**：TapticEngine 要预热，新建实例的**首次**
+//     `impactOccurred` 经常不震（症状 = "有时候震有时候不震，第一次总没反应"）
+//     ⇒ `dispatch_once` 建一次、长期持有。
+//  ② **只在状态变化的**那一下**震**，不能每帧震：手势 `Changed` 每帧都回调，
+//     每帧 impact 会连成一片马达声。所以调用点在 `armed` 变化的分支里，
+//     而**不是**在 `nbApplyOffset:` 的函数体里（那是每帧都跑的）。
+//  ③ **`prepare()` 要提前**（手势开始时）：不预热会有 ~100ms 延迟，手感"慢半拍"。
+//
+// ⚠️ 不需要切主线程：`nbPan:` / `nbApplyOffset:` 全在主线程（手势回调 + 布局），
+//    而 haptic 的 API 也要求主线程 —— 这里天然满足，别加 dispatch_async（加了反而慢一帧）。
+typedef NS_ENUM(NSInteger, NBHapticKind) {
+    NBHapticKindArm = 0,    // 刚进入「松手删除」—— 柔
+    NBHapticKindDelete = 1  // 真的执行了删除 —— 稍实一点，但仍是 Light
+};
+
+static UIImpactFeedbackGenerator *NBHapticGen(NBHapticKind kind) {
+    static UIImpactFeedbackGenerator *soft = nil;
+    static UIImpactFeedbackGenerator *light = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (@available(iOS 13.0, *)) {
+            soft = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleSoft];
+        } else {
+            // iOS 12 及以下没有 Soft，退到 Light（部署目标是 14，这条只是兜底）
+            soft = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        }
+        light = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    });
+    return (kind == NBHapticKindArm) ? soft : light;
+}
+
+// 预热：进手势时调一次，把 TapticEngine 唤醒（不预热第一次会慢/不震）
+static void NBHapticPrepare(NBHapticKind kind) {
+    [NBHapticGen(kind) prepare];
+}
+
+static void NBHapticFire(NBHapticKind kind) {
+    [NBHapticGen(kind) impactOccurred];
+}
 
 + (CGFloat)height { return kNBCardInteriorH + kNBCardInsetY * 2; }
 
@@ -584,10 +634,14 @@ static const CGFloat kNBSwipeExtraDrag = 0.35;
     // ⑤ v0.0.93：进入「松手即删」态时换文案。
     // 🔴 判据和松手时**用同一个数**（`nbOffset` 对比同一个阈值），
     //    所以"看到「松手删除」"和"松手真的删了"必然同时发生。
+    // v0.0.94：进入的那一下给一次柔和触觉 —— 🔴 必须放在 `armed != nbArmed` 的**分支里**，
+    //    不能写在函数体里：本方法每帧都跑，写外面会震成马达。
     BOOL armed = (offset <= -(kNBSwipeActionW + kNBSwipeArmAt));
     if (armed != self.nbArmed) {
         self.nbArmed = armed;
         self.swipeLabel.text = armed ? @"松手删除" : @"删除";
+        // 往"要删"的方向走才震；退回来不震（否则来回滑会一直抖）
+        if (armed) NBHapticFire(NBHapticKindArm);
     }
 }
 
@@ -624,6 +678,7 @@ static const CGFloat kNBSwipeExtraDrag = 0.35;
     if (w < 1.0) w = self.bounds.size.width;
     if (w < 1.0) {
         // 宽度都拿不到就别做动画了（退化路径：宁愿少个动画，也不能不删）
+        NBHapticFire(NBHapticKindDelete);
         if (self.nbOnDelete) self.nbOnDelete();
         return;
     }
@@ -635,6 +690,9 @@ static const CGFloat kNBSwipeExtraDrag = 0.35;
         [self nbApplyOffset:-w];
     } completion:^(BOOL finished) {
         [self nbSettleTo:0.0 animated:NO];
+        // v0.0.94：真正执行删除的那一下再给一次（Light，比进入时稍实）。
+        // 位置在复位之后、回调之前：回调里可能 reload + 弹提示，震感要压在动作本身上。
+        NBHapticFire(NBHapticKindDelete);
         if (self.nbOnDelete) self.nbOnDelete();
     }];
 }
@@ -651,6 +709,9 @@ static const CGFloat kNBSwipeExtraDrag = 0.35;
     switch (g.state) {
         case UIGestureRecognizerStateBegan:
             self.nbOffsetAtBegin = self.nbOffset;
+            // v0.0.94：唤醒 TapticEngine（预热）。放这里而不是第一次要震的时候：
+            // 预热有提前量，等到"进入待删态"那一下再 prepare 就晚了，手感慢半拍。
+            NBHapticPrepare(NBHapticKindArm);
             // 同一时刻只允许一行打开：通知列表把别的那行收起
             if (self.nbOnSwipeBegin) self.nbOnSwipeBegin();
             break;
