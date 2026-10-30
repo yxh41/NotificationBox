@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.84"
+#define NB_VER_STR @"0.0.85"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -651,6 +651,12 @@ static BOOL      gMapDumped  = NO;   // 映射普查只做一次
 static BOOL      gAPIDumped  = NO;   // 方法表只追加一次
 static NSString *gWantBundle = nil;  // 最近一次要删的 App（给「按 section 找 request」用）
 static NSArray  *gWantIDs    = nil;  // v0.0.68：本条的 cid / recordID / publisherID（精确匹配用）
+// 🔴 v0.0.85：本条记录的 title / message。精确 ID 匹配不到时用它做兜底匹配。
+//   为什么需要兜底：`nc_diag(24).txt` 34 次删除里 28 次是「同段有它条、ID 都不是目标」——
+//   系统把同一条通知重投一次就会给新 ID，盒子里那行的 sys_id 就永远匹配不上，
+//   用户看到的就是「删了没反应」。兜底判据见 NBFindRequestByContent。
+static NSString *gWantTitle  = nil;
+static NSString *gWantMsg    = nil;
 static __strong id gCSDestination = nil;  // 真 destination（CSNotificationDispatcher 实例）
 static BOOL gCSDestFromHook = NO;          // 它是「注册期 hook」接住的（不是靠 OBS 撞上的）
 static __strong id gFoundNCReq = nil;     // 找到的**真** request（系统对象，不是我造的）
@@ -1196,6 +1202,55 @@ static id NBFindOurRequest(id source, NSString *bundle, NSArray *ids,
     } @catch (__unused NSException *e) { return nil; }
 }
 
+// ---------- v0.0.85：按「同段 + 同内容」兜底找 request ----------
+// 🔴 为什么需要这条：`nc_diag(24).txt` 34 次删除里 **28 次**都是
+//   `[找] … 同段 N 条 ⇒ 都不是目标（目标已不在 NC）⇒ 不动手`。
+//   而同一份日志里 `_bulletinsForIDs:@[cid]` **能按 ID 取到那个 bulletin**
+//   （`bulletinID` 打印出来就是我们存的 cid）——说明对象还在，只是**不在 NC 现役列表里**：
+//   系统把同一条通知重投/重排过一次，给了**新的 ID**，盒子里那行的 sys_id 就成了旧 ID。
+//   ⇒ 精确匹配结构性失效。用户看到的正是「有些能删，有些不行」。
+// 🔴 兜底判据故意收得很紧（宁可不动，也不许撤错条）：
+//   ① 同 App（sectionIdentifier 相等）；
+//   ② title **和** message 都完全相等（读 BBBulletin 上的已知安全键，不摸未知类）；
+//   ③ **同段里只命中 1 条**才动手。命中 ≥2 条 = 分不清是哪一条 ⇒ 一条都不动。
+//      （和 ⑦u「同段只剩 1 条才允许按段清」同一条纪律。）
+// 🔴 内容全空的行不兜底：空 title + 空 message 对该 App 的所有通知都"相等"，
+//   兜底会退化成"随机删一条"。
+static BOOL NBStrSame(NSString *a, NSString *b) {
+    if (!a.length && !b.length) return YES;
+    if (!a.length || !b.length) return NO;
+    return [a isEqualToString:b];
+}
+
+static id NBFindRequestByContent(id source, NSString *bundle,
+                                 NSString *title, NSString *message, int *hitsOut) {
+    if (hitsOut) *hitsOut = 0;
+    if (!source || !bundle.length) return nil;
+    if (!title.length && !message.length) return nil;
+    @try {
+        id m = [source uuidsToRequests];
+        if (![m isKindOfClass:[NSDictionary class]]) return nil;
+        NSDictionary *d = (NSDictionary *)m;
+        NSMutableArray *all = [NSMutableArray arrayWithCapacity:d.count];
+        for (id k in d) NBCollectRequestsIn(d[k], all, 0);
+        int hits = 0;
+        id hit = nil;
+        for (id req in all) {
+            NSString *sid = NBKVCStr(req, @"sectionIdentifier");
+            if (!sid.length || ![sid isEqualToString:bundle]) continue;
+            id b = NBSafeValue(req, @"bulletin");
+            if (!b || b == req) continue;
+            if (!NBStrSame(NBKVCStr(b, @"title"), title)) continue;
+            if (!NBStrSame(NBKVCStr(b, @"message"), message)) continue;
+            hits++;
+            if (hits == 1) hit = req;
+            else break;             // ≥2 条 ⇒ 立刻收手，连数都不必数完
+        }
+        if (hitsOut) *hitsOut = hits;
+        return (hits == 1) ? hit : nil;
+    } @catch (__unused NSException *e) { return nil; }
+}
+
 // ---------- v0.0.83：环形缓冲 + 同段跳升判据（替换掉坏死的 NBSectionTop）----------
 // 🔴 为什么删掉 v0.0.82 的 `NBSectionTop`：它在真机上打出的 top3 是
 //    `im.xym.marknow=1, com.bankcomm.Bankcomm=1, com.github.stormbreaker.prod=1`
@@ -1497,6 +1552,14 @@ static void NBCheckDeletedAlive(void) {
                            ds[@"rows"] ?: @"?", ds[@"sysGroups"] ?: @"?",
                            ds[@"sysExtra"] ?: @"?", ds[@"noSys"] ?: @"?",
                            ds[@"txtGroups"] ?: @"?", ds[@"txtExtra"] ?: @"?");
+                // 🔴 v0.0.85：**判决性的一行**。「无 sysId N 行」只说了有多少，
+                //    没说它们有多新 —— 而"新记录也在丢 ID"和"全是老记录"是两件完全不同的事，
+                //    修法也完全不同（前者改写入侧，后者只能等新记录替换）。
+                //    `24h 内` 就是那把尺子：> 0 ⇒ 写入侧在丢 ID（配合 `[无ID#n]` 行看是哪个入口）。
+                NBDiagStep(@"  [重] 无 sysId 的时间分布：24h 内 %@ 行 / 最新 %@ 秒前 / 最老 %@ 秒前"
+                           @"（-1 = 没有这类行）\n",
+                           ds[@"noSys24h"] ?: @"?", ds[@"noSysNewestAgo"] ?: @"?",
+                           ds[@"noSysOldestAgo"] ?: @"?");
             }
             int shownG = 0;
             for (NSArray *pair in dupTs) {
@@ -1791,6 +1854,37 @@ static void NBFindAndForwardClear(NSString *why, void (^done)(void)) {
                    why, (unsigned long)scanned, gWantBundle, secHits,
                    secHits > 0 ? @"都不是目标（目标已不在 NC）⇒ 不动手"
                                : @"该段在 NC 里一条都没有");
+        // ---------- v0.0.85：精确 ID 落空 ⇒ 按内容兜底（默认开，可在设置页关掉）----------
+        // 🔴 只在这里兜底，不动 NBFindOurRequest 本身：那个函数还被 5 处「复量」调用，
+        //    一旦它也按内容认亲，「本条还在=否」这个验收判据就变成"同内容还在也算还在"
+        //    ⇒ 又是一条假绿判据（这坑本项目踩过两次）。
+        if (secHits > 0 && (gWantTitle.length || gWantMsg.length)) {
+            NSDictionary *p = NBLoadSettings();
+            NSNumber *cf = p[NB_KEY_CONTENT_FALLBACK];
+            BOOL on = cf ? [cf boolValue] : YES;    // 缺省开
+            if (on) {
+                int chits = 0;
+                id cr = NBFindRequestByContent(gNCSource, gWantBundle, gWantTitle, gWantMsg, &chits);
+                NBDiagStep(@"  [找·内容] title=%@ msg=%@ ⇒ 同内容命中 %d 条 ⇒ %@\n",
+                           NBSafeClip(gWantTitle, 30), NBSafeClip(gWantMsg, 30), chits,
+                           cr ? @"唯一命中，按它动手" : (chits > 1 ? @"多条同内容 ⇒ 不猜，不动手"
+                                                                : @"没有同内容的 ⇒ 真的不在"));
+                if (cr) {
+                    // 🔴 一句必须说的话：下面 5 处「复量」用的还是**原 ID**
+                    //    （`gWantIDs` = 盒子里那一行的旧 sys_id）。旧 ID 在兜底之前就已经
+                    //    匹配不到了 ⇒ 那些复量必然报「已删」，**对本次没有信息量**。
+                    //    不写这一行，下次我自己会把「已删」当成"界面变了"的证据（假绿）。
+                    //    「仍在/已删」要认的话，只认 `[找·内容]` 那一行有没有再出现。
+                    NBDiagStep(@"  [找·内容] ⚠️ 本次按内容动手 ⇒ 下面各处的「复量」仍按原 ID 判，"
+                               @"读数对本次无意义（别当已删的证据）\n");
+                    gFoundNCReq = cr;
+                    NBForwardClearAsync(cr, @"内容兜底(唯一)", done);
+                    return;
+                }
+            } else {
+                NBDiagStep(@"  [找·内容] 设置里已关 ⇒ 不兜底\n");
+            }
+        }
         // 没找到 request ⇒ 这一刀打不出去 ⇒ 立刻把控制权交回去，让调用方去清账本
         if (done) done();
     }
@@ -1856,6 +1950,14 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
         // 🔴 v0.0.67：把「这次要删哪个 App」记到全局 —— OBS hook 在主队列/NC 队列上
         //    也要用它去 `uuidsToRequests` 里按 section 找 request。
         gWantBundle = bundleC;
+        // 🔴 v0.0.85：本条记录的 title / message（按内容兜底用）。
+        //    🔴 每次删除都必须**重新赋值**（哪怕这段记录没有内容 ⇒ 也要显式置 nil）：
+        //       否则上一次删除的 title 会残留下来，兜底会拿"上一条的内容"去本段里认亲，
+        //       认到的必然是错的 —— 这种"跨次残留"在 v0.0.69 的 gFindTries 上已经吃过一次。
+        gWantTitle = [(NSString *)req[@"title"] copy];
+        gWantMsg   = [(NSString *)req[@"message"] copy];
+        if (![gWantTitle isKindOfClass:[NSString class]]) gWantTitle = nil;
+        if (![gWantMsg isKindOfClass:[NSString class]])   gWantMsg   = nil;
         gFoundNCReq = nil;
         // 🔴🔴 v0.0.69：每次删除都把两个上限计数**归零**。不归零的后果不是"少清一条"，
         //    而是「从第 3 条起 NC 那条路永远不再尝试」—— 用户测到第 3、4 条时会以为
@@ -2912,7 +3014,40 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
     if ([NotifyFilter shouldSkipRecordForBundle:bid]) return bid;
 
     NSString *key = [NSString stringWithFormat:@"%@|%@|%@", bid, title ?: @"", msg ?: @""];
-    if (!NBClaimKey(key)) return bid;      // 已被另一个入口记过；bundle 仍有效
+    if (!NBClaimKey(key)) {
+        // 🔴🔴 v0.0.85：**"已经被记过"不等于"已经记好了"**。
+        //   同一条通知会经过三个入口，谁先到谁记录；先到的那个可能还没拿到
+        //   `bulletinID`（系统在 publish 过程中才分配）⇒ 那一行 `sys_id` 空着
+        //   ⇒ 以后永远删不掉通知中心里那条（真机表现就是「提示通知不会变」）。
+        //   后到的入口手里有 ID，却正是被这一行 return 挡掉的 ⇒ 在这里把 ID 补写回去。
+        //   🔴 只在**这次拿到 ID** 时才补；补写自带三条护栏（只改空 sys_id / 只改最近一行 /
+        //      查 changes）和 600 秒窗口，见 NotifyStore.m 的 backfillSysId。
+        if (sysId.length) {
+            NSInteger bf = [NotifyStore backfillSysId:sysId bundle:bid title:title message:msg];
+            if (bf > 0) {
+                // 只在前 3 次打，避免热路径刷屏（这条路径每条通知都会走两次）
+                static int gBfLog = 0;
+                if (gBfLog < 3) { gBfLog++; NBLog(@"[补ID#%d] tag=%@ bundle=%@ ⇒ 补上 1 行", gBfLog, tag, bid); }
+            }
+        }
+        return bid;      // 已被另一个入口记过；bundle 仍有效
+    }
+
+    // 🔴 v0.0.85：记录侧自证 —— 走到这里说明**这条真落库了**，那就必须知道它有没有 ID。
+    //   真机 `[重]` 行报过 `无 sysId 221 行`，而用户说「有些**刚推送**的也会提示通知不会变」
+    //   ⇒ 这批空 ID 的行到底是不是老记录，只能在这里量。
+    //   🔴 上限 8 条/进程：这个函数在 publish 热路径上，diag 是**无条件追加文件**的。
+    //   🔴 必须先问 `NBDiagReady()`（文件存在）：`NBDiagAppend` 在文件不存在时会**自己新建**它，
+    //      而「方法表只写一次」的判据正是「文件不存在」⇒ 让它新建就等于把方法表永久弄丢（v0.0.73 的坑）。
+    if (!sysId.length) {
+        static int gNoIdLog = 0;
+        if (gNoIdLog < 8 && NBDiagReady()) {
+            gNoIdLog++;
+            NBDiagStep(@"[无ID#%d] tag=%@ cls=%@ bundle=%@ bID=%@ nID=%@ title=%@\n",
+                       gNoIdLog, tag, NBClassName(obj), bid,
+                       NBSafeClip(bID, 40), NBSafeClip(nID, 40), NBSafeClip(title, 30));
+        }
+    }
 
     if (firstTime) *firstTime = YES;       // 🔴 只有走到这里才算"首次"
 

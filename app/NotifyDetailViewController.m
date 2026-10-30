@@ -234,7 +234,7 @@
         //    （"验收要用视图层的量"——提示到底有没有被看见，也是视图层的事。）
         if (outc == NBSyncClearNoSysId || outc == NBSyncClearOff) {
             NSString *msg = (outc == NBSyncClearNoSysId)
-                ? @"这条记录没有系统通知 ID（是旧版本记下的），无法定位通知中心里的那一条，"
+                ? @"这条记录没有系统通知 ID，无法定位通知中心里的那一条，"
                    "所以只删掉了盒子里的记录。"
                 : @"设置里「删除时同步清通知中心」是关的，所以只删掉了盒子里的记录。";
             UIAlertController *al = [UIAlertController

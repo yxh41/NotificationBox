@@ -376,6 +376,27 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
             }
             sqlite3_finalize(st);
         }
+        // ---------- v0.0.85：无 sys_id 的行到底有多"新" ----------
+        // 🔴 这一条是**判决性**的。v0.0.84 的文案默认它们"是旧版本记下的"，
+        //   但用户明确说「有些**刚推送**的也会提示通知不会变」⇒ 必须量，不许猜。
+        //   · noSys24h > 0 ⇒ 新记录里也在丢 ID（先到的入口没拿到 bulletinID）⇒ 写入侧的问题；
+        //   · noSys24h = 0 ⇒ 这批空 ID 全是老记录（v0.0.52 之前没这一列）⇒ 只能慢慢替换。
+        //   两个「距今多少秒」用同一把尺子（`strftime('%s','now')`），
+        //   🔴 不用 `timeIntervalSince1970` 在本地算 —— 两个进程各算一遍就可能差一秒，
+        //      而这一行是给人看的判据，口径必须只有一个。
+        const char *q4 = "SELECT "
+                         "IFNULL(SUM(CASE WHEN ts>=strftime('%s','now')-86400 THEN 1 ELSE 0 END),0), "
+                         "IFNULL(CAST(strftime('%s','now')-MAX(ts) AS INTEGER),-1), "
+                         "IFNULL(CAST(strftime('%s','now')-MIN(ts) AS INTEGER),-1) "
+                         "FROM notifications WHERE sys_id IS NULL OR sys_id='';";
+        if (sqlite3_prepare_v2(db, q4, -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out[@"noSys24h"]        = @(sqlite3_column_int(st, 0));
+                out[@"noSysNewestAgo"]  = @(sqlite3_column_int(st, 1));
+                out[@"noSysOldestAgo"]  = @(sqlite3_column_int(st, 2));
+            }
+            sqlite3_finalize(st);
+        }
     } @catch (__unused NSException *e) { }
     sqlite3_close(db);
     return out;
@@ -461,6 +482,62 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         }
     }
 
+    // ---------- v0.0.85：第二级去重（同内容 + 60 秒窗口）----------
+    // 🔴 为什么非要第二级：`nc_diag(24).txt` 的 `[重]` 行给出
+    //   `盒子 2145 行 ⇒ sysId 重复 0 组(多 0 行) ｜ 同内容重复 204 组(多 1853 行)`。
+    //   ⇒ v0.0.84 按 sys_id 的判等**确实干净了**（0 组），但**同内容的重复一点没治**：
+    //     系统把同一条通知重投时会分配**新的** sys_id，按 sys_id 判等永远认不出是同一件事。
+    //     用户眼里的"重复"就是这 1853 行（占 2145 行的 86%）。
+    // 🔴 窗口必须有限（60 秒）：不设窗口 ⇒ 用户连发两条一模一样的会被吞掉；设太长同理。
+    //   ⚠️ 比的是**两条通知自己的时间戳**，不是墙钟 —— 系统重投旧通知时带的是原来的时间。
+    // 🔴 命中就只 UPDATE（顶到最新 + 顺手把 sys_id 换成这次拿到的那个），**绝不新增行**。
+    //   ⚠️ ts 用 `MAX(ts, ?)`：系统重投旧通知时带的是**原来的**时间戳，直接写会把行往后挪。
+    {
+        double inTs = date ? [date timeIntervalSince1970]
+                           : [[NSDate date] timeIntervalSince1970];
+        const char *sel = "SELECT id FROM notifications WHERE bundle=? AND title=? AND message=? "
+                          "AND ts>=? ORDER BY ts DESC LIMIT 1;";
+        sqlite3_stmt *ss = NULL;
+        sqlite3_int64 dupId = 0;
+        if (sqlite3_prepare_v2(db, sel, -1, &ss, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(ss, 1, [bundle UTF8String], -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ss, 2, [title ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ss, 3, [message ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
+            sqlite3_bind_double(ss, 4, inTs - 60.0);
+            if (sqlite3_step(ss) == SQLITE_ROW) dupId = sqlite3_column_int64(ss, 0);
+            sqlite3_finalize(ss);
+        }
+        if (dupId > 0) {
+            // 🔴 v0.0.85 为什么**允许覆盖**已有的 sys_id：系统把同一条通知重投一次会分配新 ID，
+            //   而"删记录要能删掉界面上那条"靠的正是**最新**的那个 ID。若只补空位，
+            //   这一行会永远攥着一个过期 ID ⇒ 用户点删除永远打不中现役那条
+            //   —— 这正是 `nc_diag(24).txt` 里 34 次尝试中 28 次「同段有它条、ID 都不是目标」的由来。
+            //   窗口只有 60 秒 ⇒ 能落到这里的两条必然是同一件事的重投，覆盖是安全的。
+            //   ⚠️ 反过来：这次**没**拿到 ID 时保持原样（`?<>''` 守卫），别把好 ID 抹成空。
+            const char *upd =
+                "UPDATE notifications SET ts=MAX(ts, ?), "
+                "sys_id=CASE WHEN ?<>'' THEN ? ELSE sys_id END "
+                "WHERE id=?;";
+            sqlite3_stmt *us2 = NULL;
+            int changed = 0;
+            if (sqlite3_prepare_v2(db, upd, -1, &us2, NULL) == SQLITE_OK) {
+                sqlite3_bind_double(us2, 1, inTs);
+                sqlite3_bind_text(us2, 2, [sysId ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(us2, 3, [sysId ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(us2, 4, dupId);
+                int urc2 = sqlite3_step(us2);
+                changed = (urc2 == SQLITE_DONE) ? sqlite3_changes(db) : 0;
+                sqlite3_finalize(us2);
+            }
+            // 🔴 必须查 changes：UPDATE 命中 0 行也返回 SQLITE_DONE。
+            //    命中 0 行说明这一行在这几毫秒里被别人删了 ⇒ 落到下面正经 INSERT，别把通知吞掉。
+            if (changed > 0) {
+                sqlite3_close(db);
+                return;
+            }
+        }
+    }
+
     const char *ins = "INSERT INTO notifications (bundle,title,message,subtitle,ts,hash,sys_id) "
                       "VALUES (?,?,?,?,?,?,?)";
     sqlite3_stmt *stmt;
@@ -493,6 +570,54 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         sqlite3_exec(db, [del UTF8String], NULL, NULL, NULL);
     }
     sqlite3_close(db);
+}
+
+// ---------- v0.0.85：给「刚记下但没 ID」的那一行补写 sys_id ----------
+// 🔴 真机背景（`nc_diag(24).txt`）：`[重]` 行报 `无 sysId 221 行`，而用户明确说
+//   「有些**刚推送**的，也有的会提示通知不会变」⇒ 这批空 ID 的行**不全是老记录**。
+//   机制上完全说得通：同一条通知会经过三个入口
+//   （`publishBulletin:` / `publishBulletinRequest:` / `_publishBulletinRequest:forSectionID:forDestinations:`），
+//   **谁先到谁记录**（`NBClaimKey` 只放行第一个）。先到的入口手里可能还没有 `bulletinID`
+//   —— 系统是在 publish 过程中才分配的 —— 于是那一行 `sys_id` 落成空串；
+//   后到的入口手里有 ID，却被 `NBClaimKey` 挡在 store 之前，**永远没机会补**。
+//   ⇒ 这里就是那个"补"的出口：claim 被挡时把 ID 写回去。
+// 🔴 三条护栏（少一条都会出事，v0.0.84 的教训在这里同样成立）：
+//   ① 只改 `sys_id` 为空/NULL 的行 —— 空串相同 ≠ 同一条通知，一旦允许覆盖已有 ID，
+//      会把两条不相干的通知合成一条；
+//   ② 只改**最近那一行**（`ORDER BY ts DESC LIMIT 1`）—— 同内容的历史脏行可能有好几行，
+//      一把 UPDATE 会连坐；
+//   ③ 必须查 `sqlite3_changes()` —— UPDATE 命中 0 行照样返回 `SQLITE_DONE`。
+// 🔴 窗口 600 秒：超出就不补。理由是「补错人」比「没补上」更糟——
+//   两小时前的同内容行几乎肯定不是刚才这条通知。
++ (NSInteger)backfillSysId:(NSString *)sysId
+                    bundle:(NSString *)bundle
+                     title:(NSString *)title
+                   message:(NSString *)message {
+    if (!sysId.length || !bundle.length) return 0;
+    sqlite3 *db = [self openDB];
+    if (!db) return 0;
+    NSInteger changed = 0;
+    @try {
+        double now = [[NSDate date] timeIntervalSince1970];
+        const char *upd = "UPDATE notifications SET sys_id=? WHERE id=("
+                          "SELECT id FROM notifications WHERE bundle=? AND title=? AND message=? "
+                          "AND (sys_id IS NULL OR sys_id='') AND ts>=? "
+                          "ORDER BY ts DESC LIMIT 1);";
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, upd, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, [sysId UTF8String], -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, [bundle UTF8String], -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 3, [title ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 4, [message ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
+            sqlite3_bind_double(st, 5, now - 600.0);
+            int rc = sqlite3_step(st);
+            if (rc == SQLITE_DONE) changed = sqlite3_changes(db);
+            else NBStoreLog(@"补写 sys_id 失败 rc=%d err=%s", rc, sqlite3_errmsg(db));
+            sqlite3_finalize(st);
+        }
+    } @catch (__unused NSException *e) { }
+    sqlite3_close(db);
+    return changed;
 }
 
 // 🔴🔴 v0.0.40：**筛选条件的唯一出口**。
@@ -837,17 +962,26 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
 
     // v0.0.52：删前读 bundle + sys_id（精确同步清通知中心用）。
     // 🔴 必须先读后删：删完就 SELECT 不到了。这两个值只在"开启同步清且 sys_id 非空"时才用到。
+    // v0.0.85：多读 title / message —— tweak 侧在精确 ID 落空时要靠它们做「同段同内容只命中 1 条」
+    //   的兜底匹配（见 `NB_KEY_CONTENT_FALLBACK` 的注释）。
     NSString *delBundle = nil;
     NSString *delSysId  = nil;
+    NSString *delTitle  = nil;
+    NSString *delMsg    = nil;
     {
         sqlite3_stmt *r = NULL;
-        if (sqlite3_prepare_v2(db, "SELECT bundle, sys_id FROM notifications WHERE id=?", -1, &r, NULL) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(db, "SELECT bundle, sys_id, title, message FROM notifications WHERE id=?",
+                               -1, &r, NULL) == SQLITE_OK) {
             sqlite3_bind_int64(r, 1, (sqlite3_int64)rowId);
             if (sqlite3_step(r) == SQLITE_ROW) {
                 const char *b = (const char *)sqlite3_column_text(r, 0);
                 const char *s = (const char *)sqlite3_column_text(r, 1);
+                const char *t = (const char *)sqlite3_column_text(r, 2);
+                const char *m = (const char *)sqlite3_column_text(r, 3);
                 if (b) delBundle = [NSString stringWithUTF8String:b];
                 if (s) delSysId  = [NSString stringWithUTF8String:s];
+                if (t) delTitle  = [NSString stringWithUTF8String:t];
+                if (m) delMsg    = [NSString stringWithUTF8String:m];
             }
             sqlite3_finalize(r);
         }
@@ -878,7 +1012,8 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
         if (![p[NB_KEY_SYNC_CLEAR] boolValue]) {
             if (outcome) *outcome = NBSyncClearOff;
         } else {
-            [self nbRequestClearNCWithSysId:delSysId bundle:delBundle];
+            [self nbRequestClearNCWithSysId:delSysId bundle:delBundle
+                                      title:delTitle message:delMsg];
             if (outcome) *outcome = NBSyncClearRequested;
         }
     }
@@ -927,9 +1062,15 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
 // v0.0.52：把"要清哪一条"写进共享请求文件，再 post Darwin 通知唤醒 tweak。
 // 🔴 文件用**覆盖写**：手动逐条删几乎不会竞态；批量清理 / 清空全部不触发本通道（见 deleteWithBundle:/clearAll）。
 // 🔴 整段 @try：这步只是"发个请求"，任何失败都不该影响"盒子记录已经删掉"这个结果。
-+ (void)nbRequestClearNCWithSysId:(NSString *)sysId bundle:(NSString *)bundle {
++ (void)nbRequestClearNCWithSysId:(NSString *)sysId bundle:(NSString *)bundle
+                            title:(NSString *)title message:(NSString *)message {
     @try {
-        NSDictionary *req = @{@"sysId": sysId ?: @"", @"bundle": bundle ?: @""};
+        // 🔴 v0.0.85：多带 title / message 两个键。理由见 `backfillSysId` 头注释：
+        //   系统重投同一条通知会分配新 ID，精确 ID 匹配必然落空；
+        //   tweak 侧要靠「同段 + 同 title + 同 message 且只命中 1 条」兜底。
+        //   没有这两个键，那条兜底路径就只能是猜。
+        NSDictionary *req = @{@"sysId": sysId ?: @"", @"bundle": bundle ?: @"",
+                              @"title": title ?: @"", @"message": message ?: @""};
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [NOTIFYBOX_NC_CLEAR_REQ stringByDeletingLastPathComponent]
                                      withIntermediateDirectories:YES attributes:nil error:nil];
@@ -937,7 +1078,7 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                              CFSTR("com.yxh41.notifybox.ncClear"),
                                              NULL, NULL, TRUE);
-        NBStoreLog(@"NC-CLEAR 已请求 sysId=%@ bundle=%@", sysId, bundle);
+        NBStoreLog(@"NC-CLEAR 已请求 sysId=%@ bundle=%@ title=%@", sysId, bundle, title);
     } @catch (NSException *e) {
         NBStoreLog(@"NC-CLEAR 请求失败：%@", e);
     }

@@ -19,7 +19,24 @@ typedef NS_OPTIONS(NSUInteger, NBKeywordAction) {
 //   用于"盒子删记录时同步清系统通知中心"的精确 1:1 匹配；读不到传 nil，功能自动失效。
 // v0.0.84：盒子侧重复量（只读）。返回 rows / noSys / sysGroups / sysExtra /
 //   txtGroups / txtExtra 六个键，语义见 .m 里 dupStats 的注释。
+// v0.0.85：多三个键，专门用来判「无 sys_id 的行到底是老记录还是新记录」——
+//   noSys24h / noSysNewestAgo / noSysOldestAgo（秒，-1 = 没有这类行）。
 + (NSDictionary *)dupStats;
+
+// v0.0.85：把这次才拿到的系统 ID 补写到「刚刚那条还没 ID 的行」上。
+// 🔴 为什么需要它：同一条通知会经过 publishBulletin / publishBulletinRequest /
+//   _publishBulletinRequest:forSectionID:forDestinations: 三个入口，**谁先到谁记录**。
+//   先到的那个入口可能还没拿到 bulletinID（系统在 publish 过程中才分配）
+//   ⇒ 那一行 sys_id 为空 ⇒ 以后永远删不掉通知中心里那条。
+//   后到的入口手里有 ID，但它会被 NBClaimKey 挡在 store 之前 ⇒ 在这里补写。
+// 🔴 三条护栏（少一条就出事）：① 只改 `sys_id` 为空/NULL 的行；② 只改**最近那一行**
+//   （同内容可能有历史脏行，一把 UPDATE 会连坐）；③ 必须查 `sqlite3_changes()`
+//   （UPDATE 命中 0 行也返回 SQLITE_DONE）。窗口 600 秒，超出就不补（怕补错人）。
+// 返回补上的行数（0 = 没有可补的）。
++ (NSInteger)backfillSysId:(NSString *)sysId
+                    bundle:(NSString *)bundle
+                     title:(nullable NSString *)title
+                   message:(nullable NSString *)message;
 
 + (void)recordWithBundle:(NSString *)bundle
                    title:(nullable NSString *)title

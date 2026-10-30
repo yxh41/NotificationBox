@@ -327,9 +327,17 @@ static inline NSArray<NSString *> *NBStringArray(id v) {
 //   "要删哪个"走外带共享文件（下面那个路径）。
 // 🔴 只有 App 侧写（删除时）、tweak 侧读（收到通知后执行）—— 和所有名单同族。
 #define NB_KEY_SYNC_CLEAR @"syncClearNC"   // 布尔，默认关
+// 🔴 v0.0.85：精确 ID 匹配不到时的「按内容兜底」开关（默认开）。
+//    背景（`nc_diag(24).txt`）：34 次删除里 28 次是「同段有它条、但 ID 都不是目标」——
+//    也就是**系统把同一条通知重投过一次、给了新 ID**，而盒子里那行的 sys_id 是旧的
+//    ⇒ 精确匹配永远落空 ⇒ 用户看到「删了没反应」。
+//    兜底判据故意收得很紧：**同段 + 同 title + 同 message 且只命中 1 条**才动手；
+//    命中 ≥2 条一律不动（分不清是哪个，宁可不动也不许撤错）。
+#define NB_KEY_CONTENT_FALLBACK @"contentFallbackNC"   // 布尔，默认开
 // 🔴 Darwin 通知名（不带 payload）：App 删完一条、写完请求文件后 post 它。
 #define NOTIFYBOX_NC_CLEAR_DARWIN @"com.yxh41.notifybox.ncClear"
-// 🔴 共享请求文件：App 写 {sysId, bundle}，tweak 读后执行清除。
+// 🔴 共享请求文件：App 写 {sysId, bundle, title, message}，tweak 读后执行清除。
+//   🔴 v0.0.85 起多了 title / message 两个键（按内容兜底用）。
 //   单条删除用单文件足够（手动逐条删几乎不会竞态）；批量清理 / 清空全部不触发本通道。
 #define NOTIFYBOX_NC_CLEAR_REQ @"/var/mobile/Library/NotifyBox/nc_clear_req.plist"
 

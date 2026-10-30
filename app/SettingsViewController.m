@@ -320,6 +320,22 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
                   tint:teal
                     on:[self boolOf:cur[NB_KEY_SYNC_CLEAR]]
                    key:NB_KEY_SYNC_CLEAR];
+    // ---------- v0.0.85：精确 ID 落空时按内容兜底 ----------
+    // 🔴 为什么需要这个开关：系统把同一条通知重投一次就会分配**新 ID**，
+    //    盒子里那行存的旧 ID 于是永远匹配不上 ⇒ 表现是「删了没反应」。
+    //    兜底 = 拿记录里的 title/message 去通知中心里找，**同 App + 同标题 + 同内容
+    //    且只命中 1 条**才动手；命中多条一律不动（分不清就不猜）。
+    //    🔴 默认**开**：它是"精确 ID 落空时"的最后一步，不改变精确匹配的行为。
+    //    留开关是因为它有可能删掉"内容相同但其实是另一条"的通知，得让用户能关。
+    {
+        NSNumber *cf = cur[NB_KEY_CONTENT_FALLBACK];
+        [self addSwitchRow:@"ID 对不上时按内容兜底"
+                       sub:@"同 App 同内容只命中 1 条才动手"
+                      icon:@"text.magnifyingglass"
+                      tint:teal
+                        on:(cf ? [cf boolValue] : YES)
+                       key:NB_KEY_CONTENT_FALLBACK];
+    }
 
     // ---------- 5. 拦截与过滤 ----------
     // v0.0.51：单独一区、排在「黑白名单」**之前**：流水线上先记录后过滤——
@@ -974,7 +990,8 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     //    症状：点开、保存、再进来又变回关；而保存时没有任何报错，盘上压根没这个键。
     //    ⇒ 加开关时必须同时改这里（源码判据 s0x 盯着这一点）。
     for (NSString *k in @[NB_KEY_SPEAK_ENABLED, NB_KEY_DND_ENABLED, NB_KEY_SOUND_ENABLED,
-                          NB_KEY_SOUND_DUCK_OTHERS, NB_KEY_SYNC_CLEAR]) {
+                          NB_KEY_SOUND_DUCK_OTHERS, NB_KEY_SYNC_CLEAR,
+                          NB_KEY_CONTENT_FALLBACK]) {
         UISwitch *sw = self.switches[k];
         d[k] = @(sw ? sw.isOn : NO);
     }
