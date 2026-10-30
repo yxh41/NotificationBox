@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.86"
+#define NB_VER_STR @"0.0.87"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -665,7 +665,13 @@ static NSString *gWantMsg    = nil;
 //   🔴 两个数必须成对出现 —— 只有分母没有分子（或反过来）都判不出东西（MEMORY §4.13）。
 static int gEntryHit[3]  = {0, 0, 0};
 static int gEntryTook[3] = {0, 0, 0};
-static int gPickLog      = 0;        // `[入口]` 复读日志的条数上限（热路径，必须封顶）
+// 🔴🔴 v0.0.87：**必须按入口分格**（`[3]`），不能是一个全局计数。
+//   真机 `nc_diag(28).txt` 的现场：`[无ID#n]` 8 条**全是 PBRS**，可日志里一条
+//   `[入口PBRS] orig 后…` 都找不到 —— 只有 `入口PB 补写 0 行`×6 和 `入口PBR`×6。
+//   原因：`PB` 是最热的入口（这一轮 148 次调用），全局上限 6 条**前 6 次全被 PB 吃掉**
+//   ⇒ PBRS 永远排不上队。而 PBRS 恰恰是唯一会空 ID 的那个入口（8/8）。
+//   ⇒ 加了这两个数、却因为共享上限看不见答案，等于白加。现在每格各 6 条、互不挤占。
+static int gPickLog[3]   = {0, 0, 0};   // 三个入口各自的复读日志条数上限（热路径，必须封顶）
 static __strong id gCSDestination = nil;  // 真 destination（CSNotificationDispatcher 实例）
 static BOOL gCSDestFromHook = NO;          // 它是「注册期 hook」接住的（不是靠 OBS 撞上的）
 static __strong id gFoundNCReq = nil;     // 找到的**真** request（系统对象，不是我造的）
@@ -3305,10 +3311,12 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
         if (!msg.length)   msg   = NBSafeStr(inner, @"message");
     }
 
-    BOOL wantLog = (gPickLog < 6 && NBDiagReady());
+    // 🔴 v0.0.87：按入口取自己那一格。`slot` 越界时归到 0，绝不越界写数组。
+    int lslot = (slot >= 0 && slot < 3) ? slot : 0;
+    BOOL wantLog = (gPickLog[lslot] < 6 && NBDiagReady());
     if (!idAfter.length) {
         if (wantLog) {
-            gPickLog++;
+            gPickLog[lslot]++;
             NBDiagStep(@"[入口%@] orig 后仍无 ID（bID=%@ rID=%@ pubID=%@ nID=%@）⇒ 这条路取不到\n",
                        tag, NBSafeClip(NBSafeStr(obj, @"bulletinID"), 32),
                        NBSafeClip(NBSafeStr(obj, @"recordID"), 32),
@@ -3319,7 +3327,7 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
     }
     if (!bundle.length) {
         if (wantLog) {
-            gPickLog++;
+            gPickLog[lslot]++;
             NBDiagStep(@"[入口%@] orig 后拿到 ID=%@ 但认不出 bundle ⇒ 不补写\n",
                        tag, NBSafeClip(idAfter, 44));
         }
@@ -3327,7 +3335,7 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
     }
     NSInteger n = [NotifyStore backfillSysId:idAfter bundle:bundle title:title message:msg];
     if (wantLog) {
-        gPickLog++;
+        gPickLog[lslot]++;
         NBDiagStep(@"[入口%@] orig 后取到 ID=%@ ⇒ 补写 %ld 行（bundle=%@ title=%@）\n",
                    tag, NBSafeClip(idAfter, 44), (long)n, bundle, NBSafeClip(title, 24));
     }
