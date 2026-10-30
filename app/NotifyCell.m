@@ -80,6 +80,12 @@
 @property (nonatomic, assign) CGFloat nbOffset;
 // 手势开始那一刻的位移（跟手要用「起点 + 本次平移」，不能直接用本次平移）
 @property (nonatomic, assign) CGFloat nbOffsetAtBegin;
+// v0.0.93：卡片**未位移时**的右缘（contentView 坐标）。红块宽度要跟着位移变，
+// 但 `cardView.frame` 在 transform 非 identity 时是包络值、不能拿来算 ⇒
+// layoutSubviews 里把这一条记下来。
+@property (nonatomic, assign) CGFloat nbCardMaxX;
+// v0.0.93：当前是否处于「松手即删」态（只用来避免每帧重复设 label 文案）
+@property (nonatomic, assign) BOOL nbArmed;
 
 // 🔴 内部方法必须显式声明（项目开 -Werror，靠"定义在前面"解析选择器太脆）
 - (void)nbRender;
@@ -91,6 +97,8 @@
 - (void)nbSettleTo:(CGFloat)target animated:(BOOL)animated;
 - (void)nbPan:(UIPanGestureRecognizer *)g;
 - (void)nbTapDelete:(UITapGestureRecognizer *)g;
+// v0.0.93：滑到底 —— 卡片整行滑出之后再执行删除
+- (void)nbFlyOutThenDelete;
 @end
 
 // v0.0.44：把 `query` 在 `text` 里出现的每一处都标出来。
@@ -214,6 +222,23 @@ static const CGFloat kNBSwipeActionW = 52.0;
 // 图标最多缩到多小。0.55 = "还认得出是这个图标，但显然已经不是主角"；
 // 缩到 0.2 会像个掉出来的点，只缩到 0.9 又看不出"退场"。
 static const CGFloat kNBSwipeIconMinScale = 0.55;
+
+// ================= v0.0.93：补上「继续滑到底 = 直接删」 =================
+// 🔴 上一版漏了这条路径。系统的 `trailingSwipeActionsConfigurationForRowAtIndexPath:`
+//    有一个 `performsFirstActionWithFullSwipe`（**默认 YES**）：把卡片一路滑到底松手，
+//    就直接执行第一个 action。用户原话「怎么不能继续滑动直接删除了」说的就是它 ——
+//    **不是手势冲突**，是我自绘时只实现了"滑开 52pt 停住"这一档。
+//
+// 判据（这版的核心）：**"看着像要删"和"松手真的删"必须是同一个数**。
+// ⇒ 一律用**显示位移** `nbOffset` 判（而不是另算一个 raw 位移），
+//    否则阻尼一改就出现"label 变成「松手删除」了、松手却没删"。
+//
+// 越过 52 之后还要多拖多少显示位移才算"待删"。24pt ≈ 手指再走小半厘米，
+// 太大会让人以为滑不动，太小会误删（滑开的手感和删掉是两件事）。
+static const CGFloat kNBSwipeArmAt = 24.0;
+// 越过 52 之后的阻尼系数。0.2 太"顶"（继续滑几乎不动，用户以为坏了），
+// 0.35 保留"到头了"的阻力感，又能滑出 24pt 进待删态。
+static const CGFloat kNBSwipeExtraDrag = 0.35;
 
 + (CGFloat)height { return kNBCardInteriorH + kNBCardInsetY * 2; }
 
@@ -441,6 +466,8 @@ static const CGFloat kNBSwipeIconMinScale = 0.55;
     // 🔴 它**不跟随位移**：frame 只由 card 决定，卡片移开它就露出来。
     //    右端 = 卡片右端 ⇒ 卡片左移 52 之后，露出的那块（宽 52）正好被它填满，
     //    与卡片右缘严丝合缝，不会出现"卡片走了、红块旁边留一条缝"。
+    // v0.0.93：记住卡片**未位移**时的右缘，红块宽度要按位移往左扩（见 nbApplyOffset:）
+    self.nbCardMaxX = CGRectGetMaxX(card);
     self.swipeActionView.frame = CGRectMake(CGRectGetMaxX(card) - kNBSwipeActionW,
                                             card.origin.y,
                                             kNBSwipeActionW,
@@ -504,6 +531,11 @@ static const CGFloat kNBSwipeIconMinScale = 0.55;
     // 🔴 这一段必须排在角标判定**之后**：顺序反了会拿上一轮/上一行的 isUnread 算宽度。
     CGFloat msgW = self.isUnread ? MAX(0.0, textW - 26.0) : textW;
     self.msgLabel.frame = CGRectMake(textX, msgY, msgW, msgH);
+
+    // v0.0.93：上面写死的红块宽是 52，而"滑到底"时它应该按位移变宽。
+    // 布局重算会把宽度打回 52 ⇒ 若当前不在原位，立刻按当前位移重算一次。
+    // （改的是子视图 frame，不会再触发本方法的布局，不会递归。）
+    if (self.nbOffset < -0.5) [self nbApplyOffset:self.nbOffset];
 }
 
 // ================= v0.0.92：左滑删除 =================
@@ -532,6 +564,31 @@ static const CGFloat kNBSwipeIconMinScale = 0.55;
     //    `hidden` 不是可动画属性，在动画块里设 YES 会**立刻**生效：
     //    表现为"红块先啪一下消失，卡片还在回弹路上"，中间那一瞬露出灰底。
     if (p > 0.001) self.swipeActionView.hidden = NO;
+
+    // ④ v0.0.93：红块宽度**跟着位移长**，右缘钉在卡片未位移时的右缘。
+    // 🔴 不加这一段的话，滑过 52 之后卡片继续左移、红块还是 52 宽 ⇒
+    //    红块右侧露出一条 contentView 底色（灰底），像"红块被撕掉一块"。
+    //    封顶 = 卡片宽度（整行滑出时红块正好铺满，不会越出 cell 被 clipsToBounds 切）。
+    CGFloat aw = -offset;
+    if (aw < kNBSwipeActionW) aw = kNBSwipeActionW;          // 没滑时不缩，保持 52 交给 hidden 管
+    CGFloat capW = self.cardView.bounds.size.width;          // bounds 不受 transform 影响
+    if (capW > 0.0 && aw > capW) aw = capW;
+    if (self.nbCardMaxX > 0.0) {
+        CGRect af = self.swipeActionView.frame;
+        af.origin.x = self.nbCardMaxX - aw;
+        af.size.width = aw;
+        self.swipeActionView.frame = af;
+        self.swipeLabel.frame = self.swipeActionView.bounds;
+    }
+
+    // ⑤ v0.0.93：进入「松手即删」态时换文案。
+    // 🔴 判据和松手时**用同一个数**（`nbOffset` 对比同一个阈值），
+    //    所以"看到「松手删除」"和"松手真的删了"必然同时发生。
+    BOOL armed = (offset <= -(kNBSwipeActionW + kNBSwipeArmAt));
+    if (armed != self.nbArmed) {
+        self.nbArmed = armed;
+        self.swipeLabel.text = armed ? @"松手删除" : @"删除";
+    }
 }
 
 // 收放到目标位置。`animated:NO` 只给 prepareForReuse 用（复用池里不要动画）。
@@ -552,6 +609,33 @@ static const CGFloat kNBSwipeIconMinScale = 0.55;
     } completion:^(BOOL finished) {
         // 收起到位之后才隐藏：提前隐藏会看到"红块先消失、卡片还在路上"
         if (target >= -0.001) self.swipeActionView.hidden = YES;
+    }];
+}
+
+// v0.0.93：滑到底 —— 卡片整行滑出，滑完再执行删除。
+// 🔴 为什么不在松手那一刻直接回调删除：
+//    ① 视觉上要"滑走"才符合系统 full-swipe 的印象（松手即消失太硬，像闪了一下）；
+//    ② 回调里会 `[self loadData]` ⇒ cell 立刻被复用，必须等这段动画收尾，
+//       否则复用池里那条新行会带着"滑出去"的 transform 出现在屏幕上。
+// 🔴 completion 里**先复位再回调**：删不掉时（业务侧会弹「没删掉」）cell 还在，
+//    此时它必须已经回到原位；而删成功时紧接着 reload 重建，肉眼看不到这次复位。
+- (void)nbFlyOutThenDelete {
+    CGFloat w = self.contentView.bounds.size.width;
+    if (w < 1.0) w = self.bounds.size.width;
+    if (w < 1.0) {
+        // 宽度都拿不到就别做动画了（退化路径：宁愿少个动画，也不能不删）
+        if (self.nbOnDelete) self.nbOnDelete();
+        return;
+    }
+    [UIView animateWithDuration:0.18
+                          delay:0.0
+                        options:(UIViewAnimationOptionCurveEaseIn |
+                                 UIViewAnimationOptionBeginFromCurrentState)
+                     animations:^{
+        [self nbApplyOffset:-w];
+    } completion:^(BOOL finished) {
+        [self nbSettleTo:0.0 animated:NO];
+        if (self.nbOnDelete) self.nbOnDelete();
     }];
 }
 
@@ -578,7 +662,10 @@ static const CGFloat kNBSwipeIconMinScale = 0.55;
             if (x > 0.0) {
                 x *= 0.2;                                   // 右滑越界给阻尼，别硬顶
             } else if (x < -kNBSwipeActionW) {
-                x = -kNBSwipeActionW + (x + kNBSwipeActionW) * 0.2;
+                // v0.0.93：越过"全开"之后不再锁死 —— 要留出继续往左的空间，
+                // 用户才滑得到"待删"那条线。系数 0.35 比原来的 0.2 松一点，
+                // 因为 0.2 时滑到手酸也进不了待删态（看着像"滑不动 / 坏了"）。
+                x = -kNBSwipeActionW + (x + kNBSwipeActionW) * kNBSwipeExtraDrag;
             }
             [self nbApplyOffset:x];
             break;
@@ -587,6 +674,13 @@ static const CGFloat kNBSwipeIconMinScale = 0.55;
         case UIGestureRecognizerStateEnded:
         case UIGestureRecognizerStateCancelled:
         case UIGestureRecognizerStateFailed: {
+            // v0.0.93：先判"滑到底了没有" —— 待删态松手就删。
+            // 🔴 判据必须和 `nbApplyOffset:` 里切文案用的是**同一个数**，
+            //    否则会出现"label 写着「松手删除」、松手却没删"这种最气人的情况。
+            if (self.nbOffset <= -(kNBSwipeActionW + kNBSwipeArmAt)) {
+                [self nbFlyOutThenDelete];
+                break;
+            }
             // 判据 = "速度优先、位置兜底"：快速甩一下不管拖了多远都按方向收/放；
             // 慢慢拖超过一半才算打开。300pt/s 大致是"明显有甩的动作"。
             BOOL open;
@@ -610,7 +704,10 @@ static const CGFloat kNBSwipeIconMinScale = 0.55;
     // 🔴 一次性动作必须判 state：手势 action 在每个状态变化时都会回调，
     //    不判就可能执行两次（本项目在长按菜单上必现过一件事做两遍）。
     if (g.state != UIGestureRecognizerStateEnded) return;
-    if (self.nbOnDelete) self.nbOnDelete();
+    // v0.0.93：点删除也走同一条「滑走 → 再删」的路径。
+    // 两处各写一份的话，点删是"啪一下没了"、滑到底是"滑走再没"，同一件事两种手感会打架；
+    // 而且 `nbFlyOutThenDelete` 里有"先复位再回调"，复用安全只在这一个地方保证。
+    [self nbFlyOutThenDelete];
 }
 
 // 🔴 只在"水平主导"时才开始，而且必须在**手势开始之前**答
@@ -831,6 +928,9 @@ static const CGFloat kNBSwipeIconMinScale = 0.55;
     //    `removeAllAnimations` 只清动画、不改属性值，所以下面的复位仍然有效。
     [self.cardView.layer removeAllAnimations];
     [self.iconBox.layer removeAllAnimations];
+    // v0.0.93：红块自己也会跑动画（滑出删除那 0.18s 的宽度/位置变化），一起掐掉。
+    // 不掐的症状：复用池里刚被复用的那一行，红块宽度从上一行的整行宽度慢慢缩回 52。
+    [self.swipeActionView.layer removeAllAnimations];
     [self nbApplyOffset:0.0];
     // 🔴 block 也要清：不清就会留着上一行捕获的 rowId，
     //    万一这一行没走到 cellForRow 就被点了删除 ⇒ **删掉上一条**。
