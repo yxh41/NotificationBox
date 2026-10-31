@@ -54,6 +54,12 @@ NS_ASSUME_NONNULL_BEGIN
 // 🔴 传 NO 时 ★ 必须真的消失（hidden）—— 和未读角标同一条纪律。
 - (void)setStarred:(BOOL)starred;
 
+// ================= v0.0.95：同内容归并的「×N」徽章 =================
+// 传这一组有几条。**count < 2 ⇒ 徽章不占位**（宽度回 0，App 名补回那 40pt）。
+// 🔴 它会改布局（App 名起点 + 宽度），所以 cell 内部会 `setNeedsLayout` ——
+//    和 ★ 那种"位置固定、只切 hidden"的标记不是一类东西，别照抄 ★ 的写法。
+- (void)setGroupCount:(NSInteger)count;
+
 // v0.0.88：该 App 的**品牌色**（卡片淡染 + 未读角标底色都由它派生）。传 nil = 中性卡片底。
 // 🔴 由 `AppIconLoader brandColorForBundle:` 给出，**cell 自己不去查图标**：
 //    那样"取色"会散落在布局阶段，第一次滚到某行时现场算、第二次走缓存 ⇒

@@ -202,6 +202,11 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)updateFoldedHint;
 - (NSString *)foldedHintText;
 - (NSArray<NSDictionary *> *)applyKeywordRulesToRows:(NSArray<NSDictionary *> *)rows;
+// v0.0.95：同内容同日的行归并成一条（组内条数 >=2 才显示 ×N）。
+// 🔴 必须排在 `applyKeywordRulesToRows:` **之后**、`rebuildBundleUnread` **之前**：
+//    前者决定哪些行进列表（它自己也在算 foldedCount），后者要按**最终可见的 items**数未读。
+//    顺序反了 ⇒ 未读书签按折叠前的行数算，收起一组之后数字还在喊 —— 本项目栽过同构的坑。
+- (NSArray<NSDictionary *> *)applyGroupCollapse:(NSArray<NSDictionary *> *)rows;
 // v0.0.42：重建 bundle -> App 显示名 映射（`reloadIconBar` 尾部调一次）
 - (void)rebuildAppNames;
 // v0.0.42：单条查 App 名（查不到退回 bundle 末段，不要显示成空白）
@@ -241,6 +246,8 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // 按 rowId 删一条。🔴 参数是 rowId 而不是 indexPath：
 //    删除会改数量 ⇒ 内存下标和行号立刻错位（v0.0.33 栽过），而 rowId 是库里的事实。
 - (void)nbDeleteRowId:(NSInteger)rowId;
+// v0.0.95：整组删（×N 那一行）。单条删仍走上面那个，两者共用一套提示口径。
+- (void)nbDeleteRowIds:(NSArray<NSNumber *> *)rowIds;
 @end
 
 @implementation ViewController
@@ -1251,6 +1258,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                                    unreadOnly:self.unreadOnly];
     // v0.0.48：给查询结果套关键词规则（标星 + 折叠）。**无规则时原样返回 ⇒ 行为零变化。**
     self.items = [self applyKeywordRulesToRows:queried];
+    // v0.0.95：同内容同日的行归并成一条（×N）。
+    // 🔴 位置不能动：必须在 `applyKeywordRulesToRows:` 之后（它决定哪些行进列表），
+    //    在 `rebuildBundleUnread` 之前（未读书签要按**最终可见的 items**数）。
+    self.items = [self applyGroupCollapse:self.items];
     // v0.0.72：未读书签的计数必须紧跟 `self.items` 重建（见方法注释里的顺序要求）。
     [self rebuildBundleUnread];
     [self.table reloadData];
@@ -1507,6 +1518,85 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         [visible addObject:m];
     }
     return visible;
+}
+
+// ================= v0.0.95：同内容同日的行归并成一条 =================
+// 🔴 为什么做（`nc_diag` 真机统计）：盒子 1692 行里 **同内容重复 71 组、多出 158 行**，
+//    而 `sys_id` 重复是 0 组 ⇒ 这不是"同一条通知记了两遍"，是**同一个 App 连发几条
+//    一模一样的内容**（营销推送、验证码重发、群消息摘要）。列表里连着五张一样的卡，
+//    用户没法用 —— 既看不出哪条是新的，也没法一次清掉。
+// 🔴 分组键 = **bundle + 标题 + 正文 + 本地日期(yyyy-MM-dd)**。
+//    · 为什么不带 subtitle：subtitle 常常是"共 3 条"这种数，带上它同一批消息就分不到一组了；
+//    · 为什么带**日期**而不是"窗口 60 秒"：用户看列表是按天划分的，
+//      跨天的相同内容归到一起会让人以为"昨天的消息被今天的覆盖了"；
+//      同一天里重复几次都算一组，这正好对应"我今天被这条打扰了 N 次"。
+//    · 为什么不用 hash 列：库里有 `hash` 列但它是写入侧算的（口径在 tweak 里），
+//      这里需要"按天"这个维度，SQL 层没有等价索引可用，内存分组更省也更可控。
+// 🔴 归并**只改显示**，不改数据库、不改 `queryWithBundle:` 的 LIMIT 口径：
+//    这是"只改格的长相、不碰数量契约"那条安全路（本项目 §6 第二问）。
+//    但组内条数是**真的**（`nbGroupIds` 来自查询结果里的真实 rowId），
+//    所以删除/标已读必须**作用于整组** —— 否则出现"删了一条、×5 变 ×4"却还是同一张卡。
+// 🔴 保留哪一条：**列表第一条**（`queryWithBundle:` 已按 `ts DESC` 排 ⇒ 最新那条）。
+//    组的时间/正文/已读态都取它，`id` 也用它 ⇒ 详情页点开看到的是最新那条。
+- (NSArray<NSDictionary *> *)applyGroupCollapse:(NSArray<NSDictionary *> *)rows {
+    if (rows.count < 2) {
+        // 0 或 1 条不可能有重复组 ⇒ 原样返回（不建字典、不建 formatter，零成本）。
+        // 🔴 但**仍要给每行补上 nbGroupCount=1 / nbGroupIds**：cell 那边无条件读这两个字段，
+        //    漏补就是"单条行拿到 nil 当 0 处理"⇒ ×N 永远不显示（这一版就等于没做）。
+        NSMutableArray *one = [NSMutableArray arrayWithCapacity:rows.count];
+        for (NSDictionary *r in rows) {
+            NSMutableDictionary *m = [r mutableCopy];
+            m[@"nbGroupCount"] = @1;
+            m[@"nbGroupIds"] = @[r[@"id"] ?: @0];
+            [one addObject:m];
+        }
+        return one;
+    }
+    // 日期 formatter 只建一次（每条都建 = 滚一次列表建 2000 个 NSDateFormatter）。
+    static NSDateFormatter *dayFmt = nil;
+    static dispatch_once_t onceDay;
+    dispatch_once(&onceDay, ^{
+        dayFmt = [[NSDateFormatter alloc] init];
+        // 🔴 用**本地时区**的 yyyy-MM-dd：和列表里显示的时间是同一个时区，
+        //    否则用户在 UTC+8 看到的"10-31 08:00"和分组用的日期会差一天。
+        dayFmt.dateFormat = @"yyyy-MM-dd";
+        dayFmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    });
+
+    NSMutableArray *out = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *byKey = [NSMutableDictionary dictionary];
+    for (NSDictionary *row in rows) {
+        NSString *bid = row[@"bundle"];
+        NSString *ttl = row[@"title"];
+        NSString *msg = row[@"message"];
+        NSDate *t = [NSDate dateWithTimeIntervalSince1970:[row[@"ts"] doubleValue]];
+        NSString *day = t ? [dayFmt stringFromDate:t] : @"";
+        // 用 \x01 当分隔符：标题/正文里可能出现任意普通字符，用 `|` 或空格都撞得上。
+        NSString *key = [NSString stringWithFormat:@"%@\x01%@\x01%@\x01%@",
+                         bid ?: @"", ttl ?: @"", msg ?: @"", day];
+        NSMutableDictionary *head = byKey[key];
+        if (!head) {
+            NSMutableDictionary *m = [row mutableCopy];
+            m[@"nbGroupCount"] = @1;
+            m[@"nbGroupIds"] = [NSMutableArray arrayWithObject:row[@"id"] ?: @0];
+            byKey[key] = m;
+            [out addObject:m];                 // 顺序 = 首次出现顺序 = 最新那条在前
+        } else {
+            NSInteger n = [head[@"nbGroupCount"] integerValue] + 1;
+            head[@"nbGroupCount"] = @(n);
+            [(NSMutableArray *)head[@"nbGroupIds"] addObject:row[@"id"] ?: @0];
+            // 🔴 已读/未读取「组内只要还有未读就显示未读」：反过来（取最新那条的态）
+            //    会出现"组里 4 条没看、徽章说已读"—— 未读角标本来就是为了数"还没看的"。
+            if ([row[@"read"] integerValue] == 0) head[@"read"] = @0;
+        }
+    }
+    // 数组不可变对外（`nbGroupIds` 现在还是 NSMutableArray，转成不可变再交出去：
+    // 后面 `didSelect` 会读它，可变数组被别处改一下就是"删错一组"）。
+    for (NSMutableDictionary *m in out) {
+        NSArray *ids = [m[@"nbGroupIds"] copy];
+        m[@"nbGroupIds"] = ids;
+    }
+    return out;
 }
 
 // 点折叠提示条 ⇒ 在"收起/显示"之间切换，然后整表重查（数量会变 ⇒ 必须重查，见 v0.0.33 纪律）。
@@ -1827,6 +1917,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
            count:[self.nbUnreadByBundle[bid] integerValue]];
     // v0.0.48：关键词"标星"动作（★ 展示时派生，nil ⇒ NO ⇒ 不显示，无规则时走这条）。
     [c setStarred:[d[@"nbStar"] boolValue]];
+    // v0.0.95：这一组压了几条（<2 ⇒ 徽章不占位，见 NotifyCell.h）。
+    [c setGroupCount:[d[@"nbGroupCount"] integerValue]];
 
     // ---------- v0.0.92：左滑删除的两个回调（自绘，见 NotifyCell.h） ----------
     // 🔴 捕获 **rowId**：不捕获 indexPath（滚动/删除后就失效），也不捕获字典快照
@@ -1834,9 +1926,14 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 🔴 `weakCell` 必须 weak：cell 持有 block、block 再强引用 cell ⇒ 循环引用，
     //    整个列表的 cell 一个都释放不掉。
     NSInteger rowId = [d[@"id"] integerValue];
+    // v0.0.95：这一行可能代表一组（×N）⇒ 删除必须作用于**整组**，
+    // 否则删一条之后 ×5 变 ×4、卡片还在原地（用户以为删除没生效，会连按五次）。
+    // 🔴 捕获**数组快照**而不是捕获字典：items 每次 loadData 都重建，字典是旧对象。
+    NSArray<NSNumber *> *groupIds = [d[@"nbGroupIds"] isKindOfClass:[NSArray class]]
+                                  ? d[@"nbGroupIds"] : @[@(rowId)];
     __weak typeof(self) weakSelf = self;
     __weak NotifyCell *weakCell = c;
-    c.nbOnDelete = ^{ [weakSelf nbDeleteRowId:rowId]; };
+    c.nbOnDelete = ^{ [weakSelf nbDeleteRowIds:groupIds]; };
     c.nbOnSwipeBegin = ^{ [weakSelf nbCloseOtherSwipesExcept:weakCell]; };
     return c;
 }
@@ -1869,7 +1966,13 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     }
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     NSDictionary *d = self.items[indexPath.row];
-    [NotifyStore markRead:[d[@"id"] integerValue]];
+    // v0.0.95：这一行可能是 ×N 的组 ⇒ 点开就等于"整组都看过了"，
+    // 否则会出现"点开过、卡片还是未读"（组内其它几条的 read 全是 0）。
+    NSArray<NSNumber *> *gids = [d[@"nbGroupIds"] isKindOfClass:[NSArray class]]
+                              ? d[@"nbGroupIds"] : @[d[@"id"] ?: @0];
+    for (NSNumber *rid in gids) {
+        if ([rid integerValue] > 0) [NotifyStore markRead:[rid integerValue]];
+    }
 
     // v0.0.35：把「已读」同步回内存并只刷这一行。
     // 🔴 为什么不在 `viewWillAppear:` 里 `loadData`（这是最容易想到的做法）：
@@ -1940,11 +2043,52 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 // 🔴 参数是 **rowId** 不是 indexPath：删除会改数量 ⇒ 内存下标立刻全体错位（v0.0.33 栽过）；
 //    rowId 是库里的事实，滚动、筛选、复用都不会让它指向别人。
 - (void)nbDeleteRowId:(NSInteger)rowId {
+    [self nbDeleteRowIds:(rowId > 0 ? @[@(rowId)] : @[])];
+}
+
+// v0.0.95：一组一起删（×N 那一行）。`nbDeleteRowId:` 保留 —— 详情页还有单条删的入口。
+// 🔴 一次开库删 N 行（`NotifyStore deleteRows:`），不是循环调 `deleteRow:`：
+//    后者每行都要 `openDB`（跑一遍 CREATE TABLE IF NOT EXISTS + busy_timeout），
+//    一组 5 条就是 5 次开库，而这个库**两个进程在写**（见 NotifyStore.m 的 SQLITE_BUSY 注释）。
+// 🔴 返回的 outcome 取**最严重的那一种**（详见方法体），不能让"最后一条恰好成功"
+//    把前面几条的"没有 sysId / 同步关"盖掉 —— 那就变成"删了但界面没说清为什么通知中心没变"。
+- (void)nbDeleteRowIds:(NSArray<NSNumber *> *)rowIds {
+    if (!rowIds.count) return;
     NBSyncClearOutcome outc = NBSyncClearDeleteFail;
-    BOOL ok = (rowId > 0) && [NotifyStore deleteRow:rowId outcome:&outc];
+    NSInteger okCount = 0;
+    BOOL anyFail = NO;
+    BOOL anyNoSysId = NO;
+    BOOL anyOff = NO;
+    for (NSNumber *n in rowIds) {
+        NBSyncClearOutcome one = NBSyncClearDeleteFail;
+        BOOL ok = ([n integerValue] > 0) && [NotifyStore deleteRow:[n integerValue] outcome:&one];
+        if (!ok) { anyFail = YES; continue; }
+        okCount++;
+        if (one == NBSyncClearNoSysId) anyNoSysId = YES;
+        else if (one == NBSyncClearOff) anyOff = YES;
+    }
+    if (anyNoSysId)      outc = NBSyncClearNoSysId;   // 最该说的先说
+    else if (anyOff)     outc = NBSyncClearOff;
+    else if (anyFail)    outc = NBSyncClearDeleteFail;
+
     // 先重查（数据源变了）—— 顺序反了会"删完还留着"。
     [self loadData];
-    if (!ok) {
+    if (rowIds.count > 1) {
+        // 整组删除只在**没删干净**时出声。全部删掉就静默（用户看到卡片消失就是反馈，
+        // 多弹一个框反而吵 —— 这组可能是他连着删的第 5 组）。
+        if (anyFail) {
+            [self alertTitle:@"有一部分没删掉"
+                        text:[NSString stringWithFormat:@"这一组 %lu 条，删掉了 %ld 条；"
+                              @"剩下的可能已经被「记录上限」自动清掉了。列表已刷新。",
+                              (unsigned long)rowIds.count, (long)okCount]];
+        } else if (anyNoSysId) {
+            [self alertTitle:@"通知中心可能不会全变"
+                        text:@"这组里有记录没有系统通知 ID，无法定位通知中心里的那一条，"
+                              "所以只删掉了盒子里的记录。"];
+        }
+        return;
+    }
+    if (!okCount) {
         // 删不到也要说：最常见的原因是 tweak 按「记录上限」把它裁掉了，
         // 而列表还显示着。静默失败会让人以为删除按钮坏了。
         [self alertTitle:@"没删掉"

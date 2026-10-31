@@ -229,7 +229,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.94"
+#define NB_VER_STR @"0.0.95"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -535,6 +535,19 @@ static BOOL gCsWsSuppressed = NO;   // YES ⇒ 本进程不用 ⑦s/⑦t/⑦r（
 //    ⇒ 同秒读回**必然**读到"还在"，它不是判据，是噪声。
 //    做法：⓪ 成功那条记进台账；每次进 NC 侧时扫一遍比对 ⇒ 一行就能看出"几分钟后消失"。
 static NSString *const kNBDeletedLog = @"/var/mobile/Library/NotifyBox/.nb_deleted";
+// ---------- v0.0.95：[寿] 的「上一次见到」快照 ----------
+// 🔴🔴🔴 为什么必须再加一个文件（`nc_diag` v0.0.94 复盘，这是本版最硬的一条）：
+//    `[寿]` 原来把「这次扫描没命中」直接叫「已消失」，可**扫描基数会变**：
+//      同一批 24 条台账，扫 NC 120 条 ⇒ 已消失 23 / 仍在 1
+//                        扫 NC 285 条 ⇒ 已消失  1 / 仍在 23
+//    两次都没有错，只是**分母换了**（NC 里装载的 request 数在 120~454 之间浮动）。
+//    ⇒ 「已消失」的分子被分母污染，它答不了本来那个问题（「等下去有没有用」）。
+//    ⇒ 正解不是改措辞，是换成**同口径的前后对比**：
+//       这一轮命中 ⇒ 记下 `lastSeenTs`；
+//       下一轮**不再命中、而上一轮命中过** ⇒ 这才是「本轮消失」，才配回答"等有没有用"；
+//       从来没命中过 ⇒ 「从未见到」—— 这类多半是 ⓪ 之后系统秒撤，本来就不需要界面刀。
+//    行格式：cid|lastSeenTs|lastScanAll（scanAll 一并存，用来证明"那一次分母是多少"）
+static NSString *const kNBDeletedSeen = @"/var/mobile/Library/NotifyBox/.nb_deleted_seen";
 // v0.0.79：[段] / [重] 的明细每个进程只打一次（日志窗口 ≈ 最后 50 条、全局滚动）
 static BOOL gCensusDumped = NO;
 #define NB_DEL_KEEP 24            // 台账最多留 24 条（更老的没有诊断价值，且让扫描变贵）
@@ -1378,6 +1391,75 @@ static int NBCountInWindow(id source, NSString *bundle, NSDate *ts, NSTimeInterv
     } @catch (__unused NSException *e) { return -1; }
 }
 
+// ---------- v0.0.95：⑦ 刀的「归因快照」+ 一把**独立尺子** ----------
+// 🔴🔴🔴 为什么必须加这两样（`nc_diag` v0.0.94 真机 23 次尝试复盘）：
+//   7 个「⑦ 基线 … 本条还在=是」的样本逐刀读回，看起来四把刀都能用：
+//     ⑦s 1/7 ｜ ⑦t 2/6 ｜ ⑦u 4/4
+//   可**一个都不能算在刀头上**：
+//     ① ⑦t 的那 2 次「否」，窗口里恰好夹着 `[BB→NC] 系统自己调用 observer:removeBulletin:`
+//        （第 14 / 16 次）⇒ 系统自己撤的，⑦t 只是站在旁边；
+//     ② ⑦u 的 4/4 是**循环论证**：读回走 `NBFindOurRequest(gNCSource…)`，
+//        读的就是 ⑦u 刚摘过的那张 `uuidsToRequests`。实测
+//        「量前 449 → 摘键 448 → 量后 448 → 读回 扫 448 条 ⇒ 还在=否」——
+//        NC 总条数**只因为我摘了一格才变**，系统什么都没撤。
+//        ⇒ 「用自己刚改的模型当读回源」＝恒真（§4-6 那条铁律换个位置又犯了）。
+//   ⇒ 修法两条：
+//     A. **归因快照**：每把刀前后各取一次 `gBBToNCSeen` / 系统侧 dispatcher 撤回次数 /
+//        `uuidsToRequests` 条数。窗口里系统自己动过 ⇒ 本刀**不可归因**，直接写清楚。
+//     B. **独立尺子**：换一个我方任何刀都不碰的对象问「界面层还认不认得这条」——
+//        `CSNotificationDispatcher -destination:notificationRequestForUUID:`
+//        查的是 destination（CoverSheet 主页面那个真 UI），与 NC source 的映射是两条路。
+// 🔴 尺子自己也可证伪：如果它内部其实也去查同一张表，日志里必然出现
+//    「尺子=否 而 src 条数没变」这种不可能的样本 ⇒ 下一轮据此判它作废，别硬用。
+// 🔴 这是本版**唯一**新增的系统方法调用（`destination:notificationRequestForUUID:`）。
+//    `listDestination` 早就用过了（⑦ 目的地那行），不算新挂点。
+static BOOL gDestRulerTried = NO;
+
+static int NBMapCountOf(id source) {
+    @try {
+        id m = [source uuidsToRequests];
+        if ([m isKindOfClass:[NSDictionary class]]) return (int)((NSDictionary *)m).count;
+    } @catch (__unused NSException *e) { }
+    return -1;                                   // -1 = 读不到（不许当 0）
+}
+
+// 返回 1=认 / 0=不认 / -1=没测到（**没测到不等于不认**，输出必须是三个值之一）
+static int NBDestKnowsRaw(id req) {
+    if (!req || !gCSDestination) return -1;
+    if (![gCSDestination respondsToSelector:@selector(destination:notificationRequestForUUID:)])
+        return -1;
+    id uuid = nil;
+    @try { uuid = NBSafeValue(req, @"uuid"); } @catch (__unused NSException *e) { }
+    if (!uuid) return -1;
+    id dest = nil;
+    @try {
+        if ([gCSDestination respondsToSelector:@selector(listDestination)])
+            dest = [gCSDestination listDestination];
+    } @catch (__unused NSException *e) { }
+    if (!dest) return -1;
+    if (!gDestRulerTried) {
+        gDestRulerTried = YES;
+        NBDiagStep(@"  [尺] 首次调用 CSNotificationDispatcher -destination:notificationRequestForUUID:"
+                   @"（独立尺子：查 destination，不碰 NC source 映射）\n");
+    }
+    @try {
+        id got = [gCSDestination destination:dest notificationRequestForUUID:uuid];
+        return got ? 1 : 0;
+    } @catch (__unused NSException *e) { }
+    return -1;
+}
+
+static NSString *NBDestKnowsStr(id req) {
+    int v = NBDestKnowsRaw(req);
+    if (v < 0) return @"没测到";
+    return v ? @"是" : @"否";
+}
+
+// 系统侧 dispatcher 撤回次数 = 总计数 − 我方 ⑦s 计数（gObsDispatcherWithdraw 是混计的）
+static int NBSysWithdrawCount(void) {
+    return gObsDispatcherWithdraw - gNCDirectWithdraw;
+}
+
 // 把「刚刚被 ⓪ 清掉的那条」记进台账。
 // 行格式：时间戳|bundle|bulletinID|recordID|publisherBulletinID
 // 🔴 v0.0.79：从 1 个键扩到 3 个键。原因是 `nc_diag(19).txt` 暴露的：
@@ -1424,6 +1506,24 @@ static void NBCheckDeletedAlive(void) {
         // ---- 1. 台账 ----
         NSString *old = [NSString stringWithContentsOfFile:kNBDeletedLog
                                                   encoding:NSUTF8StringEncoding error:NULL];
+        // v0.0.95：先读「上一次见到」快照（格式 cid|lastSeenTs|lastScanAll）。
+        // 🔴 读不到 ≠ 出错：第一次装这一版时它必然不存在 ⇒ 全部记「从未见到」，
+        //    下一轮起才有「本轮消失」。这个"第一轮全是从未见到"必须能自解释，
+        //    所以在输出行里把 prev=0 的条数单独打出来（见 [寿] 第三行）。
+        NSMutableDictionary<NSString *, NSNumber *> *seenPrev = [NSMutableDictionary dictionary];
+        @try {
+            NSString *st = [NSString stringWithContentsOfFile:kNBDeletedSeen
+                                                    encoding:NSUTF8StringEncoding error:NULL];
+            if (st.length) {
+                for (NSString *ln in [st componentsSeparatedByString:@"\n"]) {
+                    if (!ln.length) continue;
+                    NSArray *q = [ln componentsSeparatedByString:@"|"];
+                    if (q.count < 2 || ![(NSString *)q[0] length]) continue;
+                    double t = [q[1] doubleValue];
+                    if (t > 0) seenPrev[q[0]] = @(t);
+                }
+            }
+        } @catch (__unused NSException *e) { }
         NSMutableArray *recs = [NSMutableArray array];
         NSMutableSet  *allIDs = [NSMutableSet set];
         if (old.length) {
@@ -1434,9 +1534,12 @@ static void NBCheckDeletedAlive(void) {
                 NSMutableSet *keys = [NSMutableSet setWithObject:p[2]];
                 if (p.count >= 4 && [(NSString *)p[3] length]) [keys addObject:p[3]];
                 if (p.count >= 5 && [(NSString *)p[4] length]) [keys addObject:p[4]];
+                // prevSeen：这一条**上一次**在 NC 里被扫到是什么时候（0 = 从来没见到）
+                double prev = [seenPrev[p[2]] doubleValue];
                 [recs addObject:[@{@"ts": p[0], @"bundle": (p.count >= 2 ? p[1] : @""),
                                    @"cid": p[2], @"keys": keys, @"hitNC": @NO,
-                                   @"kN": @NO, @"kB": @NO, @"kSame": @NO} mutableCopy]];
+                                   @"kN": @NO, @"kB": @NO, @"kSame": @NO,
+                                   @"prevSeen": @(prev)} mutableCopy]];
                 [allIDs unionSet:keys];
             }
         }
@@ -1524,12 +1627,17 @@ static void NBCheckDeletedAlive(void) {
         //   ⇒ 这一版字段直接叫 `hitNC`（命中 NC = 还在），输出 `hitNC ? 仍在 : 已消`。
         //   🔴 教训：改语义先改**输出映射**，别只改变量名 —— 变量名不会让日志变对。
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        int liveN = 0, goneN = 0;
+        // v0.0.95：把「已消失」拆成两个**不同的问题**（原来混成一个，导致分子被分母污染）：
+        //   turnGoneN = 上一轮明明扫到过、这一轮扫不到了 ⇒ 它是在这一轮之间消失的
+        //               ⇒ **只有这个数才配回答"等下去有没有用"**
+        //   neverN    = 从来就没在这一侧的扫描里出现过 ⇒ 多半是 ⓪ 之后系统秒撤，
+        //               本来就不需要界面刀；把它算进"已消失"会让结论虚高
+        int liveN = 0, turnGoneN = 0, neverN = 0;
         // v0.0.91：三类归因（见 3a）。`swapN` = 只按 nid 命中、且它现在挂的 bID 与台账不同
         //   ⇒ 系统重投换了新 bulletinID 回来的**另一条**，不是我们删的那条还在。
         int sameN = 0, onlyN = 0, onlyB = 0, swapN = 0;
         int nidRecs = 0, bRecs = 0;      // **按条**数（每类命中的台账条数，不是键命中次数）
-        NSTimeInterval lOld = 0, lNew = 0, gOld = 0, gNew = 0;
+        NSTimeInterval lOld = 0, lNew = 0, tOld = 0, tNew = 0;
         for (NSDictionary *rec in recs) {
             NSTimeInterval age = now - [rec[@"ts"] doubleValue];
             if ([rec[@"kN"] boolValue]) nidRecs++;
@@ -1541,35 +1649,44 @@ static void NBCheckDeletedAlive(void) {
                 else if ([rec[@"kB"] boolValue]) onlyB++;
                 if (!lOld || age > lOld) lOld = age;
                 if (!lNew || age < lNew) lNew = age;
+            } else if ([rec[@"prevSeen"] doubleValue] > 0) {
+                turnGoneN++;
+                if (!tOld || age > tOld) tOld = age;
+                if (!tNew || age < tNew) tNew = age;
             } else {
-                goneN++;
-                if (!gOld || age > gOld) gOld = age;
-                if (!gNew || age < gNew) gNew = age;
+                neverN++;
             }
         }
         // 🔴 计数口径改过一次，必须说清楚（v0.0.91）：原来打的是「按 nid/uuid 命中 %d **次**、
         //    按 bulletin 命中 %d **次**」—— 那是**键命中次数**的全局累加，不是"几条"。
         //    我自己在复盘 `nc_diag` 时就把它读成"每条都被两把键命中"，从而推出"确实是同一条"，
         //    方向正好相反。⇒ 现在只打**按条**的数，单位写进字面量里（"条"）。
-        NBDiagStep(@"  [寿] 台账 %lu 条 × 扫 NC %lu 条 ⇒ NC 里仍在 %d / 已消失 %d"
+        NBDiagStep(@"  [寿] 台账 %lu 条 × 扫 NC %lu 条 ⇒ 仍在 %d / 本轮消失 %d / 从未见到 %d"
                    @"（nid/uuid 命中 %d 条、bulletin 命中 %d 条、本段 bulletin 读不到 %d 条）\n",
-                   (unsigned long)recs.count, (unsigned long)all.count, liveN, goneN,
+                   (unsigned long)recs.count, (unsigned long)all.count, liveN, turnGoneN, neverN,
                    nidRecs, bRecs, noBulletin);
         if (liveN) NBDiagStep(@"  [寿] 归因 同条 %d / 只nid %d（其中 bID已换 %d）/ 只bID %d\n",
                               sameN, onlyN, swapN, onlyB);
         if (liveN) NBDiagStep(@"  [寿]   仍在  ：最老 %.0fs 最新 %.0fs%@\n", lOld, lNew,
                               (lOld > 600 ? @"  ← 最老已 >10 分钟仍在 ⇒ **不会自己消失**" : @""));
-        if (goneN) NBDiagStep(@"  [寿]   已消失：最老 %.0fs 最新 %.0fs\n", gOld, gNew);
+        // 🔴 这两行是本版的重点：只有「本轮消失」能回答「等下去有没有用」。
+        if (turnGoneN) NBDiagStep(@"  [寿]   本轮消失：最老 %.0fs 最新 %.0fs"
+                                  @"  ← 上一轮还在、这一轮不在 ⇒ **这才是「等有没有用」的答案**\n",
+                                  tOld, tNew);
+        if (neverN) NBDiagStep(@"  [寿]   从未见到：%d 条（一次都没在这一侧扫到过；"
+                               @"多半是 ⓪ 之后系统秒撤 ⇒ 本来就不需要界面刀；"
+                               @"首轮安装时这一项必然 = 全部）\n", neverN);
         // 每类给 **1 条样本**（固定 ≤5 行）：日志窗口只剩最后几十行，明细不能铺开。
         // 顺序按"最能说明问题"排：同条（真没删掉）→ bID已换（重投，假"仍在"）→ 其余。
         NSString *(^tagOf)(NSDictionary *) = ^NSString *(NSDictionary *r) {
-            if (![r[@"hitNC"] boolValue]) return @"已消";
+            if (![r[@"hitNC"] boolValue])
+                return ([r[@"prevSeen"] doubleValue] > 0) ? @"本轮消失" : @"从未见到";
             if ([r[@"kSame"] boolValue]) return @"同条";
             if ([r[@"kN"] boolValue]) return (r[@"curBID"] ? @"只nid·bID已换" : @"只nid");
             if ([r[@"kB"] boolValue]) return @"只bID";
             return @"?";
         };
-        for (NSString *want in @[@"同条", @"只nid·bID已换", @"只nid", @"只bID", @"已消"]) {
+        for (NSString *want in @[@"同条", @"只nid·bID已换", @"只nid", @"只bID", @"本轮消失", @"从未见到"]) {
             for (NSDictionary *rec in [recs reverseObjectEnumerator]) {
                 if (![tagOf(rec) isEqualToString:want]) continue;
                 NBDiagStep(@"  [寿]   %@ %@ %@（%.0fs 前）·%@%@\n",
@@ -1582,6 +1699,27 @@ static void NBCheckDeletedAlive(void) {
                 break;
             }
         }
+        // ---- 4b. v0.0.95：写回「上一次见到」快照（唯一出口）----
+        // 🔴 写回规则必须写清，否则下一轮读到的口径会和这一轮不同：
+        //    本轮命中 ⇒ ts 更新成 now（它"还在"，那就在这一轮见到过）；
+        //    本轮没命中但以前见过 ⇒ **保留旧 ts 不动**（它是"本轮消失"，别再刷新，
+        //      否则下一轮会退化成"从未见到"，把已经量到的结论弄丢）；
+        //    从来没命中过 ⇒ 不写（省空间，也免得下次被误判）。
+        //    只写台账里现存的 cid ⇒ 文件不会无限膨胀。
+        @try {
+            NSMutableArray *out = [NSMutableArray array];
+            for (NSDictionary *rec in recs) {
+                NSString *cid = rec[@"cid"];
+                if (!cid.length) continue;
+                double prev = [rec[@"prevSeen"] doubleValue];
+                double val = [rec[@"hitNC"] boolValue] ? now : prev;
+                if (val <= 0) continue;
+                [out addObject:[NSString stringWithFormat:@"%@|%.0f|%lu", cid, val,
+                                (unsigned long)all.count]];
+            }
+            [[out componentsJoinedByString:@"\n"] writeToFile:kNBDeletedSeen atomically:YES
+                                                     encoding:NSUTF8StringEncoding error:NULL];
+        } @catch (__unused NSException *e) { }
 
         // ---- 5. [段] + [重]：回答「同一时间怎么有一模一样的信息」 ----
         // 🔴 只在**每个进程的头一次**打明细（日志窗口 ≈ 最后 50 条，全局滚动，必须省行数）。
@@ -2410,6 +2548,13 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     //    而且现在手里是 `[找]` 出来的**真 request**（`req.bulletin` 命中），
                     //    不是 v0.0.62 那种工厂造的空壳 —— 前提条件也换了。
                     if (still && req7) {
+                        // v0.0.95：归因快照的起点（为什么需要，见 NBDestKnowsRaw 上面的长注释）。
+                        // 🔴 三个量都取「刀动手之前」：bb2nc 是系统把撤回传给 NC 的次数，
+                        //    sysWd 是系统侧 dispatcher 撤回次数（已减我方），src 是映射条数。
+                        //    哪一把刀让其中任何一个动了，就是"谁改了谁"的硬证据。
+                        const int nbBb0 = gBBToNCSeen;
+                        const int nbWd0 = NBSysWithdrawCount();
+                        const int nbSrc0 = NBMapCountOf(gNCSource);
                         // ---- ⑦s：NC 侧派发器。系统自己撤一条时走的就是这一步 ----
                         // 依据：09:56:47 那批 `[OBS] dispatcher withdrawNotificationWithRequest:`
                         //       紧跟着 `[OBS-cs] withdrawNotificationRequest:` **成对**出现。
@@ -2436,6 +2581,15 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                                (unsigned long)sc7, sh7,
                                                still ? @"是" : @"否（已删）", how7x ?: @"?");
                                     NBReportSectionJump("7s", shBase, sh7);
+                                    // v0.0.95 归因：这一刀到底算不算数
+                                    NBDiagStep(@"  ⑦s 归因：bb2nc+%d sysWd+%d src %d→%d ⇒ %@ ｜ 尺子=%@"
+                                               @"（读回源=NC source 映射，界面刀本来就不该改它）\n",
+                                               gBBToNCSeen - nbBb0, NBSysWithdrawCount() - nbWd0,
+                                               nbSrc0, NBMapCountOf(gNCSource),
+                                               ((gBBToNCSeen - nbBb0) || (NBSysWithdrawCount() - nbWd0))
+                                               ? @"❌ 窗口内系统自己动过 ⇒ 不可归因给本刀"
+                                               : @"窗口内系统没动",
+                                               NBDestKnowsStr(req7));
                                 } @catch (NSException *e) {
                                     NBDiagStep(@"  ⑦s 读回抛: %@\n", e.reason);
                                 }
@@ -2468,6 +2622,15 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                                (unsigned long)sc7, sh7,
                                                still ? @"是" : @"否（已删）", how7x ?: @"?");
                                     NBReportSectionJump("7t", shBase, sh7);
+                                    // v0.0.95 归因（同 ⑦s）。上一版正是这里骗了我们：
+                                    // 那 2 次「否」的窗口里都夹着 `[BB→NC] 第 14/16 次`。
+                                    NBDiagStep(@"  ⑦t 归因：bb2nc+%d sysWd+%d src %d→%d ⇒ %@ ｜ 尺子=%@\n",
+                                               gBBToNCSeen - nbBb0, NBSysWithdrawCount() - nbWd0,
+                                               nbSrc0, NBMapCountOf(gNCSource),
+                                               ((gBBToNCSeen - nbBb0) || (NBSysWithdrawCount() - nbWd0))
+                                               ? @"❌ 窗口内系统自己动过 ⇒ 不可归因给本刀"
+                                               : @"窗口内系统没动",
+                                               NBDestKnowsStr(req7));
                                 } @catch (NSException *e) {
                                     NBDiagStep(@"  ⑦t 读回抛: %@\n", e.reason);
                                 }
@@ -2582,6 +2745,20 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                 NBDiagStep(@"  ⑦u 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
                                            (unsigned long)sc7, sh7,
                                            still ? @"是" : @"否（已删）", how7x ?: @"?");
+                                // 🔴🔴 v0.0.95：**上一行是恒真的，别再拿它当成败判据。**
+                                //    读回走 `NBFindOurRequest(gNCSource…)` ⇒ 读的就是本刀刚摘过的
+                                //    `uuidsToRequests`。v0.0.94 真机 4 次全"否"，而真机复算：
+                                //    量前 449 → 摘键 448 → 量后 448 → 读回「扫 448 条」⇒
+                                //    **总数只因为我摘了一格才变**，系统一个字节都没动。
+                                //    ⇒ 这行只配读成「我摘到了」，界面有没有变必须看尺子。
+                                NBDiagStep(@"  ⑦u 归因：bb2nc+%d sysWd+%d src %d→%d ⇒ %@ ｜ 尺子=%@"
+                                           @"（读回源=本刀刚改的表 ⇒ 恒真；界面看尺子）\n",
+                                           gBBToNCSeen - nbBb0, NBSysWithdrawCount() - nbWd0,
+                                           nbSrc0, NBMapCountOf(gNCSource),
+                                           ((gBBToNCSeen - nbBb0) || (NBSysWithdrawCount() - nbWd0))
+                                           ? @"❌ 窗口内系统自己动过 ⇒ 不可归因给本刀"
+                                           : @"窗口内系统没动",
+                                           NBDestKnowsStr(req7));
                                 // 🔴 v0.0.82 双读：同一次块里连读两遍。
                                 //   两次不一致 ⇒ 这个判据本身不稳定 ⇒ 之前所有「已删」都不能当证据。
                                 {
@@ -2738,6 +2915,12 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                still ? @"是" : @"否", nid7,
                                gCSDWithdraw, gCSDClear, gCSDClearSec, gCSDClearRng,
                                gCSDIncoming, gCSDDismiss, gCSDPost);
+                    // v0.0.95：把「本行 still 的读回源」写死在这里，免得下一轮又把它当独立证据。
+                    //   走过 ⑦u ⇒ 读回源已被本刀改过 ⇒ 本行的「否」不构成"界面变了"的证据；
+                    //   只走过 ⑦s/⑦t ⇒ 源没被我改，本行「否」只可能来自系统传播（= 不可归因）。
+                    NBDiagStep(@"  ⑦ 判读口径：still 的来源=NC source 映射（⑦u 摘键=%d 键 ⇒ 走过它就是恒真）"
+                               @"；界面到底变没变，只看每把刀之后的「尺子=」和 bb2nc 增量\n",
+                               gNCDirectMapKill);
                     NBDiagStep(@"  ⑦ 逐刀计数：我方 ⑦s=%d ⑦t=%d ⑦u(摘键)=%d ⑦r(段范围清)=%d"
                                @" ｜ dispatcher 撤回总计(系统+我方)=%d"
                                @" ｜ [RL] 段重载=%d [RM] modify=%d(命中 %d) [RP] 投递=%d(命中复投 %d)\n",

@@ -54,6 +54,19 @@
 // 🔴 布局判据用这个原始 BOOL，**不拿 starLabel.hidden 反推**：
 //    "拿视图状态反推数据状态"本项目栽过（attributedText 时序），星也必须存一份原始量。
 @property (nonatomic, assign) BOOL starred;
+// ================= v0.0.95：同内容归并折叠的「×N」徽章 =================
+// 🔴 为什么需要它：`nc_diag` 真机统计盒子 1692 行里，**同内容重复 71 组（多出 158 行）**，
+//    而 `sys_id` 重复是 0 组 ⇒ 不是"同一条记了两遍"，是**同一个 App 连发几条一模一样的内容**
+//    （营销推送、验证码重发、群消息摘要）。列表里连着 5 张一模一样的卡，用户没法用。
+// 🔴 位置 = **第一行最左端**（App 名前面）。三个理由：
+//    ① 第一行右端已经排满「★ + 时间」，右下角是未读角标 —— 再挤必然打架（本项目挪过三次）；
+//    ② 它和 App 名是同一句话的两半（「微信 ×5」），放一起不用眼睛跳；
+//    ③ 正文区一行都不占 —— 正文最多两行本来就紧。
+// 🔴 只在 count >= 2 时**占位**：count < 2 时宽度回 0、App 名补回那 40pt。
+//    永远占位会让每条单发通知的 App 名白少 40pt（15 个汉字变 11 个），不值。
+@property (nonatomic, strong) UILabel *groupLabel;
+// 🔴 存原始量，不拿 groupLabel.hidden 反推（同上一条纪律）。
+@property (nonatomic, assign) NSInteger groupCount;
 // v0.0.44：高亮要"先存原始串、最后统一渲染" —— 两个 setter 的调用顺序不固定，
 // 谁先到都只是记下来，真正写字在 `nbRender` 里一次做完。
 @property (nonatomic, copy) NSString *rawAppName;
@@ -402,6 +415,18 @@ static void NBHapticFire(NBHapticKind kind) {
     self.timeLabel.minimumScaleFactor = 0.8;
     [self.cardView addSubview:self.timeLabel];
 
+    // ---------- v0.0.95：「×N」归并徽章（第一行最左端，见属性区注释） ----------
+    self.groupLabel = [[UILabel alloc] init];
+    self.groupLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+    // 🔴 用 tintColor 系（不是红、不是橙）：它不是"警报"，只是"这里压了几条"。
+    //    红色在这张卡上已经有明确语义（左滑删除按钮），不能混用。
+    self.groupLabel.textColor = [UIColor secondaryLabelColor];
+    self.groupLabel.textAlignment = NSTextAlignmentLeft;
+    self.groupLabel.numberOfLines = 1;
+    self.groupLabel.lineBreakMode = NSLineBreakByClipping;
+    self.groupLabel.hidden = YES;
+    [self.cardView addSubview:self.groupLabel];
+
     // v0.0.45：subtitle 单独一行。
     // 🔴 为什么以前根本看不到它：旧逻辑是"**正文为空**才拿 subtitle 顶替正文"，
     //    而正文为空是少数情况 ⇒ 绝大多数记录的 subtitle **一个字都显示不出来**，
@@ -543,16 +568,26 @@ static void NBHapticFire(NBHapticKind kind) {
     CGFloat rowY = 12.0;              // 第一行上沿（三个控件共用）
     CGFloat rowH = 15.0;              // 第一行高（12pt 字 ≈14.3pt 行高，15 够）
 
-    // 第一行（y=12~27）：App 名（左）…… ★ 时间（右）
+    // 第一行（y=12~27）：[×N] App 名（左）…… ★ 时间（右）
     // 🔴 横坐标从右往左定，因为右边的宽度是**先算出来**的（timeW 依赖卡片宽）：
     //    时间贴右边 → ★ 在时间左边 → App 名吃掉剩下的全部宽度。
     //    反过来先算 App 名会得到"宽度取决于别人"的循环（第一行宽度是三者共享的）。
     self.timeLabel.frame = CGRectMake(w - kNBPad - timeW, rowY, timeW, rowH);
     self.starLabel.frame = CGRectMake(w - kNBPad - timeW - 4.0 - starW, rowY, starW, rowH);
+    // v0.0.95：×N 只在 >=2 时占位。宽度 34 够放 "×999"（12pt semibold ≈ 30pt）。
+    // 🔴 不占位时必须把 groupW/groupGap 都置 0 再算 appW —— 只置 hidden 不置宽度，
+    //    App 名会白少 40pt 却不显示徽章（本项目"改了视图状态、没改布局量"栽过多次）。
+    BOOL hasGroup = (self.groupCount >= 2);
+    CGFloat groupW   = hasGroup ? 34.0 : 0.0;
+    CGFloat groupGap = hasGroup ? 6.0  : 0.0;
+    self.groupLabel.hidden = !hasGroup;
+    self.groupLabel.frame  = CGRectMake(textX, rowY, groupW, rowH);
     // App 名剩余宽度：整行宽 − 时间 − 4（★与时间的间隙）− ★ − 8（App名与★的间隙）
-    // 典型 393pt 宽屏：textW 299 − 90 − 4 − 16 − 8 = **181pt**，12pt 字放得下 15 个汉字。
-    CGFloat appW = MAX(0.0, textW - timeW - 4.0 - starW - 8.0);
-    self.appLabel.frame = CGRectMake(textX, rowY, appW, rowH);
+    //                  − ×N 徽章 − 6（徽章与 App 名的间隙）
+    // 典型 393pt 宽屏：textW 299 − 90 − 4 − 16 − 8 = **181pt**（无徽章时）；
+    // 有徽章时 181 − 40 = **141pt**，12pt 字放得下 11 个汉字。
+    CGFloat appW = MAX(0.0, textW - timeW - 4.0 - starW - 8.0 - groupW - groupGap);
+    self.appLabel.frame = CGRectMake(textX + groupW + groupGap, rowY, appW, rowH);
 
     // 第二行（y=33~53）：标题，独占整行宽
     self.titleLabel2.frame = CGRectMake(textX, 33.0, textW, 20.0);
@@ -928,6 +963,24 @@ static void NBHapticFire(NBHapticKind kind) {
     self.starLabel.hidden = !starred;
 }
 
+// v0.0.95：同内容归并的「×N」徽章。
+// 🔴 必须直接写 `_groupCount`（⛔ 不许 `self.groupCount = n;`）—— setter 里调自己就无限递归，
+//    这条 v0.0.48 的 setStarred 已经踩过一次（CI #98 clang 逮到）。
+// 🔴 它**会改布局**（App 名的起点和宽度都跟着变）⇒ 必须 `setNeedsLayout`，
+//    不能像 ★ 那样只切 hidden。★ 的位置是固定的，×N 的宽度参与 appW 计算：
+//    只切 hidden 不触发布局 ⇒ 徽章显示出来了，但 App 名还是按"没有徽章"排的宽度 ⇒ 文字压到徽章上。
+- (void)setGroupCount:(NSInteger)count {
+    _groupCount = (count > 0) ? count : 0;
+    if (_groupCount >= 2) {
+        self.groupLabel.text = [NSString stringWithFormat:@"×%ld", (long)_groupCount];
+        self.groupLabel.hidden = NO;
+    } else {
+        self.groupLabel.text = nil;
+        self.groupLabel.hidden = YES;
+    }
+    [self setNeedsLayout];
+}
+
 - (void)prepareForReuse {
     [super prepareForReuse];
     // 🔴 v0.0.70：卡片底色必须复位。
@@ -974,6 +1027,10 @@ static void NBHapticFire(NBHapticKind kind) {
     // 🔴 v0.0.48：★ 同理必须复位（否则上一行标了星、这一行规则没命中，星会串过来）。
     self.starred = NO;
     self.starLabel.hidden = YES;
+    // 🔴 v0.0.95：×N 徽章同理。「凡是 setter 改过的外观，prepareForReuse 必须改回去」——
+    //    不复位的症状是"上一行是 ×5 的组，滚出去再滚回来变成单条，而中间那些行凭空空了一段"，
+    //    因为 appW 是按 groupCount 算的。走 setter 复位，顺带把 setNeedsLayout 也带上。
+    [self setGroupCount:0];
 
     // 🔴🔴 v0.0.92：左滑状态**三样一起**复位，少一样就是一个"看着像 bug 又找不到"的症状：
     //   ① `cardView.transform` 不清 ⇒ 滚回来那行卡片还是歪的（缩在左边、右边露着红块）；
