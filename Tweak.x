@@ -425,6 +425,13 @@ static BOOL NBClaimKey(NSString *key) {
 - (BOOL)dismissNotificationInLongLookAnimated:(BOOL)animated;                           // B@:B ← 返回 BOOL
 - (id)listDestination;                                                                  // @@:  列表目的地（真 UI）
 - (id)modalDestination;                                                                 // @@:  模态目的地（长按预览）
+// 🔴 v0.0.95：**独立尺子**用。必须是这个双参数签名 `@@:@@`
+//    （真机方法表：`destination:notificationRequestForUUID:\t@@:@@`，两个参数都是对象）。
+//    ⛔ 上一版就是漏了这条声明 ⇒ 往 `id` 上发未声明的选择器 = **编译期硬错**
+//    （CI：`no known instance method for selector 'destination:notificationRequestForUUID:'`），
+//    而 34 道文本自检全绿 —— 又一次证明「文本全绿挡不住编译期」。
+//    查的是 destination（封面主页面那个真 UI）认不认得这个 uuid，**不碰 NC source 的映射**。
+- (id)destination:(id)destination notificationRequestForUUID:(id)uuid;                  // @@:@@ 界面层认不认这条
 - (void)postNotificationRequest:(id)request;                                            // v@:@ （CS 侧投递）
 // ---- NC 原生路径（这条才会驱动界面）----
 - (void)withdrawNotificationWithRequest:(id)request;                     // v@:@  NCNotificationDispatcher
@@ -2547,14 +2554,18 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     //    判据到这里才第一次可信。
                     //    而且现在手里是 `[找]` 出来的**真 request**（`req.bulletin` 命中），
                     //    不是 v0.0.62 那种工厂造的空壳 —— 前提条件也换了。
+                    // ===== v0.0.95：归因快照的起点（为什么需要，见 NBDestKnowsRaw 上面的长注释）=====
+                    // 🔴🔴 这三个量必须声明在 `if (still && req7)` **外面**：
+                    //    ⑦s/⑦t 在那个块里，而 ⑦u 的条件是 `if (still && gNCSource && want7.length)`
+                    //    —— 它是**并列的另一个块**（本版第一遍就写进了 ⑦s 块里，CI 直接报
+                    //    5 处 undeclared identifier）。顺序/作用域这类事只有代码结构守得住。
+                    // 三个量都取「刀动手之前」：bb2nc 是系统把撤回传给 NC 的次数，
+                    // sysWd 是系统侧 dispatcher 撤回次数（已减我方），src 是映射条数。
+                    // 哪一把刀让其中任何一个动了，就是"谁改了谁"的硬证据。
+                    const int nbBb0 = gBBToNCSeen;
+                    const int nbWd0 = NBSysWithdrawCount();
+                    const int nbSrc0 = NBMapCountOf(gNCSource);
                     if (still && req7) {
-                        // v0.0.95：归因快照的起点（为什么需要，见 NBDestKnowsRaw 上面的长注释）。
-                        // 🔴 三个量都取「刀动手之前」：bb2nc 是系统把撤回传给 NC 的次数，
-                        //    sysWd 是系统侧 dispatcher 撤回次数（已减我方），src 是映射条数。
-                        //    哪一把刀让其中任何一个动了，就是"谁改了谁"的硬证据。
-                        const int nbBb0 = gBBToNCSeen;
-                        const int nbWd0 = NBSysWithdrawCount();
-                        const int nbSrc0 = NBMapCountOf(gNCSource);
                         // ---- ⑦s：NC 侧派发器。系统自己撤一条时走的就是这一步 ----
                         // 依据：09:56:47 那批 `[OBS] dispatcher withdrawNotificationWithRequest:`
                         //       紧跟着 `[OBS-cs] withdrawNotificationRequest:` **成对**出现。
