@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.107"
+#define NB_VER_STR @"0.0.108"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2008,6 +2008,16 @@ static NSMutableSet *sPrevNCUUIDs = nil;   // 上一轮的 uuid 集合（算「�
 static NSTimeInterval sLastNCDiagTs = 0;   // 上次打诊断的时刻（节流）
 static NSUInteger sLastNCDiagCount = 0;    // 上次打诊断时的 nc 数（节流）
 static BOOL sTsClsLogged = NO;             // timestamp 类型只报一次
+// v0.0.108：自动清「通知中心里超过 N 小时」的通知（默认关，hours<=0 直接不走）
+// 🔴 这两个必须是 static（跨扫描保留）：节流靠 sLastAutoClearTs，退避靠 sAutoClearFails。
+// 🔴 退避**不许永久禁用**（本项目的熔断铁律：标记必须带超时/版本戳）——
+//    这里用"失败越多间隔越长"，成功一次即清零，进程重启(respring)也自然归零。
+static NSTimeInterval sLastAutoClearTs = 0;   // 上次尝试的时刻
+static NSInteger sAutoClearFails = 0;         // 连续失败次数
+// 🔴 护栏文件：调用前写、返回后删。文件还在 + 版本号是本版 ⇒ 上次这条调用没回来 ⇒ 本版关掉它。
+//    **只关自动清这一条路**，不碰 `gNCSuppressed`（那会把用户手动清 NC 也一起废掉）。
+static NSString *const kNBGuardAutoClear = @"/var/mobile/Library/NotifyBox/.nb_auto_clear_pending";
+static BOOL gAutoClearSuppressed = NO;
 
 // 秒 → 人话
 static NSString *NBAgeShort(double sec) {
@@ -2100,6 +2110,81 @@ static void NBViewRecon(void) {
     }
 }
 
+// ---- v0.0.108：自动清「通知中心里超过 N 小时」的通知 ----
+// 🔴 默认关：`autoClearNCHours` 缺失 / 0 / 负数 ⇒ 第一行就返回，**装了不改任何行为**。
+// 🔴 一把刀一次调用：`destination:clearNotificationRequests:` 传**超时那一批 request 的数组**。
+//    绝不逐条撤 —— 762 条逐条调会把主队列堵死（v0.0.73 的教训：块进了 NC 队列就再没回来）。
+// 🔴 节流 + 退避：正常 3 分钟一次（清积压能连着清几批）；连续失败 ≥3 次退到 60 分钟一次；成功一次清零。
+//    退避**不永久禁用**（熔断铁律：标记必须带超时/版本戳；respring 也自然归零）。
+// 🔴 时序：调用点排在**快照写完、`[扫]` 打完**之后 ⇒ 本轮 nc 是「清之前」、下一轮是「清之后」，
+//    天然形成前后对照，不用另加判据。
+static NSInteger NBAutoClearHours(void) {
+    id v = nil;
+    @try { v = NBLoadSettings()[NB_KEY_AUTO_CLEAR_HOURS]; } @catch (__unused NSException *e) { }
+    NSInteger h = 0;
+    if ([v isKindOfClass:[NSNumber class]])       h = [(NSNumber *)v integerValue];
+    else if ([v isKindOfClass:[NSString class]])  h = [(NSString *)v integerValue];
+    // 🔴 负数一刀切 0；上限 30 天（手滑填 999999 等于"什么时候都不清"，反而失去意义）。
+    if (h < 0) h = 0;
+    if (h > 24 * 30) h = 24 * 30;
+    return h;
+}
+
+static void NBAutoClearOldRequests(NSArray *oldReqs, NSInteger hours) {
+    if (hours <= 0 || oldReqs.count == 0) return;
+    // 🔴 熔断只短路**这一条路**：绝不设 `gNCSuppressed` —— 那会把用户手动的
+    //    「删记录时同步清通知中心」一起关掉（铁律：抑制分支连带别的功能 ⇒ 用户看到"完全没效果"）。
+    if (gAutoClearSuppressed) return;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    // 退避：正常 3 分钟一次（清积压时能连着清几批）；连续失败 ≥3 次退到 60 分钟。
+    NSTimeInterval gap = (sAutoClearFails >= 3) ? 3600.0 : 180.0;
+    if (sLastAutoClearTs > 0 && now - sLastAutoClearTs < gap) return;
+    if (!gCSDestination) return;
+    if (![gCSDestination respondsToSelector:@selector(destination:clearNotificationRequests:)]) {
+        NBLog(@"!!! [自动清] CS 侧没有 destination:clearNotificationRequests: ⇒ 本版停用（hours=%ld）",
+              (long)hours);
+        return;
+    }
+    id dest = NBCSDestForScan();
+    if (!dest) {
+        NBLog(@"[自动清] 取不到 listDestination（待清 %lu 条）", (unsigned long)oldReqs.count);
+        return;
+    }
+    // 单次上限 400 条：这是主队列上的**同步**调用，条数就是最坏情况下的阻塞长度。
+    // 积压 762 条时自然分成两批（间隔 ≥3 分钟），宁可慢一点，也不要一次压 762 条进主线程。
+    NSArray *batch = oldReqs;
+    if (batch.count > 400) batch = [oldReqs subarrayWithRange:NSMakeRange(0, 400)];
+
+    sLastAutoClearTs = now;
+    // 🔴 护栏文件：**调用前写、返回后删**（⑦r 同一套，顺序不能反）。
+    //    万一这次调用不回来 ⇒ 下次启动看到「文件还在 + 版本号是本版」⇒ 自动关掉这条自动清，
+    //    并写明怎么恢复。没有它，一次卡死会变成每个版本都卡死（熔断铁律：标记必须带版本戳）。
+    [[[NSString stringWithFormat:@"%@ autoClear %@ hours=%ld n=%lu",
+        NB_VER_STR, [NSDate date], (long)hours, (unsigned long)batch.count]
+      dataUsingEncoding:NSUTF8StringEncoding] writeToFile:kNBGuardAutoClear atomically:YES];
+    @try {
+        // 🔴 日志里必须带 **destination 的类名**：这一路历史上失败过两次，两次的差别恰恰在首参 ——
+        //    ⑦a `destination:<dispatcher>` …… 4 次「已返回」但读回目标还在（v0.0.74 判死）；
+        //    ⑦b `destination:<CS 自己>` clearNotificationRequests: …… 同样 4 次全空（同上）；
+        //    ⑦r `destination:<dispatcher>` clearNotificationRequestsFromDate:toDate:inSections: ……
+        //        26 次里从无独立生效证据。
+        //    ⇒ 本版走的是**第三个首参**：`[gCSDestination listDestination]`（也就是
+        //      `destination:notificationRequestForUUID:` 一直用的那个 dest，已被证明认 request）。
+        //      "同一把刀、首参不同"不是同一件事 ⇒ 日志不带类名，下一轮就分不清是哪一种。
+        NBLog(@"[自动清] 触发 hours=%ld 待清=%lu 条（本次 %lu）｜dest=%@ → destination:clearNotificationRequests:",
+              (long)hours, (unsigned long)oldReqs.count, (unsigned long)batch.count, NBClassName(dest));
+        [gCSDestination destination:dest clearNotificationRequests:batch];
+        sAutoClearFails = 0;
+        // 🔴 「已返回」≠「它做了」（铁律）。这一行只证明调用回来了；
+        //    它到底有没有撤掉，只能靠**下一轮 `[源] nc=`**（本轮 `[扫]` 已经先打完 = 清之前的数）。
+        NBLog(@"[自动清] 已返回（下一轮 `[源] nc=` 复量看效果）");
+    } @catch (NSException *e) {
+        sAutoClearFails++;
+        NBLog(@"!!! [自动清] 抛(第 %ld 次): %@", (long)sAutoClearFails, e.reason);
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:kNBGuardAutoClear error:NULL];
+}
+
 static void NBDumpNCSnapshot(NSString *seq) {
     @try {
         if (!gNCSource) {
@@ -2135,6 +2220,9 @@ static void NBDumpNCSnapshot(NSString *seq) {
         NSInteger tb[5] = {0};          // <1h / 1-6h / 6-24h / 1-3d / >3d
         double tsMin = 0, tsMax = 0;
         NSInteger tsGot = 0;
+        // v0.0.108：自动清超时通知（默认关）。hours 每轮只读一次，循环里按它挑「超时那批」。
+        NSInteger autoHours = NBAutoClearHours();
+        NSMutableArray *oldReqs = [NSMutableArray array];
         // 先占位写数据行，最后回填表头（表头要 totals，只能扫完才知道）
         NSMutableString *rows = [NSMutableString stringWithCapacity:all.count * 96];
         for (id req in all) {
@@ -2181,6 +2269,10 @@ static void NBDumpNCSnapshot(NSString *seq) {
                     else if (age < 259200) tb[3]++;
                     else                   tb[4]++;
                     tsGot++;
+                    // v0.0.108：超时的那批**先收起来**，循环外一次调用撤掉。
+                    // 🔴 只收 req 本身（不自己造 request、不改账本）—— 762 条逐条撤会堵死主队列，
+                    //    一次 `destination:clearNotificationRequests:` 传数组是唯一安全的撤法。
+                    if (autoHours > 0 && age > (double)autoHours * 3600.0) [oldReqs addObject:req];
                 } else if (ts0 && !sTsClsLogged) {
                     sTsClsLogged = YES;   // 只报一次，别刷屏
                     NBLog(@"[源] timestamp 类型=%@（不是 NSDate ⇒ 这个键的读法要换）",
@@ -2269,6 +2361,14 @@ static void NBDumpNCSnapshot(NSString *seq) {
                 NBLog(@"[源] 分桶 <1h=%ld 1-6h=%ld 6-24h=%ld 1-3d=%ld >3d=%ld ｜本轮新增 %@ 条 ｜section top5: %@",
                       (long)tb[0], (long)tb[1], (long)tb[2], (long)tb[3], (long)tb[4],
                       added, NBSecTop(secCount, 5));
+                // v0.0.108：自动清的**状态行**。为什么单独打一行：
+                // 🔴 「没看到 `[自动清] 触发`」有四种可能（没开 / 开了但这轮没超时的 /
+                //    开了有超时的但被节流挡了 / 撤了但没效果），只靠"没日志"分不清是哪一种 ——
+                //    这正是假绿的 ⑧ 型（否定式在对象不存在时恒真）。⇒ 开着就每轮摊一行「本轮超时几条」。
+                if (autoHours > 0) {
+                    NBLog(@"[自动清] 开=%ld 小时 ｜本轮超时=%lu 条（本节流窗口内）",
+                          (long)autoHours, (unsigned long)oldReqs.count);
+                }
                 NBViewRecon();
             }
         } @catch (NSException *e) {
@@ -2289,6 +2389,15 @@ static void NBDumpNCSnapshot(NSString *seq) {
               (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
               (csDest ? 1 : 0), seq ?: @"",
               ok ? @"成功" : [NSString stringWithFormat:@"失败(%@)", err.localizedDescription ?: @"?"]);
+
+        // ---- v0.0.108：自动清（⭐ 排在「快照写完 + `[扫]` 打完」之后）----
+        // 🔴 为什么必须排在这之后（顺序铁律）：
+        //    这一句会真的把 request 从 NC 撤掉 ⇒ 如果排在扫之前，本轮 `[源] nc=` 读的是
+        //    **清之后**的数，就再也看不到"清之前是多少"；排在之后，本轮 = 清前、下一轮 = 清后，
+        //    天然形成前后对照，不额外加判据就能验这一刀到底落没落下。
+        // 🔴 也排在快照**之后**：快照是"我这一轮看到了什么"的存档，被清掉的条目在快照里留着，
+        //    以后查"它为什么不见了"时有据可查。
+        NBAutoClearOldRequests(oldReqs, autoHours);
     } @catch (NSException *e) {
         NBLog(@"!!! [扫] 抛: %@", e.reason);
     }
@@ -4778,6 +4887,31 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
                           kNBGuardCSWs, NBClip(wsBody, 60));
                 }
                 NBLog(@"--> ⑦r 护栏：干净，本次允许（版本 %@）", NB_VER_STR);
+            }
+        }
+        // ---- v0.0.108：自动清的护栏（主队列上同步调 `clearNotificationRequests:`）----
+        // 🔴 判据与 `.nc_pending` / `.nc_ws` 同一套：**文件还在 + 版本号是本版** ⇒ 上次这条调用
+        //    没回来 ⇒ 本版关掉自动清（`gAutoClearSuppressed`），并写明怎么恢复。
+        // 🔴🔴 **只关这一条路**：不动 `gNCSuppressed`。这是上一版 ⑧ 的教训 ——
+        //    一刀失败被放大成整条 NC 路径全废，用户看到的是"整个功能都没了"。
+        //    换新版本号自动获得一次重试机会（否则一次意外会把后面所有版本锁死）。
+        {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *acBody = [NSString stringWithContentsOfFile:kNBGuardAutoClear
+                                                        encoding:NSUTF8StringEncoding error:nil];
+            if (acBody && [acBody containsString:NB_VER_STR]) {
+                gAutoClearSuppressed = YES;
+                [fm removeItemAtPath:kNBGuardAutoClear error:nil];
+                NBLog(@"!!! 本版上次自动清没返回 ⇒ 本版关闭自动清（其它功能不受影响；"
+                      @"删掉 %@ 或升级版本号即可重试）。内容=%@",
+                      kNBGuardAutoClear, NBClip(acBody, 60));
+            } else {
+                if (acBody) {
+                    [fm removeItemAtPath:kNBGuardAutoClear error:nil];
+                    NBLog(@"--> %@ 是旧版本留下的（内容=%@）⇒ 已删除，本版重新试一次",
+                          kNBGuardAutoClear, NBClip(acBody, 60));
+                }
+                NBLog(@"--> 自动清护栏：干净，本次允许（版本 %@）", NB_VER_STR);
             }
         }
         // v0.0.58：挂上 NC 派发器捕获（NCNotificationDispatcher 无类方法，只能靠 hook 拿实例）

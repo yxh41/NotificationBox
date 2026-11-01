@@ -297,7 +297,9 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
               footer:@"上限默认 500，超出后淘汰最旧的。"
                      @"列表一次最多显示 2000 条：上限填得更大时，更早的记录翻不到，"
                      @"要用首页的「导出」才能看到（导出不受此限）。"
-                     @"「自动清理」按时间裁，填 0 或清空 = 关闭，与上限各自独立生效。"];
+                     @"「自动清理」按时间裁，填 0 或清空 = 关闭，与上限各自独立生效。"
+                     @"注意：「自动清理天数」裁的是盒子里的记录，「自动清通知中心」撤的是"
+                     @"系统通知中心下拉能看到的那堆 —— 两个方向，互不影响。"];
     id mx = cur[@"maxRecords"];
     NSString *mxStr = [mx respondsToSelector:@selector(stringValue)] ? [mx stringValue]
                      : ([mx isKindOfClass:[NSString class]] ? (NSString *)mx : @"");
@@ -310,6 +312,24 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     [self addFieldRow:@"自动清理天数" icon:@"arrow.counterclockwise.circle.fill" tint:teal
                    ph:@"0" value:(acd > 0 ? [NSString stringWithFormat:@"%ld", (long)acd] : @"")
              keyboard:UIKeyboardTypeNumberPad key:@"autoCleanDays"];
+    // ---------- v0.0.108：自动清「通知中心里超过 N 小时」的通知 ----------
+    // 🔴🔴 和上面「自动清理天数」是**两件不同的事**，用户最容易混，所以紧跟它放、说明里点明：
+    //    上面那个裁的是**盒子自己的记录**（数据库里的行），系统通知中心一条都不动；
+    //    这一个撤的是**系统通知中心里挂着的通知**（下拉能看到的那堆），盒子记录不动。
+    // 🔴 为什么需要它（真机读数换来的）：`[源] nc=762 有ts=762 ｜去重uuid=762 ｜字典键=762`
+    //    —— 三口径相等，说明**不是账本虚胖**，是真堆了 762 条、跨度 2.6 天。
+    //    想让它别堆，只能真去撤；改标记口径是错的（那是拿尺子骗自己）。
+    // 🔴 默认关（缺失 / 0 / 清空 = 关）：它会**真的删掉用户的通知**，绝不默认开。
+    {
+        id av = cur[NB_KEY_AUTO_CLEAR_HOURS];
+        NSInteger ach = 0;
+        if ([av isKindOfClass:[NSNumber class]])       ach = [(NSNumber *)av integerValue];
+        else if ([av isKindOfClass:[NSString class]])  ach = [(NSString *)av integerValue];
+        [self addFieldRow:@"自动清通知中心" icon:@"bell.slash.fill" tint:teal
+                       ph:@"0（关）"
+                    value:(ach > 0 ? [NSString stringWithFormat:@"%ld", (long)ach] : @"")
+                 keyboard:UIKeyboardTypeNumberPad key:NB_KEY_AUTO_CLEAR_HOURS];
+    }
     // ---------- 删除盒子记录时同步清系统通知中心（v0.0.52） ----------
     // 🔴 精确 1:1：盒子上删某一条记录时，如果该通知在系统通知中心还挂着，
     //    就把它从通知中心也删掉（只删那一条，不是按 App 整段清）。
@@ -1082,6 +1102,25 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
                     [self fail:@"自动清理天数要填 0~3650 之间（0 = 关闭，原值未改）"];
                     return;
                 }
+            }
+        } else if ([key isEqualToString:NB_KEY_AUTO_CLEAR_HOURS]) {
+            // v0.0.108：自动清通知中心（单位**小时**）。0 / 清空 = 关。
+            // 🔴 上限必须和 tweak 侧一致（`NBAutoClearHours()` 里 `24*30`）：
+            //    两边不一致就会出现"界面填得进去、实际被悄悄截到 720"这种
+            //    「设置说 A、行为是 B」的坑 —— 那比不支持更糟。
+            // 🔴 也**不许**用 `[v integerValue]` 直接吃：它对 "abc" 返回 0，
+            //    而 0 的语义正是"关" ⇒ 一个手滑就把功能关了，界面还显示"保存成功"。
+            if (v.length == 0) {
+                [d removeObjectForKey:key];       // 清空 = 关闭
+            } else {
+                NSScanner *sc = [NSScanner scannerWithString:v];
+                NSInteger n = 0;
+                if (![sc scanInteger:&n] || !sc.isAtEnd || n < 0 || n > 720) {
+                    [self fail:@"自动清通知中心要填 0~720 小时（0 = 关闭，清空也等于关闭）（原值未改）"];
+                    return;
+                }
+                if (n > 0) d[key] = @(n);
+                else [d removeObjectForKey:key];
             }
         } else {
             if (v.length) d[key] = v;
