@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.106"
+#define NB_VER_STR @"0.0.107"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2256,7 +2256,16 @@ static void NBDumpNCSnapshot(NSString *seq) {
                             (tsMax - tsMin) / 60.0,
                             NBAgeShort(nowTs - tsMin), NBAgeShort(nowTs - tsMax)];
                 }
-                NBLog(@"[源] nc=%lu 有ts=%ld ｜跨度 %@", (unsigned long)all.count, (long)tsGot, span);
+                // 🔴🔴 v0.0.107：**去重三口径**（回答用户那句「数量真有 700 多条吗」）：
+                //    ① `all.count` = 展平后的数组长度（= 原来的 nc，**可能含重复**）
+                //    ② `curUUIDs.count` = 从每条 req 的 `uuid` 读出来再**去重**的数
+                //    ③ `d.count` = `uuidsToRequests` 的字典键数（字典天然去重）
+                //    判读：①≈②≈③ 三者相等 ⇒ 账本没虚胖，nc 就是真条数（用户看到的少是因为
+                //          通知中心**按 App 分组显示**，`[视]` 里 NCNotificationListView(9) 是 9 组不是 9 条）；
+                //          ① 明显大于 ②/③ ⇒ 展平时重复收了 ⇒ nc 虚胖，标记逻辑得按去重后算。
+                NBLog(@"[源] nc=%lu 有ts=%ld ｜去重uuid=%lu ｜字典键=%lu ｜跨度 %@",
+                      (unsigned long)all.count, (long)tsGot,
+                      (unsigned long)curUUIDs.count, (unsigned long)d.count, span);
                 NBLog(@"[源] 分桶 <1h=%ld 1-6h=%ld 6-24h=%ld 1-3d=%ld >3d=%ld ｜本轮新增 %@ 条 ｜section top5: %@",
                       (long)tb[0], (long)tb[1], (long)tb[2], (long)tb[3], (long)tb[4],
                       added, NBSecTop(secCount, 5));
