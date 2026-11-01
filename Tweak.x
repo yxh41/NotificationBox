@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.114"
+#define NB_VER_STR @"0.0.115"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2013,24 +2013,35 @@ static BOOL sTsClsLogged = NO;             // timestamp 类型只报一次
 //    同一 App 的所有通知算出来是同一个哈希 ⇒ 那个字段是**死探针**，留着以后必被误用。
 // 🔴 本项目的铁律：恒为定值的字段一律删掉，而且**连声明一起删**（只删日志留声明＝留了个引子）。
 
-// ---------- v0.0.113：空快照保护（不拿"0 条"覆盖"有内容"） ----------
-// 真机血账（2026-11-02 16:35:10）：respring 后 39 秒 App 请求扫描，那一刻 NC 存储还没加载完
+// ---------- v0.0.113 起：快照写入保护（不拿"假的小数"覆盖"真的大数"） ----------
+// 真机血账 ①（2026-11-02 16:35:10）：respring 后 39 秒 App 请求扫描，那一刻 NC 存储还没加载完
 //   ⇒ `all.count == 0` ⇒ **空快照落盘** ⇒ 接下来 65 秒里 App 认为通知中心一条都没有：
 //   橙框全灭，提示条还写「盒子里的消息都不在通知中心了」——而当时实际挂着 289 条。
-// 🔴 根因是**一个值两种含义**：`nc=0` 既可能是"真的没有"，也可能是"还没读出来"。
+// 🔴🔴 真机血账 ②（2026-11-02 17:56:49，v0.0.114）：同一个坑换了张脸 —— **不是 0 条，是 81 条**。
+//   日志原文：`[源] nc=81 ... 写入=成功`；25 秒后同一轮扫描变成
+//   `[源] nc=291 ｜本轮新增 210 条`（291 − 81 = 210，精确对上）。
+//   ⇒ 81 是"读到一半"，不是"真的只剩 81"。而 v0.0.113 的判据只认 `== 0`
+//     ⇒ 这份 81 条的快照**照样把上一份 289 条的覆盖掉了**，App 之后全按 81 条判存活。
+//   🔴 教训：**"假的小数"和"假的 0"是同一件事**，判据只挡 `==0` 等于没挡。
+//   ⇒ v0.0.115 改成比值判据：本次 < 上一份的 60%（且上一份 ≥100 条）一律当"没读全"。
+// 🔴 根因是**一个值两种含义**：`nc=小` 既可能是"真的清了"，也可能是"还没读出来"。
 //    "看着小就不信"是碰运气；必须让这两种情况在代码里分开。
 // 🔴 修法必须是**带超时的抑制**，不能是永久禁用：
 //    用户手动清空通知中心时 `nc` 归 0 是**合法**的，永久禁用就再也反映不出来。
-//    ⇒ 抑制上限 `NB_EMPTY_SNAP_MAX` 秒，超时照写。
+//    ⇒ 抑制上限 `NB_SNAP_GUARD_MAX` 秒，超时照写。
 // 🔴 状态记"**首次**被抑制的时刻"而不是一个布尔：布尔没法判断超时，也就永远自愈不了
 //    （本项目的熔断铁律：标记必须带超时）。
-#define NB_EMPTY_SNAP_MAX 120.0
-static NSTimeInterval sEmptySnapSince = 0;   // 首次因"本次 0 条、上一份非 0"而抑制的时刻；0 = 未在抑制
+// 🔴 为什么还要 `NB_SNAP_GUARD_MIN`：小样本的 60% 会误伤（上一份本来就只有 5 条，
+//    清掉 2 条剩 3 条也"越过"60% 线）⇒ 上一份少于 100 条时干脆不启用比值判据。
+#define NB_SNAP_GUARD_MAX 120.0
+#define NB_SNAP_GUARD_MIN 100     // 上一份少于这个数就不启用比值判据
+#define NB_SNAP_GUARD_PCT 60      // 本次 < 上一份的 60% ⇒ 判为"没读全"
+static NSTimeInterval sSnapSuspectSince = 0;   // 首次判为"没读全"而抑制的时刻；0 = 未在抑制
 
 // 读磁盘上**现有**快照的 `nc=`（没有 / 读不到 / 格式不对都返回 0）。
-// 🔴 用途只有一个：判断"这次 0 条是不是可疑"。返回 0 时保护不触发 —— 也就是
-//    "读不到上一份"会退化成旧行为（照写），这是**故意**的：宁可漏保护，也不要因为读不到
-//    一个诊断数就把快照永远卡住。
+// 🔴 用途只有一个：给"本次这个数是不是可疑"提供**上一份的基数**（v0.0.115 起判的是比值，
+//    不再是"是不是 0"）。返回 0 时保护不触发 —— 也就是"读不到上一份"会退化成旧行为（照写），
+//    这是**故意**的：宁可漏保护，也不要因为读不到一个诊断数就把快照永远卡住。
 static NSUInteger NBPrevSnapshotNc(void) {
     @try {
         NSString *body = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SNAPSHOT
@@ -2469,25 +2480,39 @@ static void NBDumpNCSnapshot(NSString *seq) {
          (csDest ? 1 : 0), seq ?: @""];
         [out appendString:rows];
 
-        // ---- v0.0.113：空快照保护（判据在「写」之前，不在「写完再后悔」）----
-        // 🔴 为什么挡在写之前：快照是**唯一**的存活依据，一旦被 0 条覆盖，
+        // ---- v0.0.113 起：快照写入保护（v0.0.115 从「只挡 0 条」扩到「挡假的小数」）----
+        // 🔴 为什么挡在写之前：快照是**唯一**的存活依据，一旦被假的小数覆盖，
         //    App 那边没有任何办法分辨"真清空了"还是"没读出来" —— 只能跟着全灭。
         NSUInteger snapPrevNc = NBPrevSnapshotNc();
+        // 🔴 判据只用整数乘法比（`all*100 < prev*PCT`）：不引入浮点、不做除法，天然没有除零。
+        BOOL snapSuspect = NO;
+        NSString *snapWhy = nil;
+        if (snapPrevNc >= NB_SNAP_GUARD_MIN) {
+            if (all.count == 0) {
+                snapSuspect = YES;
+                snapWhy = [NSString stringWithFormat:@"0/%lu", (unsigned long)snapPrevNc];
+            } else if (all.count * 100 < snapPrevNc * NB_SNAP_GUARD_PCT) {
+                snapSuspect = YES;
+                snapWhy = [NSString stringWithFormat:@"%lu/%lu",
+                           (unsigned long)all.count, (unsigned long)snapPrevNc];
+            }
+        }
         BOOL snapSkip = NO;
-        if (all.count == 0 && snapPrevNc > 0) {
+        if (snapSuspect) {
             NSTimeInterval tnow = [[NSDate date] timeIntervalSince1970];
-            if (sEmptySnapSince <= 0) sEmptySnapSince = tnow;
-            if (tnow - sEmptySnapSince < NB_EMPTY_SNAP_MAX) snapSkip = YES;
+            if (sSnapSuspectSince <= 0) sSnapSuspectSince = tnow;
+            if (tnow - sSnapSuspectSince < NB_SNAP_GUARD_MAX) snapSkip = YES;
         } else {
-            // 有内容 ⇒ 解除；上一份本来也是空 ⇒ 这也算解除（用户真清空时不该一直抑制）
-            sEmptySnapSince = 0;
+            // 数量正常 ⇒ 解除；上一份本来也小（< MIN、压根没启用判据）⇒ 也算解除 ——
+            // 否则一个老的小样本会把抑制状态一直挂着。
+            sSnapSuspectSince = 0;
         }
 
         NSError *err = nil;
         BOOL ok = NO;
         NSString *writeState = nil;
         if (snapSkip) {
-            writeState = @"跳过(空快照保护)";
+            writeState = [NSString stringWithFormat:@"跳过(疑似没读全 %@)", snapWhy ?: @"?"];
         } else {
             ok = [out writeToFile:NOTIFYBOX_NC_SNAPSHOT atomically:YES
                         encoding:NSUTF8StringEncoding error:&err];
@@ -2499,10 +2524,10 @@ static void NBDumpNCSnapshot(NSString *seq) {
               (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
               (csDest ? 1 : 0), seq ?: @"", writeState);
         if (snapSkip) {
-            NBLog(@"=== [扫] 空快照保护：本次 0 条、上一份 %lu 条 ⇒ 判为「还没读出来」，本轮不覆盖快照"
+            NBLog(@"=== [扫] 快照写入保护：本次 %lu 条 / 上一份 %lu 条（低于上一份的 %d%%）⇒ 判为「还没读全」，本轮不覆盖快照"
                   @"（已抑制 %.0f 秒 / 上限 %.0f 秒；超时会照写，用户真清空才反映得出来）",
-                  (unsigned long)snapPrevNc,
-                  [[NSDate date] timeIntervalSince1970] - sEmptySnapSince, NB_EMPTY_SNAP_MAX);
+                  (unsigned long)all.count, (unsigned long)snapPrevNc, NB_SNAP_GUARD_PCT,
+                  [[NSDate date] timeIntervalSince1970] - sSnapSuspectSince, NB_SNAP_GUARD_MAX);
         }
 
         // ---- v0.0.108：自动清（⭐ 排在「快照写完 + `[扫]` 打完」之后）----

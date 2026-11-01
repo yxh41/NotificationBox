@@ -1943,7 +1943,21 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     if (![snapKeys isKindOfClass:[NSSet class]]) snapKeys = [NSSet set];
     NSSet *lcKeys = nil, *p8Keys = nil;
     NBBuildLooseIndex(snapKeys, &lcKeys, &p8Keys);
-    const char *sql = "SELECT sys_id FROM notifications "
+    // ---------- v0.0.115：命中/总量按「记录年龄」分档（只读诊断） ----------
+    // 🔴 为什么要这个：真机同一个「全库残留」在三份快照上量到 245 / 2 / 1，
+    //    而三次的分母几乎一样（带ID行 2140~2162、快照 nc 283~289），匹配代码一个字没动。
+    //    ⇒ 光有总数分不清下面两种完全不同的病因：
+    //      ① **通知中心里的 bulletin 换了一批新 ID**（重启后常见）⇒ 库里的旧 ID 全部失效；
+    //      ② **键根本对不上**（拆段/格式/读法错）⇒ 那是真 bug。
+    //    这两件事有一个可测的指纹：① 的命中会**集中在最近这段时间**（重启之后发布的那些），
+    //    ② 则是各年龄一样地不命中。⇒ 把命中数和分母按同样的年龄档并排打出来，就不再靠猜。
+    // 🔴 分档边界沿用扫描侧那份（<1h / 1-6h / 6-24h / >24h），两处口径必须一致，
+    //    否则「命中全在最新档」这种结论又会因为边界不同而失真。
+    static BOOL sAgeLogged = NO;
+    NSInteger hitAge[4] = {0, 0, 0, 0};
+    NSInteger allAge[4] = {0, 0, 0, 0};
+    double nowTs = [[NSDate date] timeIntervalSince1970];
+    const char *sql = "SELECT sys_id, ts FROM notifications "
                       "WHERE sys_id IS NOT NULL AND sys_id<>'';";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
@@ -1952,12 +1966,24 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
             if (!t) continue;
             scanned++;
             NSString *sid = [NSString stringWithUTF8String:t];
-            if ([self aliveStateOfSysId:sid inSnapshot:snap] == NBAliveStill) still++;
+            BOOL isStill = ([self aliveStateOfSysId:sid inSnapshot:snap] == NBAliveStill);
+            if (isStill) still++;
             // 同一遍里把两档宽松口径也数掉（分母必须是同一批行）
             BOOL ci = NO, p8 = NO;
             NBCountLooseForms(sid, lcKeys, p8Keys, &ci, &p8);
             if (ci) stillCI++;
             if (p8) stillP8++;
+            // 年龄分档：`ts` 读成 0/负数（老库没写时间）一律并进最后一档，不另设「未知」档
+            // —— 多一个档就多一个可以被读错的口径，而且这类行本来就该按"老"处理。
+            double ts = sqlite3_column_double(st, 1);
+            double age = (ts > 0) ? (nowTs - ts) : -1.0;
+            int bi = (age < 0)      ? 3
+                   : (age < 3600)   ? 0
+                   : (age < 21600)  ? 1
+                   : (age < 86400)  ? 2
+                                    : 3;
+            allAge[bi]++;
+            if (isStill) hitAge[bi]++;
         }
         sqlite3_finalize(st);
     } else {
@@ -1991,6 +2017,16 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     // 🔴 v0.0.114：把读法写在日志里，别指望下次还记得怎么解读这三档
     //    （本项目最贵的一课：一个数被反复误读，比没有这个数更糟）。
     NBStoreLog(@"全库残留读法：精确少、忽略大小写多 ⇒ 大小写问题｜两者都少、前8位多 ⇒ 格式/分隔符不同｜三个都少 ⇒ ID 真的换了（不是 bug）");
+    // 🔴 v0.0.115：年龄分档，一个进程只打一次（日志窗口只有 ~50 行，这条是定性用的）。
+    //    `scanned > 0` 是必置位的前提：库是空的就打，会把唯一一次机会烧在与病因无关的轮次上
+    //    （v0.0.111 `done` 写在最前面那个血账的同一形态）。
+    if (!sAgeLogged && scanned > 0) {
+        sAgeLogged = YES;
+        NBStoreLog(@"全库残留按年龄：命中 <1h=%ld 1-6h=%ld 6-24h=%ld >24h=%ld ｜ 带ID <1h=%ld 1-6h=%ld 6-24h=%ld >24h=%ld",
+                   (long)hitAge[0], (long)hitAge[1], (long)hitAge[2], (long)hitAge[3],
+                   (long)allAge[0], (long)allAge[1], (long)allAge[2], (long)allAge[3]);
+        NBStoreLog(@"残留按年龄读法：命中全挤在最新档 ⇒ 通知中心换了一批新 ID（重启后常见，库里的旧 ID 已失效）；各年龄一样不命中 ⇒ 键对不上（真 bug）");
+    }
     return still;
 }
 
