@@ -11142,3 +11142,139 @@ deb `notifybox-0.0.103.deb`（1,139,146 B / md5 `a3b2b96b32864815ebf3f21267167e0
   得换键名（`notificationIdentifier`）再试。
 
 日志那一行现在同时给四个数，一眼能分清"没扫到 / 扫到了但读不到 uuid / 读到了但不是同一条"。
+
+## v0.0.104 —— 「界面量不到」的真因：`NSUUID` 被 `NBStringish` 拒了（尺子坏在**读法**不是**口径**）
+
+### 1. 上一版章末的预言，对了一半
+
+v0.0.103 章末「下轮看什么」列了三种情况，第三条我是这么写的：
+
+> **报「界面量不到」** ⇒ 读不到 uuid（`csem=0`）… `Y=0` 说明 CS 侧对象没有 `uuid` 这个键，
+> 得换键名（`notificationIdentifier`）再试。
+
+真机装出来就是这一条：**「账本 688 · 界面量不到」**。
+
+但**键名没换** —— 我加了诊断去问，答案不在键名上。上一版那句话有一半是对的
+（"读不到 uuid"确实发生了），推断的另一半（"所以键名不对"）是错的。
+**「读不到」只说明"它没被读出来"，不能反推"它不存在"。**
+
+### 2. 真因：同一个函数里，两套读法
+
+v0.0.103 的严格口径是这么写的：
+
+```objc
+NSString *qu = NBKVCStr(req, @"uuid");
+NSString *gu = NBKVCStr(got, @"uuid");
+if (gu.length) { cseMeasured++; if (qu.length && [gu isEqualToString:qu]) cseYes++; }
+```
+
+`NBKVCStr` → `NBStringish`，而那个函数**只认 NSString / NSNumber**：
+
+```objc
+static NSString *NBStringish(id v) {
+    if ([v isKindOfClass:[NSString class]]) return v;
+    if ([v isKindOfClass:[NSNumber class]]) return [v stringValue];
+    return nil;   // ⛔ 不调 description
+}
+```
+
+这条铁律是 v0.0.63 用**真机卡死**换来的（未知对象摸内部锁）。它没错。
+
+错的是：**`NCNotificationRequest.uuid` 的类型是 `NSUUID`**。
+`isKindOfClass:NSString` 拒掉、`isKindOfClass:NSNumber` 也拒掉 ⇒ 一律返回 `nil`
+⇒ `gu.length == 0` ⇒ `cseMeasured` 恒 0 ⇒ 提示条永远「界面量不到」。
+
+最刺眼的地方在这里：**同一个函数里，探测那半用的是 `NBSafeValue`（它拿得到 `NSUUID` 对象）**：
+
+```objc
+id got = NBDestProbeObjWithDest(req, csDest);   // ← NBSafeValue 家族，能拿到 NSUUID
+…
+id qu = NBKVCStr(req, @"uuid");                 // ← NBStringish，拿不到
+```
+
+所以现象是「**探测跑得动、比对读不到**」。
+一个函数里两套读法，而**错的那一套，正好是要用的那一套**。
+
+> 一句话记住：**同一个字段，探测和比对必须走同一条读法。**
+> 两边读法不同时，先怀疑读法，别怀疑数据。
+
+### 3. 改法
+
+```objc
+static NSString *NBIdString(id v);   // 认 NSString / NSNumber / **NSUUID**（用公开属性 UUIDString）
+static BOOL      NBIdEqual(id a, id b);  // 先 isEqual:，再按**小写**字符串兜一次
+```
+
+- `NBIdString` 用 `NSUUID.UUIDString`：它是**公开属性**，不摸内部锁 —— 与 `description` 不是一类东西，
+  所以不违反 v0.0.63 那条铁律。
+- `NBIdEqual` 必须**两级**：
+  ① 先 `isEqual:` —— 同类对象（`NSUUID` vs `NSUUID`）直接成立；
+  ② 再转成字符串**小写**比一次 —— `UUIDString` 是**大写**，库里存的 `sys_id` 也是大写，
+     但两边的来源不同，大小写不保证一致；只比一次 `isEqualToString:` 会在跨类型时假否定。
+- 扫描块改成 `NBSafeValue` 取**对象** + `NBIdEqual` 比较。
+
+### 4. 顺手加的：一行只在故障时说话的诊断
+
+```
+=== [扫][诊] 界面对象 类=NCNotificationRequest ｜ uuid=NSUUID(要求)/NSUUID(拿到) ｜
+    nid=NSString ｜ ident=NSString ｜ bid=NSString ｜ 相等=1
+```
+
+四个候选键（`uuid` / `notificationIdentifier` / `identifier` / `bulletinID`）的**类型**一次打全，
+再下一版遇到"读不到"就不必猜该用哪把键。
+
+两个细节，都是踩过的：
+
+- **只打类名，绝不 `description`。** 未知对象摸内部锁 ⇒ 卡死（v0.0.63）。
+- **诊断行落在 `if (gu)` 守卫之外。** 本轮的故障场景恰恰是「读不到 uuid」；
+  放进守卫里就等于「只在正常时打日志」——**探针在自己要抓的那个场景里一个字都不打**。
+  这一条单独做了变异（M36）验证，否则它是一条永远绿的摆设。
+
+### 5. 判据
+
+静态 **89/89**、变异 **37/37**、deb 对拍 **25/25**、判据自查 **4/4**。
+CI `41280623090` success（一次过 —— `NSUUID` / `UUIDString` 的符号可达性没出问题：
+`NBIdString` 在 321 行、`NBIdEqual` 在 339 行、`NBSafeValue` 在 350 行、`NBClassName` 在 371 行，
+被引用的位置全都在 2055 行之后）。
+deb `notifybox-0.0.104.deb`（1,140,036 B / md5 `4dc31fa3e393a27ee8ea80ac41f6c631`）。
+
+变异新增五条（M33~M37），每条都对着这一笔的一个面：
+
+| 变异 | 形态 | 期望红 |
+|---|---|---|
+| M33 | 退回 `NBKVCStr(got, @"uuid")` —— **本轮 bug 的正身** | I9 + I11 |
+| M34 | `NBIdString` 里把 `NSUUID` 分支删掉 | I18 |
+| M35 | `NBIdEqual` 去掉小写兜底 | I21 |
+| M36 | 诊断行挪进 `if (gu)` 守卫之内 | I15 |
+| M37 | 为了"看清"打了 `description` | I16 |
+
+对拍这一轮新增了三条**二进制层**判据，都可证伪：
+
+- **D1**：dylib 里含选择器 `UUIDString`。全项目只有 `NBIdString` 用它一处 ⇒
+  v0.0.103 的包里**一定没有**（注释里提到不算，注释不进二进制）。
+- **D2/D3**：诊断行**整句**在 dylib 里恰好 1 处（UTF-16LE）。
+- **D4**：App 里有「刚刚」（提示条 5 秒内不再说「0 秒前」）。
+
+自测用两种方式证伪自己：注入（`0.0.103` / `csn=` / `UUIDString→UUIDStrxxx` 等长替换）必须翻红；
+**反向对照**（拿 v0.0.103 的包跑同一套判据）必须「新增的三条全红、版本号全红、其余 19 条全绿」。
+
+> ⚠️ 这一轮 D3 第一次就写错了：我把 `nid=` / `ident=` / `bid=` 当 ASCII 查，
+> 结果假红。原因是那句日志里有**全角竖线「｜」**，整串（含那几个 ASCII 标签）
+> 在 Mach-O 里都是 UTF-16LE。⇒ 判据写错的表现是"红在正确的地方、理由却是错的"，
+> 它会诱使你去改代码而不是改判据。
+
+> ⚠️ 也不再查 `lowercaseString`：它在 Dylib 里出现 8 处（`NotifyCommon.h` / `NotifyProbe.m` /
+> `NotifySoundDiag.m` / `Tweak.x` 老代码），查它等于什么都没查 —— 那是**假绿**的标准形态。
+
+### 6. 下轮看什么
+
+装上去，提示条这一栏会给出一个**能定性**的数：
+
+- **界面 Y 是个小的数**（比如 12 / 37，远小于账本 688）⇒ 严格口径终于真在干活了，
+  下一版把橙条判据从「同指针」换到 `cse`；
+- **界面 Y 还是几百** ⇒ CS 侧这条路量不出界面，别在这条链上耗了，换**视图层**去数
+  （NC 列表数据源 / cell 数）—— 那才是眼睛看到的；
+- **还是「界面量不到」** ⇒ 看 `=== [扫][诊]` 那两行，直接读类型：
+  - `uuid=NSUUID/NSUUID` 但 `相等=0` ⇒ 两个 uuid 本就不是同一条（`got` 回的不是它）；
+  - `uuid=` 后面是 `(null)` ⇒ `NBSafeValue` 连对象都取不到 ⇒ 换 `notificationIdentifier` 试；
+  - 整行都没有 ⇒ 诊断没跑到（`got` 为空），那是另一回事。
