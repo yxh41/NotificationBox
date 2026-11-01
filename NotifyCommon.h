@@ -447,4 +447,35 @@ static inline BOOL NBBoolValue(id v) {
     return NO;
 }
 
+// ---------- v0.0.111：内容哈希（tweak 与 App **共用同一份实现**） ----------
+// 干什么用的：真机定案（2026-11-01）——「还在通知中心」的标记一直几乎全灰，根因不是 ID 变了，
+//   而是**两侧各存一半、且两半不重叠**：
+//     · 库里的 `sys_id` 只有 `BBBulletin.bulletinID`（写入时 `notificationIdentifier` 恒 nil）；
+//     · 快照里的键是 `NCNotificationRequest.notificationIdentifier` + `NCNotificationRequest.uuid`。
+//   注意 `NCNotificationRequest.uuid` **不是** bulletinID —— 两个都是 UUID 长相的不同字段，
+//   所以"快照里有 UUID 形态的键"这件事一直没能对上号。
+// ⇒ 换一把不依赖 ID 的尺子：**内容**。ID 会被系统重投换掉，内容不会。
+//
+// 🔴🔴 这个函数**必须在共享头里只有一份**：两侧各写一份必然走岔，
+//     而走岔的表现是「一条都匹配不上」——和现在的病一模一样，且**不报错**（最难查的一类）。
+//     判据也不许各算一遍：谁要哈希就调它。
+// 🔴 为什么不用库里现有的写法（`[[NSData description] UTF8String]`）：那是 Apple 的实现细节
+//     （带尖括号和空格），拿它当"协议"等于把匹配逻辑押在别人随时能改的字符串格式上。
+//     FNV-1a 是十行、确定性、只看字节。
+// 🔴 不用 `uint64_t`（要拉 stdint），直接 `unsigned long long` —— 在 arm64 上就是 64 位。
+// 🔴 分隔符仍用 `|`：标题里含 `|` 也不会歧义，因为三段的**顺序固定**，
+//     而哈希是整体算的（不是逐段比较），含多少 `|` 都只影响这一条的哈希值。
+static inline NSString *NBContentHash(NSString *bundle, NSString *title, NSString *message) {
+    NSString *s = [NSString stringWithFormat:@"%@|%@|%@",
+                   bundle ?: @"", title ?: @"", message ?: @""];
+    NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    const unsigned char *p = (const unsigned char *)d.bytes;
+    unsigned long long h = 1469598103934665603ULL;      // FNV-1a offset basis
+    for (NSUInteger i = 0; i < d.length; i++) {
+        h ^= (unsigned long long)p[i];
+        h *= 1099511628211ULL;                          // FNV-1a prime
+    }
+    return [NSString stringWithFormat:@"%016llx", h];   // 固定 16 位小写 hex
+}
+
 #endif /* NotifyCommon_h */

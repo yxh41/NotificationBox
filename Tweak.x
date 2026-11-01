@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.110"
+#define NB_VER_STR @"0.0.111"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2008,6 +2008,10 @@ static NSMutableSet *sPrevNCUUIDs = nil;   // 上一轮的 uuid 集合（算「�
 static NSTimeInterval sLastNCDiagTs = 0;   // 上次打诊断的时刻（节流）
 static NSUInteger sLastNCDiagCount = 0;    // 上次打诊断时的 nc 数（节流）
 static BOOL sTsClsLogged = NO;             // timestamp 类型只报一次
+// v0.0.111：内容哈希样本只打前 2 条（一个进程一次）——
+// 用途是让 App 侧那 5 行 `[残]` 能和这里的 (section/title/message/hash) **并排对**，
+// 一眼看出两侧的 title/message 到底是不是同一份文字（哈希不等有两种原因，必须分开）。
+static int sHashSampleN = 0;
 // v0.0.108：自动清「通知中心里超过 N 小时」的通知（默认关，hours<=0 直接不走）
 // 🔴 这两个必须是 static（跨扫描保留）：节流靠 sLastAutoClearTs，退避靠 sAutoClearFails。
 // 🔴 退避**不许永久禁用**（本项目的熔断铁律：标记必须带超时/版本戳）——
@@ -2348,8 +2352,27 @@ static void NBDumpNCSnapshot(NSString *seq) {
                     }
                 }
             }
-            [rows appendFormat:@"%@|%@|cs=%d\n", sid ?: @"",
-             [keys componentsJoinedByString:@"|"], cs];
+            // v0.0.111：每行多带一列 `h=<内容哈希>`。
+            // 🔴 必须**像 `cs=` 一样**被 App 侧的解析器单独挑出来：不然它会被当成"一把唯一键"
+            //    塞进 keys 集合 ⇒ `键 N 个` 直接翻倍，而且是白白污染（哈希永远不可能命中 ID）。
+            // 🔴 哈希的入参必须与 App 写库时**完全一致**：(bundle, title, message)。
+            //    这里的 title/message 取自 `NCNotificationRequest`，而库里存的是
+            //    BB 发布时刻的 `BBBulletin.title/message` —— **两者不保证逐字相同**
+            //    （NC 侧可能做过分组格式化）。这正是本版要量的东西，所以本次**只写不判**。
+            {
+                NSString *t0 = NBSafeStr(req, @"title");
+                NSString *m0 = NBSafeStr(req, @"message");
+                NSString *hh = NBContentHash(sid, t0, m0);
+                [rows appendFormat:@"%@|%@|h=%@|cs=%d\n", sid ?: @"",
+                 [keys componentsJoinedByString:@"|"], hh, cs];
+                // 样本：只前 2 条、一个进程一次。给 App 侧那 5 行 `[残]` 做并排对照用。
+                if (sHashSampleN < 2) {
+                    sHashSampleN++;
+                    NBLog(@"[哈希] 样本 #%d section=%@ hash=%@ ｜title=%@ ｜msg=%@",
+                          sHashSampleN, sid ?: @"(空)",
+                          hh, NBClip(t0, 24), NBClip(m0, 24));
+                }
+            }
         }
         // ---- v0.0.105：把三件事一次报出去（节流：nc 变化 ≥30 条 或 距上次 ≥60 秒）----
         // 🔴 为什么节流：日志窗口只有 ~50 行且全局滚动。这条诊断有 3 行，
@@ -2418,7 +2441,9 @@ static void NBDumpNCSnapshot(NSString *seq) {
             NBLog(@"!!! [源] 诊断抛: %@", e.reason);
         }
 
-        [out appendFormat:@"#scan=%.0f|nc=%lu|cs=%ld|csn=%ld|cse=%ld|csem=%ld|csm=%d|seq=%@\n",
+        // 🔴 v0.0.111：`hcol=1` 是**快照格式标记** —— 光看"有没有 h= 列"分不清
+        //    「旧格式没这列」和「有列但一条都没匹配上」，而这两种情况的下一步完全不同。
+        [out appendFormat:@"#scan=%.0f|nc=%lu|cs=%ld|csn=%ld|cse=%ld|csem=%ld|csm=%d|hcol=1|seq=%@\n",
          [[NSDate date] timeIntervalSince1970], (unsigned long)all.count,
          (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
          (csDest ? 1 : 0), seq ?: @""];
