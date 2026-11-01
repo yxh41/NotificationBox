@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.102"
+#define NB_VER_STR @"0.0.103"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -1927,7 +1927,7 @@ static void NBCheckDeletedAlive(void) {
 //    （见 v0.0.86 那段注释），这里不能重犯。
 //
 // 🔴 格式（`seq` 是 App 传下来的请求序号，App 用它判断"这份是不是我刚要的那次扫描"）：
-//      首行 `#scan=<epoch>|nc=<账本条数>|cs=<界面认的条数>|csn=<实际探测条数>|csm=<0|1>|seq=<序号>`
+//      首行 `#scan=<epoch>|nc=<账本条数>|cs=<界面认的条数>|csn=<实际探测条数>|cse=<严格相等的条数>|csem=<能读到uuid的条数>|csm=<0|1>|seq=<序号>`
 //      其后每行 `<sectionIdentifier>|<key1>|<key2>|…|cs=<1|0|-1>`
 //
 // 🔴🔴 v0.0.102：为什么要多一个 `cs`
@@ -1935,11 +1935,21 @@ static void NBCheckDeletedAlive(void) {
 //    手机通知中心不可能有 637 条 —— `uuidsToRequests` 是 NC source 的**历史账本**，
 //    里面混着大量界面上早已不存在的条目。拿它当"还在不在"的依据 ⇒ **橙条必然高估**，
 //    这正是用户说的「提示条的 M 比眼睛看到的多」。
-//    同一份日志里另一个读数反而跟眼睛一致：CS 侧
-//    `- destination:notificationRequestForUUID:`（界面那一层）**是 16 / 否 74**。
+//    同一份日志里另一个读数当时看着"跟眼睛一致"：CS 侧
+//    `- destination:notificationRequestForUUID:` **是 16 / 否 74**。
 //    ⇒ 快照里同时记两个口径，App 先**同时报出来**，让"哪个等于眼睛"这件事被量一次。
 //    ⚠️ 本版**不**改橙条的判据（仍按账本）—— 一次只动一个变量。
 //    `cs=-1` / `csm=0` = 量不了（`gCSDestination` 还没捕获），⛔ 不许当 0。
+//
+// 🔴🔴🔴 v0.0.103 更正：那个「是 16 / 否 74」**不是"界面里一共有 16 条"**。
+//    它是「删除之后逐条读回」的比例（问 90 次：16 次还在、74 次已经不在），
+//    是**局部口径**；我把它当成了全库条数 ⇒ 才会预期"界面 16 条"。
+//    真机 v0.0.102 装出来的提示条是「账本 637 · **界面 672**」——
+//    界面数**不小于**账本数，一个量级 ⇒ 两把尺子都是历史账本，谁都不代表界面。
+//    ⇒ 教训：**局部口径的数不许说全库的话**（这条本来就写在项目记忆第 17 条，
+//      这次是拿一个新功能把它又踩了一遍）。
+//    所以 v0.0.103 把 CS 那一档收紧成"回来的 uuid 必须等于问的 uuid"（cse/csem），
+//    `!= nil` 只当旁证留着（cs/csn），⛔ 不再拿它当"界面认的条数"。
 static void NBDumpNCSnapshot(NSString *seq) {
     @try {
         if (!gNCSource) {
@@ -1965,6 +1975,8 @@ static void NBDumpNCSnapshot(NSString *seq) {
         NSMutableString *out = [NSMutableString stringWithCapacity:all.count * 96];
         NSUInteger withKeys = 0;
         NSInteger csYes = 0, csMeasured = 0;
+        // 🔴🔴 v0.0.103：再加一档「严格」口径（回来的那条 uuid 和我问的一样吗）
+        NSInteger cseYes = 0, cseMeasured = 0;
         // 先占位写数据行，最后回填表头（表头要 totals，只能扫完才知道）
         NSMutableString *rows = [NSMutableString stringWithCapacity:all.count * 96];
         for (id req in all) {
@@ -1988,26 +2000,43 @@ static void NBDumpNCSnapshot(NSString *seq) {
             if (keys.count) withKeys++;
 
             // ---- v0.0.102：界面口径 ----
+            // 🔴🔴 v0.0.103：`!= nil` 这一档已被真机**否掉**。v0.0.102 装出来后提示条写的是
+            //    「账本 637 · 界面 672」—— 界面数**不小于**账本数，而账本虚胖是已知的
+            //    ⇒ 这个方法对几乎任何 uuid 都回一个对象，「返回了」≠「界面真的有这条」。
+            //    所以再加一档严格：把回来的那条 uuid 读出来，**跟问的那个比一比**。
+            //    跑不通（读不到 uuid）不能当成"不认" ⇒ 单独记 csem，让 App 那边显示「量不到」。
             int cs = -1;
             if (csDest) {
-                cs = (NBDestProbeObjWithDest(req, csDest) != nil) ? 1 : 0;
+                id got = NBDestProbeObjWithDest(req, csDest);
+                cs = (got != nil) ? 1 : 0;
                 csMeasured++;
                 if (cs == 1) csYes++;
+                if (got) {
+                    // ⚠️ 这里读的是**类未知**的对象（CS 侧），缺键会抛 ⇒ 必须 NBKVCStr（内含 @try）。
+                    NSString *qu = NBKVCStr(req, @"uuid");
+                    NSString *gu = NBKVCStr(got, @"uuid");
+                    if (gu.length) {
+                        cseMeasured++;
+                        if (qu.length && [gu isEqualToString:qu]) cseYes++;
+                    }
+                }
             }
             [rows appendFormat:@"%@|%@|cs=%d\n", sid ?: @"",
              [keys componentsJoinedByString:@"|"], cs];
         }
-        [out appendFormat:@"#scan=%.0f|nc=%lu|cs=%ld|csn=%ld|csm=%d|seq=%@\n",
+        [out appendFormat:@"#scan=%.0f|nc=%lu|cs=%ld|csn=%ld|cse=%ld|csem=%ld|csm=%d|seq=%@\n",
          [[NSDate date] timeIntervalSince1970], (unsigned long)all.count,
-         (long)csYes, (long)csMeasured, (csDest ? 1 : 0), seq ?: @""];
+         (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
+         (csDest ? 1 : 0), seq ?: @""];
         [out appendString:rows];
 
         NSError *err = nil;
         BOOL ok = [out writeToFile:NOTIFYBOX_NC_SNAPSHOT atomically:YES
                           encoding:NSUTF8StringEncoding error:&err];
-        NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld（可量=%d）seq=%@ 写入=%@",
+        NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld｜严格 %ld / 可读uuid %ld（可量=%d）seq=%@ 写入=%@",
               (unsigned long)all.count, (unsigned long)withKeys,
-              (long)csYes, (long)csMeasured, (csDest ? 1 : 0), seq ?: @"",
+              (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
+              (csDest ? 1 : 0), seq ?: @"",
               ok ? @"成功" : [NSString stringWithFormat:@"失败(%@)", err.localizedDescription ?: @"?"]);
     } @catch (NSException *e) {
         NBLog(@"!!! [扫] 抛: %@", e.reason);

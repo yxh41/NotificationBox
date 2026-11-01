@@ -150,13 +150,18 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 @property (nonatomic, assign) NSTimeInterval aliveScanTs;
 // 扫描时的 NC 总条数（0 = 没记到）。只用于诊断，不参与任何显示判断。
 @property (nonatomic, assign) NSInteger aliveNC;
-// ---------- v0.0.102：界面口径（和 aliveNC 是两个不同的账本）----------
-// 🔴 真机 `nc_diag101.txt`：`扫 NC 637 条 ⇒ 仍在 63` —— 手机通知中心不可能有 637 条。
-//    `aliveNC` 来自 `uuidsToRequests`（NC source 的**历史账本**），混着大量界面上早已不存在的条目；
-//    而 CS 侧 `destination:notificationRequestForUUID:` 在同一份日志里是 **是 16 / 否 74**。
-// ⇒ 两个数都报出来，让"哪个等于眼睛"被量一次。⛔ 本版**不**改橙条的判据（仍按账本），一次只动一个变量。
+// ---------- v0.0.102/103：界面口径（和 aliveNC 是两个不同的账本）----------
+// 🔴🔴🔴 v0.0.102 装出来后真机提示条写的是「账本 637 · **界面 672**」——
+//    界面数**不小于**账本数，一个量级。说明 v0.0.102 那个判据（"CS 返回非 nil 就算认"）
+//    对几乎任何 uuid 都成立，"返回了"区分不出真假 ⇒ **那一档已废**。
+// ⚠️ 当时的推断错在哪：把日志里「尺子(NC 账本侧读回): 是 16 / 否 74」当成了
+//    "界面里一共 16 条"。那是**删除后逐条读回**的比例（问 90 次：16 次还在），
+//    是局部口径。⇒ 教训：**局部口径的数不许说全库的话**。
+// 🔴 v0.0.103 换成严格口径（`cse`）：回来的对象 uuid 必须**等于**问的 uuid 才算。
+//    读不到 uuid 的条目单独计进 `csemn`，`csemn=0` 才算"量不到"。
+//    ⛔ 本版**仍不**改橙条判据（橙条还按账本 `aliveSnap` 算）—— 先把尺子校出来，再动行为。
 @property (nonatomic, assign) NSInteger aliveCS;
-// 1 = 界面口径可量；0 = 量不了（tweak 还没捕获到 CS dispatcher）。
+// 1 = 界面严格口径可量（`csemn > 0`）；0 = 量不了（tweak 还没捕获 CS dispatcher、或读不到 uuid）。
 // 🔴 量不了时**不许**显示成 0 条 —— 那是"读不到"冒充"没有"。
 @property (nonatomic, assign) BOOL aliveCSMeasurable;
 // 当前列表里「此刻仍在通知中心」的条数。口径 = **其它筛选都算完之后、只差 aliveOnly 那一步**，
@@ -1761,9 +1766,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.aliveSnap = snap;
     self.aliveScanTs = [snap[@"scan"] doubleValue];
     self.aliveNC = [snap[@"nc"] integerValue];
-    // v0.0.102：界面口径。`csm=1` 才算量到；否则 `aliveCS` 保持 0 但**不显示成 0 条**。
-    self.aliveCSMeasurable = ([snap[@"csm"] integerValue] != 0);
-    self.aliveCS = self.aliveCSMeasurable ? [snap[@"cs"] integerValue] : 0;
+    // v0.0.103：界面**严格**口径。`csemn > 0` 才算量到（能读到 uuid 的条目数），
+    // 否则 `aliveCS` 保持 0 但**不显示成 0 条**。
+    self.aliveCSMeasurable = ([snap[@"csemn"] integerValue] > 0);
+    self.aliveCS = self.aliveCSMeasurable ? [snap[@"cse"] integerValue] : 0;
     // 🔴 保鲜期判据用 `timeIntervalSince1970` 直接比，不建 NSDateFormatter：
     //    快照里的 scan 就是 epoch，转换一道只会多一个"时区搞错"的机会。
     // 🔴 v0.0.99：阈值从 1 小时收到 **10 分钟**。通知中心是**随时会变**的东西
@@ -1942,14 +1948,20 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    如果这里写着"通知中心共 0 条"，而用户明明在通知中心看到一堆 ——
     //    那就是 tweak 没扫到 / 没权限 / 没 respring，一眼就能分辨，
     //    不用再猜"是匹配不上还是根本没数据"。
-    // 🔴🔴 v0.0.102：**两个口径都报**。真机已量出「账本 637 条 / 界面认的少得多」，
-    //    橙条目前按账本算 ⇒ 必然高估。把两个数并排放，用户一眼就能告诉我们哪个等于眼睛，
-    //    下一版再据此把橙条的判据换过去（一次只动一个变量，不拿猜测改行为）。
+    // 🔴🔴 v0.0.103：文案**必须缩短**。v0.0.102 那句
+    //    「橙色竖条 = 这条还在通知中心里 · N 条（账本 637 条 · 界面 672 条 · 扫描于 1 秒前）」
+    //    在真机上被**中间截断**成「… · 2… · 界面 672 条 · 扫描于 1 秒前）」——
+    //    橙条数 N 和账本数**全丢了**，提示条本来要传的信息一句没传到（用户截图直接佐证）。
+    //    字数是硬约束：12pt、单行、高度写死 `kNBHintH` ⇒ 按"能放下"写，不再堆形容词。
+    //    「橙色竖条」缩成「橙条」：左边那条颜色就在眼前，不需要五个字去指它。
+    // 🔴 口径说明（真机两轮量出来的）：
+    //    账本 = `uuidsToRequests`（NC source 的**历史账本**，虚胖）；
+    //    界面 = 回来的对象 uuid 必须等于问的 uuid（严格），读不到 uuid 就报「量不到」。
     NSString *scope = self.aliveCSMeasurable
-        ? [NSString stringWithFormat:@"账本 %ld 条 · 界面 %ld 条",
+        ? [NSString stringWithFormat:@"账本 %ld · 界面 %ld",
                                     (long)self.aliveNC, (long)self.aliveCS]
-        : [NSString stringWithFormat:@"账本 %ld 条 · 界面量不到", (long)self.aliveNC];
-    return [NSString stringWithFormat:@"橙色竖条 = 这条还在通知中心里 · %ld 条（%@ · 扫描于 %@前）",
+        : [NSString stringWithFormat:@"账本 %ld · 界面量不到", (long)self.aliveNC];
+    return [NSString stringWithFormat:@"橙条 = 还在通知中心 · %ld 条（%@ · %@前）",
                                      (long)self.aliveStillCount, scope,
                                      [self aliveAgeText]];
 }

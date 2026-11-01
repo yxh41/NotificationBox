@@ -1621,24 +1621,29 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
 //    · 没有文件 / 没有表头 ⇒ scan=0、keys 空（一切 Unknown）。**没有基准就没法判断新旧** ——
 //      猜成"仍在"是满屏橙条，猜成"已不在"是把真残留藏起来（最坏的那一档）⇒ 宁可什么都不说。
 //    · `#` 开头的行是表头，不是条目。
-// 🔴 表头格式 `#scan=<epoch>|nc=<账本条数>|cs=<界面认的条数>|csn=<实际探测条数>|csm=<0|1>|seq=<序号>`；
+// 🔴 表头格式 `#scan=<epoch>|nc=<账本条数>|cs=<界面认的条数>|csn=<实际探测条数>|cse=<严格相等的条数>|csem=<能读到uuid的条数>|csm=<0|1>|seq=<序号>`；
 //    条目 `<section>|<key1>|<key2>|…|cs=<1|0|-1>`。
 // 🔴 🔴 v0.0.102：`csn`（实际探测条数）**本类故意不解析** —— App 侧只需要
 //    「界面认几条」（cs）和「到底量没量到」（csm）两个数；`csn` 是给日志诊断用的。
 //    写一堆"解析了但谁都不读"的字段，在 `-Werror` 下就是一条 unused-but-set 编译错误
 //    （v0.0.102 第一次 CI 正是这么炸的），所以宁可一个都不留。
+// 🔴🔴🔴 v0.0.103：App 侧现在要的是 **`cse` / `csem`**（严格口径），
+//    `cs`（返回非 nil 就算认）**退成旁证**、本类不再解析它 —— 真机已把 `cs` 否掉：
+//    提示条量出「账本 637 · 界面 672」，两个数一个量级，说明"返回了"根本区分不出真假。
+//    `cs` 仍留在文件里给日志读，但 App 一个字节都不碰（不解析就不会有 dead variable）。
 // 🔴 `keys` 用 **NSSet**：匹配是 O(1)，而这个集合可能有几百个元素、每行都要查一次。
 + (NSDictionary *)ncSnapshot {
     NSTimeInterval scan = 0;
     NSInteger ncTotal = 0;
-    NSInteger csTotal = 0;
+    NSInteger cseTotal = 0;
+    NSInteger cseMeasured = 0;
     BOOL csOn = NO;
     NSString *seq = nil;
     NSMutableSet<NSString *> *keys = [NSMutableSet set];
     // 🔴 空快照的**唯一**形态（三个早退点共用一份，别各写一遍 ——
     //    少一个键就是"某个调用方读到 nil 然后当 0 处理"，本项目栽过）。
-    NSDictionary *empty = @{@"scan": @0, @"nc": @0, @"cs": @0, @"csm": @0,
-                            @"seq": @"", @"keys": [NSSet set]};
+    NSDictionary *empty = @{@"scan": @0, @"nc": @0, @"cse": @0, @"csemn": @0,
+                            @"csm": @0, @"seq": @"", @"keys": [NSSet set]};
     @try {
         NSString *st = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SNAPSHOT
                                                 encoding:NSUTF8StringEncoding error:NULL];
@@ -1649,11 +1654,15 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
             if ([ln hasPrefix:@"#"]) {
                 if (![ln hasPrefix:@"#scan="]) continue;
                 for (NSString *f in [ln componentsSeparatedByString:@"|"]) {
-                    if ([f hasPrefix:@"#scan="])      scan       = [[f substringFromIndex:6] doubleValue];
-                    else if ([f hasPrefix:@"nc="])    ncTotal    = [[f substringFromIndex:3] integerValue];
-                    else if ([f hasPrefix:@"cs="])    csTotal    = [[f substringFromIndex:3] integerValue];
-                    else if ([f hasPrefix:@"csm="])   csOn       = ([[f substringFromIndex:4] integerValue] != 0);
-                    else if ([f hasPrefix:@"seq="])   seq        = [f substringFromIndex:4];
+                    if ([f hasPrefix:@"#scan="])      scan        = [[f substringFromIndex:6] doubleValue];
+                    else if ([f hasPrefix:@"nc="])    ncTotal     = [[f substringFromIndex:3] integerValue];
+                    // ⚠️ 长前缀先判：`csem=` 排在 `cse=` 之前。两个前缀其实互不吞
+                    //    （`cse=` 比 "csem" 第 4 字符是 'm'≠'='；`csem=` 比 "cse=" 第 4 字符是 '='≠'m'），
+                    //    排"先长后短"是为了让这条规矩**落成代码顺序**，别指望以后加字段的人自己推。
+                    else if ([f hasPrefix:@"csem="])  cseMeasured = [[f substringFromIndex:5] integerValue];
+                    else if ([f hasPrefix:@"cse="])   cseTotal    = [[f substringFromIndex:4] integerValue];
+                    else if ([f hasPrefix:@"csm="])   csOn        = ([[f substringFromIndex:4] integerValue] != 0);
+                    else if ([f hasPrefix:@"seq="])   seq         = [f substringFromIndex:4];
                 }
                 continue;
             }
@@ -1675,8 +1684,9 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     }
     // 🔴 没有基准 ⇒ 整份作废（理由见头注释）。**早退**，不是"尽力而为"。
     if (scan <= 0) return empty;
-    return @{@"scan": @(scan), @"nc": @(ncTotal), @"cs": @(csTotal),
-             @"csm": @(csOn ? 1 : 0), @"seq": seq ?: @"", @"keys": keys};
+    return @{@"scan": @(scan), @"nc": @(ncTotal), @"cse": @(cseTotal),
+             @"csemn": @(cseMeasured), @"csm": @(csOn ? 1 : 0),
+             @"seq": seq ?: @"", @"keys": keys};
 }
 
 // ---------- 某条记录此刻在不在通知中心 ----------

@@ -307,19 +307,22 @@ typedef NS_ENUM(NSInteger, NBAliveState) {
 
 // 读一次快照。返回 @{@"scan": NSNumber(NSTimeInterval),   // 0 = 没有可用快照
 //                  @"nc":   NSNumber(NSInteger),          // 扫描时 NC **账本**总条数
-//                  @"cs":   NSNumber(NSInteger),          // 扫描时 **界面那一层**还认的条数（v0.0.102）
-//                  @"csm":  NSNumber(NSInteger),          // 1 = 界面口径可量；0 = 量不了（⛔ 不许当 0 条）
+//                  @"cse":  NSNumber(NSInteger),          // 扫描时**界面严格认**的条数（v0.0.103）
+//                  @"csemn":NSNumber(NSInteger),          // >0 才可量；0 = 量不了（⛔ 不许当 0 条）
+//                  @"csm":  NSNumber(NSInteger),          // 1 = CS dispatcher 已被捕获
 //                  @"seq":  NSString,                     // tweak 回写的那次请求序号
 //                  @"keys": NSSet<NSString *>}。          // 此刻 NC 里所有通知的**唯一标识**
 // 🔴 匹配键只有 `bulletinID` / `notificationIdentifier` / `uuid` 三把（都是唯一的）。
 //    快照里**故意不含** `recordID` / `publisherBulletinID` —— 这两个对某些 publisher 是常量，
 //    写进来会让"同 publisher 的所有通知"全部误命中（见 Tweak.x 里 NBDumpNCSnapshot 的注释）。
-// 🔴🔴 `nc` 和 `cs` 是**两个不同的口径**，别混（v0.0.102 真机量的）：
-//    真机 `nc_diag101.txt` 里 `[寿] 台账 95 条 × 扫 NC 637 条 ⇒ 仍在 63` ——
-//    手机通知中心不可能有 637 条 ⇒ `uuidsToRequests`（`nc`）是 NC source 的**历史账本**，
-//    混着大量界面上早已不存在的条目；而 CS 侧 `destination:notificationRequestForUUID:`
-//    （`cs`）在同一份日志里是 **是 16 / 否 74**，更接近"眼睛看到的"。
-//    ⇒ 两个数**都要报出来**，让"哪个等于眼睛"这件事被量一次，别靠猜。
+// 🔴🔴🔴 `nc` 和 `cse` 是**两个口径**，而且**都不等于眼睛**（v0.0.102/v0.0.103 真机量的）：
+//    · `nc`（`uuidsToRequests`）= NC source 的**历史账本**，一次返 637 条，手机挂不了那么多；
+//    · `cs`（v0.0.102 那档，"返回非 nil 就算认"）= **672 条**，比账本还大
+//      ⇒ 那个方法对几乎任何 uuid 都回一个对象，"返回了"根本区分不出真假。**这一档已废**。
+//    · `cse`（v0.0.103）= 回来的对象 uuid **必须等于**问的 uuid，只在能读到 uuid 时计入
+//      `csemn`；两者相除才是"界面真的有这条"的近似值。
+//    ⚠️ v0.0.102 曾把日志里的「是 16 / 否 74」当成"界面只有 16 条" —— 那是**删除后逐条读回**
+//       的局部口径，不是全库条数。教训：**局部口径的数不许说全库的话**。
 + (NSDictionary *)ncSnapshot;
 
 // 某条记录（`sys_id`）此刻在不在通知中心。
