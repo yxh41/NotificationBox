@@ -1826,9 +1826,16 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 }
 
 // 某一行的残留状态。**过期快照一律 Unknown**（理由见 `aliveStale` 属性注释）。
+// 🔴 v0.0.117：读 `sys_id_cand`（= `新|旧` 两组候选键）而不是 `sys_id`。
+//    NC 成批重投会换新 sys_id，库里那条被改写成新 ID，而快照可能写于重投之前
+//    ⇒ 只比 `sys_id` 就会把"其实还在通知中心"的行判成不在（总分说还在、逐行都说不在了）。
+//    候选键由 store 侧 `NBSysIdWithAlt` 拼，**与「全库残留」同一个函数**
+//    ⇒ 两个指标同口径。`sys_id` 原键继续保留原义（别处还有读者）。
 - (NBAliveState)aliveStateForRow:(NSDictionary *)row {
     if (self.aliveStale) return NBAliveUnknown;
-    return [NotifyStore aliveStateOfSysId:row[@"sys_id"] inSnapshot:self.aliveSnap];
+    NSString *cand = row[@"sys_id_cand"];
+    if (![cand isKindOfClass:[NSString class]] || cand.length == 0) cand = row[@"sys_id"];
+    return [NotifyStore aliveStateOfSysId:cand inSnapshot:self.aliveSnap];
 }
 
 // 残留筛选 + `aliveStillCount` 的计算（两个量在同一个循环里出 ⇒ 天然同口径）。

@@ -96,7 +96,7 @@ void NBSharedLog(NSString *fmt, ...) {
     const char *sql = "CREATE TABLE IF NOT EXISTS notifications ("
                       "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                       "bundle TEXT, title TEXT, message TEXT, subtitle TEXT, "
-                      "ts REAL, read INTEGER DEFAULT 0, hash TEXT, sys_id TEXT);"
+                      "ts REAL, read INTEGER DEFAULT 0, hash TEXT, sys_id TEXT, sys_id_alt TEXT);"
                       "CREATE INDEX IF NOT EXISTS idx_bundle ON notifications(bundle);"
                       "CREATE INDEX IF NOT EXISTS idx_ts ON notifications(ts);"
                       // v0.0.45：App 显示名表。**SpringBoard 写、盒子 App 读**。
@@ -113,20 +113,29 @@ void NBSharedLog(NSString *fmt, ...) {
     sqlite3_exec(db, sql, NULL, NULL, NULL);
 
     // v0.0.52：老库补 sys_id 列（精确同步清通知中心用）。
+    // v0.0.117：再补 sys_id_alt 列（系统重投换 ID 时把**旧 ID**留着，见内容去重那段）。
     // 🔴 SQLite 不支持 `ALTER TABLE … ADD COLUMN IF NOT EXISTS`，
     //    所以先 PRAGMA table_info 探测，没有才 ALTER（避免对已是新结构的库重复 ALTER 报错）。
+    // 🔴 v0.0.117：改成**一次 PRAGMA 同时探测两列**。原来只探 sys_id、探到就 break ——
+    //    再加一列时那种写法必然漏（第二次 ALTER 会被跳过，然后整版按"有这一列"去读写 ⇒
+    //    运行期 `no such column`，而且只在老库上升级才炸）。
     {
-        BOOL hasSysId = NO;
+        BOOL hasSysId = NO, hasAlt = NO;
         sqlite3_stmt *p = NULL;
         if (sqlite3_prepare_v2(db, "PRAGMA table_info(notifications)", -1, &p, NULL) == SQLITE_OK) {
             while (sqlite3_step(p) == SQLITE_ROW) {
                 const char *nm = (const char *)sqlite3_column_text(p, 1);
-                if (nm && strcmp(nm, "sys_id") == 0) { hasSysId = YES; break; }
+                if (!nm) continue;
+                if (strcmp(nm, "sys_id") == 0) hasSysId = YES;
+                if (strcmp(nm, "sys_id_alt") == 0) hasAlt = YES;
             }
             sqlite3_finalize(p);
         }
         if (!hasSysId) {
             sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN sys_id TEXT;", NULL, NULL, NULL);
+        }
+        if (!hasAlt) {
+            sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN sys_id_alt TEXT;", NULL, NULL, NULL);
         }
     }
     return db;
@@ -514,20 +523,47 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
             //   —— 这正是 `nc_diag(24).txt` 里 34 次尝试中 28 次「同段有它条、ID 都不是目标」的由来。
             //   窗口只有 60 秒 ⇒ 能落到这里的两条必然是同一件事的重投，覆盖是安全的。
             //   ⚠️ 反过来：这次**没**拿到 ID 时保持原样（`?<>''` 守卫），别把好 ID 抹成空。
+            // 🔴🔴 v0.0.117：覆盖 sys_id 之前，先把**旧 ID 存进 `sys_id_alt`**。
+            //    为什么必须这么做（真机血账，2026-11-02 18:10）：NC 成批重投时这里会把
+            //    几百行的 sys_id 改写成新 ID，而磁盘上的快照还是重投**之前**写的那一份
+            //    ⇒ 两侧 ID 空间错开 ⇒ `全库残留` 在同一份快照、同一批行上 22 秒内从 179 掉到 2，
+            //    盒子上"还在通知中心"的橙框一路灭掉，提示条还会写「都不在通知中心了」。
+            //    ⇒ 留着旧 ID，匹配（`aliveStateOfSysId` 本来就按 `|` 拆开逐段比）就跨得过这次换 ID。
+            // 🔴 三条边界：
+            //    ① `sys_id_alt` 最多留 **2 个**旧 ID（`instr(...)>0` 判断），不然每重投一次就长一截，
+            //       长到几十个 ID 时既费空间、又让"这个键命中"变成碰运气；
+            //       满了以后**丢最早那个、留最近两个**（`substr(...instr+1)`）：快照通常只落后
+            //       一两轮重投，最近两个旧 ID 才是真正用得上的；最老的那个早已过期。
+            //       不变式：`sys_id_alt` 里最多一个 `|`（两段），下面那个 `substr` 因此必然取到第 2 段。
+            //    ② 只在**旧 ID 非空且与新 ID 不同**时才动它 —— 相同就是没换 ID，不该往里塞重复串；
+            //    ③ SQLite 的 UPDATE 是**先按旧行算完所有表达式再赋值** ⇒ 下面 `sys_id_alt` 表达式里
+            //       引用的 `sys_id` 一定是改写前那个。（把 alt 写在前面只是让人读懂意图，不是语法要求。）
             const char *upd =
-                "UPDATE notifications SET ts=MAX(ts, ?), "
-                "sys_id=CASE WHEN ?<>'' THEN ? ELSE sys_id END "
-                "WHERE id=?;";
+                "UPDATE notifications SET "
+                "ts = MAX(ts, ?1), "
+                "sys_id_alt = CASE "
+                "  WHEN ?2<>'' AND sys_id<>'' AND sys_id<>?2 THEN "
+                "    CASE WHEN IFNULL(sys_id_alt,'')='' THEN sys_id "
+                "         WHEN instr(sys_id_alt,'|')>0 "
+                "              THEN substr(sys_id_alt, instr(sys_id_alt,'|')+1) || '|' || sys_id "
+                "         ELSE sys_id_alt || '|' || sys_id END "
+                "  ELSE sys_id_alt END, "
+                "sys_id = CASE WHEN ?2<>'' THEN ?2 ELSE sys_id END "
+                "WHERE id=?3;";
             sqlite3_stmt *us2 = NULL;
             int changed = 0;
             if (sqlite3_prepare_v2(db, upd, -1, &us2, NULL) == SQLITE_OK) {
                 sqlite3_bind_double(us2, 1, inTs);
                 sqlite3_bind_text(us2, 2, [sysId ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(us2, 3, [sysId ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(us2, 4, dupId);
+                sqlite3_bind_int64(us2, 3, dupId);
                 int urc2 = sqlite3_step(us2);
                 changed = (urc2 == SQLITE_DONE) ? sqlite3_changes(db) : 0;
                 sqlite3_finalize(us2);
+            } else {
+                // 🔴 v0.0.117：prepare 失败**必须**留痕。不报的话 changed 仍是 0 ⇒ 直接落到
+                //    下面 INSERT ⇒ 同一条通知被记两遍，而日志上什么都看不出来
+                //    （本项目吃过"静默落一行"的亏，这类错只能靠一行日志抓）。
+                NBStoreLog(@"内容去重 prepare 失败 err=%s", sqlite3_errmsg(db));
             }
             // 🔴 必须查 changes：UPDATE 命中 0 行也返回 SQLITE_DONE。
             //    命中 0 行说明这一行在这几毫秒里被别人删了 ⇒ 落到下面正经 INSERT，别把通知吞掉。
@@ -701,6 +737,43 @@ static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nul
     return kNBListLimit;
 }
 
+// ---------- v0.0.117：把「现役 ID」和「保留的旧 ID」拼成一组候选键 ----------
+// 🔴 为什么需要它：NC（通知中心）成批重投时会**换新 sys_id**，内容去重那条 UPDATE
+//    就把库里的 `sys_id` 改写成了新 ID ⇒ 快照写于重投之前的话，两侧 ID 空间当场错开。
+//    真机实测后果：同一份快照、同一批 2163 行，「全库残留」22 秒内 179 → 91 → 2。
+//    ⇒ 改写前把旧 ID 存进 `sys_id_alt`，这里拼成 `新|旧` 交给 `aliveStateOfSysId`，
+//      它本来就按 `|` 拆开逐段比 —— **匹配逻辑一行不用改**，跨度就自动跨过重投。
+// 🔴 绝不许把旧 ID 拼进 `sys_id` 本身：`deDupBySysId` 是按 `sys_id` **整串** `GROUP BY` 的，
+//    一改分组结果就变，列表会冒出重复行。旧 ID 必须留在独立列里。
+// 🔴 去重保序：同一个 ID 出现两次会让 `[残]` 的「段=」数虚高，而那个数正是我们要读的量。
+// 🔴 总长设上限：`sys_id` 是 TEXT 不限长，但一行日志打印不了无限长；
+//    超过上限就**丢掉多出来的旧 ID**（宁可少匹配一个旧 ID，不许把日志撑爆）。
+// ⚠️ 这个 helper 有两个调用点（列表行映射 `NBAppendRow` 在前、残留计数在后），
+//    ⇒ 定义必须放在**最早**那个调用点之前（C 里先用后定义 = undeclared identifier）。
+#define NB_SYSID_ALT_SEP @"|"
+#define NB_SYSID_CAND_MAXLEN 200
+static NSString *NBSysIdWithAlt(NSString *sysId, NSString *alt) {
+    if (![alt isKindOfClass:[NSString class]] || alt.length == 0) return sysId ?: @"";
+    if (![sysId isKindOfClass:[NSString class]] || sysId.length == 0) return alt;
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *p in [sysId componentsSeparatedByString:NB_SYSID_SEP]) {
+        if (p.length && ![out containsObject:p]) [out addObject:p];
+    }
+    for (NSString *p in [alt componentsSeparatedByString:NB_SYSID_ALT_SEP]) {
+        if (p.length && ![out containsObject:p]) [out addObject:p];
+    }
+    NSString *joined = [out componentsJoinedByString:NB_SYSID_SEP];
+    if (joined.length > NB_SYSID_CAND_MAXLEN) {
+        // 截到上限后最后一段可能是半个 ID ⇒ 宁可整段丢掉，也不留半截去比
+        NSString *cut = [joined substringToIndex:NB_SYSID_CAND_MAXLEN];
+        NSRange r = [cut rangeOfString:NB_SYSID_SEP options:NSBackwardsSearch];
+        if (r.location != NSNotFound) cut = [cut substringToIndex:r.location];
+        NBStoreLog(@"候选键超长已截断 %lu→%lu", (unsigned long)joined.length, (unsigned long)cut.length);
+        joined = cut;
+    }
+    return joined;
+}
+
 // v0.0.44：把"一行结果 → 字典"抽成一份。
 // 🔴 列表和导出现在共用它 —— 两处各抄一遍列号，改 SELECT 时必然有一处漏改，
 //    而那种错不会报错，只会让某一列悄悄变成空串。
@@ -709,10 +782,13 @@ static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nul
 //    `row[@"sys_id"]` 恒为 `nil` ⇒ `aliveStateOfSysId:` 恒返回 `NBAliveUnknown`
 //    ⇒ `aliveStillCount` **恒为 0**，且**一条报错都没有**（nil 一路传到 `if (!sysId.length) return Unknown;`）。
 //    真机表现：tweak 日志明写「NC 现状 4 条（有键 4）写入=成功」，盒子上却是 0 条。
-//    ⇒ 判据必须把「SELECT 列表 / 这里的列号映射 / 消费端读的键名」三处钉在一起，
+    //    ⇒ 判据必须把「SELECT 列表 / 这里的列号映射 / 消费端读的键名」三处钉在一起，
 //      静态查"代码里出现过 sys_id"完全挡不住这类（本项目 Z4 那族：绿的原因不等于它要证的事）。
 //    ⚠️ 改这里必须同时改**两个** SELECT（列表 + 导出）：它们共用本函数，
 //      列数/列序不一致会让后面某一列读到 NULL 而静默变空。
+// v0.0.117：末尾加了第 9 列 `IFNULL(sys_id_alt,'')`，**四个** SELECT 一起加了
+//    （列表两条 + 导出两条）。静态判据要数 `IFNULL(sys_id_alt` 出现 4 次 ——
+//    只加一处就会让另一处的第 9 列读到 NULL，而 `?: ""` 会让它静默变空串。
 static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"id"]       = @(sqlite3_column_int(st, 0));
@@ -726,6 +802,15 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     d[@"read"]     = @(sqlite3_column_int(st, 6));
     // v0.0.100：第 8 列。`sys_id` 是列表页判"还在不在通知中心"的唯一依据（见上面的血账）。
     d[@"sys_id"]   = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 7) ?: ""];
+    // 🔴🔴 v0.0.117：第 9 列 `sys_id_alt`（保留的旧 ID），拼成 `新|旧` 放进**另一个键**。
+    //    为什么不直接改进 `sys_id`：那个键还有别的读者（导出、以及后续可能的 NC 清请求），
+    //    改它的语义 = 在别处静默改行为。这里只多给一个"候选键"专用键，
+    //    消费端（`ViewController` 的存活标记）改读它，`sys_id` 原义不动。
+    // 🔴 口径必须和 `countStillInDBWithSnapshot:` 一致 —— 同一个界面里"互相解释"的两个指标
+    //    （残留条数 vs 每行标记）不同口径，就会出现"总数说还在、逐行都说不在了"。
+    NSString *sid7 = d[@"sys_id"] ?: @"";
+    NSString *salt8 = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 8) ?: ""];
+    d[@"sys_id_cand"] = NBSysIdWithAlt(sid7, salt8);
     [res addObject:d];
 }
 
@@ -747,8 +832,8 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     //    ⇒ 残留标记恒 0，而且不报错。加/删列时**四个** SELECT（列表两条 + 导出两条）
     //    和 `NBAppendRow` 的列号必须一起改。
     NSString *head = unreadOnly
-        ? @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id FROM notifications WHERE read=0"
-        : @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id FROM notifications WHERE 1=1";
+        ? @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,'') FROM notifications WHERE read=0"
+        : @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,'') FROM notifications WHERE 1=1";
     NSString *tail = [NSString stringWithFormat:@" ORDER BY ts DESC LIMIT %ld", (long)kNBListLimit];
     sqlite3_stmt *st = NBPrepareScope(db, head, tail, bundle, since, q, searchBundles);
     if (st) {
@@ -775,8 +860,8 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     sqlite3 *db = [self openDB];
     if (!db) return res;
     NSString *head = unreadOnly
-        ? @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id FROM notifications WHERE read=0"
-        : @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id FROM notifications WHERE 1=1";
+        ? @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,'') FROM notifications WHERE read=0"
+        : @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,'') FROM notifications WHERE 1=1";
     sqlite3_stmt *st = NBPrepareScope(db, head, @" ORDER BY ts DESC", bundle, since, q, searchBundles);
     if (st) {
         while (sqlite3_step(st) == SQLITE_ROW) NBAppendRow(st, res);
@@ -1706,6 +1791,8 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
              @"seq": seq ?: @"", @"keys": keys};
 }
 
+// ---------- v0.0.117：`NBSysIdWithAlt` 定义在文件前部（最早的调用点 `NBAppendRow` 之前）。 ----------
+
 // ---------- 某条记录此刻在不在通知中心 ----------
 // 🔴🔴 **必须按 `|` 拆开逐段匹配**：库里的 `sys_id` 存的是 `bulletinID|notificationIdentifier`
 //    （写入侧把两个候选键拼起来，见 Tweak.x 的 sysId 拼装处），而快照里每个键都是**单独一个**。
@@ -1816,7 +1903,9 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
 
         // ② v0.0.112：**必须先卡 `ts <= 快照时刻`**。
         //    不卡就是"拿最新数据比旧快照" ⇒ 这 5 行永远全否（v0.0.111 的血账）。
-        const char *sql = "SELECT bundle, sys_id, ts, title FROM notifications "
+        // v0.0.117：带上 `sys_id_alt` —— 否则这 5 行会按"只有现役 ID"去比，
+        //   和上面那个三档统计（已经拼了旧 ID）口径不一致，两处数会打架。
+        const char *sql = "SELECT bundle, sys_id, sys_id_alt, ts, title FROM notifications "
                           "WHERE sys_id IS NOT NULL AND sys_id<>'' AND ts <= ?1 "
                           "ORDER BY ts DESC LIMIT 5;";
         sqlite3_stmt *st = NULL;
@@ -1832,10 +1921,13 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
             idx++;
             const char *cb = (const char *)sqlite3_column_text(st, 0);
             const char *cs = (const char *)sqlite3_column_text(st, 1);
-            double ts = sqlite3_column_double(st, 2);
-            const char *ct = (const char *)sqlite3_column_text(st, 3);
+            const char *ca = (const char *)sqlite3_column_text(st, 2);
+            double ts = sqlite3_column_double(st, 3);
+            const char *ct = (const char *)sqlite3_column_text(st, 4);
             NSString *bundle = cb ? [NSString stringWithUTF8String:cb] : nil;
-            NSString *sysId  = cs ? [NSString stringWithUTF8String:cs] : nil;
+            NSString *sysId0 = cs ? [NSString stringWithUTF8String:cs] : nil;
+            NSString *sysAlt = ca ? [NSString stringWithUTF8String:ca] : nil;
+            NSString *sysId  = NBSysIdWithAlt(sysId0, sysAlt);
             NSString *title  = ct ? [NSString stringWithUTF8String:ct] : @"";
 
             NSMutableArray *parts = [NSMutableArray array];
@@ -1979,7 +2071,16 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     double winMin = [snap[@"tmin"] doubleValue];
     BOOL winOk = (winMax > 0);
     NSInteger winRows = 0, winStill = 0;
-    const char *sql = "SELECT sys_id, ts FROM notifications "
+    // v0.0.117：这两个数就是**这一版修的东西到底修好没有**的唯一直接证据。
+    //   `altRows` = 带旧 ID 的行（证明**写入侧**真在写 `sys_id_alt`，否则整版是空转）；
+    //   `altSaved` = 只靠旧 ID 才判成 Still 的行（证明**匹配侧**真的靠它救回来了）。
+    //   🔴 只报 `altSaved` 不报 `altRows` 就会犯"没有分母"的错：altRows=0 时 altSaved
+    //      必然是 0，那说明的是"没在写"，不是"匹配没用"。
+    NSInteger altRows = 0, altSaved = 0;
+    // 🔴 v0.0.117：把保留的旧 ID 一起取出来拼成候选键（`新|旧`），跨过 NC 重投换 ID。
+    //    WHERE 一个字不动：`sys_id_alt` 只在 `sys_id` 非空、且被改写过时才写
+    //    ⇒ 「带 ID 的行」这个分母的口径不会因为这次改动而变（否则年龄分档全都要重算）。
+    const char *sql = "SELECT sys_id, ts, IFNULL(sys_id_alt,'') FROM notifications "
                       "WHERE sys_id IS NOT NULL AND sys_id<>'';";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
@@ -1987,9 +2088,19 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
             const char *t = (const char *)sqlite3_column_text(st, 0);
             if (!t) continue;
             scanned++;
-            NSString *sid = [NSString stringWithUTF8String:t];
+            NSString *sid0 = [NSString stringWithUTF8String:t];
+            const char *ta = (const char *)sqlite3_column_text(st, 2);
+            NSString *salt = ta ? [NSString stringWithUTF8String:ta] : nil;
+            NSString *sid = NBSysIdWithAlt(sid0, salt);
             BOOL isStill = ([self aliveStateOfSysId:sid inSnapshot:snap] == NBAliveStill);
             if (isStill) still++;
+            // v0.0.117：把"只靠旧 ID 才救回来"的行单独数出来。
+            // 🔴 只在真有旧 ID 时才多查一次（没有旧 ID 的行，`sid` 和 `sid0` 完全相同，
+            //    再查一遍是同义反复，白花时间而且给出的 0 没有意义）。
+            if (salt.length) {
+                altRows++;
+                if (isStill && [self aliveStateOfSysId:sid0 inSnapshot:snap] != NBAliveStill) altSaved++;
+            }
             // 同一遍里把两档宽松口径也数掉（分母必须是同一批行）
             BOOL ci = NO, p8 = NO;
             NBCountLooseForms(sid, lcKeys, p8Keys, &ci, &p8);
@@ -2056,6 +2167,13 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     } else {
         NBStoreLog(@"窗内残留 -1 / -1（快照里没有 tmin/tmax ⇒ 这个口径算不出来；不是 0）");
     }
+    // 🔴🔴 v0.0.117：**这一行是判断"这一版修好没有"的唯一直接证据**，必须每轮都打。
+    //    两个数缺一个就读不出结论：`带旧ID的行 0` ⇒ **写入侧压根没在写**（整版空转），
+    //    这时 `救回 0` 说明的是"没东西可救"，不是"匹配没用" —— 两种情况的修法完全不同。
+    //    `带旧ID的行 > 0` 而 `救回 0` ⇒ 旧 ID 一条都没命中，才轮到怀疑匹配/快照时刻。
+    NBStoreLog(@"旧ID救回 %ld 条 / 带旧ID的行 %ld ｜ 这是「只靠旧 ID 才判成还在通知中心」的行数；带旧ID=0 ⇒ 写入侧没在写 sys_id_alt（整版空转），不是匹配没用",
+               (long)altSaved, (long)altRows);
+
     // 🔴 v0.0.115：年龄分档，一个进程只打一次（日志窗口只有 ~50 行，这条是定性用的）。
     //    `scanned > 0` 是必置位的前提：库是空的就打，会把唯一一次机会烧在与病因无关的轮次上
     //    （v0.0.111 `done` 写在最前面那个血账的同一形态）。
