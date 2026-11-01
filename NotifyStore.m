@@ -1572,89 +1572,104 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     return s;
 }
 
-#pragma mark - v0.0.98 通知中心存活快照（只读）
+#pragma mark - v0.0.99 通知中心「现状」快照（只读）
 
+// ---------- 请求 tweak 扫一次 ----------
+// 🔴 和 `nbRequestClearNCWithSysId:` 是**两条独立通道**：那个会动系统状态（撤通知），
+//    这个纯只读。⛔ 绝不复用同一个 Darwin 通知名 —— 一次"只想看一眼"的请求
+//    会走进清通知的流程。
+// 🔴 写失败（沙盒/权限）只记日志，不影响调用方 —— 列表照常显示，只是标记不出来。
++ (void)requestNCSnapshotWithSeq:(NSString *)seq {
+    @try {
+        NSString *body = seq.length ? seq : [NSString stringWithFormat:@"%.0f",
+                                             [[NSDate date] timeIntervalSince1970] * 1000.0];
+        [[NSFileManager defaultManager] createDirectoryAtPath:
+            [NOTIFYBOX_NC_SCAN_REQ stringByDeletingLastPathComponent]
+                                     withIntermediateDirectories:YES attributes:nil error:nil];
+        NSError *err = nil;
+        BOOL ok = [body writeToFile:NOTIFYBOX_NC_SCAN_REQ atomically:YES
+                           encoding:NSUTF8StringEncoding error:&err];
+        if (!ok) {
+            NBStoreLog(@"扫描请求写不进去：%@", err.localizedDescription ?: @"?");
+        }
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             CFSTR(NB_NC_SCAN_NOTIFY_NAME),
+                                             NULL, NULL, TRUE);
+        NBStoreLog(@"已请求扫描 NC 现状 seq=%@", body);
+    } @catch (NSException *e) {
+        NBStoreLog(@"扫描请求失败：%@", e);
+    }
+}
+
+// ---------- 读快照 ----------
 // 🔴🔴 这个方法的全部工作就是**如实翻译** tweak 落盘的那份快照，不做任何推断：
-//    · 没有文件           ⇒ scan=0，states 空（一切 Unknown）；
-//    · 有文件但没有表头    ⇒ 同上（**没有基准就没法判断新旧** —— 见下面的注释）；
-//    · 有条目但 ts <= 0   ⇒ 跳过（不写 0 是因为 0 表示"从来没见到"，不能当时间用）。
-// 🔴 为什么缺表头必须整份作废：条目的第三列是"扫描时 NC 总条数"，不是时间。
-//    v0.0.95/v0.0.96 两版的文件里**根本没有**表头（v0.0.98 才加），
-//    那时想判断"这条是新是旧"只能靠猜。而"猜"的两种写法都很坏：
-//    猜成"仍在" ⇒ 满屏橙条（用户会以为清理功能坏了）；
-//    猜成"已消失" ⇒ 把真正残留的藏起来（用户以为清干净了，最坏的那一档）。
-//    ⇒ 宁可什么都不说。用户升级后删一条记录，表头就有了。
-+ (NSDictionary *)aliveSnapshot {
-    NSMutableDictionary<NSString *, NSNumber *> *states = [NSMutableDictionary dictionary];
+//    · 没有文件 / 没有表头 ⇒ scan=0、keys 空（一切 Unknown）。**没有基准就没法判断新旧** ——
+//      猜成"仍在"是满屏橙条，猜成"已不在"是把真残留藏起来（最坏的那一档）⇒ 宁可什么都不说。
+//    · `#` 开头的行是表头，不是条目。
+// 🔴 表头格式 `#scan=<epoch>|nc=<总条数>|seq=<序号>`；条目 `<section>|<key1>|<key2>|…`。
+// 🔴 `keys` 用 **NSSet**：匹配是 O(1)，而这个集合可能有几百个元素、每行都要查一次。
++ (NSDictionary *)ncSnapshot {
     NSTimeInterval scan = 0;
     NSInteger ncTotal = 0;
+    NSString *seq = nil;
+    NSMutableSet<NSString *> *keys = [NSMutableSet set];
     @try {
-        NSString *st = [NSString stringWithContentsOfFile:NOTIFYBOX_ALIVE_SNAPSHOT
+        NSString *st = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SNAPSHOT
                                                 encoding:NSUTF8StringEncoding error:NULL];
-        if (!st.length) return @{@"scan": @0, @"nc": @0, @"states": @{}};
+        if (!st.length) return @{@"scan": @0, @"nc": @0, @"seq": @"", @"keys": [NSSet set]};
         for (NSString *ln in [st componentsSeparatedByString:@"\n"]) {
             if (!ln.length) continue;
             // ---------- 表头 ----------
             if ([ln hasPrefix:@"#"]) {
-                // 格式 `#scan=<epoch>|nc=<总条数>`。🔴 别用 KVC/JSON 那套去解 ——
-                // 这里只有一个固定形状，多引一个解析器就是多一处能出错的地方。
                 if (![ln hasPrefix:@"#scan="]) continue;
-                NSArray *h = [ln componentsSeparatedByString:@"|"];
-                if (h.count < 1) continue;
-                NSString *tsPart = [(NSString *)h[0] substringFromIndex:6];   // 跳过 "#scan="
-                scan = [tsPart doubleValue];
-                if (h.count >= 2) {
-                    NSString *ncPart = (NSString *)h[1];
-                    if ([ncPart hasPrefix:@"nc="]) ncTotal = [[ncPart substringFromIndex:3] integerValue];
+                for (NSString *f in [ln componentsSeparatedByString:@"|"]) {
+                    if ([f hasPrefix:@"#scan="])      scan    = [[f substringFromIndex:6] doubleValue];
+                    else if ([f hasPrefix:@"nc="])    ncTotal = [[f substringFromIndex:3] integerValue];
+                    else if ([f hasPrefix:@"seq="])   seq     = [f substringFromIndex:4];
                 }
                 continue;
             }
-            // ---------- 条目 `<cid>|<lastSeenTs>|<ncTotal>` ----------
+            // ---------- 条目：第 0 段是 sectionIdentifier，其后每一段都是一把唯一键 ----------
             NSArray *q = [ln componentsSeparatedByString:@"|"];
-            if (q.count < 2) continue;
-            NSString *cid = (NSString *)q[0];
-            if (!cid.length) continue;
-            double ts = [(NSString *)q[1] doubleValue];
-            if (ts <= 0) continue;      // 0 = 从来没见到 ⇒ 写不进结论
-            states[cid] = @(ts);
+            // 🔴 从下标 1 开始：第 0 段是 sectionIdentifier（App 里叫 bundle），
+            //    **它不是唯一键**，放进匹配集会误命中（一个 App 的所有通知都同段）。
+            for (NSUInteger i = 1; i < q.count; i++) {
+                NSString *k = q[i];
+                if (k.length) [keys addObject:k];
+            }
         }
     } @catch (__unused NSException *e) {
-        return @{@"scan": @0, @"nc": @0, @"states": @{}};
+        return @{@"scan": @0, @"nc": @0, @"seq": @"", @"keys": [NSSet set]};
     }
-
-    // 🔴 没有基准 ⇒ 整份作废（理由见头注释）。这里**早退**，不是"尽力而为"。
-    if (scan <= 0) return @{@"scan": @0, @"nc": @0, @"states": @{}};
-
-    // ---------- 把「时间戳」翻成「三态」 ----------
-    // 🔴 这一步必须在**读完整个文件之后**做：`scan` 来自首行，而首行可能排在任何位置
-    //    （现在的写入点保证它在最前，但解析器不该依赖顺序 —— 依赖了就是个静默的定时炸弹）。
-    NSMutableDictionary<NSString *, NSNumber *> *out =
-        [NSMutableDictionary dictionaryWithCapacity:states.count];
-    for (NSString *cid in states) {
-        double ts = [states[cid] doubleValue];
-        // 🔴 不用 `fabs()`：这里不需要它的语义，而多一个数学库依赖就多一个"某平台没来由地
-        //    编不过"的可能。两个不等式写法更直白，也顺手把 `ts > scan`（时钟回拨）排除掉。
-        double d = ts - scan;
-        if (d >= -NB_ALIVE_SAME_SCAN_TOL && d <= NB_ALIVE_SAME_SCAN_TOL) {
-            out[cid] = @(NBAliveStill);
-        } else if (d < -NB_ALIVE_SAME_SCAN_TOL) {
-            out[cid] = @(NBAliveGone);
-        }
-        // ts > scan（时钟回拨 / 文件被手改过）⇒ 不进任何一态，按 Unknown 处理。
-        // 🔴 这里**不许**兜底成 Gone 或 Still —— 一个看不懂的数就该闭嘴。
-    }
-    return @{@"scan": @(scan), @"nc": @(ncTotal), @"states": out};
+    // 🔴 没有基准 ⇒ 整份作废（理由见头注释）。**早退**，不是"尽力而为"。
+    if (scan <= 0) return @{@"scan": @0, @"nc": @0, @"seq": @"", @"keys": [NSSet set]};
+    return @{@"scan": @(scan), @"nc": @(ncTotal), @"seq": seq ?: @"", @"keys": keys};
 }
 
+// ---------- 某条记录此刻在不在通知中心 ----------
+// 🔴🔴 **必须按 `|` 拆开逐段匹配**：库里的 `sys_id` 存的是 `bulletinID|notificationIdentifier`
+//    （写入侧把两个候选键拼起来，见 Tweak.x 的 sysId 拼装处），而快照里每个键都是**单独一个**。
+//    拿整串去查只有单个键的集合 ⇒ 一条也命中不了。v0.0.98 就是栽在这里：
+//    功能看着装好了，屏幕上一条都没有 —— 而且**不报错**，最难查的一种。
+// 🔴 任一候选段命中就算"仍在"：两个键说的是同一条通知，命中哪个都算数。
+// 🔴 拆开后**空段要跳过**：`"bID|"` 这种（只有一把键时写入侧仍会带分隔符）拆出来是空串，
+//    拿空串去查集合虽然查不到，但语义上它是"没有这个键"，不是"这个键不在"。
 + (NBAliveState)aliveStateOfSysId:(NSString *)sysId inSnapshot:(NSDictionary *)snap {
     if (!sysId.length || ![snap isKindOfClass:[NSDictionary class]]) return NBAliveUnknown;
-    NSDictionary *states = snap[@"states"];
-    if (![states isKindOfClass:[NSDictionary class]]) return NBAliveUnknown;
-    NSNumber *v = states[sysId];
-    if (![v isKindOfClass:[NSNumber class]]) return NBAliveUnknown;
-    NSInteger n = v.integerValue;
-    if (n == NBAliveStill || n == NBAliveGone) return (NBAliveState)n;
-    return NBAliveUnknown;
+    NSSet *keys = snap[@"keys"];
+    if (![keys isKindOfClass:[NSSet class]]) return NBAliveUnknown;
+    // 快照里的扫描时刻为 0 ⇒ 根本没读过 ⇒ 一律 Unknown（不许当 Gone）
+    if ([snap[@"scan"] doubleValue] <= 0) return NBAliveUnknown;
+
+    NSArray *parts = [sysId componentsSeparatedByString:NB_SYSID_SEP];
+    for (NSString *p in parts) {
+        if (!p.length) continue;
+        // 🔴 大小写敏感查、不留兜底：这些 ID 是系统给的十六进制串，
+        //    "差不多的键"在本项目里已经造成过撤错条（loose 兜底 v0.0.75 已删）。
+        if ([keys containsObject:p]) return NBAliveStill;
+    }
+    return NBAliveGone;
 }
+
 
 @end

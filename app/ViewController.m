@@ -155,11 +155,16 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 @property (nonatomic, assign) NSInteger aliveStillCount;
 // YES = 只看残留（第七个筛选维度，纯内存派生、不落库）。
 @property (nonatomic, assign) BOOL aliveOnly;
-// YES = 快照存在但已过期（超过 `NB_ALIVE_FRESH_SEC`）⇒ 一条橙条都不打，只报"上次扫描是多久前"。
+// YES = 快照存在但已过期（超过 `NB_NC_SNAPSHOT_FRESH_SEC`）⇒ 一条橙条都不打，只报"扫描于多久前"。
 // 🔴 为什么不"过期也照打"：这份快照只在**删掉一条记录之后**重写，用户三天前删的那批，
 //    三天后才打开盒子 —— 那时他早已手动清空通知中心了。打上去就是拿旧结论冒充现状。
 @property (nonatomic, assign) BOOL aliveStale;
 @property (nonatomic, strong) UIButton *aliveHint;
+// v0.0.99：本次扫描请求的序号 + 是否还在等结果。
+// 🔴 用 seq 而不是一个 BOOL：BOOL 挡不住"这次的结果到了、其实是上一次请求的"。
+//    和 `searchGen`（防抖代次）同一条理由。
+@property (nonatomic, copy)   NSString *ncScanSeq;
+@property (nonatomic, assign) BOOL ncScanPending;
 // v0.0.42：bundle -> App 显示名。**同时给两件事用**：
 //   ① 列表每一行显示「这条是哪个 App 的」—— 以前只有图标，图标加载失败就只剩一个字母；
 //   ② 搜索时把「微信」「招商银行」这种词匹配成 bundle 列表，再传给 NotifyStore。
@@ -235,6 +240,8 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // 🔴 声明顺序 = 调用顺序（`loadAliveSnapshot` → `applyAliveFilter` → `updateAliveHint`），
 //    项目开 -Werror，靠"定义在前面"解析选择器太脆（v0.0.48 setStarred 那次就是这么炸的）。
 - (void)loadAliveSnapshot;
+- (void)requestNCSnapshot;
+- (void)ncWaitAndReload:(NSInteger)left;
 - (NBAliveState)aliveStateForRow:(NSDictionary *)row;
 - (NSArray<NSDictionary *> *)applyAliveFilter:(NSArray<NSDictionary *> *)rows;
 - (void)onAliveHintTap;
@@ -353,10 +360,17 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self refreshIfChanged];
+    // v0.0.99：每次进列表都请 tweak 扫一次通知中心现状。
+    // 🔴 放在 `refreshIfChanged` **之后**：那个只在库变了才重查，而"通知中心变了"
+    //    跟库一点关系都没有（用户手动划掉几条，库里的记录一条没少）。
+    //    ⇒ 这两个刷新是**正交**的，谁也不能替谁。
+    [self requestNCSnapshot];
 }
 
 - (void)onForeground:(NSNotification *)note {
     [self refreshIfChanged];
+    // v0.0.99：回前台同样要重扫（用户在通知中心里划掉了几条，这里必须跟上）。
+    [self requestNCSnapshot];
 }
 
 - (void)onSettings:(id)sender {
@@ -1038,8 +1052,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 🔴🔴 `aliveStale` 必须写进这个判据里：过期时全部行都是 Unknown ⇒ `aliveStillCount == 0`，
     //    若只判 `stillCount > 0 || aliveOnly`，那句"已过期"文案就**永远不会出现**
     //    （分支写了、条件到不了 = 交了等于没交）。
-    BOOL showAliveHint = (self.aliveScanTs > 0 &&
-                          (self.aliveStillCount > 0 || self.aliveOnly || self.aliveStale));
+    // 🔴🔴 v0.0.99：改成**常驻**（只看列表里有没有东西）。
+    //    v0.0.98 的判据要求 `aliveScanTs > 0`，于是"还没有扫描结果"时整条提示条不显示 ——
+    //    而那恰好是最需要说话的时候（用户看到的就是"装了个新版什么都没变"）。
+    //    现在这句同时是**功能入口**：没数据时它写"点这里重新扫描"，点了就重扫。
+    BOOL showAliveHint = (self.items.count > 0);
 
     CGFloat cardX = NBInset;
     CGFloat cardW = w - NBInset * 2;
@@ -1716,9 +1733,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 // 读一次快照（`loadData` 里调，全刷新唯一入口）。
 // 🔴 三件事一起定：`aliveSnap`（判每行状态用）、`aliveScanTs`（报时刻用）、`aliveStale`（保鲜期）。
 //    分成三个方法各读一次文件，就会拿到"三个不同扫描时刻"的数（本项目"分母自己会变"同款）。
+// 🔴🔴 v0.0.99 换数据源：读的是**通知中心现状**（`ncSnapshot`），不再是删除台账。
+//    v0.0.98 那套回答的是"上次清理时哪些还在"，只在删记录后刷新 ⇒ 用户不删就永远空白。
 - (void)loadAliveSnapshot {
-    NSDictionary *snap = [NotifyStore aliveSnapshot];
-    // 🔴 防御一行：`aliveSnapshot` 自己的每条路径都返回字典，但这里是**跨文件契约**，
+    NSDictionary *snap = [NotifyStore ncSnapshot];
+    // 🔴 防御一行：`ncSnapshot` 自己的每条路径都返回字典，但这里是**跨文件契约**，
     //    对面以后改成一个 nil 返回值也不会崩 —— 崩在凌晨三点的推送页面上是最贵的。
     if (![snap isKindOfClass:[NSDictionary class]]) snap = @{};
     self.aliveSnap = snap;
@@ -1726,9 +1745,57 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.aliveNC = [snap[@"nc"] integerValue];
     // 🔴 保鲜期判据用 `timeIntervalSince1970` 直接比，不建 NSDateFormatter：
     //    快照里的 scan 就是 epoch，转换一道只会多一个"时区搞错"的机会。
+    // 🔴 v0.0.99：阈值从 1 小时收到 **10 分钟**。通知中心是**随时会变**的东西
+    //    （用户手动划掉、系统自动清理都算）⇒ 拿十分钟前的结论当现状，
+    //    性质和"拿删除台账当现状"是一样的。
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     self.aliveStale = (self.aliveScanTs > 0 &&
-                       (now - self.aliveScanTs) > NB_ALIVE_FRESH_SEC);
+                       (now - self.aliveScanTs) > NB_NC_SNAPSHOT_FRESH_SEC);
+}
+
+// ================= v0.0.99：主动请求扫描 =================
+// 🔴 为什么需要它：快照只能由 tweak 写（`uuidsToRequests` 在 SpringBoard 里）。
+//    如果只在"删记录之后"才刷新，用户想看一眼现状就得先删一条 —— 那不是功能，是副作用。
+// ⇒ 每次进列表 / 回前台 / 下拉刷新，都请 tweak 扫一次。
+// 🔴 时序：请求是**异步**的（Darwin 通知 → tweak 主队列 → 写文件），所以不能"发完立刻读"。
+//    这里发完等 `kNBScanWait` 再读一次，用 `seq` 判断"读到的是不是我这回要的那份"：
+//    是 ⇒ 直接用；不是（tweak 还没写完）⇒ 再等一轮，最多两轮。
+//    ⛔ 不做成"轮询到成功为止"：tweak 没在跑（比如用户只装了 App 没 respring）时
+//       会永远转下去。两轮之后就用手上最旧的那份，并在提示条上如实报扫描时刻。
+- (void)requestNCSnapshot {
+    // 已经在等了 ⇒ 不重复发。连续滑动列表会触发很多次 loadData，
+    // 每次发一遍请求等于把 tweak 主队列刷满（而每次都要遍历全部 NC request）。
+    if (self.ncScanPending) return;
+    self.ncScanPending = YES;
+    NSString *seq = [NSString stringWithFormat:@"%.0f",
+                     [[NSDate date] timeIntervalSince1970] * 1000.0];
+    self.ncScanSeq = seq;
+    [NotifyStore requestNCSnapshotWithSeq:seq];
+    [self ncWaitAndReload:2];       // 最多两轮
+}
+
+// 等一轮再读。`left` = 还能等几轮。
+- (void)ncWaitAndReload:(NSInteger)left {
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(ws) self2 = ws;
+        if (!self2) return;
+        NSDictionary *snap = [NotifyStore ncSnapshot];
+        BOOL mine = [snap[@"seq"] isEqualToString:(self2.ncScanSeq ?: @"")];
+        if (mine || left <= 1) {
+            self2.ncScanPending = NO;
+            // 读到的就是这次要的（或已经没有轮次了）⇒ 整表重刷一次把标记刷出来。
+            // 🔴 只在"内容真的变了"时 reload，否则每次进列表都会白刷一遍
+            //    （`loadData` 要跑 6~8 条 SQL，见 scheduleLoadData 的注释）。
+            NSTimeInterval got = [snap[@"scan"] doubleValue];
+            if (got > self2.aliveScanTs + 0.5 || !mine) {
+                [self2 loadData];
+            }
+            return;
+        }
+        [self2 ncWaitAndReload:left - 1];
+    });
 }
 
 // 某一行的残留状态。**过期快照一律 Unknown**（理由见 `aliveStale` 属性注释）。
@@ -1738,7 +1805,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 }
 
 // 残留筛选 + `aliveStillCount` 的计算（两个量在同一个循环里出 ⇒ 天然同口径）。
-// 🔴 为什么 `aliveStillCount` 要在这里算、而不是在 `aliveSnapshot` 里数一遍：
+// 🔴 为什么 `aliveStillCount` 要在这里算、而不是在 `ncSnapshot` 里数一遍：
 //    快照里的 Still 是**全库口径**（所有删过的记录），而提示条说的是"**当前列表里**还有几条"。
 //    拿全库数来讲当前列表，就会出现"提示条说 12 条、列表里只有 1 条"这种自相矛盾
 //    （红点按全库算、列表按时间窗查那次的同一个错）。
@@ -1761,23 +1828,14 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 // 🔴 必须走 `loadData` 而不是只筛内存：切完 `aliveStillCount` 的口径会变
 //    （列表本身变了），只改内存数组就是"只改账本的读数"。
 - (void)onAliveHintTap {
-    // 快照过期时点击没有意义（列表里一条橙条都没有，"只看残留"会是空列表）。
-    // 这时改成把当前这份快照的用途讲清楚，不让用户白点。
-    if (self.aliveStale) {
-        UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:@"上次扫描已过期"
-                             message:[NSString stringWithFormat:
-                @"最近一次扫描通知中心是 %@ 前（当时通知中心共 %ld 条）。\n\n"
-                @"这份快照只在**删除记录**之后重写 —— "
-                @"去通知列表删掉任意一条（或再删一条你要清理的），回来就有了。\n\n"
-                @"过期快照不会给任何行打标记：那是拿旧结论冒充现状。",
-                [self aliveAgeText], (long)self.aliveNC]
-                      preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel
-                                           handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
+    // ---------- 没有数据 / 已过期 ⇒ 这个点击的语义是「重新扫描」 ----------
+    // 🔴 不是弹窗解释，是**真的去扫**。用户点它是想看到结果，不是想读一段说明。
+    if (self.aliveScanTs <= 0 || self.aliveStale) {
+        if (self.ncScanPending) return;      // 正在扫，别叠请求
+        [self requestNCSnapshot];
         return;
     }
+    // ---------- 有数据 ⇒ 这个点击的语义是「只看这些」 ----------
     self.aliveOnly = !self.aliveOnly;
     [self loadData];
 }
@@ -1793,14 +1851,12 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [NSString stringWithFormat:@"%.0f 天", d / 86400.0];
 }
 
-// 刷新残留提示条（`loadData` 里调一次）。
+// 刷新提示条（`loadData` 里调一次）。
 - (void)updateAliveHint {
-    // 快照不存在（从没删过 / 装的是旧版 tweak）⇒ 一个字都不说。
-    // 🔴 这时候不是"没有残留"，而是"没量过" —— 无话可说是对的，说"0 条"是编数据。
-    if (self.aliveScanTs <= 0) {
-        [self.aliveHint setTitle:nil forState:UIControlStateNormal];
-        return;
-    }
+    // 🔴 v0.0.99：删掉了"没快照就清空标题"那条早退。
+    //    它让「点这里重新扫描」这句话永远到不了 —— 而这正是 v0.0.98 用户
+    //    「什么都没看到」的直接原因之一：失败路径**没有任何出口**。
+    //    现在的分寸是：**不知道就说不知道，并且给一个能点的动作**。
     NSString *t = [self aliveHintText];
     [self.aliveHint setTitle:t.length ? [t stringByAppendingString:@" ›"] : nil
                     forState:UIControlStateNormal];
@@ -1808,29 +1864,40 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 
 // 残留提示文案的唯一来源（`›` 由 `updateAliveHint` 加，和 foldedHint 同规矩）。
 - (NSString *)aliveHintText {
+    // ---------- 还没有任何扫描结果 ----------
+    // 🔴 这时候必须**说出去**，不能一个字都不说。v0.0.98 的教训：快照读不到时整条提示条
+    //    直接不显示，用户看到的就是"装了个新版，什么都没变" —— 而真正的原因是
+    //    tweak 没扫 / 没 respring / 权限不对，全都无从判断。
+    if (self.aliveScanTs <= 0) {
+        return @"想看你哪些消息还在通知中心？点这里重新扫描";
+    }
     // ---------- 过期 ----------
     if (self.aliveStale) {
-        return [NSString stringWithFormat:@"上次扫描通知中心是 %@前（已过期，标记已关）",
+        return [NSString stringWithFormat:@"上次扫描是 %@前（已过期，标记已关）· 点此重新扫描",
                                          [self aliveAgeText]];
     }
-    // ---------- 只看残留（已开启） ----------
+    // ---------- 只看这些（已开启） ----------
     if (self.aliveOnly) {
-        return [NSString stringWithFormat:@"只看残留：%ld 条（点此看全部）",
+        return [NSString stringWithFormat:@"只看仍在通知中心的 %ld 条（点此看全部）",
                                          (long)self.aliveStillCount];
     }
     // ---------- 0 条 ----------
-    // 🔴 文案的分寸：能说的只有"上次清理时"这个时刻的事实。
-    //    ⛔ 不许写「通知中心还在」或「通知中心已清空」—— 前者是没量过的断言（v0.0.97 已证伪），
-    //    后者更坏：那是"我没看见残留"却说成"系统里没有了"。
+    // 🔴 文案的分寸：能说的只有"**这次扫描时**"这个时刻的事实。
+    //    ⛔ 不许写「通知中心已清空」—— 那是"我没看见"冒充"系统里没有"（本项目最贵的一类断言）。
     if (self.aliveStillCount <= 0) {
-        return [NSString stringWithFormat:@"上次清理（%@前）后通知中心已无残留",
+        return [NSString stringWithFormat:@"盒子里的消息都不在通知中心了（扫描于 %@前）",
                                          [self aliveAgeText]];
     }
-    // ---------- 有残留 ----------
+    // ---------- 有 ----------
     // 文案三要素一次说全：**橙条含义 + 条数 + 时刻**。
     // 缺了「橙条」那句，用户看不懂列表左边那条颜色是什么（这个标记没有文字，全靠这句解释）。
-    return [NSString stringWithFormat:@"橙色竖条 = 上次清理（%@前）时仍在通知中心 · %ld 条",
-                                     [self aliveAgeText], (long)self.aliveStillCount];
+    // 🔴 把「通知中心总共几条」也报出来，不是为了好看：它是**扫描真的跑通了**的唯一旁证。
+    //    如果这里写着"通知中心共 0 条"，而用户明明在通知中心看到一堆 ——
+    //    那就是 tweak 没扫到 / 没权限 / 没 respring，一眼就能分辨，
+    //    不用再猜"是匹配不上还是根本没数据"。
+    return [NSString stringWithFormat:@"橙色竖条 = 这条还在通知中心里 · %ld 条（通知中心共 %ld 条 · 扫描于 %@前）",
+                                     (long)self.aliveStillCount, (long)self.aliveNC,
+                                     [self aliveAgeText]];
 }
 
 // 🔴 文案必须说清「被什么挡住了」，否则用户不知道往哪一步退。

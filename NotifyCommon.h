@@ -378,6 +378,30 @@ static inline NSArray<NSString *> *NBStringArray(id v) {
 //    那种情况本来就不该有标记。
 #define NB_ALIVE_FRESH_SEC 3600.0
 
+// ================= v0.0.99：通知中心「现状」快照 =================
+// 🔴🔴 为什么 v0.0.98 那套必须换掉（用户原话：「我只是想看消息盒子里的哪些消息还有在通知中心中显示」）：
+//    v0.0.98 读的是**删除台账**（`.nb_deleted_seen`），它回答的是「上次清理时哪些还在」。
+//    两个致命问题：
+//      ① **语义不对**：只在**删记录之后**才刷新。用户不删就永远没有数据 ⇒ 满屏空白；
+//      ② **键对不上**（硬 bug）：库里的 `sys_id` 存的是 `bulletinID|notificationIdentifier`
+//         （两个键用 `|` 拼起来，见 NotifyStore 写入侧），而台账里的 cid 是**单个** ID
+//         ⇒ 拿整串去查单个键，**一条也命中不了**。
+//    ⇒ 这一版改成：tweak 扫一遍**当前 NC 里所有 request 的全部标识**，落盘成"现状"；
+//      App 把 `sys_id` 按 `|` 拆开逐段匹配。谁在、谁不在，说的是**此刻**的事。
+// 🔴 谁来触发扫描：**App 主动请求**（打开列表 / 下拉刷新 / 回前台时）。
+//    不能让用户"先删一条才能看" —— 那不是功能，那是副作用。
+#define NOTIFYBOX_NC_SCAN_REQ  @"/var/mobile/Library/NotifyBox/nc_scan_req.txt"
+#define NOTIFYBOX_NC_SNAPSHOT  @"/var/mobile/Library/NotifyBox/.nb_nc_snapshot"
+// Darwin 通知名（App → tweak：「请扫一次」）
+#define NB_NC_SCAN_NOTIFY_NAME "com.yxh41.notifybox.ncScan"
+// 快照超过这么久就不打标记，只报"扫描于多久前"并给一个重新扫描的入口。
+// 🔴 10 分钟：通知中心是**随时会变**的东西（用户手动划掉、系统自动清理），
+//    拿十分钟前的结论当现状，性质和"拿删除台账当现状"是一样的。
+#define NB_NC_SNAPSHOT_FRESH_SEC 600.0
+// `sys_id` 里两个候选 ID 的分隔符（写入侧 `bID|nID`，见 Tweak.x 的 sysId 拼装处）。
+// 🔴 App 侧匹配**必须按它拆开逐段查** —— 拿整串去查单个键是这个功能最大的坑。
+#define NB_SYSID_SEP @"|"
+
 // ---------- 统一日志 ----------
 // 🔴 v0.0.12：原来 Tweak.x 里有份 static NBLog，新加的 NotifySpeaker/NotifyProbe 够不着。
 //    **复制一份日志函数**是最差解（两份轮转逻辑迟早走岔），所以把实现沉到 NotifyStore.m

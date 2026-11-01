@@ -286,32 +286,39 @@ typedef NS_ENUM(NSInteger, NBSyncClearOutcome) {
 //    日志文件不存在时（连 App 都没写成功），这份数据是唯一能定位的现场。
 + (NSString *)envCheck;
 
-#pragma mark - v0.0.98 通知中心存活快照（只读）
+#pragma mark - v0.0.98/99 通知中心状态（只读）
 
-// 「这条记录删掉之后，通知中心里那张卡片到底还在不在」—— 三态。
-// 🔴🔴 为什么是**三**态而不是两态（这两态的实现原理上产不出第三态）：
-//    tweak 落盘的 `.nb_deleted_seen` 里只写「上一次在 NC 里见到它是什么时候」，
-//    于是"从没见到过"和"见到过但现在没了"在只看精确匹配的实现里**长得一样**。
-//    而这两种在真机上语义完全不同（v0.0.97 的 `nc_diag(3).txt` 62 次米家删除里
-//    有 14 次属于"从来没见到"），混成一个"已消失"就是在编数据。
+// 「这条记录现在还在不在通知中心里」—— 三态。
+// 🔴🔴 为什么是**三**态而不是两态：快照里没有它，可能是"已经不在 NC 了"，
+//    也可能是"这次根本没扫到 / 没扫过"。只看精确匹配的实现**原理上产不出第三态**，
+//    而这两种在真机上完全不同（v0.0.97 的 `nc_diag(3).txt` 62 次米家删除里有 14 次
+//    属于"从来没见到"）。混成一个"已消失"就是在编数据。
 typedef NS_ENUM(NSInteger, NBAliveState) {
-    NBAliveUnknown = 0,   // 快照里没有这条 / 没有快照文件 / 快照已过期 ⇒ **不许**当"已消失"
-    NBAliveStill   = 1,   // 上次扫描时**仍在**通知中心（唯一能下结论的那一态）
-    NBAliveGone    = 2,   // 上次扫描时已经不在（见到过、这轮没了）
+    NBAliveUnknown = 0,   // 没有快照 / 快照过期 / 这条没有 sys_id ⇒ **不许**当"已消失"
+    NBAliveStill   = 1,   // 快照里命中 ⇒ **此刻仍在**通知中心（唯一能下结论的那一态）
+    NBAliveGone    = 2,   // 快照新鲜且没命中 ⇒ 此刻不在通知中心
 };
 
-// 读一次快照，返回 @{@"scan": NSNumber(NSTimeInterval),   // 0 = 没有可用快照
-//                  @"nc":   NSNumber(NSInteger),          // 扫描时 NC 总条数（0 = 没记）
-//                  @"states": @{sysId: NSNumber(NBAliveState)}}。
-// 🔴 一条一读、一次成型：**不许**分成"先问时间、再问状态"两个方法 ——
-//    两次读文件之间 tweak 可能正好重写了一次，那样拿到的"扫描时刻"和"状态"就不是同一次扫描的
-//    （本项目"分母自己会变"的同款坑）。
-// 🔴 `states` 里**只放能定性的**（Still / Gone）；拿不到的一律不出现，调用方按 Unknown 处理。
-// 🔴 文件不存在 / 表头丢了 ⇒ 返回 scan=0 + 空 states，**绝不**把每一条都猜成 Gone。
-+ (NSDictionary *)aliveSnapshot;
+// ---------- v0.0.99：请求 tweak 扫一次「通知中心现状」 ----------
+// 🔴 为什么必须请求而不是自己读：`uuidsToRequests` 在 SpringBoard 进程里，盒子 App 没有权限。
+// 🔴 `seq` 由调用方给（用时间戳即可）。tweak 会把它原样写进快照表头 ⇒ App 能判断
+//    "手上这份是不是我刚要的那次扫描"，而不是拿上一份旧数据当新结论。
++ (void)requestNCSnapshotWithSeq:(NSString *)seq;
 
-// sysId → 状态。**必须带 `snap` 参数**（把 `aliveSnapshot` 的结果传进来），
-// 理由同上：同一次刷新里所有行必须用同一份快照，不能一行读一次文件。
+// 读一次快照。返回 @{@"scan": NSNumber(NSTimeInterval),   // 0 = 没有可用快照
+//                  @"nc":   NSNumber(NSInteger),          // 扫描时 NC 总条数
+//                  @"seq":  NSString,                     // tweak 回写的那次请求序号
+//                  @"keys": NSSet<NSString *>}。          // 此刻 NC 里所有通知的**唯一标识**
+// 🔴 匹配键只有 `bulletinID` / `notificationIdentifier` / `uuid` 三把（都是唯一的）。
+//    快照里**故意不含** `recordID` / `publisherBulletinID` —— 这两个对某些 publisher 是常量，
+//    写进来会让"同 publisher 的所有通知"全部误命中（见 Tweak.x 里 NBDumpNCSnapshot 的注释）。
++ (NSDictionary *)ncSnapshot;
+
+// 某条记录（`sys_id`）此刻在不在通知中心。
+// 🔴🔴 **必须按 `|` 拆开逐段匹配**：库里的 `sys_id` 存的是 `bulletinID|notificationIdentifier`
+//    （两个候选键拼起来的，见 Tweak.x 的 sysId 拼装处），而快照里每个键都是**单独一个**。
+//    拿整串 `"bID|nID"` 去查只有 `"bID"` 的集合 ⇒ **一条也命中不了**。
+//    v0.0.98 就是栽在这里：功能看着装好了，屏幕上一条都没有。
 + (NBAliveState)aliveStateOfSysId:(nullable NSString *)sysId
                        inSnapshot:(NSDictionary *)snap;
 

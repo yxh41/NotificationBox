@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.98"
+#define NB_VER_STR @"0.0.99"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -1864,6 +1864,79 @@ static void NBCheckDeletedAlive(void) {
     }
 }
 
+// ================= v0.0.99：通知中心「现状」快照 =================
+// 把**此刻** NC 里每一条通知的全部唯一标识落盘，供盒子 App 逐条比对
+// （「消息盒子里哪些消息现在还挂在通知中心」）。
+//
+// 🔴🔴 和 v0.0.98 的 `.nb_deleted_seen` 是两件事，别混：
+//    `.nb_deleted_seen` = **删除台账**（我删过谁、删完它还在不在），只在删记录时刷新；
+//    这一份 = **现状**（现在挂的都是谁），由 App 主动请求触发。
+//    用户要的是后者 —— 「先删一条才能看」不是功能，是副作用。
+//
+// 🔴 只写**唯一键**：`bulletinID` / `notificationIdentifier` / `uuid`。
+//    ⛔ 绝不写 `recordID` / `publisherBulletinID` —— 这两个对某些 publisher 是**常量**
+//    （真机见过 `recordID=kNetWorkChangeNofi`），写进去会让"同 publisher 的所有通知"
+//    全都匹配上，屏幕上变成满屏橙条。这个坑在 sysId 拼装那边已经付过一次代价
+//    （见 v0.0.86 那段注释），这里不能重犯。
+//
+// 🔴 格式（`seq` 是 App 传下来的请求序号，App 用它判断"这份是不是我刚要的那次扫描"）：
+//      首行 `#scan=<epoch>|nc=<总条数>|seq=<序号>`
+//      其后每行 `<sectionIdentifier>|<key1>|<key2>|…`
+static void NBDumpNCSnapshot(NSString *seq) {
+    @try {
+        if (!gNCSource) {
+            // 🔴 这不是错误现场，是**还没到时候**：`gNCSource` 由
+            //    `NCBulletinNotificationSource -initWithDispatcher:…` 捕获，
+            //    SpringBoard 刚起来时可能还没走到。留一行日志，别静默。
+            NBLog(@"=== [扫] 跳过（还没捕获到 NC source，稍后再试）seq=%@", seq ?: @"");
+            return;
+        }
+        id m = [gNCSource uuidsToRequests];
+        if (![m isKindOfClass:[NSDictionary class]]) {
+            NBLog(@"!!! [扫] uuidsToRequests 读不到（%@）seq=%@",
+                  NBClassName(m), seq ?: @"");
+            return;
+        }
+        NSDictionary *d = (NSDictionary *)m;
+        NSMutableArray *all = [NSMutableArray arrayWithCapacity:d.count];
+        for (id k in d) NBCollectRequestsIn([d objectForKey:k], all, 0);
+
+        NSMutableString *out = [NSMutableString stringWithCapacity:all.count * 96];
+        [out appendFormat:@"#scan=%.0f|nc=%lu|seq=%@\n",
+         [[NSDate date] timeIntervalSince1970], (unsigned long)all.count, seq ?: @""];
+        NSUInteger withKeys = 0;
+        for (id req in all) {
+            NSString *sid = NBKVCStr(req, @"sectionIdentifier");
+            NSMutableArray *keys = [NSMutableArray arrayWithCapacity:3];
+            // ---- request 自己的两把 ----
+            for (NSString *k in @[@"notificationIdentifier", @"uuid"]) {
+                NSString *v = NBKVCStr(req, k);
+                if (v.length && ![keys containsObject:v]) [keys addObject:v];
+            }
+            // ---- bulletin 上那把最权威的 ----
+            // 🔴 `NBSafeValue` 而不是直接 KVC：req.bulletin 在 BB 被撤之后可能变 nil，
+            //    对 nil 发 KVC 会抛（本项目"类未知的元素别读 KVC 键"那条纪律）。
+            id b = NBSafeValue(req, @"bulletin");
+            if (b) {
+                NSString *bid = NBKVCStr(b, @"bulletinID");
+                if (bid.length && ![keys containsObject:bid]) [keys addObject:bid];
+            }
+            // 一把键都没有的条目对匹配毫无用处，但也**不丢** ——
+            // 丢掉会让"NC 总条数"和实际行数对不上，以后查起来像是我少扫了。
+            if (keys.count) withKeys++;
+            [out appendFormat:@"%@|%@\n", sid ?: @"", [keys componentsJoinedByString:@"|"]];
+        }
+        NSError *err = nil;
+        BOOL ok = [out writeToFile:NOTIFYBOX_NC_SNAPSHOT atomically:YES
+                          encoding:NSUTF8StringEncoding error:&err];
+        NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）seq=%@ 写入=%@",
+              (unsigned long)all.count, (unsigned long)withKeys, seq ?: @"",
+              ok ? @"成功" : [NSString stringWithFormat:@"失败(%@)", err.localizedDescription ?: @"?"]);
+    } @catch (NSException *e) {
+        NBLog(@"!!! [扫] 抛: %@", e.reason);
+    }
+}
+
 // 把一批 request 的 section/nid 打出来（最多 max 条）。只读 KVC，不碰 description。
 static void NBLogRequests(NSString *tag, id requests, int max) {
     NSArray *arr = nil;
@@ -2199,6 +2272,32 @@ static void NBDiagStep(NSString *fmt, ...) {
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NBDiagAppend(s);
+}
+
+// ================= v0.0.99：App 请求「扫一次通知中心现状」 =================
+// 🔴 为什么走 Darwin 通知而不是让 App 自己读：`uuidsToRequests` 是 SpringBoard 进程里的对象，
+//    盒子 App 没有权限 —— 按「读不到就问权限、换有权限的进程代做、结果落共享介质」这条纪律，
+//    唯一正解是 App 写请求、tweak 扫、App 读结果。
+// 🔴 为什么必须 `dispatch_async` 到主队列：读 `uuidsToRequests` 是纯 getter（只读字典），
+//    但要保证和系统自己的读写错开。**绝不 dispatch_sync** —— Darwin 回调里同步等别的队列
+//    是本项目栽过的那类死锁（主队列上同步调未知方法 ⇒ 看门狗注销）。
+// 🔴 Darwin 回调里**只做派发**，不读文件、不扫：回调的线程环境不确定，
+//    真活留到主队列上做（读取就一行，很快）。
+static void NBScanNCCallback(CFNotificationCenterRef center, void *observer,
+                             CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    // seq 从请求文件读（App 每次扫描都写一个新的时间戳当序号）。
+    // 局部变量拷进 block：回调返回后栈帧就没了。
+    __block NSString *seq = nil;
+    @try {
+        NSString *body = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SCAN_REQ
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        seq = [body stringByTrimmingCharactersInSet:
+               [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    } @catch (__unused NSException *e) { }
+    NSString *seqC = [seq copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NBDumpNCSnapshot(seqC);
+    });
 }
 
 // 盒子 App 删记录后唤醒我们，精确清掉那一条通知。
@@ -4238,6 +4337,15 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
             CFSTR("com.yxh41.notifybox.ncClear"), NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
         NBLog(@"=== [v%@] 已注册 Darwin 通知观察者（NC 同步清除）", NB_VER_STR);
+        // v0.0.99：再注册一个「扫一次现状」的观察者。盒子 App 打开列表 / 下拉刷新时触发。
+        // 🔴 和上面那个是**两条独立通道**：前者会动系统状态（撤通知），后者纯只读。
+        //    分开而不是复用同一个通知名 —— 复用的话，一次"只想看一眼"的请求会走进清通知的流程。
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            NULL, NBScanNCCallback,
+            CFSTR(NB_NC_SCAN_NOTIFY_NAME), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        NBLog(@"=== [v%@] 已注册 Darwin 通知观察者（扫 NC 现状）", NB_VER_STR);
         // 🔴🔴 v0.0.62/63：NC 路径的「卡死自恢复」检查。
         //    `.nc_pending` 在进 NC 路径前写、正常跑完删 ⇒ 它还在 = 上次没回来。
         //    `.nc_off` = 永久禁用，只删 BB 账本（不卡，但界面也不变）。
