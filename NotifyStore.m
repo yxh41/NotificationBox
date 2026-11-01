@@ -1621,8 +1621,11 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
 //    · 没有文件 / 没有表头 ⇒ scan=0、keys 空（一切 Unknown）。**没有基准就没法判断新旧** ——
 //      猜成"仍在"是满屏橙条，猜成"已不在"是把真残留藏起来（最坏的那一档）⇒ 宁可什么都不说。
 //    · `#` 开头的行是表头，不是条目。
-// 🔴 表头格式 `#scan=<epoch>|nc=<账本条数>|cs=<界面认的条数>|csn=<实际探测条数>|cse=<严格相等的条数>|csem=<能读到uuid的条数>|csm=<0|1>|seq=<序号>`；
+// 🔴 表头格式 `#scan=<epoch>|nc=<账本条数>|cs=<界面认的条数>|csn=<实际探测条数>|cse=<严格相等的条数>|csem=<能读到uuid的条数>|csm=<0|1>|tmin=<NC最早那条的epoch>|tmax=<NC最新那条的epoch>|seq=<序号>`；
 //    条目 `<section>|<key1>|<key2>|…|cs=<1|0|-1>`。
+// 🔴 v0.0.116：`tmin`/`tmax` 是给「窗内残留」用的（见 `countStillInDBWithSnapshot:`）。
+//    旧快照没有这两个字段 ⇒ 解析成 0 ⇒ 窗内口径报 -1（**没算出来用 -1，不用 0**）。
+//    向后兼容是**故意**的：装上新版那一刻磁盘上还是旧文件，不能因为少两个字段就整份作废。
 // 🔴 🔴 v0.0.102：`csn`（实际探测条数）**本类故意不解析** —— App 侧只需要
 //    「界面认几条」（cs）和「到底量没量到」（csm）两个数；`csn` 是给日志诊断用的。
 //    写一堆"解析了但谁都不读"的字段，在 `-Werror` 下就是一条 unused-but-set 编译错误
@@ -1639,6 +1642,8 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     NSInteger cseMeasured = 0;
     BOOL csOn = NO;
     NSString *seq = nil;
+    // v0.0.116：通知中心的时间跨度（0 = 旧快照没这两个字段 / 一条都没读到时间）
+    NSTimeInterval tmin = 0, tmax = 0;
     NSMutableSet<NSString *> *keys = [NSMutableSet set];
     // v0.0.112：v0.0.111 在这里收过一份 `hashes`（`h=` 列）和一个 `hcol` 标记，已全部撤掉。
     // 🔴 撤的理由：扫描侧算出来的哈希恒等于 `bundle||` ⇒ 同一 App 所有通知同哈希 ⇒ 死探针。
@@ -1646,7 +1651,8 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     // 🔴 空快照的**唯一**形态（三个早退点共用一份，别各写一遍 ——
     //    少一个键就是"某个调用方读到 nil 然后当 0 处理"，本项目栽过）。
     NSDictionary *empty = @{@"scan": @0, @"nc": @0, @"cse": @0, @"csemn": @0,
-                            @"csm": @0, @"seq": @"", @"keys": [NSSet set]};
+                            @"csm": @0, @"tmin": @0, @"tmax": @0,
+                            @"seq": @"", @"keys": [NSSet set]};
     @try {
         NSString *st = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SNAPSHOT
                                                 encoding:NSUTF8StringEncoding error:NULL];
@@ -1665,6 +1671,8 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
                     else if ([f hasPrefix:@"csem="])  cseMeasured = [[f substringFromIndex:5] integerValue];
                     else if ([f hasPrefix:@"cse="])   cseTotal    = [[f substringFromIndex:4] integerValue];
                     else if ([f hasPrefix:@"csm="])   csOn        = ([[f substringFromIndex:4] integerValue] != 0);
+                    else if ([f hasPrefix:@"tmin="])  tmin        = [[f substringFromIndex:5] doubleValue];
+                    else if ([f hasPrefix:@"tmax="])  tmax        = [[f substringFromIndex:5] doubleValue];
                     else if ([f hasPrefix:@"seq="])   seq         = [f substringFromIndex:4];
                 }
                 continue;
@@ -1694,6 +1702,7 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     if (scan <= 0) return empty;
     return @{@"scan": @(scan), @"nc": @(ncTotal), @"cse": @(cseTotal),
              @"csemn": @(cseMeasured), @"csm": @(csOn ? 1 : 0),
+             @"tmin": @(tmin), @"tmax": @(tmax),
              @"seq": seq ?: @"", @"keys": keys};
 }
 
@@ -1957,6 +1966,19 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     NSInteger hitAge[4] = {0, 0, 0, 0};
     NSInteger allAge[4] = {0, 0, 0, 0};
     double nowTs = [[NSDate date] timeIntervalSince1970];
+    // ---------- v0.0.116：「窗内残留」—— 分母只取**可能活着**的行 ----------
+    // 🔴 真机血账（2026-11-02 18:10:12）：`全库残留 179 ／ 带ID行 2163` 读成"匹配只有 8.3%"，
+    //    但按年龄并排一看：<1h 2/6、1-6h 27/70、6-24h 149/312、**>24h 1/1775**。
+    //    而那一刻通知中心里最老的才 23.9 小时 ⇒ 那 1775 行（占库 **82%**）比 NC 最老的还老，
+    //    **结构上不可能命中**。它们只是把分母撑大，把百分比压成假象。
+    //    ⇒ 窗内口径：`ts` 落在 `[tmin, tmax]`（= 通知中心自己的时间跨度）里的行才算分母。
+    //      同一份数据：全库 179/2163 = 8.3%（假） vs 窗内 178/388 = 46%（真）。
+    // 🔴 旧口径**一个字不动**、并排保留：局部口径不许说全库的话，两个数各有各的用途
+    //    （全库那个 0 才是"盒子里的消息都不在通知中心了"的依据）。
+    double winMax = [snap[@"tmax"] doubleValue];
+    double winMin = [snap[@"tmin"] doubleValue];
+    BOOL winOk = (winMax > 0);
+    NSInteger winRows = 0, winStill = 0;
     const char *sql = "SELECT sys_id, ts FROM notifications "
                       "WHERE sys_id IS NOT NULL AND sys_id<>'';";
     sqlite3_stmt *st = NULL;
@@ -1984,6 +2006,11 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
                                     : 3;
             allAge[bi]++;
             if (isStill) hitAge[bi]++;
+            // 窗内：上下界都要卡（`tmin` 缺失时只卡上界，别因为读不到下界就整窗作废）
+            if (winOk && ts > 0 && ts <= winMax && (winMin <= 0 || ts >= winMin)) {
+                winRows++;
+                if (isStill) winStill++;
+            }
         }
         sqlite3_finalize(st);
     } else {
@@ -2017,6 +2044,18 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     // 🔴 v0.0.114：把读法写在日志里，别指望下次还记得怎么解读这三档
     //    （本项目最贵的一课：一个数被反复误读，比没有这个数更糟）。
     NBStoreLog(@"全库残留读法：精确少、忽略大小写多 ⇒ 大小写问题｜两者都少、前8位多 ⇒ 格式/分隔符不同｜三个都少 ⇒ ID 真的换了（不是 bug）");
+    // 🔴 v0.0.116：「窗内残留」—— 这才是判断"匹配好不好"该看的百分比。
+    //    全库那个百分比的分母里混着大批"比通知中心最老的还老"的行，本来就不可能命中。
+    //    没算出来（旧快照没有 tmin/tmax）一律报 -1，**不许报 0**（0 会被读成"算出来是零"）。
+    if (winOk && winRows > 0) {
+        double winSpanMin = (winMax - ((winMin > 0) ? winMin : winMax)) / 60.0;
+        NBStoreLog(@"窗内残留 %ld 条 / %ld 行（%.1f%%）｜ 窗 = 通知中心跨度 %.0f 分 ｜ 全库那个 %.1f%% 被「结构上不可能活着」的老记录稀释，别拿它下结论",
+                   (long)winStill, (long)winRows,
+                   (double)winStill * 100.0 / (double)winRows, winSpanMin,
+                   (scanned > 0) ? (double)still * 100.0 / (double)scanned : -1.0);
+    } else {
+        NBStoreLog(@"窗内残留 -1 / -1（快照里没有 tmin/tmax ⇒ 这个口径算不出来；不是 0）");
+    }
     // 🔴 v0.0.115：年龄分档，一个进程只打一次（日志窗口只有 ~50 行，这条是定性用的）。
     //    `scanned > 0` 是必置位的前提：库是空的就打，会把唯一一次机会烧在与病因无关的轮次上
     //    （v0.0.111 `done` 写在最前面那个血账的同一形态）。
@@ -2025,7 +2064,18 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
         NBStoreLog(@"全库残留按年龄：命中 <1h=%ld 1-6h=%ld 6-24h=%ld >24h=%ld ｜ 带ID <1h=%ld 1-6h=%ld 6-24h=%ld >24h=%ld",
                    (long)hitAge[0], (long)hitAge[1], (long)hitAge[2], (long)hitAge[3],
                    (long)allAge[0], (long)allAge[1], (long)allAge[2], (long)allAge[3]);
-        NBStoreLog(@"残留按年龄读法：命中全挤在最新档 ⇒ 通知中心换了一批新 ID（重启后常见，库里的旧 ID 已失效）；各年龄一样不命中 ⇒ 键对不上（真 bug）");
+        // 🔴🔴 v0.0.116：上一版这条读法**写错了方向**，必须改。
+        //    v0.0.115 只给了两种：「命中全挤在最新档 ⇒ 换 ID」/「各年龄都不命中 ⇒ 键对不上」。
+        //    真机 2026-11-02 18:10:12 的读数（2/6、27/70、149/312、1/1775）**两种都不是** ——
+        //    真实答案是第三种：命中率在三档里大致相同（33%/39%/48%），只有 **>24h 那档是 0**，
+        //    因为那 1775 行比通知中心最老的（23.9 小时）还老，结构上不可能活着。
+        //    ⇒ 判据的分类不全，就会把一次"正常"读成"没结论"，甚至读成"bug"。
+        NBStoreLog(@"残留按年龄读法：>24h 那档几乎必然是 0 —— 比通知中心最老的还老，结构上不可能活着，不是 bug、也不许拿它算百分比；要看就看 <1h/1-6h/6-24h 三档的命中率，三档都接近 0 才是键对不上（真 bug）");
+        // 🔴 v0.0.116：这个数**不是稳定量**，必须写进日志，否则下次又会被当成"匹配坏了"。
+        //    实测（同一份快照、同一批 2163 行、22 秒内）：179 → 91 → 2。
+        //    机制：NC 成批重投时，库里那些行的 `sys_id` 正被成批改写成新 ID（同内容去重那条路），
+        //    而快照还是重投**之前**写的那一份 ⇒ 两侧 ID 空间在同一个窗口里错开。
+        NBStoreLog(@"⚠️ 残留是个移动靶：同一份快照 + 同一批行，实测 22 秒内 179→91→2 —— NC 成批重投时库里的 sys_id 正被改写成新 ID ⇒ 必须连「扫描于 N 秒前」和「本轮新增 N 条」一起看，离开重投窗口才稳定");
     }
     return still;
 }

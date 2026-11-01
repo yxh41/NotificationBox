@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.115"
+#define NB_VER_STR @"0.0.116"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2474,10 +2474,15 @@ static void NBDumpNCSnapshot(NSString *seq) {
 
         // v0.0.112：v0.0.111 的表头 `hcol=1` 一并撤掉 —— 列没了还留着标记，
         //   会让 App 侧以为"有哈希列但一个都没解析到"，那是**假线索**（比没线索更费时间）。
-        [out appendFormat:@"#scan=%.0f|nc=%lu|cs=%ld|csn=%ld|cse=%ld|csem=%ld|csm=%d|seq=%@\n",
+        // v0.0.116：表头加 `tmin` / `tmax`（通知中心里最早 / 最新那一条的时间戳）。
+        //   真机血账：`全库残留 179 / 带ID行 2163` 看着像"匹配只有 8%"，实际那 2163 行里
+        //   有 **1775 行（82%）比通知中心最老的还老**（NC 最老 23.9 小时）⇒ 结构上不可能活着。
+        //   ⇒ 分母被"注定不可能命中"的行稀释了。这两个数**扫描时本来就算好了**（tsMin/tsMax），
+        //   落到表头零成本，App 侧就能算「窗内残留」这个干净口径。
+        [out appendFormat:@"#scan=%.0f|nc=%lu|cs=%ld|csn=%ld|cse=%ld|csem=%ld|csm=%d|tmin=%.0f|tmax=%.0f|seq=%@\n",
          [[NSDate date] timeIntervalSince1970], (unsigned long)all.count,
          (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
-         (csDest ? 1 : 0), seq ?: @""];
+         (csDest ? 1 : 0), tsMin, tsMax, seq ?: @""];
         [out appendString:rows];
 
         // ---- v0.0.113 起：快照写入保护（v0.0.115 从「只挡 0 条」扩到「挡假的小数」）----
