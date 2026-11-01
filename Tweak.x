@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.108"
+#define NB_VER_STR @"0.0.109"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2014,10 +2014,25 @@ static BOOL sTsClsLogged = NO;             // timestamp 类型只报一次
 //    这里用"失败越多间隔越长"，成功一次即清零，进程重启(respring)也自然归零。
 static NSTimeInterval sLastAutoClearTs = 0;   // 上次尝试的时刻
 static NSInteger sAutoClearFails = 0;         // 连续失败次数
+// v0.0.109：上一次「撤满了上限」⇒ 说明还有积压 ⇒ 下一轮只等 20 秒。
+// 🔴 为什么必须单独一个标记：180 秒这条节流是给"稳定状态"用的（别每轮都去调系统），
+//    但**清积压时它变成了障碍** —— 真机 2026-11-01 14:29~14:31 三轮都有 91~92 条超时，
+//    距上次只隔 18 / 97 / 170 秒 ⇒ 全被 180 秒挡掉，用户看到「有 92 条超时却一动不动」。
+//    铁律：上限要按「每次操作」算，不能按"固定时间窗"算。
+static BOOL sAutoClearBacklog = NO;
 // 🔴 护栏文件：调用前写、返回后删。文件还在 + 版本号是本版 ⇒ 上次这条调用没回来 ⇒ 本版关掉它。
 //    **只关自动清这一条路**，不碰 `gNCSuppressed`（那会把用户手动清 NC 也一起废掉）。
 static NSString *const kNBGuardAutoClear = @"/var/mobile/Library/NotifyBox/.nb_auto_clear_pending";
 static BOOL gAutoClearSuppressed = NO;
+
+// 🔴🔴 节流间隔的**唯一出口**：节流判断和状态行都调它。
+//    两处各算一遍必然走岔 —— 走岔的表现是「日志说还要等 N 秒、实际却在干活的秒数上没动」，
+//    而这种错只有对着日志逐行验算才看得出（本项目"同一界面里互相解释的两个指标必须同口径"）。
+static NSTimeInterval NBAutoClearGap(void) {
+    if (sAutoClearFails >= 3) return 3600.0;   // 连续失败 ≥3 次 ⇒ 退到 60 分钟（**不永久禁用**）
+    if (sAutoClearBacklog)    return 20.0;     // 上一轮撤满上限 ⇒ 还有积压 ⇒ 20 秒后再来
+    return 180.0;                              // 稳定状态 ⇒ 3 分钟一次足够
+}
 
 // 秒 → 人话
 static NSString *NBAgeShort(double sec) {
@@ -2114,7 +2129,8 @@ static void NBViewRecon(void) {
 // 🔴 默认关：`autoClearNCHours` 缺失 / 0 / 负数 ⇒ 第一行就返回，**装了不改任何行为**。
 // 🔴 一把刀一次调用：`destination:clearNotificationRequests:` 传**超时那一批 request 的数组**。
 //    绝不逐条撤 —— 762 条逐条调会把主队列堵死（v0.0.73 的教训：块进了 NC 队列就再没回来）。
-// 🔴 节流 + 退避：正常 3 分钟一次（清积压能连着清几批）；连续失败 ≥3 次退到 60 分钟一次；成功一次清零。
+// 🔴 节流 + 退避（v0.0.109 起分三档，唯一出口 `NBAutoClearGap()`）：
+//    稳定状态 3 分钟一次；**上一轮撤满上限 ⇒ 还有积压 ⇒ 20 秒**；连续失败 ≥3 次退到 60 分钟。
 //    退避**不永久禁用**（熔断铁律：标记必须带超时/版本戳；respring 也自然归零）。
 // 🔴 时序：调用点排在**快照写完、`[扫]` 打完**之后 ⇒ 本轮 nc 是「清之前」、下一轮是「清之后」，
 //    天然形成前后对照，不用另加判据。
@@ -2131,14 +2147,16 @@ static NSInteger NBAutoClearHours(void) {
 }
 
 static void NBAutoClearOldRequests(NSArray *oldReqs, NSInteger hours) {
-    if (hours <= 0 || oldReqs.count == 0) return;
+    if (hours <= 0) { sAutoClearBacklog = NO; return; }   // 关掉时把积压标记也归零
+    // 🔴 没有超时的 ⇒ 顺手把「还有积压」清掉。不清的话它会一直挂着，
+    //    让后面偶发出现的旧通知按 20 秒一轮去撤（比该有的频率高一个数量级）。
+    if (oldReqs.count == 0) { sAutoClearBacklog = NO; return; }
     // 🔴 熔断只短路**这一条路**：绝不设 `gNCSuppressed` —— 那会把用户手动的
     //    「删记录时同步清通知中心」一起关掉（铁律：抑制分支连带别的功能 ⇒ 用户看到"完全没效果"）。
     if (gAutoClearSuppressed) return;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    // 退避：正常 3 分钟一次（清积压时能连着清几批）；连续失败 ≥3 次退到 60 分钟。
-    NSTimeInterval gap = (sAutoClearFails >= 3) ? 3600.0 : 180.0;
-    if (sLastAutoClearTs > 0 && now - sLastAutoClearTs < gap) return;
+    // 间隔只有一个出口（`NBAutoClearGap()`）：3 分钟 / 有积压 20 秒 / 连败 60 分钟。
+    if (sLastAutoClearTs > 0 && now - sLastAutoClearTs < NBAutoClearGap()) return;
     if (!gCSDestination) return;
     if (![gCSDestination respondsToSelector:@selector(destination:clearNotificationRequests:)]) {
         NBLog(@"!!! [自动清] CS 侧没有 destination:clearNotificationRequests: ⇒ 本版停用（hours=%ld）",
@@ -2151,9 +2169,10 @@ static void NBAutoClearOldRequests(NSArray *oldReqs, NSInteger hours) {
         return;
     }
     // 单次上限 400 条：这是主队列上的**同步**调用，条数就是最坏情况下的阻塞长度。
-    // 积压 762 条时自然分成两批（间隔 ≥3 分钟），宁可慢一点，也不要一次压 762 条进主线程。
+    // 积压 762 条时自然分成两批（有积压 ⇒ 下一轮只等 20 秒），宁可慢一点，也不要一次压 762 条进主线程。
     NSArray *batch = oldReqs;
     if (batch.count > 400) batch = [oldReqs subarrayWithRange:NSMakeRange(0, 400)];
+    BOOL capped = (oldReqs.count > batch.count);   // 撤满上限 ⇒ 还有积压
 
     sLastAutoClearTs = now;
     // 🔴 护栏文件：**调用前写、返回后删**（⑦r 同一套，顺序不能反）。
@@ -2175,11 +2194,20 @@ static void NBAutoClearOldRequests(NSArray *oldReqs, NSInteger hours) {
               (long)hours, (unsigned long)oldReqs.count, (unsigned long)batch.count, NBClassName(dest));
         [gCSDestination destination:dest clearNotificationRequests:batch];
         sAutoClearFails = 0;
+        sAutoClearBacklog = capped;
         // 🔴 「已返回」≠「它做了」（铁律）。这一行只证明调用回来了；
         //    它到底有没有撤掉，只能靠**下一轮 `[源] nc=`**（本轮 `[扫]` 已经先打完 = 清之前的数）。
-        NBLog(@"[自动清] 已返回（下一轮 `[源] nc=` 复量看效果）");
+        //    v0.0.109：把「还剩多少 / 下一轮多久后」一起打出来 —— 用户看到"还有 91 条"
+        //    却不知道要不要等，是最容易被读成"坏了"的那一类沉默。
+        if (capped) {
+            NBLog(@"[自动清] 已返回 ｜还剩 %lu 条待清 ⇒ 下一轮只等 %.0f 秒继续",
+                  (unsigned long)(oldReqs.count - batch.count), NBAutoClearGap());
+        } else {
+            NBLog(@"[自动清] 已返回（本批已清完；下一轮 `[源] nc=` 复量看效果）");
+        }
     } @catch (NSException *e) {
         sAutoClearFails++;
+        sAutoClearBacklog = NO;   // 失败时别按 20 秒猛重试（交给 fails 退避）
         NBLog(@"!!! [自动清] 抛(第 %ld 次): %@", (long)sAutoClearFails, e.reason);
     }
     [[NSFileManager defaultManager] removeItemAtPath:kNBGuardAutoClear error:NULL];
@@ -2366,8 +2394,23 @@ static void NBDumpNCSnapshot(NSString *seq) {
                 //    开了有超时的但被节流挡了 / 撤了但没效果），只靠"没日志"分不清是哪一种 ——
                 //    这正是假绿的 ⑧ 型（否定式在对象不存在时恒真）。⇒ 开着就每轮摊一行「本轮超时几条」。
                 if (autoHours > 0) {
-                    NBLog(@"[自动清] 开=%ld 小时 ｜本轮超时=%lu 条（本节流窗口内）",
-                          (long)autoHours, (unsigned long)oldReqs.count);
+                    // v0.0.109：被节流挡着的时候**必须说出来**，还要说出"还差几秒"。
+                    // 🔴 真机代价（2026-11-01 14:29~14:31）：三轮都报「超时=91~92 条」却一动不动，
+                    //    因为距上次只隔 18/97/170 秒、全在 180 秒窗口里 —— 用户只能读成"功能坏了"。
+                    //    这就是假绿第 ⑧ 型的反面：**该发生的没发生的理由，也必须打出来**。
+                    NSString *acState = @"";
+                    if (gAutoClearSuppressed) {
+                        acState = @" ｜本版自动清已熔断（上次调用没返回，见启动日志）";
+                    } else if (oldReqs.count > 0) {
+                        double left = 0;
+                        if (sLastAutoClearTs > 0)
+                            left = NBAutoClearGap() - (nowTs - sLastAutoClearTs);
+                        acState = (left > 0.5)
+                            ? [NSString stringWithFormat:@" ｜等节流 还需 %.0f 秒", left]
+                            : @" ｜下一轮就动手";
+                    }
+                    NBLog(@"[自动清] 开=%ld 小时 ｜本轮超时=%lu 条%@",
+                          (long)autoHours, (unsigned long)oldReqs.count, acState);
                 }
                 NBViewRecon();
             }
