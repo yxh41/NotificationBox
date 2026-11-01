@@ -190,6 +190,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#include <pthread.h>          // v0.0.96：诊断文件追加要加锁（多线程写同一文件会互相盖掉行首）
 #import "NotifyStore.h"
 #import "NotifyCommon.h"
 #import "NotifyFilter.h"
@@ -229,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.95"
+#define NB_VER_STR @"0.0.96"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -555,6 +556,40 @@ static NSString *const kNBDeletedLog = @"/var/mobile/Library/NotifyBox/.nb_delet
 //       从来没命中过 ⇒ 「从未见到」—— 这类多半是 ⓪ 之后系统秒撤，本来就不需要界面刀。
 //    行格式：cid|lastSeenTs|lastScanAll（scanAll 一并存，用来证明"那一次分母是多少"）
 static NSString *const kNBDeletedSeen = @"/var/mobile/Library/NotifyBox/.nb_deleted_seen";
+// ===== v0.0.96：⑦u 的「对照实验」开关（不摘键）=====
+// 🔴 为什么需要：v0.0.95 日志里 8 次三刀序列全是 `尺子 是 → 是 → 否`，
+//   只有 ⑦u（摘键）能把它翻成"否"，而读回扫的 `uuidsToRequests` 也正是它改的那张表
+//   （扫 557→556、同段 15→14）。⇒ **尺子很可能不独立**，它的"否"可能只是表少了一条。
+//   要证伪只有一条路：**同一条件下不摘键，看尺子会不会自己翻**。
+//   这个开关做成文件，不用重编译就能跑对照（放上文件 ⇒ 本次尝试跳过 ⑦u）。
+//   判读：放上 .nb_skip_u 之后，如果 +5s/+30s/+90s 复量仍然"判不了/在"⇒ ⑦u 是唯一动的；
+//         如果复量变成"不在" ⇒ 真正动手的是系统，⑦u 一直在冒充功劳。
+static NSString *const kNBControlSkipU = @"/var/mobile/Library/NotifyBox/.nb_skip_u";
+
+// ===== v0.0.96：读回改成**三态**（在 / 不在 / 判不了）=====
+// 🔴 为什么必须改：v0.0.95 真机日志里这一对读数自相矛盾 ——
+//     ⑦s 调用 ⇒ 扫 557 条 / 同段 15 条 ⇒ 本条还在=是   ← 一条没少（⑦s 空转）
+//     ⑦u 摘键 ⇒ 扫 556 条 / 同段 14 条 ⇒ 本条还在=否
+//   而那个「否」的真实来源是 `匹配=无精确命中（同段有它条 → 不动手）`：
+//   **把"匹配不上"写成了"已删"**。同段还有 14 条，凭什么断言"它不在"？
+//   ⇒ 三态：1=在 / 0=不在（该段一条都没有，铁定不在）/ -1=判不了（同段有它条、无精确命中）。
+//   ⚠️ 行为**不变**：判不了仍按"不动手"走（和以前完全一样），只是日志不再把猜测写成结论。
+static int NBStillTri(int found, int secHits) {
+    if (found) return 1;
+    if (secHits <= 0) return 0;
+    return -1;
+}
+
+static NSString *NBStillStr(int tri) {
+    if (tri > 0) return @"是";
+    if (tri == 0) return @"否（该段一条都没有）";
+    return @"判不了（同段有它条、无精确命中）";
+}
+
+static BOOL NBControlSkipU(void) {
+    // 每轮现查（不缓存）：用户放上/删掉文件立刻生效，不用 respring
+    return [[NSFileManager defaultManager] fileExistsAtPath:kNBControlSkipU];
+}
 // v0.0.79：[段] / [重] 的明细每个进程只打一次（日志窗口 ≈ 最后 50 条、全局滚动）
 static BOOL gCensusDumped = NO;
 #define NB_DEL_KEEP 24            // 台账最多留 24 条（更老的没有诊断价值，且让扫描变贵）
@@ -881,20 +916,36 @@ static NSUInteger NBDiagWriteFile(NSString *sysId, NSString *bundle) {
 // v0.0.57：把一段文本**追加**到诊断文件末尾（方法表已经写好了，这里只追加「本次尝试记录」）。
 //   🔴 为什么追加而不是重写：方法表是静态的（一次就够）；每次删除的尝试过程才是新信息。
 //      两者放同一个文件 ⇒ 用户下次只要把这一个文件整份发来，信息就齐了。
+// ===== v0.0.96：这一把锁是**必须**的，不是保险 =====
+// 🔴 真机证据（v0.0.95 导出件，255,889 B / 2,239 行）：4 行行首被吃掉，共 8 个非法 UTF-8 字节：
+//      ��返回 ⇒ 现在补 ⓪ / ③        ← 原文是 `  [账本] NC 那一刀已返回 ⇒ …`
+//      ��列（v0.0.64 真机：投了但块从没被执行）
+//   每次都精确丢 **24 字节**、切在汉字中间 ⇒ 是**字节级覆盖**，不是编码问题、也不抛异常。
+//   4 处全落在 `19:20:13~19:20:26`（10 次京东 + 6 次移动，间隔 1~2 秒）——
+//   主队列 / BB 队列 / CS 观测 hook 三条线程同时 append，各自 `seekToEndOfFile` 拿到
+//   同一个偏移，后写者把前写者的**行首**盖掉（尾巴反而留下）。
+//   ⇒ 修法：整段 seek+write 进互斥锁，一次 write 落盘。
+//   ⚠️ 用 pthread 而不是 `@synchronized(nil)`：锁对象为 nil 时 `@synchronized` 是空操作，
+//      等于没锁 —— 这种"看着加了锁其实没加"的坑比不加更危险。
+static pthread_mutex_t gNBAppendLock = PTHREAD_MUTEX_INITIALIZER;
+
 static void NBDiagAppend(NSString *text) {
     if (!text.length) return;
+    NSData *payload = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (!payload.length) return;
+    pthread_mutex_lock(&gNBAppendLock);
     @try {
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:NOTIFYBOX_NC_DIAG_PATH];
         if (!fh) {
-            [text writeToFile:NOTIFYBOX_NC_DIAG_PATH atomically:YES
-                     encoding:NSUTF8StringEncoding error:nil];
-            return;
+            [payload writeToFile:NOTIFYBOX_NC_DIAG_PATH atomically:YES];
+        } else {
+            @try {
+                [fh seekToEndOfFile];
+                [fh writeData:payload];
+            } @finally { [fh closeFile]; }
         }
-        @try {
-            [fh seekToEndOfFile];
-            [fh writeData:[text dataUsingEncoding:NSUTF8StringEncoding]];
-        } @finally { [fh closeFile]; }
     } @catch (__unused NSException *e) { }
+    pthread_mutex_unlock(&gNBAppendLock);
 }
 
 // ---------- v0.0.61 / v0.0.64：NC 层的读与取 ----------
@@ -2483,7 +2534,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
                         shBase = sh7;
                         NBDiagStep(@"  ⑦ 基线：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@ nid=%@（匹配=%@）\n",
-                                   (unsigned long)sc7, sh7, still ? @"是" : @"否", nid7, how7x ?: @"?");
+                                   (unsigned long)sc7, sh7, NBStillStr(NBStillTri(still, sh7)), nid7, how7x ?: @"?");
                     } @catch (NSException *e) {
                         NBDiagStep(@"  ⑦ 基线抛: %@\n", e.reason);
                     }
@@ -2590,7 +2641,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                     still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
                                     NBDiagStep(@"  ⑦s 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
                                                (unsigned long)sc7, sh7,
-                                               still ? @"是" : @"否（已删）", how7x ?: @"?");
+                                               NBStillStr(NBStillTri(still, sh7)), how7x ?: @"?");
                                     NBReportSectionJump("7s", shBase, sh7);
                                     // v0.0.95 归因：这一刀到底算不算数
                                     NBDiagStep(@"  ⑦s 归因：bb2nc+%d sysWd+%d src %d→%d ⇒ %@ ｜ 尺子=%@"
@@ -2631,7 +2682,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                     still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
                                     NBDiagStep(@"  ⑦t 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
                                                (unsigned long)sc7, sh7,
-                                               still ? @"是" : @"否（已删）", how7x ?: @"?");
+                                               NBStillStr(NBStillTri(still, sh7)), how7x ?: @"?");
                                     NBReportSectionJump("7t", shBase, sh7);
                                     // v0.0.95 归因（同 ⑦s）。上一版正是这里骗了我们：
                                     // 那 2 次「否」的窗口里都夹着 `[BB→NC] 第 14/16 次`。
@@ -2665,7 +2716,19 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     //    ⇒ 必须显式把它从 uuidsToRequests / bulletinsToUUIDs 里摘掉。
                     //    🔴 这一刀和前三把的本质区别：前三把动的是**界面**，这一把动的是**账本**。
                     //       按 §1 的纪律，改模型的刀要放在最后，且必须有独立的读回。
-                    if (still && gNCSource && want7.length) {
+                    // ===== v0.0.96：⑦u 的对照开关（.nb_skip_u 存在 ⇒ 本次故意不摘键）=====
+                    // 目的只有一个：**证伪「尺子」是否独立**。
+                    // 放上文件后跑一次删除，然后看 +5s/+30s/+90s 复量：
+                    //   · 复量仍「是 / 判不了」⇒ 说明前三把刀（含系统传播）确实没让它消失，
+                    //     同时也说明 ⑦u 的"否"只是把表改小了；
+                    //   · 复量变「否（该段一条都没有）」⇒ 真正让它消失的是系统/别的路径，
+                    //     ⑦u 一直在替别人记功。
+                    const BOOL nbSkipU = NBControlSkipU();
+                    if (still && nbSkipU) {
+                        NBDiagStep(@"  ⑦u 跳过（对照实验：.nb_skip_u 存在 ⇒ 故意不摘键；"
+                                   @"看 +5s/+30s/+90s 复量来判断尺子是否独立）\n");
+                    }
+                    if (still && !nbSkipU && gNCSource && want7.length) {
                         @try {
                             NSDictionary *m0 = nil;
                             @try { m0 = [gNCSource uuidsToRequests]; } @catch (__unused NSException *e) { }
@@ -2755,7 +2818,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                 still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
                                 NBDiagStep(@"  ⑦u 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@（匹配=%@）\n",
                                            (unsigned long)sc7, sh7,
-                                           still ? @"是" : @"否（已删）", how7x ?: @"?");
+                                           NBStillStr(NBStillTri(still, sh7)), how7x ?: @"?");
                                 // 🔴🔴 v0.0.95：**上一行是恒真的，别再拿它当成败判据。**
                                 //    读回走 `NBFindOurRequest(gNCSource…)` ⇒ 读的就是本刀刚摘过的
                                 //    `uuidsToRequests`。v0.0.94 真机 4 次全"否"，而真机复算：
@@ -2779,11 +2842,11 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                     if (still2 != still || sc8 != sc7 || sh8 != sh7) {
                                         NBDiagStep(@"  ⑦u 🔴 读回不稳定：①扫 %lu/同段 %d/还在=%@ ｜ "
                                                    @"②扫 %lu/同段 %d/还在=%@ ⇒ 两次之间映射变了\n",
-                                                   (unsigned long)sc7, sh7, still ? @"是" : @"否",
-                                                   (unsigned long)sc8, sh8, still2 ? @"是" : @"否");
+                                                   (unsigned long)sc7, sh7, NBStillStr(NBStillTri(still, sh7)),
+                                                   (unsigned long)sc8, sh8, NBStillStr(NBStillTri(still2, sh8)));
                                     } else {
                                         NBDiagStep(@"  ⑦u 读回稳定（连读两次同结果：扫 %lu 条 / 同段 %d 条 / 还在=%@）\n",
-                                                   (unsigned long)sc8, sh8, still2 ? @"是" : @"否");
+                                                   (unsigned long)sc8, sh8, NBStillStr(NBStillTri(still2, sh8)));
                                     }
                                 }
                             }
@@ -2842,7 +2905,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                             @try {
                                 still = (NBFindOurRequest(gNCSource, want7, gWantIDs, &how7x, &sc7, &sh7) != nil);
                                 NBDiagStep(@"  ⑦r 读回：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@\n",
-                                           (unsigned long)sc7, sh7, still ? @"是" : @"否（已删）");
+                                           (unsigned long)sc7, sh7, NBStillStr(NBStillTri(still, sh7)));
                             } @catch (NSException *e) {
                                 NBDiagStep(@"  ⑦r 读回抛: %@\n", e.reason);
                             }
@@ -2888,10 +2951,10 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                 NSUInteger scT = 0; int shT = 0; NSString *howT = nil;
                                 BOOL stT = (NBFindOurRequest(gNCSource, want7, gWantIDs, &howT, &scT, &shT) != nil);
                                 NBDiagStep(@"  ⑦T +%.0fs 复量 nid=%@：扫 %lu 条 / 同段 %d 条 ⇒ 本条还在=%@"
-                                           @"（匹配=%@ ｜ dispatcher 撤回总计=%d，其中我方 ⑦s=%d/⑦t=%d/⑦u=%d"
+                                           @"（匹配=%@ ｜ 下面是**本进程累计**：撤回总计=%d，其中我方 ⑦s=%d/⑦t=%d/⑦u=%d"
                                            @" ｜ [RL] 重载=%d [RM] %d(命中 %d) [RP] %d(命中 %d)）\n",
                                            sec, nidT,
-                                           (unsigned long)scT, shT, stT ? @"是" : @"否（已删）", howT ?: @"?",
+                                           (unsigned long)scT, shT, NBStillStr(NBStillTri(stT, shT)), howT ?: @"?",
                                            gObsDispatcherWithdraw, gNCDirectWithdraw,
                                            gCSDirectWithdraw, gNCDirectMapKill,
                                            gNoteLoadedSeen, gModifySeen, gModifyHit,
@@ -2923,17 +2986,27 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         }
                     }
                     NBDiagStep(@"  ⑦ 结束：本条还在=%@ nid=%@ ｜ CS 侧观测计数 撤回=%d 清=%d 段清=%d 段范围清=%d incoming=%d 长按=%d（投递=%d 存活对照）\n",
-                               still ? @"是" : @"否", nid7,
+                               NBStillStr(NBStillTri(still, sh7)), nid7,
                                gCSDWithdraw, gCSDClear, gCSDClearSec, gCSDClearRng,
                                gCSDIncoming, gCSDDismiss, gCSDPost);
                     // v0.0.95：把「本行 still 的读回源」写死在这里，免得下一轮又把它当独立证据。
                     //   走过 ⑦u ⇒ 读回源已被本刀改过 ⇒ 本行的「否」不构成"界面变了"的证据；
                     //   只走过 ⑦s/⑦t ⇒ 源没被我改，本行「否」只可能来自系统传播（= 不可归因）。
-                    NBDiagStep(@"  ⑦ 判读口径：still 的来源=NC source 映射（⑦u 摘键=%d 键 ⇒ 走过它就是恒真）"
-                               @"；界面到底变没变，只看每把刀之后的「尺子=」和 bb2nc 增量\n",
-                               gNCDirectMapKill);
-                    NBDiagStep(@"  ⑦ 逐刀计数：我方 ⑦s=%d ⑦t=%d ⑦u(摘键)=%d ⑦r(段范围清)=%d"
-                               @" ｜ dispatcher 撤回总计(系统+我方)=%d"
+                    // v0.0.96：口径再收紧一层 —— v0.0.95 真机证明「尺子」也不独立。
+                    //   决定性读数（同一次尝试，窗口内 bb2nc+0 sysWd+0 src 不变）：
+                    //     ⑦s 调用 ⇒ 扫 557 / 同段 15 ⇒ 还在=是 ｜ 尺子=是
+                    //     ⑦t 调用 ⇒ 扫 557 / 同段 15 ⇒ 还在=是 ｜ 尺子=是
+                    //     ⑦u 摘键 ⇒ 扫 556 / 同段 14 ⇒ 还在=否 ｜ 尺子=否
+                    //   前两把刀**一条都没少**（真·空转）；只有摘键能翻，且翻的方式是
+                    //   "读回扫的那张表少了一条" ⇒ **尺子很可能与读回同源**，不能当独立证据。
+                    NBDiagStep(@"  ⑦ 判读口径：still 三态（是/否/判不了）= 扫 %lu 条后的精确匹配结果，"
+                               @"「判不了」是从前的「否（已删）」；⑦u 摘键=%d 键 ⇒ 走过它读回恒为否；"
+                               @"尺子也被证明与这张表同源（⑦s/⑦t 都翻不动、只有摘键能翻）"
+                               @"⇒ **三个读数里没有一个能单独证明「界面变了」**，要证明只能靠"
+                               @"+5s/+30s/+90s 复量 + 用户眼睛\n",
+                               (unsigned long)sc7, gNCDirectMapKill);
+                    NBDiagStep(@"  ⑦ 逐刀计数（**本进程累计**，不是本次尝试）：我方 ⑦s=%d ⑦t=%d ⑦u(摘键)=%d ⑦r(段范围清)=%d"
+                               @" ｜ dispatcher 撤回总计(累计，系统+我方)=%d"
                                @" ｜ [RL] 段重载=%d [RM] modify=%d(命中 %d) [RP] 投递=%d(命中复投 %d)\n",
                                gNCDirectWithdraw, gCSDirectWithdraw, gNCDirectMapKill,
                                gCSDClearRng, gObsDispatcherWithdraw,
