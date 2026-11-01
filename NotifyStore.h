@@ -286,8 +286,6 @@ typedef NS_ENUM(NSInteger, NBSyncClearOutcome) {
 //    日志文件不存在时（连 App 都没写成功），这份数据是唯一能定位的现场。
 + (NSString *)envCheck;
 
-@end
-
 #pragma mark - v0.0.98 通知中心存活快照（只读）
 
 // 「这条记录删掉之后，通知中心里那张卡片到底还在不在」—— 三态。
@@ -316,5 +314,7 @@ typedef NS_ENUM(NSInteger, NBAliveState) {
 // 理由同上：同一次刷新里所有行必须用同一份快照，不能一行读一次文件。
 + (NBAliveState)aliveStateOfSysId:(nullable NSString *)sysId
                        inSnapshot:(NSDictionary *)snap;
+
+@end
 
 NS_ASSUME_NONNULL_END
