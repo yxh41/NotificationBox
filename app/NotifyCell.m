@@ -100,12 +100,14 @@
 // v0.0.93：当前是否处于「松手即删」态（只用来避免每帧重复设 label 文案）
 @property (nonatomic, assign) BOOL nbArmed;
 
-// ================= v0.0.98：通知中心残留标记 =================
-// 🔴 挂 **cardView**（卡片左缘内侧）：色条要和卡片同高同圆角曲率，
-//    挂 contentView 就得自己算 `card.origin.y` 和高度，多一处能对不上的地方。
-// 🔴 存的是**数值状态**而不是"色条 visible"：本项目反复栽在"拿视图状态反推数据状态"上
-//    （attributedText 时序、标星、未读角标各一次）。`hidden` 是它的输出。
-@property (nonatomic, strong) UIView *aliveBar;
+// ================= v0.0.98 / v0.0.106：通知中心残留标记 =================
+// 🔴 v0.0.106：用户要求把原来「卡片左缘一条 4pt 实心橙条」改成**整卡一圈细线**
+//    ⇒ 不再单独挂 `aliveBar` 这个 view，直接画在 **cardView.layer.border** 上：
+//    ① 天然跟卡片走（左滑位移 / 圆角 / clipsToBounds 全部一致）⇒ 不会有"无主的橙线"；
+//    ② 不占布局（border 画在边框上，不参与任何横坐标算账，和原来那条 4pt 同理）；
+//    ③ 少一个视图 ⇒ 少一处"复用时串到别的行上"的风险。
+// 🔴 存的是**数值状态**而不是"线 visible"：本项目反复栽在"拿视图状态反推数据状态"上
+//    （attributedText 时序、标星、未读角标各一次）。`borderWidth` 是它的**输出**。
 @property (nonatomic, assign) NSInteger aliveState;
 
 // 🔴 内部方法必须显式声明（项目开 -Werror，靠"定义在前面"解析选择器太脆）
@@ -362,16 +364,16 @@ static void NBHapticFire(NBHapticKind kind) {
     self.cardView.clipsToBounds = YES;
     [self.contentView addSubview:self.cardView];
 
-    // ---------- v0.0.98：通知中心残留标记（卡片左缘的橙条） ----------
-    // 🔴 位置：**紧跟 cardView 之后 add**，此时卡片底色已在、文字还没进来。
-    //    竖条在 x=0..4，而所有文字都从 `kNBPad`（=12）起排 ⇒ 两者不重叠，
-    //    所以 z 序在这里不影响观感（不像 pinView 必须最后 add）。
-    // 🔴 但**必须挂 cardView**：挂 contentView 的话，左滑时卡片位移、色条留在原地，
-    //    会露出"一条无主的橙线"（v0.0.92 红块那条注释讲的是反过来的需求，别照抄）。
-    self.aliveBar = [[UIView alloc] init];
-    self.aliveBar.backgroundColor = [UIColor systemOrangeColor];
-    self.aliveBar.hidden = YES;      // 默认藏 —— 复用池里"默认可见的装饰"必串（见头文件注释）
-    [self.cardView addSubview:self.aliveBar];
+    // ---------- v0.0.98 / v0.0.106：通知中心残留标记（整卡一圈细线） ----------
+    // 🔴 v0.0.106：原来是「cardView 左缘一条 4pt 实心橙条」（aliveBar 那个 view）。
+    //    用户要求改成**整卡一圈细线** ⇒ 现在**不建任何视图**，直接在 cardView.layer 上画边框：
+    //    `borderWidth = 1`（在通知中心里）/ `0`（不在），颜色 = systemOrangeColor。
+    // 🔴 为什么这样最稳：cardView 已经设了 cornerRadius(14) + cornerCurveContinuous +
+    //    clipsToBounds ⇒ 边框天然贴着卡片圆角走；左滑时它和卡片一起位移
+    //    （挂 contentView 才会留下"一条无主的橙线"——v0.0.92 红块那条注释讲的是反过来的需求）。
+    // 🔴 默认必须是「无线」：复用池里"默认可见的装饰"必串到干净行上（见头文件注释）。
+    self.cardView.layer.borderWidth = 0.0;
+    self.cardView.layer.borderColor = NULL;
 
     // 图标容器：真图标和首字母共用一块底。
     // 🔴🔴 v0.0.88：挂到 **contentView** 上，不再挂 cardView —— 图标现在在卡片**外面**
@@ -578,13 +580,15 @@ static void NBHapticFire(NBHapticKind kind) {
     //    父子关系已经是 cardView，写在这里就等于给它加上一次卡片原点（v0.0.88 的原始病根）。
 
     // ---------- 卡片内（cardView 坐标，⛔ 一个都不许再加卡片原点） ----------
-    // ---------- v0.0.98：通知中心残留标记 ----------
-    // 🔴 宽度 4、贴左缘、**整卡高**。它不参与下面任何一条横坐标的算账
-    //    （`appW` 只减 timeW / starW / groupW，不认它）⇒ 对布局影响为 0。
-    // 🔴 用**数值状态**判显隐，不看 `hidden` 反推（见类扩展里的注释）。
+    // ---------- v0.0.98 / v0.0.106：通知中心残留标记（整卡一圈细线） ----------
+    // 🔴 v0.0.106：改成 border ⇒ 不占任何横坐标（`appW` 只减 timeW / starW / groupW），
+    //    对布局影响仍然为 0，原来那条 4pt 的"不参与算账"结论继续成立。
+    // 🔴 颜色每帧重设：`layer.borderColor` 是 CGColor，**不会**跟着 traitCollection
+    //    自动切深浅色 ⇒ 必须每次从 `systemOrangeColor` 现取（否则深色/浅色来回切会留旧色）。
+    // 🔴 用**数值状态**判显隐，不看 `borderWidth` 反推（见类扩展里的注释）。
     BOOL aliveOn = (self.aliveState == 1);
-    self.aliveBar.hidden = !aliveOn;
-    self.aliveBar.frame = aliveOn ? CGRectMake(0, 0, 4.0, h) : CGRectZero;
+    self.cardView.layer.borderWidth = aliveOn ? 1.0 : 0.0;
+    self.cardView.layer.borderColor = aliveOn ? [UIColor systemOrangeColor].CGColor : NULL;
 
     CGFloat textX = kNBPad;
     CGFloat textW = MAX(0.0, w - kNBPad * 2);
@@ -1008,16 +1012,19 @@ static void NBHapticFire(NBHapticKind kind) {
     [self setNeedsLayout];
 }
 
-// ================= v0.0.98：通知中心残留标记 =================
-// 只切 hidden + 在 layoutSubviews 里定 frame（宽度不参与任何别的算账，见头文件注释）。
+// ================= v0.0.98 / v0.0.106：通知中心残留标记 =================
+// v0.0.106：细线画在 cardView.layer 上（不再有 aliveBar 视图）。
+// 这里**立即**把 border 切到位，同时 `setNeedsLayout` 让 layoutSubviews 再校一次颜色。
 // 🔴 必须直接写 `_aliveState`（⛔ 不许 `self.aliveState = n;`，那是 setter 里调自己 ⇒ 爆栈）。
 - (void)setAliveTag:(NSInteger)state {
     _aliveState = state;
-    // 🔴 这里**只置 hidden、不留 frame 给下一帧**：frame 由 layoutSubviews 按 `aliveState` 重算。
-    //    但不触发布局的话，「复用回来的行从有橙条变成没橙条」要等下一次布局才生效 ——
-    //    而 cell 复用时 UITableView 未必会再布局一次 ⇒ 屏幕上会留下一条**串到别的行上**的橙条。
-    //    `setNeedsLayout` 很便宜（本表行高常量、布局里没有昂贵计算），宁多勿漏。
-    self.aliveBar.hidden = (state != 1);
+    // 🔴 立刻切一次 border：光等 layoutSubviews 的话，「复用回来的行从有线变成没线」
+    //    要等下一次布局才生效，而 cell 复用时 UITableView 未必会再布局一次
+    //    ⇒ 屏幕上会留下**串到别的行上**的一圈橙线。`setNeedsLayout` 很便宜
+    //    （本表行高常量、布局里没有昂贵计算），宁多勿漏。
+    BOOL on = (state == 1);
+    self.cardView.layer.borderWidth = on ? 1.0 : 0.0;
+    self.cardView.layer.borderColor = on ? [UIColor systemOrangeColor].CGColor : NULL;
     [self setNeedsLayout];
 }
 
@@ -1032,6 +1039,10 @@ static void NBHapticFire(NBHapticKind kind) {
     //    走 `setBrandColor:nil` 而不是直接写 backgroundColor：那个 setter 会**同时**
     //    把角标底色也刷回默认值，一条命令复位两处，不会漏。
     self.brandColor = nil;
+    // 🔴 v0.0.106：卡片细线同理（"凡是 setter 改过的外观，prepareForReuse 必须改回去"）。
+    //    不复位就是「复用回来的一行本来干净，却带着上一行的橙框」——和底色串色同一类症状。
+    self.cardView.layer.borderWidth = 0.0;
+    self.cardView.layer.borderColor = NULL;
     self.iconView.image = nil;
     self.iconView.hidden = YES;
     self.letterLabel.hidden = NO;
