@@ -11,6 +11,8 @@
 #import "NotifyExport.h"     // v0.0.44 导出
 // v0.0.71：统一视觉层（颜色 / 圆角 / 图标 / 分组卡片的唯一来源）
 #import "NBTheme.h"
+// v0.0.118：长按菜单里的「打开」⇒ 按 bundleId 打开对应 App（两条路 + 失败留痕都在那个模块里）
+#import "AppLauncher.h"
 
 // v0.0.38：「全标已读」按钮的固定宽度。「全标已读」4 个汉字 @14pt ≈ 56pt，
 // 加左右各 16pt 内边距 ⇒ 88 够宽裕。写常量是因为布局里要拿它算分段控件的宽度，
@@ -312,6 +314,18 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)nbDeleteRowId:(NSInteger)rowId;
 // v0.0.95：整组删（×N 那一行）。单条删仍走上面那个，两者共用一套提示口径。
 - (void)nbDeleteRowIds:(NSArray<NSNumber *> *)rowIds;
+
+// ================= v0.0.118：长按卡片的菜单（打开 App / 复制） =================
+// 🔴 菜单内容**只在这里定义**：cell 只负责"长按了 ⇒ 问你"，不知道菜单里有什么。
+//    这样加/减动作只有一处要改，cell 复用也不会带着上一行的动作跑。
+- (UIMenu *)nbMenuForRow:(NSDictionary *)row;
+// 「打开」的落点。🔴 只发请求 + toast，**绝不 present** ——
+//    这个动作是在菜单正在收起的瞬间执行的，此时 present 会被系统静默丢掉。
+- (void)nbOpenAppWithBundle:(NSString *)bundleId;
+// v0.0.118：浮层提示（1.4 秒淡出）。不走 `alertTitle:`：
+//    那个是 alert（要 present），而这里最常发生的时刻正是"菜单刚收起"，
+//    两条 present 撞在一起就是"点了没反应"。浮层只往视图上贴一个 label，不涉及 present。
+- (void)nbToast:(NSString *)text;
 @end
 
 @implementation ViewController
@@ -2315,6 +2329,13 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     __weak NotifyCell *weakCell = c;
     c.nbOnDelete = ^{ [weakSelf nbDeleteRowIds:groupIds]; };
     c.nbOnSwipeBegin = ^{ [weakSelf nbCloseOtherSwipesExcept:weakCell]; };
+    // ---------- v0.0.118：长按菜单 ----------
+    // 🔴 每次 cellForRow 都重设一次（cell 会复用）：菜单里的 App 名 / 动作必须跟着**当前这一行**，
+    //    留着上一次的就会"长按 A 行、菜单里写着 B 的 App 名"。
+    // 🔴 捕获的是 rowId 那一组的**数组快照**（和删除同一个理由），不是 indexPath。
+    c.nbMenuBuilder = ^UIMenu *{
+        return [weakSelf nbMenuForRow:d];
+    };
     return c;
 }
 
@@ -2432,6 +2453,133 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 //    一组 5 条就是 5 次开库，而这个库**两个进程在写**（见 NotifyStore.m 的 SQLITE_BUSY 注释）。
 // 🔴 返回的 outcome 取**最严重的那一种**（详见方法体），不能让"最后一条恰好成功"
 //    把前面几条的"没有 sysId / 同步关"盖掉 —— 那就变成"删了但界面没说清为什么通知中心没变"。
+// ================= v0.0.118：长按菜单 =================
+// 菜单里放什么，**只由这里决定**（cell 只管"长按了 ⇒ 问你"）。
+// 当前两项：
+//   ① 打开「App 名」—— 这条通知是哪个 App 弹的就跳到哪个 App；
+//   ② 复制内容 —— 把标题/正文/副标题拼起来放剪贴板（和详情页同一套拼法）。
+// 🔴 为什么**故意不做**「删除」：左滑已经是删除，多一个入口就多一条"两处提示口径"
+//    要维护；而且删除失败时会 present alert，正好撞上"菜单正在收起"那一刻
+//    ⇒ 那个 alert 会被系统静默丢掉，用户看到的是"点了没反应"。少一个入口少一类坑。
+- (UIMenu *)nbMenuForRow:(NSDictionary *)row {
+    if (![row isKindOfClass:[NSDictionary class]]) return nil;
+
+    NSString *bid  = row[@"bundle"];
+    NSString *name = [self appNameForBundle:bid];
+    // 🔴 标题里带上 App 名：列表里同一个 App 可能有好几张卡，
+    //    光写「打开」用户不知道会跳到哪儿去。名字取不到时退回裸「打开」，不能留空标题。
+    NSString *openTitle = name.length
+                        ? [NSString stringWithFormat:@"打开「%@」", name]
+                        : @"打开";
+
+    __weak typeof(self) weakSelf = self;
+    NSMutableArray<UIMenuElement *> *acts = [NSMutableArray arrayWithCapacity:2];
+
+    UIAction *openAct = [UIAction actionWithTitle:openTitle
+                                            image:[UIImage systemImageNamed:@"arrow.up.forward.app"]
+                                       identifier:nil
+                                          handler:^(__kindof UIAction *a) {
+        [weakSelf nbOpenAppWithBundle:bid];
+    }];
+    [acts addObject:openAct];
+
+    UIAction *copyAct = [UIAction actionWithTitle:@"复制内容"
+                                            image:[UIImage systemImageNamed:@"doc.on.doc"]
+                                       identifier:nil
+                                          handler:^(__kindof UIAction *a) {
+        // 拼法和详情页 `plainText` 一致（标题 / 正文 / 副标题，缺哪个跳哪个）。
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        id tv = row[@"title"];
+        id mv = row[@"message"];
+        id sv = row[@"subtitle"];
+        if ([tv isKindOfClass:[NSString class]] && [(NSString *)tv length]) [parts addObject:(NSString *)tv];
+        if ([mv isKindOfClass:[NSString class]] && [(NSString *)mv length]) [parts addObject:(NSString *)mv];
+        if ([sv isKindOfClass:[NSString class]] && [(NSString *)sv length]) [parts addObject:(NSString *)sv];
+        if (!parts.count) [parts addObject:@"（这条通知没有内容）"];
+        UIPasteboard *pb = [UIPasteboard generalPasteboard];
+        pb.string = [parts componentsJoinedByString:@"\n"];
+        [weakSelf nbToast:@"已复制"];
+    }];
+    [acts addObject:copyAct];
+
+    return [UIMenu menuWithTitle:@"" children:acts];
+}
+
+- (void)nbOpenAppWithBundle:(NSString *)bundleId {
+    NBOpenAppResult r = [AppLauncher openBundle:bundleId];
+    NSString *text = [AppLauncher textForResult:r];
+    // 成功时 `text` 是 nil ⇒ 静默（App 已经切到前台，那本身就是反馈）。
+    if (!text.length) return;
+    [self nbToast:text];
+}
+
+// 浮层提示：贴在视图正中，1.4 秒后淡出。
+// 🔴 为什么不用 `alertTitle:text:`（现成的 alert 入口）：这个提示出现的最常见时刻
+//    正是"长按菜单刚收起"，而菜单本身是一次 present ⇒ 同时再 present 一个 alert
+//    会被系统丢掉（真机表现：点了没反应，日志里什么都没有）。
+//    往视图上贴 label 不涉及 present，任何时刻都安全。
+- (void)nbToast:(NSString *)text {
+    if (!text.length) return;
+    UIView *host = self.view;
+    if (!host) return;
+
+    // 同一时刻只留一个：连点两下不该叠出两层黑底（叠起来颜色更深、看着像卡了）。
+    static NSInteger kToastTag = 0x4E42;   // 'NB'
+    // 🔴 必须遍历 `subviews` 的**副本**：循环里 `removeFromSuperview` 会改动 `subviews` 本身，
+    //    边遍历边改是未定义行为（快枚举会直接抛 "collection was mutated while being enumerated"）。
+    for (UIView *old in [host.subviews copy]) {
+        if (old.tag == kToastTag) [old removeFromSuperview];
+    }
+
+    UIView *box = [[UIView alloc] init];
+    box.tag = kToastTag;
+    box.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.82];
+    box.layer.cornerRadius = 12.0;
+    box.layer.masksToBounds = YES;
+    box.alpha = 0.0;
+    box.translatesAutoresizingMaskIntoConstraints = NO;
+    box.userInteractionEnabled = NO;      // 提示不该挡住底下的列表
+    [host addSubview:box];
+
+    UILabel *lb = [[UILabel alloc] init];
+    lb.text = text;
+    lb.textColor = [UIColor whiteColor];
+    lb.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+    lb.textAlignment = NSTextAlignmentCenter;
+    lb.numberOfLines = 0;
+    lb.translatesAutoresizingMaskIntoConstraints = NO;
+    [box addSubview:lb];
+
+    // 内边距 14/12：外面套一层 box 而不是直接给 label 加背景 ——
+    // UILabel 没有 contentInsets，硬给背景会让文字顶到圆角上。
+    [NSLayoutConstraint activateConstraints:@[
+        [lb.leadingAnchor  constraintEqualToAnchor:box.leadingAnchor  constant:14.0],
+        [lb.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-14.0],
+        [lb.topAnchor      constraintEqualToAnchor:box.topAnchor      constant:10.0],
+        [lb.bottomAnchor   constraintEqualToAnchor:box.bottomAnchor   constant:-10.0],
+        [box.centerXAnchor constraintEqualToAnchor:host.centerXAnchor],
+        [box.centerYAnchor constraintEqualToAnchor:host.centerYAnchor],
+        // 🔴 必须限宽：长句子不限宽会顶到屏幕边上（本项目吃过"提示语被截断/挤出屏幕"的亏）。
+        [box.widthAnchor   constraintLessThanOrEqualToAnchor:host.widthAnchor constant:-72.0],
+    ]];
+
+    [UIView animateWithDuration:0.18
+                          delay:0.0
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        box.alpha = 1.0;
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.35
+                              delay:1.1
+                            options:UIViewAnimationOptionCurveEaseIn
+                         animations:^{
+            box.alpha = 0.0;
+        } completion:^(BOOL finished2) {
+            [box removeFromSuperview];
+        }];
+    }];
+}
+
 - (void)nbDeleteRowIds:(NSArray<NSNumber *> *)rowIds {
     if (!rowIds.count) return;
     NBSyncClearOutcome outc = NBSyncClearDeleteFail;

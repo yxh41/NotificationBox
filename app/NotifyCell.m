@@ -4,7 +4,8 @@
 // 🔴 v0.0.92：cell 自己要当 pan 手势的 delegate —— 判"这次滑动算不算左滑"必须
 //    在手势**开始之前**答（`gestureRecognizerShouldBegin:`），识别之后再判就晚了：
 //    那一刻 tableView 的垂直滚动已经被抢走了，表现为"列表滚不动/滚起来一顿一顿"。
-@interface NotifyCell () <UIGestureRecognizerDelegate>
+// v0.0.118：再兼任长按菜单的 delegate（只答一句"这一行的菜单是什么"，见 nbMenuBuilder）。
+@interface NotifyCell () <UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate>
 // 🔴 v0.0.70：卡片容器。以前所有子视图直接挂在 `contentView` 上、靠系统分隔线区分行，
 //    整屏是一块连续的灰白。现在改成「灰色大底 + 一张张圆角卡片」：
 //    · 卡片之间靠**留白**分行，不再需要分隔线（`separatorStyle = None`）
@@ -109,6 +110,13 @@
 // 🔴 存的是**数值状态**而不是"线 visible"：本项目反复栽在"拿视图状态反推数据状态"上
 //    （attributedText 时序、标星、未读角标各一次）。`borderWidth` 是它的**输出**。
 @property (nonatomic, assign) NSInteger aliveState;
+
+// ================= v0.0.118：长按菜单 =================
+// 🔴 挂在 **contentView** 上，不挂 cardView：contentView 才是 cell 的"整行"，
+//    长按卡片外的留白也该出菜单（卡片只占中间一段，留白也是这一行）。
+// 🔴 它和左滑的 `nbPan` 是两套独立的手势，天然不打架：
+//    长按要求"按住不动"，`nbPan` 要求"横向移动"，谁先满足谁开始。
+@property (nonatomic, strong) UIContextMenuInteraction *nbMenu;
 
 // 🔴 内部方法必须显式声明（项目开 -Werror，靠"定义在前面"解析选择器太脆）
 - (void)nbRender;
@@ -523,6 +531,14 @@ static void NBHapticFire(NBHapticKind kind) {
     self.nbPan.delegate = self;
     [self.contentView addGestureRecognizer:self.nbPan];
 
+    // ---------- v0.0.118：长按菜单 ----------
+    // 🔴 必须用 `addInteraction:`（UIContextMenuInteraction 是 UIInteraction，不是手势），
+    //    加错成 `addGestureRecognizer:` 编译期就报类型不符。
+    // 🔴 只在 init 里加一次：cell 会被复用，但 interaction 属于视图本身、可以跟一辈子；
+    //    每次 cellForRow 只换 `nbMenuBuilder`（菜单内容），不重建 interaction。
+    self.nbMenu = [[UIContextMenuInteraction alloc] initWithDelegate:self];
+    [self.contentView addInteraction:self.nbMenu];
+
     return self;
 }
 
@@ -835,6 +851,31 @@ static void NBHapticFire(NBHapticKind kind) {
     // 两处各写一份的话，点删是"啪一下没了"、滑到底是"滑走再没"，同一件事两种手感会打架；
     // 而且 `nbFlyOutThenDelete` 里有"先复位再回调"，复用安全只在这一个地方保证。
     [self nbFlyOutThenDelete];
+}
+
+#pragma mark - v0.0.118 长按菜单
+
+// 长按卡片 ⇒ 出菜单。**内容不由 cell 决定**，只向列表要（`nbMenuBuilder`）。
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction
+                        configurationForMenuAtLocation:(CGPoint)location {
+    // 列表没给内容 ⇒ 这一行不弹菜单（返回 nil 是系统约定，不是"忘了返回"）。
+    if (!self.nbMenuBuilder) return nil;
+
+    // 🔴 左滑打开状态下长按：先把卡片收回原位再弹。
+    //    不收的话菜单的预览快照就是"卡片歪在左边、右边露着红块"的样子，看着像渲染坏了；
+    //    而且这时用户长按的本意多半不是继续左滑。
+    if ([self nbIsSwiped]) [self nbCloseSwipeAnimated:YES];
+
+    __weak typeof(self) weakSelf = self;
+    return [UIContextMenuConfiguration
+        configurationWithIdentifier:nil
+                    previewProvider:nil
+                     actionProvider:^UIMenu * _Nullable(NSArray<UIMenuElement *> *suggestedActions) {
+        // 🔴 **弹的那一刻现问列表**，绝不在 cell 里缓存一个 UIMenu：
+        //    缓存下来就会带着上一行的动作（上一行的 App 名、上一行的 rowId）跑 ——
+        //    复用池里最爱串的正是这种"存下来的行为"，而且症状是"删错了行"这种最贵的错。
+        return weakSelf.nbMenuBuilder ? weakSelf.nbMenuBuilder() : nil;
+    }];
 }
 
 // 🔴 只在"水平主导"时才开始，而且必须在**手势开始之前**答
