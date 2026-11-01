@@ -1762,6 +1762,12 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
     if (scanTs <= 0) return;      // 没读过快照 ⇒ 连"截至时刻"都没有，直接留待下次
     NSSet *keys = snap[@"keys"];
     if (![keys isKindOfClass:[NSSet class]]) keys = [NSSet set];
+    // 🔴🔴 v0.0.113：**空快照也不算"能取样"**。
+    //    空快照是带上 `#scan=` 时刻的（`nc=0` 照样写盘），所以 v0.0.112 只判 `scanTs > 0`
+    //    挡不住它：读到空快照 ⇒ 键集为空 ⇒ 那 5 行必然全「否」，而 `done` 已经烧掉，
+    //    本进程再也不会重跑 —— 这正是 v0.0.111 `hcol=0` 那个错的同一种形态。
+    //    ⇒ 判据必须包含"键集非空"，否则这行诊断在某些启动时序下仍是恒否判据。
+    if (keys.count == 0) return;
     done = YES;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     @try {

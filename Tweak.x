@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.112"
+#define NB_VER_STR @"0.0.113"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2012,6 +2012,41 @@ static BOOL sTsClsLogged = NO;             // timestamp 类型只报一次
 // 🔴 删它的理由见 NotifyCommon.h 顶部那段：扫描侧 `title`/`message` 恒 nil ⇒
 //    同一 App 的所有通知算出来是同一个哈希 ⇒ 那个字段是**死探针**，留着以后必被误用。
 // 🔴 本项目的铁律：恒为定值的字段一律删掉，而且**连声明一起删**（只删日志留声明＝留了个引子）。
+
+// ---------- v0.0.113：空快照保护（不拿"0 条"覆盖"有内容"） ----------
+// 真机血账（2026-11-02 16:35:10）：respring 后 39 秒 App 请求扫描，那一刻 NC 存储还没加载完
+//   ⇒ `all.count == 0` ⇒ **空快照落盘** ⇒ 接下来 65 秒里 App 认为通知中心一条都没有：
+//   橙框全灭，提示条还写「盒子里的消息都不在通知中心了」——而当时实际挂着 289 条。
+// 🔴 根因是**一个值两种含义**：`nc=0` 既可能是"真的没有"，也可能是"还没读出来"。
+//    "看着小就不信"是碰运气；必须让这两种情况在代码里分开。
+// 🔴 修法必须是**带超时的抑制**，不能是永久禁用：
+//    用户手动清空通知中心时 `nc` 归 0 是**合法**的，永久禁用就再也反映不出来。
+//    ⇒ 抑制上限 `NB_EMPTY_SNAP_MAX` 秒，超时照写。
+// 🔴 状态记"**首次**被抑制的时刻"而不是一个布尔：布尔没法判断超时，也就永远自愈不了
+//    （本项目的熔断铁律：标记必须带超时）。
+#define NB_EMPTY_SNAP_MAX 120.0
+static NSTimeInterval sEmptySnapSince = 0;   // 首次因"本次 0 条、上一份非 0"而抑制的时刻；0 = 未在抑制
+
+// 读磁盘上**现有**快照的 `nc=`（没有 / 读不到 / 格式不对都返回 0）。
+// 🔴 用途只有一个：判断"这次 0 条是不是可疑"。返回 0 时保护不触发 —— 也就是
+//    "读不到上一份"会退化成旧行为（照写），这是**故意**的：宁可漏保护，也不要因为读不到
+//    一个诊断数就把快照永远卡住。
+static NSUInteger NBPrevSnapshotNc(void) {
+    @try {
+        NSString *body = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SNAPSHOT
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        if (!body.length) return 0;
+        NSRange nl = [body rangeOfString:@"\n"];
+        NSString *h0 = (nl.location == NSNotFound) ? body : [body substringToIndex:nl.location];
+        if (![h0 hasPrefix:@"#"]) return 0;
+        for (NSString *f in [h0 componentsSeparatedByString:@"|"]) {
+            if ([f hasPrefix:@"nc="]) return (NSUInteger)[[f substringFromIndex:3] integerValue];
+        }
+    } @catch (__unused NSException *e) {
+        return 0;
+    }
+    return 0;
+}
 // v0.0.108：自动清「通知中心里超过 N 小时」的通知（默认关，hours<=0 直接不走）
 // 🔴 这两个必须是 static（跨扫描保留）：节流靠 sLastAutoClearTs，退避靠 sAutoClearFails。
 // 🔴 退避**不许永久禁用**（本项目的熔断铁律：标记必须带超时/版本戳）——
@@ -2434,14 +2469,41 @@ static void NBDumpNCSnapshot(NSString *seq) {
          (csDest ? 1 : 0), seq ?: @""];
         [out appendString:rows];
 
+        // ---- v0.0.113：空快照保护（判据在「写」之前，不在「写完再后悔」）----
+        // 🔴 为什么挡在写之前：快照是**唯一**的存活依据，一旦被 0 条覆盖，
+        //    App 那边没有任何办法分辨"真清空了"还是"没读出来" —— 只能跟着全灭。
+        NSUInteger snapPrevNc = NBPrevSnapshotNc();
+        BOOL snapSkip = NO;
+        if (all.count == 0 && snapPrevNc > 0) {
+            NSTimeInterval tnow = [[NSDate date] timeIntervalSince1970];
+            if (sEmptySnapSince <= 0) sEmptySnapSince = tnow;
+            if (tnow - sEmptySnapSince < NB_EMPTY_SNAP_MAX) snapSkip = YES;
+        } else {
+            // 有内容 ⇒ 解除；上一份本来也是空 ⇒ 这也算解除（用户真清空时不该一直抑制）
+            sEmptySnapSince = 0;
+        }
+
         NSError *err = nil;
-        BOOL ok = [out writeToFile:NOTIFYBOX_NC_SNAPSHOT atomically:YES
-                          encoding:NSUTF8StringEncoding error:&err];
+        BOOL ok = NO;
+        NSString *writeState = nil;
+        if (snapSkip) {
+            writeState = @"跳过(空快照保护)";
+        } else {
+            ok = [out writeToFile:NOTIFYBOX_NC_SNAPSHOT atomically:YES
+                        encoding:NSUTF8StringEncoding error:&err];
+            writeState = ok ? @"成功"
+                            : [NSString stringWithFormat:@"失败(%@)", err.localizedDescription ?: @"?"];
+        }
         NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld｜严格 %ld / 可读uuid %ld（可量=%d）seq=%@ 写入=%@",
               (unsigned long)all.count, (unsigned long)withKeys,
               (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
-              (csDest ? 1 : 0), seq ?: @"",
-              ok ? @"成功" : [NSString stringWithFormat:@"失败(%@)", err.localizedDescription ?: @"?"]);
+              (csDest ? 1 : 0), seq ?: @"", writeState);
+        if (snapSkip) {
+            NBLog(@"=== [扫] 空快照保护：本次 0 条、上一份 %lu 条 ⇒ 判为「还没读出来」，本轮不覆盖快照"
+                  @"（已抑制 %.0f 秒 / 上限 %.0f 秒；超时会照写，用户真清空才反映得出来）",
+                  (unsigned long)snapPrevNc,
+                  [[NSDate date] timeIntervalSince1970] - sEmptySnapSince, NB_EMPTY_SNAP_MAX);
+        }
 
         // ---- v0.0.108：自动清（⭐ 排在「快照写完 + `[扫]` 打完」之后）----
         // 🔴 为什么必须排在这之后（顺序铁律）：
