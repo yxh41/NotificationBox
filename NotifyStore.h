@@ -322,6 +322,16 @@ typedef NS_ENUM(NSInteger, NBAliveState) {
 + (NBAliveState)aliveStateOfSysId:(nullable NSString *)sysId
                        inSnapshot:(NSDictionary *)snap;
 
+// ---------- v0.0.100：全库口径「此刻还在通知中心」的行数 ----------
+// 🔴🔴 为什么必须和列表口径分开：`aliveStillCount`（App 侧）是**当前列表**的数，
+//    受时间窗 / App 筛选 / 未读 / LIMIT 2000 影响。拿它说「盒子里的消息都不在通知中心了」
+//    就是**用局部数做全库断言** —— 记录明明还在，只是被筛选挡住，那句话就是假的。
+// ⇒ 规矩：**全库 0 才准说"都不在"**；全库 >0 而列表 0 必须说"被当前筛选挡住了"。
+// 🔴 匹配规则只认 `aliveStateOfSysId:inSnapshot:` 一份实现（本方法逐行调它）。
+// ⚠️ 快照不可用（`scan <= 0` / 过期）时返回 0 —— 调用方**不许**把它当"都不在"，
+//    那两个分支必须在文案里先被挡掉。
++ (NSInteger)countStillInDBWithSnapshot:(NSDictionary *)snap;
+
 @end
 
 NS_ASSUME_NONNULL_END

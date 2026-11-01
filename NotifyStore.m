@@ -704,6 +704,15 @@ static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nul
 // v0.0.44：把"一行结果 → 字典"抽成一份。
 // 🔴 列表和导出现在共用它 —— 两处各抄一遍列号，改 SELECT 时必然有一处漏改，
 //    而那种错不会报错，只会让某一列悄悄变成空串。
+// 🔴🔴 v0.0.100 血账：`sys_id` 列从 v0.0.52 就进库了，但**列表 SELECT 一直没取它**，
+//    本函数也就一直没映射它。后果不是"少一列空串"，而是
+//    `row[@"sys_id"]` 恒为 `nil` ⇒ `aliveStateOfSysId:` 恒返回 `NBAliveUnknown`
+//    ⇒ `aliveStillCount` **恒为 0**，且**一条报错都没有**（nil 一路传到 `if (!sysId.length) return Unknown;`）。
+//    真机表现：tweak 日志明写「NC 现状 4 条（有键 4）写入=成功」，盒子上却是 0 条。
+//    ⇒ 判据必须把「SELECT 列表 / 这里的列号映射 / 消费端读的键名」三处钉在一起，
+//      静态查"代码里出现过 sys_id"完全挡不住这类（本项目 Z4 那族：绿的原因不等于它要证的事）。
+//    ⚠️ 改这里必须同时改**两个** SELECT（列表 + 导出）：它们共用本函数，
+//      列数/列序不一致会让后面某一列读到 NULL 而静默变空。
 static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"id"]       = @(sqlite3_column_int(st, 0));
@@ -715,6 +724,8 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     d[@"subtitle"] = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 4) ?: ""];
     d[@"ts"]       = @(sqlite3_column_double(st, 5));
     d[@"read"]     = @(sqlite3_column_int(st, 6));
+    // v0.0.100：第 8 列。`sys_id` 是列表页判"还在不在通知中心"的唯一依据（见上面的血账）。
+    d[@"sys_id"]   = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 7) ?: ""];
     [res addObject:d];
 }
 
@@ -731,9 +742,13 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     // 🔴 用 `read=0` 而不是 `read<>1`：后者对 NULL 不成立，老库若有 read 为 NULL 的行
     //    会既不进"未读"也不进"已读"，凭空消失。
     // v0.0.40：WHERE 部分交给 `NBPrepareScope`，本方法只负责"读哪些列、怎么排序"。
+    // 🔴🔴 v0.0.100：**必须带 `sys_id`**。列表页要靠它判"这条还在不在通知中心"
+    //    （`ViewController` 读 `row[@"sys_id"]`）。v0.0.99 漏了这一列 ⇒ 消费端恒拿 nil
+    //    ⇒ 残留标记恒 0，而且不报错。加/删列时**四个** SELECT（列表两条 + 导出两条）
+    //    和 `NBAppendRow` 的列号必须一起改。
     NSString *head = unreadOnly
-        ? @"SELECT id,bundle,title,message,subtitle,ts,read FROM notifications WHERE read=0"
-        : @"SELECT id,bundle,title,message,subtitle,ts,read FROM notifications WHERE 1=1";
+        ? @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id FROM notifications WHERE read=0"
+        : @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id FROM notifications WHERE 1=1";
     NSString *tail = [NSString stringWithFormat:@" ORDER BY ts DESC LIMIT %ld", (long)kNBListLimit];
     sqlite3_stmt *st = NBPrepareScope(db, head, tail, bundle, since, q, searchBundles);
     if (st) {
@@ -760,8 +775,8 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     sqlite3 *db = [self openDB];
     if (!db) return res;
     NSString *head = unreadOnly
-        ? @"SELECT id,bundle,title,message,subtitle,ts,read FROM notifications WHERE read=0"
-        : @"SELECT id,bundle,title,message,subtitle,ts,read FROM notifications WHERE 1=1";
+        ? @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id FROM notifications WHERE read=0"
+        : @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id FROM notifications WHERE 1=1";
     sqlite3_stmt *st = NBPrepareScope(db, head, @" ORDER BY ts DESC", bundle, since, q, searchBundles);
     if (st) {
         while (sqlite3_step(st) == SQLITE_ROW) NBAppendRow(st, res);
@@ -1669,6 +1684,55 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
         if ([keys containsObject:p]) return NBAliveStill;
     }
     return NBAliveGone;
+}
+
+// ---------- v0.0.100：全库口径「此刻还在通知中心」的行数 ----------
+// 🔴🔴 为什么需要第二个数：`aliveStillCount` 是**当前列表**口径（受时间窗 / App 筛选 /
+//    未读筛选 / LIMIT 2000 影响）。拿它去说「盒子里的消息都不在通知中心了」，
+//    就是在用**局部**的数做一个**全库**的断言 —— 用户明明有记录还在通知中心，
+//    只是被时间窗挡在列表外，屏幕上那句就会是假话。
+//    （本项目同一个形态栽过：红点按全库算、列表按时间窗查。）
+// ⇒ 两个数都要有，并且在文案里**分开说**：全库 0 才准说"都不在"，
+//    全库 >0 而列表 0 就必须说"被当前筛选挡住了"。
+// 🔴 匹配规则只有 `aliveStateOfSysId:` 一份实现 —— 这里逐行调它，不另写一套。
+//    （两处各写一遍判等 ⇒ 改一处忘一处，本项目已付过代价。）
+// 🔴 只取 `sys_id` 一列，不整行取：几千行也只是几个指针，且不碰任何界面字段。
++ (NSInteger)countStillInDBWithSnapshot:(NSDictionary *)snap {
+    if (![snap isKindOfClass:[NSDictionary class]]) return 0;
+    // 没有可用快照 ⇒ 一条都判不了，返回 0 但调用方**不许**把它当"都不在"
+    // （`aliveHintText` 里 `aliveScanTs <= 0` / `aliveStale` 两个分支已经先把它挡掉了）。
+    if ([snap[@"scan"] doubleValue] <= 0) return 0;
+    sqlite3 *db = [self openDB];
+    if (!db) return 0;
+    NSInteger still = 0;
+    NSInteger scanned = 0;      // 有多少行**带 ID** 参与了比对（用来区分"键不重合"和"根本没 ID"）
+    const char *sql = "SELECT sys_id FROM notifications "
+                      "WHERE sys_id IS NOT NULL AND sys_id<>'';";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *t = (const char *)sqlite3_column_text(st, 0);
+            if (!t) continue;
+            scanned++;
+            NSString *sid = [NSString stringWithUTF8String:t];
+            if ([self aliveStateOfSysId:sid inSnapshot:snap] == NBAliveStill) still++;
+        }
+        sqlite3_finalize(st);
+    } else {
+        NBStoreLog(@"countStillInDB prepare 失败 err=%s", sqlite3_errmsg(db));
+    }
+    sqlite3_close(db);
+    // 🔴 v0.0.100 自证：这一行是"匹配到底成不成立"的唯一直接证据。
+    //    v0.0.99 那个 bug（列表 SELECT 漏了 sys_id ⇒ 消费端恒 nil ⇒ 恒 0）全程**不报错**，
+    //    只能靠"tweak 日志说 4 条、界面说 0 条"这种跨进程对拍才发现。
+    //    有了这一行，「全库 4 / 界面 0」当场就能定位到列表那一侧。
+    // 🔴 `带ID行` 是**分母**：它等于 0 说明库里根本没有可比对的 ID（等于没数据），
+    //    它很大而残留 0 才是"键对不上"（等于匹配规则有问题）。两个数缺一个就判不了。
+    NBStoreLog(@"全库残留 %ld 条 ｜ 带ID行 %ld ｜ 快照 nc=%@ 键 %lu 个 ｜ 扫描于 %.0f 秒前",
+               (long)still, (long)scanned, snap[@"nc"] ?: @"?",
+               (unsigned long)[(NSSet *)snap[@"keys"] count],
+               [[NSDate date] timeIntervalSince1970] - [snap[@"scan"] doubleValue]);
+    return still;
 }
 
 

@@ -150,8 +150,9 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 @property (nonatomic, assign) NSTimeInterval aliveScanTs;
 // 扫描时的 NC 总条数（0 = 没记到）。只用于诊断，不参与任何显示判断。
 @property (nonatomic, assign) NSInteger aliveNC;
-// 当前列表里「上次清理时仍在」的条数。口径 = **其它筛选都算完之后、只差 aliveOnly 那一步**，
+// 当前列表里「此刻仍在通知中心」的条数。口径 = **其它筛选都算完之后、只差 aliveOnly 那一步**，
 // 和 `foldedCount` 同一个位置（"提示条和眼前这个视图同口径"）。
+// ⚠️ 只是**列表**口径，不是全库 —— 全库那个数是 `aliveAllCount`（v0.0.100）。
 @property (nonatomic, assign) NSInteger aliveStillCount;
 // YES = 只看残留（第七个筛选维度，纯内存派生、不落库）。
 @property (nonatomic, assign) BOOL aliveOnly;
@@ -159,6 +160,14 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // 🔴 为什么不"过期也照打"：这份快照只在**删掉一条记录之后**重写，用户三天前删的那批，
 //    三天后才打开盒子 —— 那时他早已手动清空通知中心了。打上去就是拿旧结论冒充现状。
 @property (nonatomic, assign) BOOL aliveStale;
+// ---------- v0.0.100：全库口径的残留条数 ----------
+// 🔴🔴 `aliveStillCount` 是**当前列表**口径（受时间窗 / App / 未读 / LIMIT 2000 影响）。
+//    拿它去说「盒子里的消息都不在通知中心了」，就是用局部数做**全库**断言 ——
+//    记录明明还在、只是被筛选挡在列表外，那句话就是假的。
+//    规矩：**全库 0 才准说"都不在"**；全库 >0 而列表 0 必须说"被当前筛选挡住了"。
+// 🔴 `-1` = **没算**（列表里已经有残留，不需要这个数）。⛔ 不许拿 0 表示"没算"——
+//    0 和"全库真的没有"是两件事，混起来就是又一次"读不到 ≠ 不存在"。
+@property (nonatomic, assign) NSInteger aliveAllCount;
 @property (nonatomic, strong) UIButton *aliveHint;
 // v0.0.99：本次扫描请求的序号 + 是否还在等结果。
 // 🔴 用 seq 而不是一个 BOOL：BOOL 挡不住"这次的结果到了、其实是上一次请求的"。
@@ -1821,6 +1830,14 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         if (self.aliveOnly && !still) continue;
         [out addObject:row];
     }
+    // ---------- v0.0.100：全库口径只在必要时才算 ----------
+    // 🔴 判据是"列表里一条残留都没有" —— 只有这种时候才需要回答
+    //    「是盒子里真的都没有了，还是被当前筛选挡住了」。
+    //    列表里已经有 ⇒ 不需要这个数，记 `-1`（没算），省掉几千行的扫描。
+    // ⛔ 不许为了省事把它写成 `aliveStillCount`：那是列表口径，冒充全库就是撒谎。
+    self.aliveAllCount = (self.aliveStillCount > 0)
+        ? -1
+        : [NotifyStore countStillInDBWithSnapshot:self.aliveSnap];
     return out;
 }
 
@@ -1832,6 +1849,14 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 🔴 不是弹窗解释，是**真的去扫**。用户点它是想看到结果，不是想读一段说明。
     if (self.aliveScanTs <= 0 || self.aliveStale) {
         if (self.ncScanPending) return;      // 正在扫，别叠请求
+        [self requestNCSnapshot];
+        return;
+    }
+    // ---------- v0.0.100：列表里一条残留都没有 ⇒ 这个点击**不能**是「只看残留」 ----------
+    // 🔴 切过去只会得到一个空列表（"只看仍在通知中心的 0 条"），用户会以为插件坏了。
+    //    这个状态下点击的语义只能是「重新扫一次」。
+    if (self.aliveStillCount <= 0) {
+        if (self.ncScanPending) return;
         [self requestNCSnapshot];
         return;
     }
@@ -1884,7 +1909,17 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // ---------- 0 条 ----------
     // 🔴 文案的分寸：能说的只有"**这次扫描时**"这个时刻的事实。
     //    ⛔ 不许写「通知中心已清空」—— 那是"我没看见"冒充"系统里没有"（本项目最贵的一类断言）。
+    // 🔴🔴 v0.0.100 分叉：`aliveStillCount` 是**当前列表**口径，`aliveAllCount` 才是全库。
+    //    只有全库也是 0 才准说"都不在"；全库有、列表没有 ⇒ **是筛选挡的**，
+    //    这时候说"都不在"就是拿局部数做全库断言（用户会照着这句话去怀疑插件坏了）。
     if (self.aliveStillCount <= 0) {
+        if (self.aliveAllCount > 0) {
+            // ⚠️ 这里**不点名**具体该退哪一步：时间窗 / App / 未读 / 未读筛选可能同时生效，
+            //    点名一个会把用户带进死路（`hiddenHintText` 那段注释的同一条理由）。
+            return [NSString stringWithFormat:
+                    @"还有 %ld 条在通知中心，当前筛选把它们挡住了（扫描于 %@前）",
+                    (long)self.aliveAllCount, [self aliveAgeText]];
+        }
         return [NSString stringWithFormat:@"盒子里的消息都不在通知中心了（扫描于 %@前）",
                                          [self aliveAgeText]];
     }
