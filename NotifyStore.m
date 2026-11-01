@@ -1765,7 +1765,9 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSSet *keys) {
         const char *sql = "SELECT bundle, sys_id, ts FROM notifications "
                           "WHERE sys_id IS NOT NULL AND sys_id<>'' ORDER BY ts DESC LIMIT 5;";
         sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(db, sql, -1, &st) != SQLITE_OK) {
+        // 🔴 第 5 参 `pzTail` **不能省**：`sqlite3_prepare_v2` 是 5 参数，
+        //    少写一个编译期直接 "too few arguments"（v0.0.110 CI 首跑就栽在这）。
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
             NBStoreLog(@"[残] 诊断 prepare 失败 err=%s", sqlite3_errmsg(db));
             return;
         }
