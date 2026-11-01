@@ -1714,6 +1714,103 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     return NBAliveGone;
 }
 
+// ---------- v0.0.110：只读诊断「全库残留」为什么这么低 ----------
+// 真机读数（2026-11-01）：快照 nc=379（其中 24h 内 276 条），库里 2138 条带 ID 行，
+// **只命中 6 条**；上一版 762 条在册时只命中 1 条。两种可能，必须分开：
+//   ① **ID 早换了** —— 系统重投会给新 bulletinID / notificationIdentifier（本项目已知现象），
+//      老记录的 ID 对不上任何现存通知 ⇒ 这是「本来就这样」，不用改；
+//   ② **拆段/格式对不上** —— `sys_id` 是 `bid|nid`，快照 keys 里都是**单把键**
+//      ⇒ 真 bug，后果是列表上「还在通知中心」的标记几乎全灰。
+// 分辨办法（全只读）：把库里**最近 5 条**的 sys_id 原样打出来，逐段标「在不在键集里」，
+// 再把**同一 section** 的 2 个快照键摆到旁边 —— 眼睛一比就知道 ID 到底换没换。
+// 🔴 一个进程只打一次（`static done`）：日志窗口只有 ~50 行，这条一次就够定性。
+// 🔴 ID 截成 8…4 位：保留能比对的形状，又不至于把一行撑爆。
+// 🔴 绝不改匹配逻辑：先让眼睛看清是哪种，再决定动不动手（本项目「量看着小 ≠ 尺子坏了」）。
+static NSString *NBShortId(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) return @"(空)";
+    if (s.length <= 13) return s;
+    return [NSString stringWithFormat:@"%@…%@", [s substringToIndex:8],
+            [s substringFromIndex:s.length - 4]];
+}
+
+static void NBDiagAliveMatchOnce(sqlite3 *db, NSSet *keys) {
+    static BOOL done = NO;
+    if (done || !db) return;
+    done = YES;
+    if (![keys isKindOfClass:[NSSet class]]) return;
+    @try {
+        // ① 重读快照文件，按 section 把键分组
+        //    —— `snap` 里只剩一个扁平 key 集（解析时 section 被丢了），要并排比就得自己再分一次。
+        NSMutableDictionary<NSString *, NSMutableArray *> *secKeys = [NSMutableDictionary dictionary];
+        NSString *body = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SNAPSHOT
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        for (NSString *ln in [body componentsSeparatedByString:@"\n"]) {
+            if (!ln.length || [ln hasPrefix:@"#"]) continue;
+            NSArray *q = [ln componentsSeparatedByString:@"|"];
+            if (q.count < 2) continue;
+            NSString *sec = q[0];
+            NSMutableArray *arr = [secKeys objectForKey:sec];
+            if (!arr) { arr = [NSMutableArray array]; [secKeys setObject:arr forKey:sec]; }
+            for (NSUInteger i = 1; i < q.count && arr.count < 6; i++) {
+                NSString *k = q[i];
+                if (!k.length || [k hasPrefix:@"cs="]) continue;
+                [arr addObject:k];
+            }
+        }
+        NBStoreLog(@"[残] 诊断：快照分 %lu 段 / 键 %lu 个 ⇒ 下面 5 行是库里最近的（ts 倒序），"
+                   @"每段后面的 (在/否) = 「这个 ID 在不在快照键集里」",
+                   (unsigned long)secKeys.count, (unsigned long)keys.count);
+
+        // ② 库里最近 5 条（带 ID 的）
+        const char *sql = "SELECT bundle, sys_id, ts FROM notifications "
+                          "WHERE sys_id IS NOT NULL AND sys_id<>'' ORDER BY ts DESC LIMIT 5;";
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, sql, -1, &st) != SQLITE_OK) {
+            NBStoreLog(@"[残] 诊断 prepare 失败 err=%s", sqlite3_errmsg(db));
+            return;
+        }
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        int idx = 0;
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            idx++;
+            const char *cb = (const char *)sqlite3_column_text(st, 0);
+            const char *cs = (const char *)sqlite3_column_text(st, 1);
+            double ts = sqlite3_column_double(st, 2);
+            NSString *bundle = cb ? [NSString stringWithUTF8String:cb] : nil;
+            NSString *sysId  = cs ? [NSString stringWithUTF8String:cs] : nil;
+
+            NSMutableArray *parts = [NSMutableArray array];
+            NSInteger hit = 0;
+            for (NSString *p in [sysId componentsSeparatedByString:NB_SYSID_SEP]) {
+                if (!p.length) continue;
+                BOOL in = [keys containsObject:p];
+                if (in) hit++;
+                [parts addObject:[NSString stringWithFormat:@"%@(%@)", NBShortId(p), in ? @"在" : @"否"]];
+            }
+            NSString *age = @"?时";
+            if (ts > 0) {
+                double d = now - ts;
+                if (d < 0) d = 0;
+                age = (d < 3600) ? [NSString stringWithFormat:@"%.0f分前", d / 60.0]
+                                 : [NSString stringWithFormat:@"%.1f时前", d / 3600.0];
+            }
+            NSArray *sample = bundle ? [secKeys objectForKey:bundle] : nil;
+            NSMutableArray *sv = [NSMutableArray array];
+            for (NSUInteger i = 0; sample && i < sample.count && sv.count < 2; i++)
+                [sv addObject:NBShortId(sample[i])];
+
+            NBStoreLog(@"[残] #%d %@ %@ ｜库(段=%lu 命中=%ld): %@ ｜快照同段键: %@",
+                       idx, bundle.length ? bundle : @"(空bundle)", age,
+                       (unsigned long)parts.count, (long)hit,
+                       parts.count ? [parts componentsJoinedByString:@" "] : @"（sys_id 拆不出段）",
+                       sv.count ? [sv componentsJoinedByString:@" "] : @"（该段快照里没有条目）");
+        }
+        sqlite3_finalize(st);
+    } @catch (NSException *e) {
+        NBStoreLog(@"[残] 诊断抛: %@", e.reason);
+    }
+}
+
 // ---------- v0.0.100：全库口径「此刻还在通知中心」的行数 ----------
 // 🔴🔴 为什么需要第二个数：`aliveStillCount` 是**当前列表**口径（受时间窗 / App 筛选 /
 //    未读筛选 / LIMIT 2000 影响）。拿它去说「盒子里的消息都不在通知中心了」，
@@ -1749,6 +1846,9 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     } else {
         NBStoreLog(@"countStillInDB prepare 失败 err=%s", sqlite3_errmsg(db));
     }
+    // v0.0.110：顺手做一次「为什么命中这么低」的只读诊断（一个进程只打一次，内部幂等）。
+    // 🔴 必须放在 close 之前：它要用同一个 db 句柄。
+    NBDiagAliveMatchOnce(db, (NSSet *)snap[@"keys"]);
     sqlite3_close(db);
     // 🔴 v0.0.100 自证：这一行是"匹配到底成不成立"的唯一直接证据。
     //    v0.0.99 那个 bug（列表 SELECT 漏了 sys_id ⇒ 消费端恒 nil ⇒ 恒 0）全程**不报错**，
