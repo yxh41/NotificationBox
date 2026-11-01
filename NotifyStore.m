@@ -1907,7 +1907,10 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
         NSString *s = (NSString *)k;
         if (!s.length) continue;
         [lc addObject:[s lowercaseString]];
-        [p8 addObject:[[(s.length >= 8) ? [s substringToIndex:8] : s] lowercaseString]];
+        // 🔴 三元不许直接当消息接收者（`[[cond ? a : b] xxx]` 解析不了，
+        //    clang 报 `error: expected identifier`）⇒ 先落到变量再发消息。
+        NSString *h = (s.length >= 8) ? [s substringToIndex:8] : s;
+        [p8 addObject:[h lowercaseString]];
     }
     if (lcOut) *lcOut = lc;
     if (p8Out) *p8Out = p8;
