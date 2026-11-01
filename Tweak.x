@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.96"
+#define NB_VER_STR @"0.0.97"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2606,7 +2606,7 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     //    而且现在手里是 `[找]` 出来的**真 request**（`req.bulletin` 命中），
                     //    不是 v0.0.62 那种工厂造的空壳 —— 前提条件也换了。
                     // ===== v0.0.95：归因快照的起点（为什么需要，见 NBDestKnowsRaw 上面的长注释）=====
-                    // 🔴🔴 这三个量必须声明在 `if (still && req7)` **外面**：
+                    // 🔴🔴 这三个量必须声明在 `if (req7)` **外面**：
                     //    ⑦s/⑦t 在那个块里，而 ⑦u 的条件是 `if (still && gNCSource && want7.length)`
                     //    —— 它是**并列的另一个块**（本版第一遍就写进了 ⑦s 块里，CI 直接报
                     //    5 处 undeclared identifier）。顺序/作用域这类事只有代码结构守得住。
@@ -2616,7 +2616,34 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                     const int nbBb0 = gBBToNCSeen;
                     const int nbWd0 = NBSysWithdrawCount();
                     const int nbSrc0 = NBMapCountOf(gNCSource);
-                    if (still && req7) {
+                    // ================= v0.0.97：门槛从 `still` 解耦成 `req7` =================
+                    // 🔴🔴🔴 本版存在的**全部理由**（`nc_diag(3).txt`，62 次米家删除全量）：
+                    //   v0.0.96 把米家**全部** 62 条都删了，⓪ 执行 48 次全部成功
+                    //   （`⓪ 之后 BB live` 61→14 逐条递减、`✅ ⓪ 清掉本条` 48 次），
+                    //   `[寿]` 台账「仍在」从 22 一路降到 **0**，NC 段 62→14 ——
+                    //   **账本层面一条不剩，可用户眼睛看到的是「通知中心都还在」。**
+                    //   🔴 而四把界面刀**一次都没跑**：⑦s=0 ⑦t=0 ⑦u=0 ⑦r=0，
+                    //      305 次读回**全部**是「判不了」，一次「是」都没有。
+                    // ⇒ 根因不是刀坏了，是**门槛把刀锁死了**：三把刀的条件都是
+                    //   `if (still && …)`，而 `still` = 「在 `uuidsToRequests` 里还能精确查到」。
+                    //   两个独立事实叠起来就必然锁死：
+                    //     ① ⓪ 撤完 BB，系统这次是**同秒**把 NC 映射也清了
+                    //        （20 次 `[BB→NC]` 传播延迟**全部 0 秒**；v0.0.95 那轮是 13~99 秒）；
+                    //     ② `uuidsToRequests` 只是 **NC source 的账本**，它清了 ≠ CS 界面清了。
+                    //   ⇒ 「账本里还有」这个条件，恰恰是「界面还没被系统自己撤掉」的同义词。
+                    //     系统一快，条件永远不成立 ⇒ 界面残留永远没人补刀。
+                    // 🔴🔴 这正是 §1.12 那条「别把必须拿到手的挂在可能不发生的事件上」的同构：
+                    //   **别把界面刀挂在「系统还没来得及搬账本」上**。上一版能跑，是运气不是修好了。
+                    // ⇒ 门槛改成 `req7`（⓪ 之前 `[找]` 精确匹配到的那条**真 request**，
+                    //   对象一直攥在手里）。用它打不会撤错条 —— 它本身就是严格匹配的结果，
+                    //   不是 loose 兜底（那个 v0.0.75 已删）。⑦u 仍保留 `still`：
+                    //   它要摘 `uuidsToRequests` 里的键，表里没键就摘不了，这个依赖是物理的。
+                    if (req7) {
+                        if (!still) {
+                            // 显式打这一行：否则日志里看不出「明明账本已清，为什么还打刀」。
+                            NBDiagStep(@"  ⑦ 账本已清但仍打界面刀（v0.0.97：界面不跟 uuidsToRequests 走 —— "
+                                       @"⓪ 之后系统同秒清了映射，界面侧可能还残留）\n");
+                        }
                         // ---- ⑦s：NC 侧派发器。系统自己撤一条时走的就是这一步 ----
                         // 依据：09:56:47 那批 `[OBS] dispatcher withdrawNotificationWithRequest:`
                         //       紧跟着 `[OBS-cs] withdrawNotificationRequest:` **成对**出现。
@@ -2660,9 +2687,13 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                             NBDiagStep(@"  ⑦s 跳过（没有 dispatcher，或方法不在表里）\n");
                         }
                         // ---- ⑦t：CS 侧（界面层）那一刀 —— 系统那条链的最后一步 ----
-                        // 🔴 只在 ⑦s 没撤掉时才打：⑦s 生效时它内部本来就会走到 CS，
-                        //    重复打没有收益，只会让「谁起的作用」变糊。
-                        if (still && gCSDestination
+                        // 🔴 v0.0.97：**去掉 `still` 条件**。原来写的是「只在 ⑦s 没撤掉时才打」，
+                        //    那个假设建立在「⑦s 撤了账本 = 界面也撤了」上 —— 本版真机已经证伪：
+                        //    48 次 ⓪ 成功、NC 段 62→14、`[寿]` 仍在归零，界面却纹丝不动。
+                        //    ⇒ ⑦s 撤的是 NC 侧，界面归 CS（`CSNotificationDispatcher`）管，
+                        //      两者不是一份数据。⑦t 是**唯一**直接对 CS 下的刀，
+                        //      它的执行与否不能由 NC 账本的状态来代理。
+                        if (gCSDestination
                             && [gCSDestination respondsToSelector:@selector(withdrawNotificationRequest:)]) {
                             if (gCsWsSuppressed) {
                                 NBDiagStep(@"  ⑦t 跳过（%@ 压制；删它并 respring 可恢复）\n", kNBGuardOff);
@@ -2919,13 +2950,19 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                         //    ⓪ 撤回 BB 之后，系统自己把整条链跑完了
                         //    （`_sendRemoveBulletins` → `[BB→NC] observer:removeBulletin:` →
                         //      `[OBS] dispatcher withdrawNotificationWithRequest:` →
-                        //      `[OBS-cs] withdrawNotificationRequest:`），
-                        //    ⑦ 基线 复量就是「本条还在=否」⇒ 界面侧**已经干净了**。
+                        //      `[OBS-cs] withdrawNotificationRequest:`）。
                         //    ⇒ 这时候再打 ⑦r 是多余的，而且 ⑦r 是唯一一把有连带风险的刀。
                         //    🔴 必须显式打这一行：否则日志里 ⑦r 一次都不出现，
                         //       下一轮会读成"⑦r 没跑"，而事实是"根本不需要跑"（假绿的 ⑧ 型反过来）。
-                        NBDiagStep(@"  ⑦r 不需要（此刻本条已不在 NC —— 要么 ⓪ 之后系统自己撤了，"
-                                   @"要么 ⑦s/⑦t 刚刚撤掉了；看上面的逐刀读回是哪一种）\n");
+                        // 🔴🔴🔴 v0.0.97：原文这里写的是「⑦ 基线 复量就是「本条还在=否」⇒
+                        //    **界面侧已经干净了**」—— 后半句是**没量过的断言**，本版真机直接证伪：
+                        //    `nc_diag(3).txt` 62 次米家删除里 21 次走到这一行，
+                        //    NC 段 62→14、`[寿]` 台账「仍在」22→**0**、48 次 ⓪ 全部「✅ 清掉本条」，
+                        //    而用户眼睛看到的是「通知中心都还在」。
+                        //    ⇒ 「本条不在 NC」只能推出「**账本**干净」，推不出「界面干净」。
+                        //      断言撤掉，只陈述当场量到的事实。
+                        NBDiagStep(@"  ⑦r 不需要（本条已不在 NC **账本**；⚠️ 这只说明账本干净，"
+                                   @"**不能**推出界面干净 —— v0.0.97 真机已证伪该推断）\n");
                     }
 
                     // ---------- v0.0.78：[寿] 旧删台账（本轮的核心取证）----------
@@ -3020,6 +3057,21 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                                    NBRingDump([[NSDate date] timeIntervalSince1970], 300, @"reload");
                     } @catch (__unused NSException *e) { }
                 });
+            }
+            // ================= v0.0.97：定位不到的那一类，不许再静默 =================
+            // 🔴 真机读数（`nc_diag(3).txt`）：62 次米家删除里 **14 次**走的是这一条 ——
+            //    `⓪ 跳过（BB 里本来就没有对象）` 且 `[找]` 也没拿到 request，
+            //    于是上面那个 gate 直接不成立 ⇒ **⑦ 整段（含四把界面刀）连进都没进**。
+            //    这 14 次里有 13 次连 `⑦ 基线` 都没有（日志里那几块是纯空白）——
+            //    而用户看到的是「通知中心都还在」。
+            // ⇒ 以前这种情况**一个字的日志都不留**，读日志的人只会以为"刀没生效"，
+            //   查不到"根本没走到"。现在显式打出来，并把"没有可用的刀"这个事实写在明面上。
+            // 🔴 下一版要解的正是这一类：手里只有 sysId（UUID），BB 没有、NC 账本按各种键
+            //    都匹配不上，唯一可能有效的是按 **section + 时间窗**批量清（⑦r 那条路），
+            //    但那把刀有连带风险（会带走同段别人的通知），必须先量清楚再开。
+            else if (!bbIn && !gFoundNCReq) {
+                NBDiagStep(@"  [找] 定位不到 ⇒ ⑦ 整段跳过（BB 没有对象，NC 账本也匹配不上）"
+                           @"⚠️ 本条**没有可用的刀**：界面若仍残留，本版无能为力\n");
             }
             };   // ← bbCleanup 结束，**这里只是定义，没有被调用**
 
