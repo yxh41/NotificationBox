@@ -136,6 +136,30 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 @property (nonatomic, strong) UIButton *starBtn;
 // v0.0.49：关键词规则指纹（settings.plist 派生，不进数据库）—— 见 refreshIfChanged。
 @property (nonatomic, copy)   NSArray<NSDictionary *> *lastRules;
+
+// ================= v0.0.98：通知中心残留标记 =================
+// 🔴🔴 这个功能回答的是用户的原话：「还在通知中心显示的信息卡片，我们能打上标签吗」。
+//    侦察结论：**数据侧本来就够用** —— tweak 的 `[寿]` 台账早就算出了三态并落盘，
+//    缺的只是 App 从来没读过（全仓 0 处引用）。所以这一版**不碰系统通知中心的视图层**
+//    （那是最贵、最容易连带的一条路），只在盒子自己的列表上做标记。
+// 🔴 一次刷新只读**一份**快照（`aliveSnap`）：`aliveStateOfSysId:inSnapshot:` 要求调用方
+//    把快照传进去，就是为了不让"一行读一次文件"变成"扫描时刻和状态不是同一次"。
+@property (nonatomic, strong) NSDictionary *aliveSnap;
+// 上次扫描时刻（0 = 没有可用快照）。提示条要把它报出来 ——
+// 🔴 标记说的是**过去某个时刻**的事，不报时刻就是让用户把它当现状。
+@property (nonatomic, assign) NSTimeInterval aliveScanTs;
+// 扫描时的 NC 总条数（0 = 没记到）。只用于诊断，不参与任何显示判断。
+@property (nonatomic, assign) NSInteger aliveNC;
+// 当前列表里「上次清理时仍在」的条数。口径 = **其它筛选都算完之后、只差 aliveOnly 那一步**，
+// 和 `foldedCount` 同一个位置（"提示条和眼前这个视图同口径"）。
+@property (nonatomic, assign) NSInteger aliveStillCount;
+// YES = 只看残留（第七个筛选维度，纯内存派生、不落库）。
+@property (nonatomic, assign) BOOL aliveOnly;
+// YES = 快照存在但已过期（超过 `NB_ALIVE_FRESH_SEC`）⇒ 一条橙条都不打，只报"上次扫描是多久前"。
+// 🔴 为什么不"过期也照打"：这份快照只在**删掉一条记录之后**重写，用户三天前删的那批，
+//    三天后才打开盒子 —— 那时他早已手动清空通知中心了。打上去就是拿旧结论冒充现状。
+@property (nonatomic, assign) BOOL aliveStale;
+@property (nonatomic, strong) UIButton *aliveHint;
 // v0.0.42：bundle -> App 显示名。**同时给两件事用**：
 //   ① 列表每一行显示「这条是哪个 App 的」—— 以前只有图标，图标加载失败就只剩一个字母；
 //   ② 搜索时把「微信」「招商银行」这种词匹配成 bundle 列表，再传给 NotifyStore。
@@ -207,6 +231,16 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    前者决定哪些行进列表（它自己也在算 foldedCount），后者要按**最终可见的 items**数未读。
 //    顺序反了 ⇒ 未读书签按折叠前的行数算，收起一组之后数字还在喊 —— 本项目栽过同构的坑。
 - (NSArray<NSDictionary *> *)applyGroupCollapse:(NSArray<NSDictionary *> *)rows;
+// v0.0.98：通知中心残留标记五件套。
+// 🔴 声明顺序 = 调用顺序（`loadAliveSnapshot` → `applyAliveFilter` → `updateAliveHint`），
+//    项目开 -Werror，靠"定义在前面"解析选择器太脆（v0.0.48 setStarred 那次就是这么炸的）。
+- (void)loadAliveSnapshot;
+- (NBAliveState)aliveStateForRow:(NSDictionary *)row;
+- (NSArray<NSDictionary *> *)applyAliveFilter:(NSArray<NSDictionary *> *)rows;
+- (void)onAliveHintTap;
+- (void)updateAliveHint;
+- (NSString *)aliveHintText;
+- (NSString *)aliveAgeText;
 // v0.0.42：重建 bundle -> App 显示名 映射（`reloadIconBar` 尾部调一次）
 - (void)rebuildAppNames;
 // v0.0.42：单条查 App 名（查不到退回 bundle 末段，不要显示成空白）
@@ -937,6 +971,22 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
               forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.foldedHint];
 
+    // v0.0.98：通知中心残留提示（`aliveStillCount > 0` 才显示，见 viewDidLayoutSubviews）。
+    // 🔴 创建方式、字号、颜色、对齐全部照抄 `foldedHint` / `hiddenHint` ——
+    //    同屏第四条提示，**不引第二套写法**（本项目"同一个东西只留一份实现"的纪律）。
+    // 🔴 这一条**可点**，点一下切「只看残留」：因为用户的原话是"能打上标签吗" ——
+    //    标签只是告诉他有哪些，真正想做的事是"把这些清掉"，那就得能一键只看它们。
+    self.aliveHint = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.aliveHint.titleLabel.font = [UIFont systemFontOfSize:12];
+    self.aliveHint.titleLabel.adjustsFontSizeToFitWidth = YES;
+    self.aliveHint.titleLabel.minimumScaleFactor = 0.85;
+    self.aliveHint.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    [self.aliveHint setTitleColor:[UIColor systemOrangeColor] forState:UIControlStateNormal];
+    self.aliveHint.hidden = YES;
+    [self.aliveHint addTarget:self action:@selector(onAliveHintTap)
+             forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.aliveHint];
+
     // 顶部 App 图标栏（横向滚动）
     self.iconBar = [[UIScrollView alloc] init];
     self.iconBar.showsHorizontalScrollIndicator = NO;
@@ -980,6 +1030,16 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // =====================================================================
     BOOL showHint = (self.hiddenUnread > 0 && self.items.count > 0);
     BOOL showFoldedHint = (self.foldedCount > 0);
+    // v0.0.98：残留提示的可见性判据。
+    // 🔴 和 `foldedHint` 一样**故意不串 `items.count`**：它可能正是列表空掉的原因
+    //    （「只看残留」+ 当前筛选里一条都没有），那时更要显示，否则用户只看到"暂无记录"。
+    // 🔴 但过期快照也要有一条出口：`aliveStale` 时虽然一条橙条都不打，仍显示提示条
+    //    告诉他"上次扫描是多久前、再删一条就会刷新" —— 否则这个功能看起来像坏了。
+    // 🔴🔴 `aliveStale` 必须写进这个判据里：过期时全部行都是 Unknown ⇒ `aliveStillCount == 0`，
+    //    若只判 `stillCount > 0 || aliveOnly`，那句"已过期"文案就**永远不会出现**
+    //    （分支写了、条件到不了 = 交了等于没交）。
+    BOOL showAliveHint = (self.aliveScanTs > 0 &&
+                          (self.aliveStillCount > 0 || self.aliveOnly || self.aliveStale));
 
     CGFloat cardX = NBInset;
     CGFloat cardW = w - NBInset * 2;
@@ -1036,6 +1096,18 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         cy += kNBHintH;
     } else {
         self.foldedHint.frame = CGRectZero;
+    }
+
+    // v0.0.98：通知中心残留提示。排在上两条之后，节奏与它们一致（前一条在场时 2pt、不在时 8pt）。
+    // 🔴 不显示时必须把 frame 也清零（只 hidden 不清 frame ⇒ 卡片底部凭空多一截空白，
+    //    这个坑 v0.0.40 的 hiddenHint 已经踩过一次，注释就在上面几行）。
+    self.aliveHint.hidden = !showAliveHint;
+    if (showAliveHint) {
+        cy += (showHint || showFoldedHint) ? 2 : 8;
+        self.aliveHint.frame = CGRectMake(inX, cy, inW, kNBHintH);
+        cy += kNBHintH;
+    } else {
+        self.aliveHint.frame = CGRectZero;
     }
 
     cy += 10;   // 卡片下内边距
@@ -1251,6 +1323,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 算好的 bundle 列表作为参数传下去。`searchBundles` 只在 `search` 非空时才有意义。
     NSArray<NSString *> *searchBundles = [self bundlesMatchingSearch:self.searchText];
 
+    // v0.0.98：通知中心残留快照。**一次刷新只读一份**（理由见属性注释）。
+    // 🔴 位置必须在 `applyAliveFilter:` 之前，也在 `cellForRow` 之前 —— 而这两处都在后面，
+    //    所以放在这里（查询之前）就够了，顺便让"读快照"和"查库"两件事互不依赖。
+    [self loadAliveSnapshot];
+
     NSArray<NSDictionary *> *queried = [NotifyStore queryWithBundle:self.filterBundle
                                         since:[self sinceFromSeg]
                                        search:self.searchText
@@ -1262,6 +1339,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 🔴 位置不能动：必须在 `applyKeywordRulesToRows:` 之后（它决定哪些行进列表），
     //    在 `rebuildBundleUnread` 之前（未读书签要按**最终可见的 items**数）。
     self.items = [self applyGroupCollapse:self.items];
+    // v0.0.98：残留筛选。**必须排在归并之后**：
+    //    归并保留下来的那条是"最新那条"，而 `aliveStillCount` 是给提示条报数的 ——
+    //    如果放在归并之前，一个 ×5 的组会被数 5 次，提示条说"12 条仍在"而列表里只有 3 张卡，
+    //    用户按这个数去找必然找不到（本项目"分母自己会变"的同款）。
+    self.items = [self applyAliveFilter:self.items];
     // v0.0.72：未读书签的计数必须紧跟 `self.items` 重建（见方法注释里的顺序要求）。
     [self rebuildBundleUnread];
     [self.table reloadData];
@@ -1292,6 +1374,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self updateHiddenUnread];
     // v0.0.48：折叠提示条紧随其后刷新（它出现/消失同样改变起始 y，靠下面那句 setNeedsLayout）。
     [self updateFoldedHint];
+    // v0.0.98：残留提示条（同上，出现/消失也改起始 y）。
+    [self updateAliveHint];
     [self.view setNeedsLayout];
 }
 
@@ -1440,6 +1524,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     if (self.starOnly) {
         self.starOnly = NO;
         self.starBtn.selected = NO;
+        changed = YES;
+    }
+    // v0.0.98：残留筛选也清 —— 和 starOnly 同一类理由（它同样**挡未读**：
+    // 一条已读未读都可能有橙条，但"没有橙条"的行一律被它挡掉）。
+    // 🔴 不过它挡的**不是**未读口径而是"有没有残留"，所以严格说它不影响提示条承诺的那个数；
+    //    这里仍然清掉，是为了守住另一条更硬的规矩：**「清干净筛选」必须是真的清干净**。
+    //    留一个维度不动，"三个筛选都清了还看不到"这种更坏的情况就会出现。
+    if (self.aliveOnly) {
+        self.aliveOnly = NO;
         changed = YES;
     }
     if (self.filterBundle.length) {
@@ -1618,6 +1711,128 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     }
     return [NSString stringWithFormat:@"%ld 条被关键词规则收起", (long)self.foldedCount];
 }
+// ================= v0.0.98：通知中心残留标记 =================
+
+// 读一次快照（`loadData` 里调，全刷新唯一入口）。
+// 🔴 三件事一起定：`aliveSnap`（判每行状态用）、`aliveScanTs`（报时刻用）、`aliveStale`（保鲜期）。
+//    分成三个方法各读一次文件，就会拿到"三个不同扫描时刻"的数（本项目"分母自己会变"同款）。
+- (void)loadAliveSnapshot {
+    NSDictionary *snap = [NotifyStore aliveSnapshot];
+    // 🔴 防御一行：`aliveSnapshot` 自己的每条路径都返回字典，但这里是**跨文件契约**，
+    //    对面以后改成一个 nil 返回值也不会崩 —— 崩在凌晨三点的推送页面上是最贵的。
+    if (![snap isKindOfClass:[NSDictionary class]]) snap = @{};
+    self.aliveSnap = snap;
+    self.aliveScanTs = [snap[@"scan"] doubleValue];
+    self.aliveNC = [snap[@"nc"] integerValue];
+    // 🔴 保鲜期判据用 `timeIntervalSince1970` 直接比，不建 NSDateFormatter：
+    //    快照里的 scan 就是 epoch，转换一道只会多一个"时区搞错"的机会。
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    self.aliveStale = (self.aliveScanTs > 0 &&
+                       (now - self.aliveScanTs) > NB_ALIVE_FRESH_SEC);
+}
+
+// 某一行的残留状态。**过期快照一律 Unknown**（理由见 `aliveStale` 属性注释）。
+- (NBAliveState)aliveStateForRow:(NSDictionary *)row {
+    if (self.aliveStale) return NBAliveUnknown;
+    return [NotifyStore aliveStateOfSysId:row[@"sys_id"] inSnapshot:self.aliveSnap];
+}
+
+// 残留筛选 + `aliveStillCount` 的计算（两个量在同一个循环里出 ⇒ 天然同口径）。
+// 🔴 为什么 `aliveStillCount` 要在这里算、而不是在 `aliveSnapshot` 里数一遍：
+//    快照里的 Still 是**全库口径**（所有删过的记录），而提示条说的是"**当前列表里**还有几条"。
+//    拿全库数来讲当前列表，就会出现"提示条说 12 条、列表里只有 1 条"这种自相矛盾
+//    （红点按全库算、列表按时间窗查那次的同一个错）。
+- (NSArray<NSDictionary *> *)applyAliveFilter:(NSArray<NSDictionary *> *)rows {
+    self.aliveStillCount = 0;
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:rows.count];
+    for (NSDictionary *row in rows) {
+        BOOL still = ([self aliveStateForRow:row] == NBAliveStill);
+        if (still) self.aliveStillCount += 1;
+        // 🔴 顺序：**先计数再筛掉**。反过来的话「只看残留」模式下
+        //    `aliveStillCount` 恒等于 items.count，提示条就再也说不出"别的被筛掉了多少"。
+        //    （本项目在计数型判据上栽过同一形态：按条计数必须在分类判断之前累加。）
+        if (self.aliveOnly && !still) continue;
+        [out addObject:row];
+    }
+    return out;
+}
+
+// 点残留提示条 ⇒ 切「只看残留」，然后整表重查。
+// 🔴 必须走 `loadData` 而不是只筛内存：切完 `aliveStillCount` 的口径会变
+//    （列表本身变了），只改内存数组就是"只改账本的读数"。
+- (void)onAliveHintTap {
+    // 快照过期时点击没有意义（列表里一条橙条都没有，"只看残留"会是空列表）。
+    // 这时改成把当前这份快照的用途讲清楚，不让用户白点。
+    if (self.aliveStale) {
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"上次扫描已过期"
+                             message:[NSString stringWithFormat:
+                @"最近一次扫描通知中心是 %@ 前（当时通知中心共 %ld 条）。\n\n"
+                @"这份快照只在**删除记录**之后重写 —— "
+                @"去通知列表删掉任意一条（或再删一条你要清理的），回来就有了。\n\n"
+                @"过期快照不会给任何行打标记：那是拿旧结论冒充现状。",
+                [self aliveAgeText], (long)self.aliveNC]
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel
+                                           handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    self.aliveOnly = !self.aliveOnly;
+    [self loadData];
+}
+
+// 「多久以前」的人话。`aliveScanTs <= 0` 时返回 @"—"（调用方不该在 0 时问）。
+- (NSString *)aliveAgeText {
+    if (self.aliveScanTs <= 0) return @"—";
+    double d = [[NSDate date] timeIntervalSince1970] - self.aliveScanTs;
+    if (d < 0) d = 0;
+    if (d < 90) return [NSString stringWithFormat:@"%.0f 秒", d];
+    if (d < 5400) return [NSString stringWithFormat:@"%.0f 分钟", d / 60.0];
+    if (d < 172800) return [NSString stringWithFormat:@"%.0f 小时", d / 3600.0];
+    return [NSString stringWithFormat:@"%.0f 天", d / 86400.0];
+}
+
+// 刷新残留提示条（`loadData` 里调一次）。
+- (void)updateAliveHint {
+    // 快照不存在（从没删过 / 装的是旧版 tweak）⇒ 一个字都不说。
+    // 🔴 这时候不是"没有残留"，而是"没量过" —— 无话可说是对的，说"0 条"是编数据。
+    if (self.aliveScanTs <= 0) {
+        [self.aliveHint setTitle:nil forState:UIControlStateNormal];
+        return;
+    }
+    NSString *t = [self aliveHintText];
+    [self.aliveHint setTitle:t.length ? [t stringByAppendingString:@" ›"] : nil
+                    forState:UIControlStateNormal];
+}
+
+// 残留提示文案的唯一来源（`›` 由 `updateAliveHint` 加，和 foldedHint 同规矩）。
+- (NSString *)aliveHintText {
+    // ---------- 过期 ----------
+    if (self.aliveStale) {
+        return [NSString stringWithFormat:@"上次扫描通知中心是 %@前（已过期，标记已关）",
+                                         [self aliveAgeText]];
+    }
+    // ---------- 只看残留（已开启） ----------
+    if (self.aliveOnly) {
+        return [NSString stringWithFormat:@"只看残留：%ld 条（点此看全部）",
+                                         (long)self.aliveStillCount];
+    }
+    // ---------- 0 条 ----------
+    // 🔴 文案的分寸：能说的只有"上次清理时"这个时刻的事实。
+    //    ⛔ 不许写「通知中心还在」或「通知中心已清空」—— 前者是没量过的断言（v0.0.97 已证伪），
+    //    后者更坏：那是"我没看见残留"却说成"系统里没有了"。
+    if (self.aliveStillCount <= 0) {
+        return [NSString stringWithFormat:@"上次清理（%@前）后通知中心已无残留",
+                                         [self aliveAgeText]];
+    }
+    // ---------- 有残留 ----------
+    // 文案三要素一次说全：**橙条含义 + 条数 + 时刻**。
+    // 缺了「橙条」那句，用户看不懂列表左边那条颜色是什么（这个标记没有文字，全靠这句解释）。
+    return [NSString stringWithFormat:@"橙色竖条 = 上次清理（%@前）时仍在通知中心 · %ld 条",
+                                     [self aliveAgeText], (long)self.aliveStillCount];
+}
+
 // 🔴 文案必须说清「被什么挡住了」，否则用户不知道往哪一步退。
 //    **但只在能确定唯一出口时才点名**：三种筛选叠加时点名其中一个（比如
 //    "点「全部」图标看全"）会把人带进死路 —— 他照做了还是看不到，就会认定
@@ -1740,6 +1955,20 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                               @"添加一条带「★ 标星」动作的规则）"];
         }
     }
+    // v0.0.98：「只看残留」把列表筛空时必须解释 —— 否则用户看到"暂无记录"
+    //    会以为记录丢了（它们其实都在，只是没有橙条）。
+    // 🔴 这一句不能拿"0 条残留"当结论说 —— 快照过期时 `aliveStale` 会让**所有**行都是
+    //    Unknown，那时"只看残留"必然是空的，而真相是"没量过"，不是"没有残留"。
+    if (self.aliveOnly) {
+        if (self.aliveStale) {
+            [t appendFormat:@"\n\n（上次扫描已经是 %@前，本次标记全部关闭 ⇒ "
+                              @"「只看残留」看不到任何行。去通知列表删掉任意一条就会重新扫描）",
+                              [self aliveAgeText]];
+        } else {
+            [t appendString:@"\n\n（「只看残留」只显示上次清理时仍在通知中心的那几条，"
+                              @"当前筛选范围里没有）"];
+        }
+    }
     // v0.0.48：列表被关键词规则折叠空时，**必须说清"其实有 N 条、被规则收着"** ——
     //    否则屏幕只剩"暂无记录"，用户会以为记录丢了（而它们是被自己设的规则收起的）。
     //    上面那条可点的 foldedHint 提示条是同一个事实的"可操作版"，这里补一句解释，不矛盾。
@@ -1785,6 +2014,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // v0.0.49：★ 维度。写在搜索之前 —— 它比搜索"更靠近列表语义"（筛的是行本身）。
     if (self.starOnly) {
         [a addObject:@"★ 只看标星"];
+    }
+    // v0.0.98：残留维度。排在搜索之前、★ 之后 —— 和 ★ 一样，它筛的是**行本身**。
+    if (self.aliveOnly) {
+        [a addObject:@"只看通知中心残留"];
     }
     if (self.searchText.length) {
         [a addObject:[NSString stringWithFormat:@"搜索「%@」", self.searchText]];
@@ -1919,6 +2152,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [c setStarred:[d[@"nbStar"] boolValue]];
     // v0.0.95：这一组压了几条（<2 ⇒ 徽章不占位，见 NotifyCell.h）。
     [c setGroupCount:[d[@"nbGroupCount"] integerValue]];
+    // v0.0.98：通知中心残留橙条。**必须无条件调**（传 0 也要调）——
+    // 它是 cell 的"默认可见装饰"里唯一一个由外部决定显隐的，
+    // 漏调一次就是"上一条的橙条留在这一行上"（复用池串味的经典形态）。
+    [c setAliveTag:[self aliveStateForRow:d]];
 
     // ---------- v0.0.92：左滑删除的两个回调（自绘，见 NotifyCell.h） ----------
     // 🔴 捕获 **rowId**：不捕获 indexPath（滚动/删除后就失效），也不捕获字典快照

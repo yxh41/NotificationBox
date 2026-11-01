@@ -349,6 +349,35 @@ static inline NSArray<NSString *> *NBStringArray(id v) {
 // 🔴 只读类结构，**不调用任何未知方法**（零崩溃风险）。
 #define NOTIFYBOX_NC_DIAG_PATH @"/var/mobile/Library/NotifyBox/nc_diag.txt"
 
+// ---------- v0.0.98：通知中心存活快照（供盒子 App 打「仍在」标记） ----------
+// 🔴🔴 为什么这件事只能由 tweak 做：盒子 App 没有权限读 `NCBulletinNotificationSource.uuidsToRequests`
+//    （那是 SpringBoard 进程里的对象）。按"读不到就问权限、换有权限的进程代做"这条纪律，
+//    唯一正解是 **tweak 扫、落盘、App 读** —— 不能让 App 自己去猜。
+// 🔴 文件由 tweak 在**每次删除结束时**覆盖写（`NBCheckDeletedAlive` 尾部，唯一写入点）。
+//    格式：
+//      首行 `#scan=<epoch>|nc=<NC总条数>`   ← 本次扫描时刻，**判断"新/旧"的基准**
+//      其后每条 `<cid>|<lastSeenTs>|<ncTotal>`
+//    语义：
+//      · `lastSeenTs ≈ scan` ⇒ 这一条**本次扫描还见到** ⇒ 通知中心仍在；
+//      · `lastSeenTs < scan` 且 > 0 ⇒ 上次见到是那个时候，**这一轮没了** ⇒ 已消失；
+//      · 文件里没有这个 cid ⇒ **从未见到**（多半 ⓪ 之后系统秒撤，本来就不需要界面刀）。
+// 🔴 三种状态里**只有第一种能下"仍在"的结论**，另外两种都不能反推"界面干净了"——
+//    v0.0.97 真机已经证伪过："账本干净"推不出"界面干净"。所以 App 里的标记文案必须写成
+//    「上次清理时仍在」，⛔ 不许写成「通知中心还在」—— 后者是没量过的断言。
+#define NOTIFYBOX_ALIVE_SNAPSHOT @"/var/mobile/Library/NotifyBox/.nb_deleted_seen"
+// 判定"本次扫描见到过"的容差（秒）。写文件时 `lastSeenTs` 直接取 `now`、表头也取 `now`，
+// 两者本来相等；留 2 秒是为跨进程读到的浮点/取整差异兜底，不参与任何业务判断。
+#define NB_ALIVE_SAME_SCAN_TOL 2.0
+// 🔴🔴 快照的**保鲜期**（秒）。超过它就**一条标记都不打**，只在提示条上如实报"上次扫描是多久前"。
+//    为什么必须有这道闸：这份快照只在 **tweak 删掉一条记录之后**才重写一次。
+//    用户三天前删的那批、三天后才打开盒子 App，屏幕上照样会飘一排"仍在"的橙条 ——
+//    而那时他早就手动把通知中心清空了。**标记说的是一件过去时刻的事，不是现在的事**，
+//    所以要么新鲜到能当现状用，要么就别装成现状。
+// 🔴 1 小时这个数不是拍的：`NBCheckDeletedAlive` 在每次删除结束时都跑（含 +5s/+30s/+90s
+//    的延迟复量），用户"删完就来看"的窗口远小于它。真正过期的场景是"很久以前删的" ——
+//    那种情况本来就不该有标记。
+#define NB_ALIVE_FRESH_SEC 3600.0
+
 // ---------- 统一日志 ----------
 // 🔴 v0.0.12：原来 Tweak.x 里有份 static NBLog，新加的 NotifySpeaker/NotifyProbe 够不着。
 //    **复制一份日志函数**是最差解（两份轮转逻辑迟早走岔），所以把实现沉到 NotifyStore.m

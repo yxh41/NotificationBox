@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.97"
+#define NB_VER_STR @"0.0.98"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -592,7 +592,13 @@ static BOOL NBControlSkipU(void) {
 }
 // v0.0.79：[段] / [重] 的明细每个进程只打一次（日志窗口 ≈ 最后 50 条、全局滚动）
 static BOOL gCensusDumped = NO;
-#define NB_DEL_KEEP 24            // 台账最多留 24 条（更老的没有诊断价值，且让扫描变贵）
+// v0.0.98：24 → 200。原来写"更老的没有诊断价值"是站在**看日志**的角度说的；
+//   但这份台账现在还要供**盒子 App 打标记**用（"这条在通知中心还在吗"），
+//   24 条根本盖不住一次批量删除（v0.0.97 真机一次删了 62 条米家）。
+// 🔴 提高上限**几乎不增加扫描成本**：`NBCheckDeletedAlive` 是先给每条台账建好 key 集合，
+//   再遍历一遍 NC request 做 O(1) 查表 ⇒ 成本是 O(NC 条数)，与台账条数无关。
+//   真正变贵的是那个小文件的序列化，200 行可忽略。
+#define NB_DEL_KEEP 200           // 台账最多留 200 条
 // 🔴 版本号写进护栏文件：**每个新版本自动获得一次重试机会**。
 //    否则 v0.0.62 那次卡死留下的 `.nc_off` 会一直压着，新版明明修好了也测不到。
 // 🔴 v0.0.71：`#define NB_VER_STR` **已上移到 `#define NBLog` 那一区**（文件最前面的宏区）。
@@ -1575,6 +1581,7 @@ static void NBCheckDeletedAlive(void) {
             if (st.length) {
                 for (NSString *ln in [st componentsSeparatedByString:@"\n"]) {
                     if (!ln.length) continue;
+                    if ([ln hasPrefix:@"#"]) continue;   // v0.0.98：首行是 `#scan=…|nc=…` 表头，不是条目
                     NSArray *q = [ln componentsSeparatedByString:@"|"];
                     if (q.count < 2 || ![(NSString *)q[0] length]) continue;
                     double t = [q[1] doubleValue];
@@ -1766,6 +1773,13 @@ static void NBCheckDeletedAlive(void) {
         //    只写台账里现存的 cid ⇒ 文件不会无限膨胀。
         @try {
             NSMutableArray *out = [NSMutableArray array];
+            // 🔴🔴 v0.0.98：**首行加表头**，写死这次扫描的时刻。
+            //   为什么非加不可：这份文件现在要给盒子 App 读来做「通知中心仍在」标记，
+            //   而 App 光看 `cid|lastSeenTs|ncTotal` 判断不出"这个 lastSeenTs 算新还是算旧"——
+            //   没有扫描时刻当基准，「仍在」和「三小时前仍在但现在没了」长得一模一样。
+            //   ⇒ 基准必须由**写文件的一方**给出，不能让读的人猜（那是"分母自己会变"的同款）。
+            // 格式 `#scan=<epoch>|nc=<total>`：App 侧遇到 `#` 开头就解析表头，不解析条目。
+            [out addObject:[NSString stringWithFormat:@"#scan=%.0f|nc=%lu", now, (unsigned long)all.count]];
             for (NSDictionary *rec in recs) {
                 NSString *cid = rec[@"cid"];
                 if (!cid.length) continue;

@@ -100,6 +100,14 @@
 // v0.0.93：当前是否处于「松手即删」态（只用来避免每帧重复设 label 文案）
 @property (nonatomic, assign) BOOL nbArmed;
 
+// ================= v0.0.98：通知中心残留标记 =================
+// 🔴 挂 **cardView**（卡片左缘内侧）：色条要和卡片同高同圆角曲率，
+//    挂 contentView 就得自己算 `card.origin.y` 和高度，多一处能对不上的地方。
+// 🔴 存的是**数值状态**而不是"色条 visible"：本项目反复栽在"拿视图状态反推数据状态"上
+//    （attributedText 时序、标星、未读角标各一次）。`hidden` 是它的输出。
+@property (nonatomic, strong) UIView *aliveBar;
+@property (nonatomic, assign) NSInteger aliveState;
+
 // 🔴 内部方法必须显式声明（项目开 -Werror，靠"定义在前面"解析选择器太脆）
 - (void)nbRender;
 // v0.0.72：未读书签的唯一入口（数字 + 显隐）。和 nbRender 分开：
@@ -354,6 +362,17 @@ static void NBHapticFire(NBHapticKind kind) {
     self.cardView.clipsToBounds = YES;
     [self.contentView addSubview:self.cardView];
 
+    // ---------- v0.0.98：通知中心残留标记（卡片左缘的橙条） ----------
+    // 🔴 位置：**紧跟 cardView 之后 add**，此时卡片底色已在、文字还没进来。
+    //    竖条在 x=0..4，而所有文字都从 `kNBPad`（=12）起排 ⇒ 两者不重叠，
+    //    所以 z 序在这里不影响观感（不像 pinView 必须最后 add）。
+    // 🔴 但**必须挂 cardView**：挂 contentView 的话，左滑时卡片位移、色条留在原地，
+    //    会露出"一条无主的橙线"（v0.0.92 红块那条注释讲的是反过来的需求，别照抄）。
+    self.aliveBar = [[UIView alloc] init];
+    self.aliveBar.backgroundColor = [UIColor systemOrangeColor];
+    self.aliveBar.hidden = YES;      // 默认藏 —— 复用池里"默认可见的装饰"必串（见头文件注释）
+    [self.cardView addSubview:self.aliveBar];
+
     // 图标容器：真图标和首字母共用一块底。
     // 🔴🔴 v0.0.88：挂到 **contentView** 上，不再挂 cardView —— 图标现在在卡片**外面**
     //    左侧那条槽里（HyperOS 的排法）。挂错父视图的症状是"图标整个不见"：
@@ -559,6 +578,14 @@ static void NBHapticFire(NBHapticKind kind) {
     //    父子关系已经是 cardView，写在这里就等于给它加上一次卡片原点（v0.0.88 的原始病根）。
 
     // ---------- 卡片内（cardView 坐标，⛔ 一个都不许再加卡片原点） ----------
+    // ---------- v0.0.98：通知中心残留标记 ----------
+    // 🔴 宽度 4、贴左缘、**整卡高**。它不参与下面任何一条横坐标的算账
+    //    （`appW` 只减 timeW / starW / groupW，不认它）⇒ 对布局影响为 0。
+    // 🔴 用**数值状态**判显隐，不看 `hidden` 反推（见类扩展里的注释）。
+    BOOL aliveOn = (self.aliveState == 1);
+    self.aliveBar.hidden = !aliveOn;
+    self.aliveBar.frame = aliveOn ? CGRectMake(0, 0, 4.0, h) : CGRectZero;
+
     CGFloat textX = kNBPad;
     CGFloat textW = MAX(0.0, w - kNBPad * 2);
     // 时间宽 90：容得下 "10-30 08:11"（12pt ≈ 66pt），并且**永远落在卡片内**
@@ -981,6 +1008,19 @@ static void NBHapticFire(NBHapticKind kind) {
     [self setNeedsLayout];
 }
 
+// ================= v0.0.98：通知中心残留标记 =================
+// 只切 hidden + 在 layoutSubviews 里定 frame（宽度不参与任何别的算账，见头文件注释）。
+// 🔴 必须直接写 `_aliveState`（⛔ 不许 `self.aliveState = n;`，那是 setter 里调自己 ⇒ 爆栈）。
+- (void)setAliveTag:(NSInteger)state {
+    _aliveState = state;
+    // 🔴 这里**只置 hidden、不留 frame 给下一帧**：frame 由 layoutSubviews 按 `aliveState` 重算。
+    //    但不触发布局的话，「复用回来的行从有橙条变成没橙条」要等下一次布局才生效 ——
+    //    而 cell 复用时 UITableView 未必会再布局一次 ⇒ 屏幕上会留下一条**串到别的行上**的橙条。
+    //    `setNeedsLayout` 很便宜（本表行高常量、布局里没有昂贵计算），宁多勿漏。
+    self.aliveBar.hidden = (state != 1);
+    [self setNeedsLayout];
+}
+
 - (void)prepareForReuse {
     [super prepareForReuse];
     // 🔴 v0.0.70：卡片底色必须复位。
@@ -1027,6 +1067,10 @@ static void NBHapticFire(NBHapticKind kind) {
     // 🔴 v0.0.48：★ 同理必须复位（否则上一行标了星、这一行规则没命中，星会串过来）。
     self.starred = NO;
     self.starLabel.hidden = YES;
+    // 🔴 v0.0.98：橙条同理（"凡是 setter 改过的外观，prepareForReuse 必须改回去"）。
+    //    不复位的症状特别坏：橙条是**贴着卡片左缘的实心色块**，串到一条本来干净的行上，
+    //    用户会认为"这条还没清掉" ⇒ 直接去通知中心又删一遍。
+    [self setAliveTag:0];
     // 🔴 v0.0.95：×N 徽章同理。「凡是 setter 改过的外观，prepareForReuse 必须改回去」——
     //    不复位的症状是"上一行是 ×5 的组，滚出去再滚回来变成单条，而中间那些行凭空空了一段"，
     //    因为 appW 是按 groupCount 算的。走 setter 复位，顺带把 setNeedsLayout 也带上。

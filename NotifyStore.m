@@ -1572,4 +1572,89 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     return s;
 }
 
+#pragma mark - v0.0.98 通知中心存活快照（只读）
+
+// 🔴🔴 这个方法的全部工作就是**如实翻译** tweak 落盘的那份快照，不做任何推断：
+//    · 没有文件           ⇒ scan=0，states 空（一切 Unknown）；
+//    · 有文件但没有表头    ⇒ 同上（**没有基准就没法判断新旧** —— 见下面的注释）；
+//    · 有条目但 ts <= 0   ⇒ 跳过（不写 0 是因为 0 表示"从来没见到"，不能当时间用）。
+// 🔴 为什么缺表头必须整份作废：条目的第三列是"扫描时 NC 总条数"，不是时间。
+//    v0.0.95/v0.0.96 两版的文件里**根本没有**表头（v0.0.98 才加），
+//    那时想判断"这条是新是旧"只能靠猜。而"猜"的两种写法都很坏：
+//    猜成"仍在" ⇒ 满屏橙条（用户会以为清理功能坏了）；
+//    猜成"已消失" ⇒ 把真正残留的藏起来（用户以为清干净了，最坏的那一档）。
+//    ⇒ 宁可什么都不说。用户升级后删一条记录，表头就有了。
++ (NSDictionary *)aliveSnapshot {
+    NSMutableDictionary<NSString *, NSNumber *> *states = [NSMutableDictionary dictionary];
+    NSTimeInterval scan = 0;
+    NSInteger ncTotal = 0;
+    @try {
+        NSString *st = [NSString stringWithContentsOfFile:NOTIFYBOX_ALIVE_SNAPSHOT
+                                                encoding:NSUTF8StringEncoding error:NULL];
+        if (!st.length) return @{@"scan": @0, @"nc": @0, @"states": @{}};
+        for (NSString *ln in [st componentsSeparatedByString:@"\n"]) {
+            if (!ln.length) continue;
+            // ---------- 表头 ----------
+            if ([ln hasPrefix:@"#"]) {
+                // 格式 `#scan=<epoch>|nc=<总条数>`。🔴 别用 KVC/JSON 那套去解 ——
+                // 这里只有一个固定形状，多引一个解析器就是多一处能出错的地方。
+                if (![ln hasPrefix:@"#scan="]) continue;
+                NSArray *h = [ln componentsSeparatedByString:@"|"];
+                if (h.count < 1) continue;
+                NSString *tsPart = [(NSString *)h[0] substringFromIndex:6];   // 跳过 "#scan="
+                scan = [tsPart doubleValue];
+                if (h.count >= 2) {
+                    NSString *ncPart = (NSString *)h[1];
+                    if ([ncPart hasPrefix:@"nc="]) ncTotal = [[ncPart substringFromIndex:3] integerValue];
+                }
+                continue;
+            }
+            // ---------- 条目 `<cid>|<lastSeenTs>|<ncTotal>` ----------
+            NSArray *q = [ln componentsSeparatedByString:@"|"];
+            if (q.count < 2) continue;
+            NSString *cid = (NSString *)q[0];
+            if (!cid.length) continue;
+            double ts = [(NSString *)q[1] doubleValue];
+            if (ts <= 0) continue;      // 0 = 从来没见到 ⇒ 写不进结论
+            states[cid] = @(ts);
+        }
+    } @catch (__unused NSException *e) {
+        return @{@"scan": @0, @"nc": @0, @"states": @{}};
+    }
+
+    // 🔴 没有基准 ⇒ 整份作废（理由见头注释）。这里**早退**，不是"尽力而为"。
+    if (scan <= 0) return @{@"scan": @0, @"nc": @0, @"states": @{}};
+
+    // ---------- 把「时间戳」翻成「三态」 ----------
+    // 🔴 这一步必须在**读完整个文件之后**做：`scan` 来自首行，而首行可能排在任何位置
+    //    （现在的写入点保证它在最前，但解析器不该依赖顺序 —— 依赖了就是个静默的定时炸弹）。
+    NSMutableDictionary<NSString *, NSNumber *> *out =
+        [NSMutableDictionary dictionaryWithCapacity:states.count];
+    for (NSString *cid in states) {
+        double ts = [states[cid] doubleValue];
+        // 🔴 不用 `fabs()`：这里不需要它的语义，而多一个数学库依赖就多一个"某平台没来由地
+        //    编不过"的可能。两个不等式写法更直白，也顺手把 `ts > scan`（时钟回拨）排除掉。
+        double d = ts - scan;
+        if (d >= -NB_ALIVE_SAME_SCAN_TOL && d <= NB_ALIVE_SAME_SCAN_TOL) {
+            out[cid] = @(NBAliveStill);
+        } else if (d < -NB_ALIVE_SAME_SCAN_TOL) {
+            out[cid] = @(NBAliveGone);
+        }
+        // ts > scan（时钟回拨 / 文件被手改过）⇒ 不进任何一态，按 Unknown 处理。
+        // 🔴 这里**不许**兜底成 Gone 或 Still —— 一个看不懂的数就该闭嘴。
+    }
+    return @{@"scan": @(scan), @"nc": @(ncTotal), @"states": out};
+}
+
++ (NBAliveState)aliveStateOfSysId:(NSString *)sysId inSnapshot:(NSDictionary *)snap {
+    if (!sysId.length || ![snap isKindOfClass:[NSDictionary class]]) return NBAliveUnknown;
+    NSDictionary *states = snap[@"states"];
+    if (![states isKindOfClass:[NSDictionary class]]) return NBAliveUnknown;
+    NSNumber *v = states[sysId];
+    if (![v isKindOfClass:[NSNumber class]]) return NBAliveUnknown;
+    NSInteger n = v.integerValue;
+    if (n == NBAliveStill || n == NBAliveGone) return (NBAliveState)n;
+    return NBAliveUnknown;
+}
+
 @end

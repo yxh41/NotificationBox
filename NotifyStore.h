@@ -288,4 +288,33 @@ typedef NS_ENUM(NSInteger, NBSyncClearOutcome) {
 
 @end
 
+#pragma mark - v0.0.98 通知中心存活快照（只读）
+
+// 「这条记录删掉之后，通知中心里那张卡片到底还在不在」—— 三态。
+// 🔴🔴 为什么是**三**态而不是两态（这两态的实现原理上产不出第三态）：
+//    tweak 落盘的 `.nb_deleted_seen` 里只写「上一次在 NC 里见到它是什么时候」，
+//    于是"从没见到过"和"见到过但现在没了"在只看精确匹配的实现里**长得一样**。
+//    而这两种在真机上语义完全不同（v0.0.97 的 `nc_diag(3).txt` 62 次米家删除里
+//    有 14 次属于"从来没见到"），混成一个"已消失"就是在编数据。
+typedef NS_ENUM(NSInteger, NBAliveState) {
+    NBAliveUnknown = 0,   // 快照里没有这条 / 没有快照文件 / 快照已过期 ⇒ **不许**当"已消失"
+    NBAliveStill   = 1,   // 上次扫描时**仍在**通知中心（唯一能下结论的那一态）
+    NBAliveGone    = 2,   // 上次扫描时已经不在（见到过、这轮没了）
+};
+
+// 读一次快照，返回 @{@"scan": NSNumber(NSTimeInterval),   // 0 = 没有可用快照
+//                  @"nc":   NSNumber(NSInteger),          // 扫描时 NC 总条数（0 = 没记）
+//                  @"states": @{sysId: NSNumber(NBAliveState)}}。
+// 🔴 一条一读、一次成型：**不许**分成"先问时间、再问状态"两个方法 ——
+//    两次读文件之间 tweak 可能正好重写了一次，那样拿到的"扫描时刻"和"状态"就不是同一次扫描的
+//    （本项目"分母自己会变"的同款坑）。
+// 🔴 `states` 里**只放能定性的**（Still / Gone）；拿不到的一律不出现，调用方按 Unknown 处理。
+// 🔴 文件不存在 / 表头丢了 ⇒ 返回 scan=0 + 空 states，**绝不**把每一条都猜成 Gone。
++ (NSDictionary *)aliveSnapshot;
+
+// sysId → 状态。**必须带 `snap` 参数**（把 `aliveSnapshot` 的结果传进来），
+// 理由同上：同一次刷新里所有行必须用同一份快照，不能一行读一次文件。
++ (NBAliveState)aliveStateOfSysId:(nullable NSString *)sysId
+                       inSnapshot:(NSDictionary *)snap;
+
 NS_ASSUME_NONNULL_END
