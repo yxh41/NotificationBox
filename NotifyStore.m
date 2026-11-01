@@ -1621,13 +1621,17 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
 //    · 没有文件 / 没有表头 ⇒ scan=0、keys 空（一切 Unknown）。**没有基准就没法判断新旧** ——
 //      猜成"仍在"是满屏橙条，猜成"已不在"是把真残留藏起来（最坏的那一档）⇒ 宁可什么都不说。
 //    · `#` 开头的行是表头，不是条目。
-// 🔴 表头格式 `#scan=<epoch>|nc=<总条数>|seq=<序号>`；条目 `<section>|<key1>|<key2>|…`。
+// 🔴 表头格式 `#scan=<epoch>|nc=<账本条数>|cs=<界面认的条数>|csn=<实际探测条数>|csm=<0|1>|seq=<序号>`；
+//    条目 `<section>|<key1>|<key2>|…|cs=<1|0|-1>`。
+// 🔴 🔴 v0.0.102：`csn`（实际探测条数）**本类故意不解析** —— App 侧只需要
+//    「界面认几条」（cs）和「到底量没量到」（csm）两个数；`csn` 是给日志诊断用的。
+//    写一堆"解析了但谁都不读"的字段，在 `-Werror` 下就是一条 unused-but-set 编译错误
+//    （v0.0.102 第一次 CI 正是这么炸的），所以宁可一个都不留。
 // 🔴 `keys` 用 **NSSet**：匹配是 O(1)，而这个集合可能有几百个元素、每行都要查一次。
 + (NSDictionary *)ncSnapshot {
     NSTimeInterval scan = 0;
     NSInteger ncTotal = 0;
     NSInteger csTotal = 0;
-    NSInteger csMeasured = 0;
     BOOL csOn = NO;
     NSString *seq = nil;
     NSMutableSet<NSString *> *keys = [NSMutableSet set];
@@ -1648,7 +1652,6 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
                     if ([f hasPrefix:@"#scan="])      scan       = [[f substringFromIndex:6] doubleValue];
                     else if ([f hasPrefix:@"nc="])    ncTotal    = [[f substringFromIndex:3] integerValue];
                     else if ([f hasPrefix:@"cs="])    csTotal    = [[f substringFromIndex:3] integerValue];
-                    else if ([f hasPrefix:@"csn="])   csMeasured = [[f substringFromIndex:4] integerValue];
                     else if ([f hasPrefix:@"csm="])   csOn       = ([[f substringFromIndex:4] integerValue] != 0);
                     else if ([f hasPrefix:@"seq="])   seq        = [f substringFromIndex:4];
                 }
