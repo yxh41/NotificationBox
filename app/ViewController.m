@@ -1888,6 +1888,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     if (self.aliveScanTs <= 0) return @"—";
     double d = [[NSDate date] timeIntervalSince1970] - self.aliveScanTs;
     if (d < 0) d = 0;
+    // v0.0.104：真机提示条上写着「· 0 秒前」—— 刚扫完还报"0 秒前"读着别扭，
+    // 而且 5 秒以内本来就等于"刚刚"。只改这一档，其余口径不动。
+    if (d < 5) return @"刚刚";
     if (d < 90) return [NSString stringWithFormat:@"%.0f 秒", d];
     if (d < 5400) return [NSString stringWithFormat:@"%.0f 分钟", d / 60.0];
     if (d < 172800) return [NSString stringWithFormat:@"%.0f 小时", d / 3600.0];

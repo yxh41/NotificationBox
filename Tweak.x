@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.103"
+#define NB_VER_STR @"0.0.104"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -304,6 +304,47 @@ static NSString *NBStringish(id v) {
     if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
     if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v stringValue];
     return nil;   // ⛔ 不调 description
+}
+
+// 🔴🔴🔴 v0.0.104：**比较两个标识必须用这个，不许用 `NBKVCStr` + `isEqualToString`**。
+//    真机血账：v0.0.103 的严格口径写成
+//        NSString *gu = NBKVCStr(got, @"uuid");  if (gu.length) …
+//    而上游 `NBStringish` **只认 NSString / NSNumber**（为了不碰 `description`，见上）。
+//    `NCNotificationRequest.uuid` 是 **NSUUID** 类型 ⇒ `NBStringish` 一律返回 nil
+//    ⇒ `csem` 恒 0 ⇒ 提示条永远显示「界面量不到」（v0.0.103 装出来就是这样）。
+//    ⚠️ 讽刺的是同一份代码里探测那段用的是 `NBSafeValue`（能拿到 NSUUID 对象），
+//       所以「探测能跑、比对读不到」—— 一个函数里两套读法，错的那套正好是要用的那套。
+//    ⇒ 标识类字段一律 `NBSafeValue` 取**对象**，比较交给下面两个函数。
+//
+// 把一个"标识"尽力转成字符串：只为**跨类型比较**（NSUUID vs NSString）服务。
+// ⛔ 只碰三类安全类型；`UUIDString` 是 NSUUID 的公开属性，不摸内部锁 —— 与 `description` 不同。
+static NSString *NBIdString(id v) {
+    if (!v) return nil;
+    if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v stringValue];
+    if ([v isKindOfClass:[NSUUID class]]) {
+        @try {
+            return [(NSUUID *)v UUIDString];
+        } @catch (__unused NSException *e) {
+            return nil;
+        }
+    }
+    return nil;
+}
+
+// 两个标识"说的是不是同一件事"。
+// · 先直接 `isEqual:`（同类对象，NSUUID / NSString / NSNumber 都实现了）
+// · 再按转成字符串后的**小写**比一次：`NSUUID` 的 `UUIDString` 是大写、
+//   而库里存的 `sys_id` 是写入侧取到的大写串；两边大小写不一致时直接比会假否定。
+static BOOL NBIdEqual(id a, id b) {
+    if (!a || !b) return NO;
+    @try {
+        if ([a isEqual:b]) return YES;
+    } @catch (__unused NSException *e) { }
+    NSString *sa = NBIdString(a);
+    NSString *sb = NBIdString(b);
+    if (!sa.length || !sb.length) return NO;
+    return [[sa lowercaseString] isEqualToString:[sb lowercaseString]];
 }
 
 static id NBSafeValue(id obj, NSString *key) {
@@ -1977,6 +2018,8 @@ static void NBDumpNCSnapshot(NSString *seq) {
         NSInteger csYes = 0, csMeasured = 0;
         // 🔴🔴 v0.0.103：再加一档「严格」口径（回来的那条 uuid 和我问的一样吗）
         NSInteger cseYes = 0, cseMeasured = 0;
+        // v0.0.104：诊断只打前 2 例（几百条里打两行足够定性，且日志窗口只有 ~50 行）
+        NSInteger diagShown = 0;
         // 先占位写数据行，最后回填表头（表头要 totals，只能扫完才知道）
         NSMutableString *rows = [NSMutableString stringWithCapacity:all.count * 96];
         for (id req in all) {
@@ -2012,12 +2055,27 @@ static void NBDumpNCSnapshot(NSString *seq) {
                 csMeasured++;
                 if (cs == 1) csYes++;
                 if (got) {
-                    // ⚠️ 这里读的是**类未知**的对象（CS 侧），缺键会抛 ⇒ 必须 NBKVCStr（内含 @try）。
-                    NSString *qu = NBKVCStr(req, @"uuid");
-                    NSString *gu = NBKVCStr(got, @"uuid");
-                    if (gu.length) {
+                    // 🔴🔴 v0.0.104：改成 `NBSafeValue` 取**对象** + `NBIdEqual` 比较。
+                    //    v0.0.103 用 `NBKVCStr` ⇒ `NBStringish` 只认 NSString/NSNumber，
+                    //    而 `uuid` 是 **NSUUID** ⇒ 恒 nil ⇒ csem 恒 0 ⇒「界面量不到」。
+                    id qu = NBSafeValue(req, @"uuid");
+                    id gu = NBSafeValue(got, @"uuid");
+                    if (gu) {
                         cseMeasured++;
-                        if (qu.length && [gu isEqualToString:qu]) cseYes++;
+                        if (NBIdEqual(gu, qu)) cseYes++;
+                    }
+                    // 自证：**不管读没读到**都要打前 2 例 —— 「读不到」正是这些行的用途。
+                    //    把四个候选键的**类型**一起打出来：一眼能看出该用哪把键。
+                    // ⛔ 只打类名，绝不 `description`（未知对象摸内部锁 ⇒ 卡死）。
+                    if (diagShown < 2) {
+                        diagShown++;
+                        NBLog(@"=== [扫][诊] 界面对象 类=%@ ｜ uuid=%@(req)/%@(got) ｜ "
+                              @"nid=%@ ｜ ident=%@ ｜ bid=%@ ｜ 相等=%d",
+                              NBClassName(got), NBClassName(qu), NBClassName(gu),
+                              NBClassName(NBSafeValue(got, @"notificationIdentifier")),
+                              NBClassName(NBSafeValue(got, @"identifier")),
+                              NBClassName(NBSafeValue(got, @"bulletinID")),
+                              NBIdEqual(gu, qu) ? 1 : 0);
                     }
                 }
             }
