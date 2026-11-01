@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.104"
+#define NB_VER_STR @"0.0.105"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -1991,6 +1991,115 @@ static void NBCheckDeletedAlive(void) {
 //      这次是拿一个新功能把它又踩了一遍）。
 //    所以 v0.0.103 把 CS 那一档收紧成"回来的 uuid 必须等于问的 uuid"（cse/csem），
 //    `!= nil` 只当旁证留着（cs/csn），⛔ 不再拿它当"界面认的条数"。
+// ================= v0.0.105：只读诊断（不动功能，一次量清三件事） =================
+// 🔴🔴🔴 v0.0.104 真机读数把 CS 侧这条链**判死**了：
+//    七次扫描 `nc / cs / cse / csem` **四个数一个不差**（8/179/245/265/271/692/692）。
+//    不是巧合，是**结构恒等**：`all` 就是从 `uuidsToRequests` 取的，
+//    再拿同一个 uuid 回去问 destination —— 它按 uuid 查，回来当然同 uuid。
+//    ⇒ 这条尺子**不可能**给出小于 nc 的数。v0.0.102/103/104 三版都在量同一份账本，
+//      只是换了三种问法。**CS 侧查询作废，不是再收紧能救的。**
+//    换尺子之前必须先回答：
+//      ① 692 条是**历史账本**还是**我们自己刷出来的**？（→ timestamp 跨度/分桶 + section top5 + 本轮新增）
+//      ② 扫描那一刻视图层到底有没有内容？（→ 决定下一版能不能走「数 cell」这条路）
+//      ③ `timestamp` 这个键拿不拿得到、是什么类型？（读不到就得换键）
+//    ⚠️ 全部落在**已有的扫描函数内**，**零新增 hook** —— 两个以上没跑过的新挂点不能同轮。
+
+static NSMutableSet *sPrevNCUUIDs = nil;   // 上一轮的 uuid 集合（算「本轮新增」）
+static NSTimeInterval sLastNCDiagTs = 0;   // 上次打诊断的时刻（节流）
+static NSUInteger sLastNCDiagCount = 0;    // 上次打诊断时的 nc 数（节流）
+static BOOL sTsClsLogged = NO;             // timestamp 类型只报一次
+
+// 秒 → 人话
+static NSString *NBAgeShort(double sec) {
+    if (sec < 0 || sec > 1e10) return @"?";
+    if (sec < 3600)  return [NSString stringWithFormat:@"%.0f分", sec / 60.0];
+    if (sec < 86400) return [NSString stringWithFormat:@"%.1f时", sec / 3600.0];
+    return [NSString stringWithFormat:@"%.1f天", sec / 86400.0];
+}
+
+// 计数字典 → "key:count key:count …"（按次数降序取前 top）
+// ⚠️ key 是 sectionIdentifier（NSString），可安全 `%@`；⛔ 绝不拿它去碰别的未知对象。
+static NSString *NBSecTop(NSDictionary *m, int top) {
+    if (![m isKindOfClass:[NSDictionary class]] || m.count == 0) return @"（无可分组）";
+    NSArray *sorted = [[m allKeys] sortedArrayUsingComparator:^NSComparisonResult(id a, id b) {
+        NSInteger va = [[m objectForKey:a] integerValue];
+        NSInteger vb = [[m objectForKey:b] integerValue];
+        if (va < vb) return NSOrderedDescending;
+        if (va > vb) return NSOrderedAscending;
+        return NSOrderedSame;
+    }];
+    NSMutableArray *parts = [NSMutableArray array];
+    NSInteger n = (NSInteger)sorted.count < top ? (NSInteger)sorted.count : top;
+    for (NSInteger i = 0; i < n; i++) {
+        id k = [sorted objectAtIndex:i];
+        [parts addObject:[NSString stringWithFormat:@"%@:%ld", k,
+                          (long)[[m objectForKey:k] integerValue]]];
+    }
+    return [parts componentsJoinedByString:@" "];
+}
+
+// 🔴🔴🔴 v0.0.105：**本 TU 只 import Foundation，没有 UIKit**。
+//    `NotifyBox_FRAMEWORKS` 里也没有 UIKit（那是 App 侧才有的）。
+//    ⇒ 这里**一律用 `id` + runtime 拿**，绝不写 `UIApplication` / `UIWindow` / `UIView`
+//      这些类型名 —— 写类型名就是编译期 `undeclared identifier`，
+//      而八道文本自检会**全绿**（括号、宏、行尾都没问题）。
+//      这是「编译期才是硬闸门」的第 N 次实例。
+// ⚠️ 而往 `id` 上发**没在可见 `@interface` 里声明过**的选择器，同样是编译期硬错
+//    （v0.0.72 炸过一次：`no known instance method for selector`）⇒ 下面四个必须声明。
+@interface NSObject (NBViewRecon)
++ (id)sharedApplication;   // UIApplication 的**类**方法
+- (id)windows;             // UIApplication → NSArray<UIWindow *>
+- (BOOL)isKeyWindow;       // UIWindow
+- (id)subviews;           // UIView → NSArray<UIView *>
+@end
+
+// 视图层侦察：**必须主线程**（扫描本身已经在主队列上，见 NBScanNCCallback）。
+// ⛔ 只读 `class` / `subviews.count`，绝不 `description`（v0.0.63 摸内部锁卡死过一次）。
+// ⛔ 限节点 400、限 12 个命中：视图树可能几千节点，无限遍历会拖住主线程 ⇒ 看门狗。
+static void NBViewRecon(void) {
+    @try {
+        if (![NSThread isMainThread]) {
+            NBLog(@"[视] 不在主线程 ⇒ 跳过（绝不在后台线程碰视图树）");
+            return;
+        }
+        Class appCls = NSClassFromString(@"UIApplication");
+        if (!appCls) { NBLog(@"[视] UIApplication 类取不到"); return; }
+        id app = [appCls sharedApplication];
+        if (!app) { NBLog(@"[视] sharedApplication 取不到"); return; }
+        id wins = [app windows];
+        if (![wins isKindOfClass:[NSArray class]]) {
+            NBLog(@"[视] windows 不是数组（%@）", NBClassName(wins));
+            return;
+        }
+        id kw = nil;
+        for (id w in (NSArray *)wins) {
+            if ([w respondsToSelector:@selector(isKeyWindow)] && [w isKeyWindow]) { kw = w; break; }
+        }
+        if (!kw) { NBLog(@"[视] keyWindow 取不到（扫描时可能没有前台窗口）"); return; }
+
+        NSMutableArray *found = [NSMutableArray array];
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:kw];
+        NSInteger visited = 0;
+        while (stack.count && visited < 400 && (NSInteger)found.count < 12) {
+            id v = [stack lastObject];
+            [stack removeLastObject];
+            visited++;
+            NSString *cn = NBClassName(v);
+            id subs = [v subviews];
+            NSUInteger subN = [subs isKindOfClass:[NSArray class]] ? [(NSArray *)subs count] : 0;
+            if ([cn rangeOfString:@"Notif"].location != NSNotFound) {
+                [found addObject:[NSString stringWithFormat:@"%@(%lu)", cn, (unsigned long)subN]];
+            }
+            if (subN) [stack addObjectsFromArray:(NSArray *)subs];
+        }
+        NBLog(@"[视] keyWindow=%@ 节点=%ld ｜含 Notif 的类 %lu 个：%@",
+              NBClassName(kw), (long)visited, (unsigned long)found.count,
+              found.count ? [found componentsJoinedByString:@" "] : @"（一个都没有）");
+    } @catch (NSException *e) {
+        NBLog(@"!!! [视] 抛: %@", e.reason);
+    }
+}
+
 static void NBDumpNCSnapshot(NSString *seq) {
     @try {
         if (!gNCSource) {
@@ -2020,6 +2129,12 @@ static void NBDumpNCSnapshot(NSString *seq) {
         NSInteger cseYes = 0, cseMeasured = 0;
         // v0.0.104：诊断只打前 2 例（几百条里打两行足够定性，且日志窗口只有 ~50 行）
         NSInteger diagShown = 0;
+        // v0.0.105：账本溯源统计（只读，不参与任何判据、不进快照文件）
+        NSMutableDictionary *secCount = [NSMutableDictionary dictionary];
+        NSMutableSet *curUUIDs = [NSMutableSet set];
+        NSInteger tb[5] = {0};          // <1h / 1-6h / 6-24h / 1-3d / >3d
+        double tsMin = 0, tsMax = 0;
+        NSInteger tsGot = 0;
         // 先占位写数据行，最后回填表头（表头要 totals，只能扫完才知道）
         NSMutableString *rows = [NSMutableString stringWithCapacity:all.count * 96];
         for (id req in all) {
@@ -2041,6 +2156,40 @@ static void NBDumpNCSnapshot(NSString *seq) {
             // 一把键都没有的条目对匹配毫无用处，但也**不丢** ——
             // 丢掉会让"NC 总条数"和实际行数对不上，以后查起来像是我少扫了。
             if (keys.count) withKeys++;
+
+            // ---- v0.0.105：账本溯源（只读）----
+            // ① section 分布：692 条是不是集中在某一个 App（=谁在刷）
+            // ② timestamp 分桶：是不是跨了好几天（=历史账本，不是被刷）
+            // ③ uuid 集合：和上一轮 diff，算「本轮新增」
+            {
+                NSString *sk = sid.length ? sid : @"(空)";
+                NSInteger c0 = [[secCount objectForKey:sk] integerValue];
+                [secCount setObject:@(c0 + 1) forKey:sk];
+
+                // ⚠️ `timestamp` 走 NBSafeValue 取**对象**，不走 NBStringish ——
+                //    v0.0.104 的血账：`NBStringish` 只认 NSString/NSNumber，`uuid` 是 NSUUID
+                //    ⇒ 恒 nil ⇒「界面量不到」整整两版。日期同理，它是 NSDate。
+                id ts0 = NBSafeValue(req, @"timestamp");
+                if ([ts0 isKindOfClass:[NSDate class]]) {
+                    double t = [(NSDate *)ts0 timeIntervalSince1970];
+                    double age = [[NSDate date] timeIntervalSince1970] - t;
+                    if (tsMin <= 0 || t < tsMin) tsMin = t;
+                    if (t > tsMax) tsMax = t;
+                    if (age < 3600)        tb[0]++;
+                    else if (age < 21600)  tb[1]++;
+                    else if (age < 86400)  tb[2]++;
+                    else if (age < 259200) tb[3]++;
+                    else                   tb[4]++;
+                    tsGot++;
+                } else if (ts0 && !sTsClsLogged) {
+                    sTsClsLogged = YES;   // 只报一次，别刷屏
+                    NBLog(@"[源] timestamp 类型=%@（不是 NSDate ⇒ 这个键的读法要换）",
+                          NBClassName(ts0));
+                }
+
+                NSString *uu = NBIdString(NBSafeValue(req, @"uuid"));
+                if (uu.length) [curUUIDs addObject:[uu lowercaseString]];
+            }
 
             // ---- v0.0.102：界面口径 ----
             // 🔴🔴 v0.0.103：`!= nil` 这一档已被真机**否掉**。v0.0.102 装出来后提示条写的是
@@ -2082,6 +2231,41 @@ static void NBDumpNCSnapshot(NSString *seq) {
             [rows appendFormat:@"%@|%@|cs=%d\n", sid ?: @"",
              [keys componentsJoinedByString:@"|"], cs];
         }
+        // ---- v0.0.105：把三件事一次报出去（节流：nc 变化 ≥30 条 或 距上次 ≥60 秒）----
+        // 🔴 为什么节流：日志窗口只有 ~50 行且全局滚动。这条诊断有 3 行，
+        //    692 条的高频扫描下不节流会把别的证据全挤掉。
+        @try {
+            NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
+            NSInteger delta = (NSInteger)all.count - (NSInteger)sLastNCDiagCount;
+            if (sLastNCDiagTs <= 0 || delta >= 30 || delta <= -30
+                || nowTs - sLastNCDiagTs >= 60) {
+                sLastNCDiagTs = nowTs;
+                sLastNCDiagCount = all.count;
+
+                NSString *added = @"?";
+                if (sPrevNCUUIDs) {
+                    NSMutableSet *nw = [NSMutableSet setWithSet:curUUIDs];
+                    [nw minusSet:sPrevNCUUIDs];
+                    added = [NSString stringWithFormat:@"%ld", (long)nw.count];
+                }
+                sPrevNCUUIDs = curUUIDs;
+
+                NSString *span = @"读不到 timestamp";
+                if (tsGot > 0 && tsMax > tsMin) {
+                    span = [NSString stringWithFormat:@"%.0f分（最早 %@前 / 最新 %@前）",
+                            (tsMax - tsMin) / 60.0,
+                            NBAgeShort(nowTs - tsMin), NBAgeShort(nowTs - tsMax)];
+                }
+                NBLog(@"[源] nc=%lu 有ts=%ld ｜跨度 %@", (unsigned long)all.count, (long)tsGot, span);
+                NBLog(@"[源] 分桶 <1h=%ld 1-6h=%ld 6-24h=%ld 1-3d=%ld >3d=%ld ｜本轮新增 %@ 条 ｜section top5: %@",
+                      (long)tb[0], (long)tb[1], (long)tb[2], (long)tb[3], (long)tb[4],
+                      added, NBSecTop(secCount, 5));
+                NBViewRecon();
+            }
+        } @catch (NSException *e) {
+            NBLog(@"!!! [源] 诊断抛: %@", e.reason);
+        }
+
         [out appendFormat:@"#scan=%.0f|nc=%lu|cs=%ld|csn=%ld|cse=%ld|csem=%ld|csm=%d|seq=%@\n",
          [[NSDate date] timeIntervalSince1970], (unsigned long)all.count,
          (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
