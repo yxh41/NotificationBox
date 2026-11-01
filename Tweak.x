@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.101"
+#define NB_VER_STR @"0.0.102"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -1507,33 +1507,51 @@ static int NBMapCountOf(id source) {
 //    改成「返回对象 + 一个文件内静态三态」，非 ARC/ARC 两种模型下行为完全一致。
 static int gDestProbeStatus = -1;      // 上一次探测的三态：1=认 / 0=不认 / -1=没测到
 
-// 🔴 返回 CS 侧那**一个** request 对象（可能 nil）；三态见 `gDestProbeStatus`。
-//    ⚠️ 这两个必须在**同一个线程**上连续用（本项目的 ⑦ 段全在 SpringBoard 主队列上串行跑）。
-static id NBDestProbeObj(id req) {
-    gDestProbeStatus = -1;
-    if (!req || !gCSDestination) return nil;
+// ---------- v0.0.102：取一次 destination，循环里复用 ----------
+// 🔴 为什么不每次现取：v0.0.102 的「扫描」要对**几百条** request 各问一次
+//    （真机 `uuidsToRequests` 有 637 条），每条都现取 `listDestination` 是白开销。
+// 🔴 取不到就返回 nil —— 调用方**必须**把它当成"量不了"，写成 cs=-1，
+//    ⛔ 不许写成 0（0 是"界面上没有"，那是完全不同的一句话）。
+static id NBCSDestForScan(void) {
+    if (!gCSDestination) return nil;
     if (![gCSDestination respondsToSelector:@selector(destination:notificationRequestForUUID:)])
         return nil;
-    id uuid = nil;
-    @try { uuid = NBSafeValue(req, @"uuid"); } @catch (__unused NSException *e) { }
-    if (!uuid) return nil;
     id dest = nil;
     @try {
         if ([gCSDestination respondsToSelector:@selector(listDestination)])
             dest = [gCSDestination listDestination];
     } @catch (__unused NSException *e) { }
-    if (!dest) return nil;
-    if (!gDestRulerTried) {
+    if (dest && !gDestRulerTried) {
         gDestRulerTried = YES;
         NBDiagStep(@"  [尺] 首次调用 CSNotificationDispatcher -destination:notificationRequestForUUID:"
                    @"（独立尺子：查 destination，不碰 NC source 映射）\n");
     }
+    return dest;
+}
+
+// 核心探测：dest 由调用方给。
+// 🔴 返回 CS 侧给出的那**一个**对象（可能 nil）；三态见 `gDestProbeStatus`。
+static id NBDestProbeObjWithDest(id req, id dest) {
+    gDestProbeStatus = -1;
+    if (!req || !dest || !gCSDestination) return nil;
+    if (![gCSDestination respondsToSelector:@selector(destination:notificationRequestForUUID:)])
+        return nil;
+    id uuid = nil;
+    @try { uuid = NBSafeValue(req, @"uuid"); } @catch (__unused NSException *e) { }
+    if (!uuid) return nil;
     @try {
         id got = [gCSDestination destination:dest notificationRequestForUUID:uuid];
         gDestProbeStatus = got ? 1 : 0;
         return got;
     } @catch (__unused NSException *e) { }
     return nil;
+}
+
+// 单条探测（⑦t 用；只调一次，现取 dest 无所谓）
+static id NBDestProbeObj(id req) {
+    id dest = NBCSDestForScan();
+    if (!dest) { gDestProbeStatus = -1; return nil; }
+    return NBDestProbeObjWithDest(req, dest);
 }
 
 // 只要三态读数（原来的语义完全不变，调用点一个都不用改）
@@ -1909,8 +1927,19 @@ static void NBCheckDeletedAlive(void) {
 //    （见 v0.0.86 那段注释），这里不能重犯。
 //
 // 🔴 格式（`seq` 是 App 传下来的请求序号，App 用它判断"这份是不是我刚要的那次扫描"）：
-//      首行 `#scan=<epoch>|nc=<总条数>|seq=<序号>`
-//      其后每行 `<sectionIdentifier>|<key1>|<key2>|…`
+//      首行 `#scan=<epoch>|nc=<账本条数>|cs=<界面认的条数>|csn=<实际探测条数>|csm=<0|1>|seq=<序号>`
+//      其后每行 `<sectionIdentifier>|<key1>|<key2>|…|cs=<1|0|-1>`
+//
+// 🔴🔴 v0.0.102：为什么要多一个 `cs`
+//    真机 `nc_diag101.txt`：[寿] 台账 95 条 × 扫 NC **637** 条 ⇒ 仍在 **63**。
+//    手机通知中心不可能有 637 条 —— `uuidsToRequests` 是 NC source 的**历史账本**，
+//    里面混着大量界面上早已不存在的条目。拿它当"还在不在"的依据 ⇒ **橙条必然高估**，
+//    这正是用户说的「提示条的 M 比眼睛看到的多」。
+//    同一份日志里另一个读数反而跟眼睛一致：CS 侧
+//    `- destination:notificationRequestForUUID:`（界面那一层）**是 16 / 否 74**。
+//    ⇒ 快照里同时记两个口径，App 先**同时报出来**，让"哪个等于眼睛"这件事被量一次。
+//    ⚠️ 本版**不**改橙条的判据（仍按账本）—— 一次只动一个变量。
+//    `cs=-1` / `csm=0` = 量不了（`gCSDestination` 还没捕获），⛔ 不许当 0。
 static void NBDumpNCSnapshot(NSString *seq) {
     @try {
         if (!gNCSource) {
@@ -1930,10 +1959,14 @@ static void NBDumpNCSnapshot(NSString *seq) {
         NSMutableArray *all = [NSMutableArray arrayWithCapacity:d.count];
         for (id k in d) NBCollectRequestsIn([d objectForKey:k], all, 0);
 
+        // 🔴 一次取好 dest（几百条循环里复用）；取不到 ⇒ csm=0，逐条写 cs=-1
+        id csDest = NBCSDestForScan();
+
         NSMutableString *out = [NSMutableString stringWithCapacity:all.count * 96];
-        [out appendFormat:@"#scan=%.0f|nc=%lu|seq=%@\n",
-         [[NSDate date] timeIntervalSince1970], (unsigned long)all.count, seq ?: @""];
         NSUInteger withKeys = 0;
+        NSInteger csYes = 0, csMeasured = 0;
+        // 先占位写数据行，最后回填表头（表头要 totals，只能扫完才知道）
+        NSMutableString *rows = [NSMutableString stringWithCapacity:all.count * 96];
         for (id req in all) {
             NSString *sid = NBKVCStr(req, @"sectionIdentifier");
             NSMutableArray *keys = [NSMutableArray arrayWithCapacity:3];
@@ -1953,13 +1986,28 @@ static void NBDumpNCSnapshot(NSString *seq) {
             // 一把键都没有的条目对匹配毫无用处，但也**不丢** ——
             // 丢掉会让"NC 总条数"和实际行数对不上，以后查起来像是我少扫了。
             if (keys.count) withKeys++;
-            [out appendFormat:@"%@|%@\n", sid ?: @"", [keys componentsJoinedByString:@"|"]];
+
+            // ---- v0.0.102：界面口径 ----
+            int cs = -1;
+            if (csDest) {
+                cs = (NBDestProbeObjWithDest(req, csDest) != nil) ? 1 : 0;
+                csMeasured++;
+                if (cs == 1) csYes++;
+            }
+            [rows appendFormat:@"%@|%@|cs=%d\n", sid ?: @"",
+             [keys componentsJoinedByString:@"|"], cs];
         }
+        [out appendFormat:@"#scan=%.0f|nc=%lu|cs=%ld|csn=%ld|csm=%d|seq=%@\n",
+         [[NSDate date] timeIntervalSince1970], (unsigned long)all.count,
+         (long)csYes, (long)csMeasured, (csDest ? 1 : 0), seq ?: @""];
+        [out appendString:rows];
+
         NSError *err = nil;
         BOOL ok = [out writeToFile:NOTIFYBOX_NC_SNAPSHOT atomically:YES
                           encoding:NSUTF8StringEncoding error:&err];
-        NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）seq=%@ 写入=%@",
-              (unsigned long)all.count, (unsigned long)withKeys, seq ?: @"",
+        NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld（可量=%d）seq=%@ 写入=%@",
+              (unsigned long)all.count, (unsigned long)withKeys,
+              (long)csYes, (long)csMeasured, (csDest ? 1 : 0), seq ?: @"",
               ok ? @"成功" : [NSString stringWithFormat:@"失败(%@)", err.localizedDescription ?: @"?"]);
     } @catch (NSException *e) {
         NBLog(@"!!! [扫] 抛: %@", e.reason);

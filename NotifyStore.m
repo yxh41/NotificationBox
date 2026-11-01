@@ -1626,21 +1626,31 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
 + (NSDictionary *)ncSnapshot {
     NSTimeInterval scan = 0;
     NSInteger ncTotal = 0;
+    NSInteger csTotal = 0;
+    NSInteger csMeasured = 0;
+    BOOL csOn = NO;
     NSString *seq = nil;
     NSMutableSet<NSString *> *keys = [NSMutableSet set];
+    // 🔴 空快照的**唯一**形态（三个早退点共用一份，别各写一遍 ——
+    //    少一个键就是"某个调用方读到 nil 然后当 0 处理"，本项目栽过）。
+    NSDictionary *empty = @{@"scan": @0, @"nc": @0, @"cs": @0, @"csm": @0,
+                            @"seq": @"", @"keys": [NSSet set]};
     @try {
         NSString *st = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SNAPSHOT
                                                 encoding:NSUTF8StringEncoding error:NULL];
-        if (!st.length) return @{@"scan": @0, @"nc": @0, @"seq": @"", @"keys": [NSSet set]};
+        if (!st.length) return empty;
         for (NSString *ln in [st componentsSeparatedByString:@"\n"]) {
             if (!ln.length) continue;
             // ---------- 表头 ----------
             if ([ln hasPrefix:@"#"]) {
                 if (![ln hasPrefix:@"#scan="]) continue;
                 for (NSString *f in [ln componentsSeparatedByString:@"|"]) {
-                    if ([f hasPrefix:@"#scan="])      scan    = [[f substringFromIndex:6] doubleValue];
-                    else if ([f hasPrefix:@"nc="])    ncTotal = [[f substringFromIndex:3] integerValue];
-                    else if ([f hasPrefix:@"seq="])   seq     = [f substringFromIndex:4];
+                    if ([f hasPrefix:@"#scan="])      scan       = [[f substringFromIndex:6] doubleValue];
+                    else if ([f hasPrefix:@"nc="])    ncTotal    = [[f substringFromIndex:3] integerValue];
+                    else if ([f hasPrefix:@"cs="])    csTotal    = [[f substringFromIndex:3] integerValue];
+                    else if ([f hasPrefix:@"csn="])   csMeasured = [[f substringFromIndex:4] integerValue];
+                    else if ([f hasPrefix:@"csm="])   csOn       = ([[f substringFromIndex:4] integerValue] != 0);
+                    else if ([f hasPrefix:@"seq="])   seq        = [f substringFromIndex:4];
                 }
                 continue;
             }
@@ -1648,17 +1658,22 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
             NSArray *q = [ln componentsSeparatedByString:@"|"];
             // 🔴 从下标 1 开始：第 0 段是 sectionIdentifier（App 里叫 bundle），
             //    **它不是唯一键**，放进匹配集会误命中（一个 App 的所有通知都同段）。
+            // 🔴 v0.0.102：末尾的 `cs=N` **不是键**，必须挑掉。
+            //    不挑也不会误命中（UUID 不可能叫 "cs=1"），但那属于"靠巧合正确"——
+            //    以后快照再加字段（`th=…` 之类）就会变成真的 bug。这里按前缀排除。
             for (NSUInteger i = 1; i < q.count; i++) {
                 NSString *k = q[i];
-                if (k.length) [keys addObject:k];
+                if (!k.length || [k hasPrefix:@"cs="]) continue;
+                [keys addObject:k];
             }
         }
     } @catch (__unused NSException *e) {
-        return @{@"scan": @0, @"nc": @0, @"seq": @"", @"keys": [NSSet set]};
+        return empty;
     }
     // 🔴 没有基准 ⇒ 整份作废（理由见头注释）。**早退**，不是"尽力而为"。
-    if (scan <= 0) return @{@"scan": @0, @"nc": @0, @"seq": @"", @"keys": [NSSet set]};
-    return @{@"scan": @(scan), @"nc": @(ncTotal), @"seq": seq ?: @"", @"keys": keys};
+    if (scan <= 0) return empty;
+    return @{@"scan": @(scan), @"nc": @(ncTotal), @"cs": @(csTotal),
+             @"csm": @(csOn ? 1 : 0), @"seq": seq ?: @"", @"keys": keys};
 }
 
 // ---------- 某条记录此刻在不在通知中心 ----------

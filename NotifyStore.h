@@ -306,12 +306,20 @@ typedef NS_ENUM(NSInteger, NBAliveState) {
 + (void)requestNCSnapshotWithSeq:(NSString *)seq;
 
 // 读一次快照。返回 @{@"scan": NSNumber(NSTimeInterval),   // 0 = 没有可用快照
-//                  @"nc":   NSNumber(NSInteger),          // 扫描时 NC 总条数
+//                  @"nc":   NSNumber(NSInteger),          // 扫描时 NC **账本**总条数
+//                  @"cs":   NSNumber(NSInteger),          // 扫描时 **界面那一层**还认的条数（v0.0.102）
+//                  @"csm":  NSNumber(NSInteger),          // 1 = 界面口径可量；0 = 量不了（⛔ 不许当 0 条）
 //                  @"seq":  NSString,                     // tweak 回写的那次请求序号
 //                  @"keys": NSSet<NSString *>}。          // 此刻 NC 里所有通知的**唯一标识**
 // 🔴 匹配键只有 `bulletinID` / `notificationIdentifier` / `uuid` 三把（都是唯一的）。
 //    快照里**故意不含** `recordID` / `publisherBulletinID` —— 这两个对某些 publisher 是常量，
 //    写进来会让"同 publisher 的所有通知"全部误命中（见 Tweak.x 里 NBDumpNCSnapshot 的注释）。
+// 🔴🔴 `nc` 和 `cs` 是**两个不同的口径**，别混（v0.0.102 真机量的）：
+//    真机 `nc_diag101.txt` 里 `[寿] 台账 95 条 × 扫 NC 637 条 ⇒ 仍在 63` ——
+//    手机通知中心不可能有 637 条 ⇒ `uuidsToRequests`（`nc`）是 NC source 的**历史账本**，
+//    混着大量界面上早已不存在的条目；而 CS 侧 `destination:notificationRequestForUUID:`
+//    （`cs`）在同一份日志里是 **是 16 / 否 74**，更接近"眼睛看到的"。
+//    ⇒ 两个数**都要报出来**，让"哪个等于眼睛"这件事被量一次，别靠猜。
 + (NSDictionary *)ncSnapshot;
 
 // 某条记录（`sys_id`）此刻在不在通知中心。

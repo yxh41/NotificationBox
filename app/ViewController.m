@@ -150,6 +150,15 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 @property (nonatomic, assign) NSTimeInterval aliveScanTs;
 // 扫描时的 NC 总条数（0 = 没记到）。只用于诊断，不参与任何显示判断。
 @property (nonatomic, assign) NSInteger aliveNC;
+// ---------- v0.0.102：界面口径（和 aliveNC 是两个不同的账本）----------
+// 🔴 真机 `nc_diag101.txt`：`扫 NC 637 条 ⇒ 仍在 63` —— 手机通知中心不可能有 637 条。
+//    `aliveNC` 来自 `uuidsToRequests`（NC source 的**历史账本**），混着大量界面上早已不存在的条目；
+//    而 CS 侧 `destination:notificationRequestForUUID:` 在同一份日志里是 **是 16 / 否 74**。
+// ⇒ 两个数都报出来，让"哪个等于眼睛"被量一次。⛔ 本版**不**改橙条的判据（仍按账本），一次只动一个变量。
+@property (nonatomic, assign) NSInteger aliveCS;
+// 1 = 界面口径可量；0 = 量不了（tweak 还没捕获到 CS dispatcher）。
+// 🔴 量不了时**不许**显示成 0 条 —— 那是"读不到"冒充"没有"。
+@property (nonatomic, assign) BOOL aliveCSMeasurable;
 // 当前列表里「此刻仍在通知中心」的条数。口径 = **其它筛选都算完之后、只差 aliveOnly 那一步**，
 // 和 `foldedCount` 同一个位置（"提示条和眼前这个视图同口径"）。
 // ⚠️ 只是**列表**口径，不是全库 —— 全库那个数是 `aliveAllCount`（v0.0.100）。
@@ -1752,6 +1761,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.aliveSnap = snap;
     self.aliveScanTs = [snap[@"scan"] doubleValue];
     self.aliveNC = [snap[@"nc"] integerValue];
+    // v0.0.102：界面口径。`csm=1` 才算量到；否则 `aliveCS` 保持 0 但**不显示成 0 条**。
+    self.aliveCSMeasurable = ([snap[@"csm"] integerValue] != 0);
+    self.aliveCS = self.aliveCSMeasurable ? [snap[@"cs"] integerValue] : 0;
     // 🔴 保鲜期判据用 `timeIntervalSince1970` 直接比，不建 NSDateFormatter：
     //    快照里的 scan 就是 epoch，转换一道只会多一个"时区搞错"的机会。
     // 🔴 v0.0.99：阈值从 1 小时收到 **10 分钟**。通知中心是**随时会变**的东西
@@ -1930,8 +1942,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    如果这里写着"通知中心共 0 条"，而用户明明在通知中心看到一堆 ——
     //    那就是 tweak 没扫到 / 没权限 / 没 respring，一眼就能分辨，
     //    不用再猜"是匹配不上还是根本没数据"。
-    return [NSString stringWithFormat:@"橙色竖条 = 这条还在通知中心里 · %ld 条（通知中心共 %ld 条 · 扫描于 %@前）",
-                                     (long)self.aliveStillCount, (long)self.aliveNC,
+    // 🔴🔴 v0.0.102：**两个口径都报**。真机已量出「账本 637 条 / 界面认的少得多」，
+    //    橙条目前按账本算 ⇒ 必然高估。把两个数并排放，用户一眼就能告诉我们哪个等于眼睛，
+    //    下一版再据此把橙条的判据换过去（一次只动一个变量，不拿猜测改行为）。
+    NSString *scope = self.aliveCSMeasurable
+        ? [NSString stringWithFormat:@"账本 %ld 条 · 界面 %ld 条",
+                                    (long)self.aliveNC, (long)self.aliveCS]
+        : [NSString stringWithFormat:@"账本 %ld 条 · 界面量不到", (long)self.aliveNC];
+    return [NSString stringWithFormat:@"橙色竖条 = 这条还在通知中心里 · %ld 条（%@ · 扫描于 %@前）",
+                                     (long)self.aliveStillCount, scope,
                                      [self aliveAgeText]];
 }
 
