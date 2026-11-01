@@ -1770,16 +1770,21 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
     if (keys.count == 0) return;
     done = YES;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    // v0.0.114：两档宽松索引（只诊断）
+    NSSet *lcKeys = nil, *p8Keys = nil;
+    NBBuildLooseIndex(keys, &lcKeys, &p8Keys);
     @try {
         // ① 重读快照文件，按 section 把键分组
         //    —— `snap` 里只剩一个扁平 key 集（解析时 section 被丢了），要并排比就得自己再分一次。
         NSMutableDictionary<NSString *, NSMutableArray *> *secKeys = [NSMutableDictionary dictionary];
+        NSInteger rowCount = 0;      // v0.0.114：快照里到底有几行（键/行 比值能判断 `bulletin` 在不在）
         NSString *body = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SNAPSHOT
                                                   encoding:NSUTF8StringEncoding error:NULL];
         for (NSString *ln in [body componentsSeparatedByString:@"\n"]) {
             if (!ln.length || [ln hasPrefix:@"#"]) continue;
             NSArray *q = [ln componentsSeparatedByString:@"|"];
             if (q.count < 2) continue;
+            rowCount++;
             NSString *sec = q[0];
             NSMutableArray *arr = [secKeys objectForKey:sec];
             if (!arr) { arr = [NSMutableArray array]; [secKeys setObject:arr forKey:sec]; }
@@ -1791,9 +1796,12 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
             }
         }
         // 报快照有多旧：这是判"这 5 行该不该中"的前提，缺了它读出来的数又会被误读。
-        NBStoreLog(@"[残] 诊断：快照分 %lu 段 / 键 %lu 个 / 写于 %.0f 秒前",
-                   (unsigned long)secKeys.count, (unsigned long)keys.count,
-                   now - scanTs);
+        // v0.0.114：「键/行」比值是判断 `bulletin` 在不在的旁证 ——
+        //   每行本应最多 3 把（nid / uuid / bulletinID），实测恒为 2 ⇒ 有一把从来没进过键集。
+        double kpr = (rowCount > 0) ? ((double)keys.count / (double)rowCount) : -1.0;
+        NBStoreLog(@"[残] 诊断：快照分 %lu 段 / %ld 行 / 键 %lu 个（%.2f 键/行）/ 写于 %.0f 秒前",
+                   (unsigned long)secKeys.count, (long)rowCount,
+                   (unsigned long)keys.count, kpr, now - scanTs);
         NBStoreLog(@"[残] 下面 5 行取的是「快照写下那一刻之前」最近的 5 条"
                    @"（ts<=快照时刻，倒序）：段后的 (在/否) = 该段 ID 在不在快照键集里");
 
@@ -1829,6 +1837,9 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
                 if (in) hit++;
                 [parts addObject:[NSString stringWithFormat:@"%@(%@)", NBShortId(p), in ? @"在" : @"否"]];
             }
+            // v0.0.114：同一行的两档宽松口径，和精确数并排打（只诊断，不参与匹配）
+            BOOL ci = NO, p8 = NO;
+            NBCountLooseForms(sysId, lcKeys, p8Keys, &ci, &p8);
             NSString *age = @"?时";
             if (ts > 0) {
                 double d = now - ts;
@@ -1842,9 +1853,11 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
                 [sv addObject:NBShortId(sample[i])];
 
             // v0.0.112：这里原来还对每条现算一次内容哈希，已撤（扫描侧恒等于 `bundle||`）。
-            NBStoreLog(@"[残] #%d %@ %@ ｜库ID(段=%lu 命中=%ld): %@ ｜同段键: %@ ｜title=%@",
+            // v0.0.114：精确 / 忽略大小写 / 前8位 三档并排 —— 一眼看出"差在哪一档"。
+            NBStoreLog(@"[残] #%d %@ %@ ｜库ID(段=%lu 精确=%ld/忽略大小写=%d/前8位=%d): %@ ｜同段键: %@ ｜title=%@",
                        idx, bundle.length ? bundle : @"(空bundle)", age,
                        (unsigned long)parts.count, (long)hit,
+                       ci ? 1 : 0, p8 ? 1 : 0,
                        parts.count ? [parts componentsJoinedByString:@" "] : @"（sys_id 拆不出段）",
                        sv.count ? [sv componentsJoinedByString:@" "] : @"（该段快照里没有条目）",
                        NBShortId(title));
@@ -1853,6 +1866,51 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
     } @catch (NSException *e) {
         NBStoreLog(@"[残] 诊断抛: %@", e.reason);
     }
+}
+
+// ---------- v0.0.114：三档「宽松口径」，**只用于诊断，绝不参与匹配** ----------
+// 为什么需要：同一个「全库残留」在代码未变时出现过 1 / 2 / 6 / 245 / 254 这些值，
+//   跨度 100 倍以上。在没量出"差在哪一档"之前，任何结论都是猜（v0.0.110 就这么猜错过）。
+// 三档的读法：
+//   · 精确少、忽略大小写多   ⇒ **大小写**问题（真机上快照每行两把键，一把小写一把大写，
+//                              而库里 `sys_id` 是大写 —— 这个组合必须先排掉）
+//   · 两者都少、前8位多      ⇒ 分隔符 / 前后缀 / 格式不同（同一个 UUID 的两种写法）
+//   · 三个都少              ⇒ ID 真的换了（那就不是 bug，是该换尺子）
+// 🔴🔴 「前8位」是**故意做松**的诊断量，⛔ 永远不许拿去当匹配依据 ——
+//    本项目在 loose 兜底上出过撤错条（v0.0.75 已删过一版）。
+// 🔴 三个数必须**在同一遍循环里**累加：各扫一遍会让"分母相同"从事实变成假设。
+static void NBCountLooseForms(NSString *sysId, NSSet *lcKeys, NSSet *p8Keys,
+                              BOOL *ciOut, BOOL *p8Out) {
+    if (ciOut) *ciOut = NO;
+    if (p8Out) *p8Out = NO;
+    if (!sysId.length) return;
+    for (NSString *p in [sysId componentsSeparatedByString:NB_SYSID_SEP]) {
+        if (!p.length) continue;
+        if (lcKeys && [lcKeys containsObject:[p lowercaseString]]) {
+            if (ciOut) *ciOut = YES;
+        }
+        if (p8Keys) {
+            NSString *h = (p.length >= 8) ? [p substringToIndex:8] : p;
+            if ([p8Keys containsObject:[h lowercaseString]]) {
+                if (p8Out) *p8Out = YES;
+            }
+        }
+    }
+}
+
+// 从快照键集派生两份宽松索引（忽略大小写 / 前 8 位）。键集很小（几百个），一次建好复用。
+static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
+    NSMutableSet *lc = [NSMutableSet setWithCapacity:keys.count];
+    NSMutableSet *p8 = [NSMutableSet setWithCapacity:keys.count];
+    for (id k in keys) {
+        if (![k isKindOfClass:[NSString class]]) continue;
+        NSString *s = (NSString *)k;
+        if (!s.length) continue;
+        [lc addObject:[s lowercaseString]];
+        [p8 addObject:[[(s.length >= 8) ? [s substringToIndex:8] : s] lowercaseString]];
+    }
+    if (lcOut) *lcOut = lc;
+    if (p8Out) *p8Out = p8;
 }
 
 // ---------- v0.0.100：全库口径「此刻还在通知中心」的行数 ----------
@@ -1875,6 +1933,13 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
     if (!db) return 0;
     NSInteger still = 0;
     NSInteger scanned = 0;      // 有多少行**带 ID** 参与了比对（用来区分"键不重合"和"根本没 ID"）
+    // v0.0.114：两档宽松口径（只诊断）。真实匹配仍然只走 `aliveStateOfSysId:` 一份实现。
+    NSInteger stillCI = 0;      // 忽略大小写
+    NSInteger stillP8 = 0;      // 前 8 位相同
+    NSSet *snapKeys = snap[@"keys"];
+    if (![snapKeys isKindOfClass:[NSSet class]]) snapKeys = [NSSet set];
+    NSSet *lcKeys = nil, *p8Keys = nil;
+    NBBuildLooseIndex(snapKeys, &lcKeys, &p8Keys);
     const char *sql = "SELECT sys_id FROM notifications "
                       "WHERE sys_id IS NOT NULL AND sys_id<>'';";
     sqlite3_stmt *st = NULL;
@@ -1885,6 +1950,11 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
             scanned++;
             NSString *sid = [NSString stringWithUTF8String:t];
             if ([self aliveStateOfSysId:sid inSnapshot:snap] == NBAliveStill) still++;
+            // 同一遍里把两档宽松口径也数掉（分母必须是同一批行）
+            BOOL ci = NO, p8 = NO;
+            NBCountLooseForms(sid, lcKeys, p8Keys, &ci, &p8);
+            if (ci) stillCI++;
+            if (p8) stillP8++;
         }
         sqlite3_finalize(st);
     } else {
@@ -1910,10 +1980,14 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
     // 🔴 没扫过就报 -1（本项目铁律：没算出来用 -1，不用 0 —— 0 会被读成"算出来是零"）。
     double scanTs2 = [snap[@"scan"] doubleValue];
     double snapAge = (scanTs2 > 0) ? ([[NSDate date] timeIntervalSince1970] - scanTs2) : -1.0;
-    NBStoreLog(@"全库残留 %ld 条 ｜ 带ID行 %ld ｜ 快照 nc=%@ 键 %lu 个 ｜ 扫描于 %.0f 秒前",
-               (long)still, (long)scanned, snap[@"nc"] ?: @"?",
+    NBStoreLog(@"全库残留 %ld 条 ｜ 忽略大小写 %ld ｜ 前8位同 %ld ｜ 带ID行 %ld ｜ 快照 nc=%@ 键 %lu 个 ｜ 扫描于 %.0f 秒前",
+               (long)still, (long)stillCI, (long)stillP8, (long)scanned,
+               snap[@"nc"] ?: @"?",
                (unsigned long)[(NSSet *)snap[@"keys"] count],
                snapAge);
+    // 🔴 v0.0.114：把读法写在日志里，别指望下次还记得怎么解读这三档
+    //    （本项目最贵的一课：一个数被反复误读，比没有这个数更糟）。
+    NBStoreLog(@"全库残留读法：精确少、忽略大小写多 ⇒ 大小写问题｜两者都少、前8位多 ⇒ 格式/分隔符不同｜三个都少 ⇒ ID 真的换了（不是 bug）");
     return still;
 }
 
