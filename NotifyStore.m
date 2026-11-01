@@ -1640,17 +1640,13 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     BOOL csOn = NO;
     NSString *seq = nil;
     NSMutableSet<NSString *> *keys = [NSMutableSet set];
-    // v0.0.111：快照里那些 `h=<内容哈希>` 单独收一份。
-    // 🔴 **绝不能混进 `keys`**：keys 是"唯一键"集合，混进去会让「键 N 个」直接翻倍，
-    //    而且哈希永远不可能等于任何 ID ⇒ 白白污染，还会把以后的人数算歪。
-    // 🔴 本版 `hashes` **只进诊断、不参与匹配**（匹配逻辑一个字没动）。
-    NSMutableSet<NSString *> *hashes = [NSMutableSet set];
-    BOOL hcol = NO;      // 快照有没有 `h=` 这一列（`hcol=1`）—— 区分"旧格式"与"有列但全不匹配"
+    // v0.0.112：v0.0.111 在这里收过一份 `hashes`（`h=` 列）和一个 `hcol` 标记，已全部撤掉。
+    // 🔴 撤的理由：扫描侧算出来的哈希恒等于 `bundle||` ⇒ 同一 App 所有通知同哈希 ⇒ 死探针。
+    //    这里少两个键，`empty` 字典也跟着少两个（形状必须一一对应，不许只改一边）。
     // 🔴 空快照的**唯一**形态（三个早退点共用一份，别各写一遍 ——
     //    少一个键就是"某个调用方读到 nil 然后当 0 处理"，本项目栽过）。
     NSDictionary *empty = @{@"scan": @0, @"nc": @0, @"cse": @0, @"csemn": @0,
-                            @"csm": @0, @"seq": @"", @"keys": [NSSet set],
-                            @"hashes": [NSSet set], @"hcol": @0};
+                            @"csm": @0, @"seq": @"", @"keys": [NSSet set]};
     @try {
         NSString *st = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SNAPSHOT
                                                 encoding:NSUTF8StringEncoding error:NULL];
@@ -1669,7 +1665,6 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
                     else if ([f hasPrefix:@"csem="])  cseMeasured = [[f substringFromIndex:5] integerValue];
                     else if ([f hasPrefix:@"cse="])   cseTotal    = [[f substringFromIndex:4] integerValue];
                     else if ([f hasPrefix:@"csm="])   csOn        = ([[f substringFromIndex:4] integerValue] != 0);
-                    else if ([f hasPrefix:@"hcol="])  hcol        = ([[f substringFromIndex:5] integerValue] != 0);
                     else if ([f hasPrefix:@"seq="])   seq         = [f substringFromIndex:4];
                 }
                 continue;
@@ -1681,13 +1676,14 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
             // 🔴 v0.0.102：末尾的 `cs=N` **不是键**，必须挑掉。
             //    不挑也不会误命中（UUID 不可能叫 "cs=1"），但那属于"靠巧合正确"——
             //    以后快照再加字段（`th=…` 之类）就会变成真的 bug。这里按前缀排除。
-            // 🔴 v0.0.111：新增的 `h=<哈希>` 同样必须**单独挑走**（进 hashes），
-            //    绝不能落进 keys —— 否则「键 N 个」直接翻倍，全是污染。
+            // 🔴 v0.0.112：`h=` 这一列已经不再写，但**必须继续跳过** ——
+            //    v0.0.111 写的旧快照每行还带着一个 `h=<16位hex>`，装上新版时
+            //    App 启动那一刻磁盘上就是那种旧文件。不跳过的后果：哈希串被当成一把"唯一键"
+            //    塞进 keys ⇒「键 N 个」虚高（每行多一个），而且它是**恒不命中**的污染。
+            //    ⚠️ 这一行是向后兼容，不是死代码；等能确认设备上不会再有旧快照了才可删。
             for (NSUInteger i = 1; i < q.count; i++) {
                 NSString *k = q[i];
-                if (!k.length) continue;
-                if ([k hasPrefix:@"h="])  { [hashes addObject:[k substringFromIndex:2]]; continue; }
-                if ([k hasPrefix:@"cs="]) continue;
+                if (!k.length || [k hasPrefix:@"cs="] || [k hasPrefix:@"h="]) continue;
                 [keys addObject:k];
             }
         }
@@ -1698,8 +1694,7 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     if (scan <= 0) return empty;
     return @{@"scan": @(scan), @"nc": @(ncTotal), @"cse": @(cseTotal),
              @"csemn": @(cseMeasured), @"csm": @(csOn ? 1 : 0),
-             @"seq": seq ?: @"", @"keys": keys,
-             @"hashes": hashes, @"hcol": @(hcol ? 1 : 0)};
+             @"seq": seq ?: @"", @"keys": keys};
 }
 
 // ---------- 某条记录此刻在不在通知中心 ----------
@@ -1727,16 +1722,26 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     return NBAliveGone;
 }
 
-// ---------- v0.0.110：只读诊断「全库残留」为什么这么低 ----------
-// 真机读数（2026-11-01）：快照 nc=379（其中 24h 内 276 条），库里 2138 条带 ID 行，
-// **只命中 6 条**；上一版 762 条在册时只命中 1 条。两种可能，必须分开：
-//   ① **ID 早换了** —— 系统重投会给新 bulletinID / notificationIdentifier（本项目已知现象），
-//      老记录的 ID 对不上任何现存通知 ⇒ 这是「本来就这样」，不用改；
-//   ② **拆段/格式对不上** —— `sys_id` 是 `bid|nid`，快照 keys 里都是**单把键**
-//      ⇒ 真 bug，后果是列表上「还在通知中心」的标记几乎全灰。
-// 分辨办法（全只读）：把库里**最近 5 条**的 sys_id 原样打出来，逐段标「在不在键集里」，
-// 再把**同一 section** 的 2 个快照键摆到旁边 —— 眼睛一比就知道 ID 到底换没换。
+// ---------- v0.0.110 起：只读诊断「全库残留」为什么低（v0.0.112 修正取样口径） ----------
+// 🔴🔴 v0.0.112 修的核心缺陷：**这行诊断以前是个恒否判据。**
+//    它原来取「库里最新 5 条」（`ORDER BY ts DESC LIMIT 5`），而快照是**更早**写的
+//    ⇒ 最新那 5 条当时还没发生，**结构上永远不可能出现在那份快照里** ⇒ `命中=0` 是必然。
+//    真机（2026-11-02）就是被它带偏的：#1 是 3 分前、#5 是 18 分前，而快照写于 26 分钟前，
+//    五行全是「否」。我据此得出「两侧 ID 完全不重叠」——**错的**。
+//    ⇒ 现在改成先卡 **`ts <= 快照时刻`** 再倒序取 5 条：取"快照写下那一刻之前"最近的几条，
+//      这几条才**有可能**在快照里，判据才有"是/否"两种结果。
+//    🔴 记住这个反模式：凡是「拿最新数据去比旧快照」的判据，天生恒否。
+//
+// 当初为什么要这个诊断：真机报「全库残留」极低，需要分辨是
+//   ① ID 被系统重投换掉了（老记录对不上现存通知 ⇒ 本来就这样，不用改）；
+//   ② 拆段/格式对不上（真 bug，后果就是列表上「还在通知中心」的标记几乎全灰）。
+// 🔴 后来查明 ① ② 都不是：那个「2 条」是在 **respring 后 40 秒**量的 ——
+//    那时通知中心只加载出 4 条（`[源] nc=4`，51 秒后就是 293 条）。
+//    换成重启前那份快照，同一个指标就是 254 / 2154，而当时通知中心总共 296 条 ⇒ 匹配率 ≈86%。
+//    **结论：匹配逻辑一直是好的，坏的是尺子。** 用户真机也确认橙框"对得上"。
 // 🔴 一个进程只打一次（`static done`）：日志窗口只有 ~50 行，这条一次就够定性。
+//    ⚠️ 但 `done` **只在本函数真能跑取样时才置位**：拿不到快照时刻就直接退出、留待下次。
+//    v0.0.111 的血账：`hcol=0` 说明它读完旧格式快照就把那唯一一次机会烧掉了，整版什么也没测到。
 // 🔴 ID 截成 8…4 位：保留能比对的形状，又不至于把一行撑爆。
 // 🔴 绝不改匹配逻辑：先让眼睛看清是哪种，再决定动不动手（本项目「量看着小 ≠ 尺子坏了」）。
 static NSString *NBShortId(NSString *s) {
@@ -1749,11 +1754,16 @@ static NSString *NBShortId(NSString *s) {
 static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
     static BOOL done = NO;
     if (done || !db || ![snap isKindOfClass:[NSDictionary class]]) return;
-    done = YES;
+    // 🔴🔴 `done` 必须在**确认能取样之后**才置位（下面几行）。
+    //    v0.0.111 把 `done = YES` 写在了最前面，于是"快照还没写成新格式"那一轮
+    //    就把本进程唯一的一次机会烧掉了，整版一条数据都没测到。
+    //    ⇒ 顺序就是判据：**先确认前提，再消费一次性的机会。**
+    double scanTs = [snap[@"scan"] doubleValue];
+    if (scanTs <= 0) return;      // 没读过快照 ⇒ 连"截至时刻"都没有，直接留待下次
     NSSet *keys = snap[@"keys"];
-    NSSet *hashes = snap[@"hashes"];
     if (![keys isKindOfClass:[NSSet class]]) keys = [NSSet set];
-    if (![hashes isKindOfClass:[NSSet class]]) hashes = [NSSet set];
+    done = YES;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     @try {
         // ① 重读快照文件，按 section 把键分组
         //    —— `snap` 里只剩一个扁平 key 集（解析时 section 被丢了），要并排比就得自己再分一次。
@@ -1769,23 +1779,23 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
             if (!arr) { arr = [NSMutableArray array]; [secKeys setObject:arr forKey:sec]; }
             for (NSUInteger i = 1; i < q.count && arr.count < 6; i++) {
                 NSString *k = q[i];
+                // `h=` 同上下：旧快照里还有这列，跳过的理由一样（否则会被摆成"同段键"骗眼睛）。
                 if (!k.length || [k hasPrefix:@"cs="] || [k hasPrefix:@"h="]) continue;
                 [arr addObject:k];
             }
         }
-        // v0.0.111：把「旧格式没这列」与「有列但一条没匹配上」分开报
-        // —— 这两种情况的下一步完全不同，混在一起就会误判成"哈希算法不同源"。
-        // 🔴 只报「去重后 hash 个数」：我手上没有"带 h 的行数"这个量，
-        //    硬写一个一样的数当两个指标 = 编数字（本项目「局部口径不许说全库的话」）。
-        NBStoreLog(@"[残] 诊断：快照分 %lu 段 / 键 %lu 个 / hcol=%ld ｜去重 hash %lu 个",
+        // 报快照有多旧：这是判"这 5 行该不该中"的前提，缺了它读出来的数又会被误读。
+        NBStoreLog(@"[残] 诊断：快照分 %lu 段 / 键 %lu 个 / 写于 %.0f 秒前",
                    (unsigned long)secKeys.count, (unsigned long)keys.count,
-                   (long)[snap[@"hcol"] integerValue], (unsigned long)hashes.count);
-        NBStoreLog(@"[残] 下面 5 行是库里最近的（ts 倒序）：段后的 (在/否) 看 ID，"
-                   @"hash 后的 (中/否) 看内容 —— 两列都要看，只中一半说明只用对了一半");
+                   now - scanTs);
+        NBStoreLog(@"[残] 下面 5 行取的是「快照写下那一刻之前」最近的 5 条"
+                   @"（ts<=快照时刻，倒序）：段后的 (在/否) = 该段 ID 在不在快照键集里");
 
-        // ② 库里最近 5 条（带 ID 的）。v0.0.111 多取 title/message：哈希要现算。
-        const char *sql = "SELECT bundle, sys_id, ts, title, message FROM notifications "
-                          "WHERE sys_id IS NOT NULL AND sys_id<>'' ORDER BY ts DESC LIMIT 5;";
+        // ② v0.0.112：**必须先卡 `ts <= 快照时刻`**。
+        //    不卡就是"拿最新数据比旧快照" ⇒ 这 5 行永远全否（v0.0.111 的血账）。
+        const char *sql = "SELECT bundle, sys_id, ts, title FROM notifications "
+                          "WHERE sys_id IS NOT NULL AND sys_id<>'' AND ts <= ?1 "
+                          "ORDER BY ts DESC LIMIT 5;";
         sqlite3_stmt *st = NULL;
         // 🔴 第 5 参 `pzTail` **不能省**：`sqlite3_prepare_v2` 是 5 参数，
         //    少写一个编译期直接 "too few arguments"（v0.0.110 CI 首跑就栽在这）。
@@ -1793,7 +1803,7 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
             NBStoreLog(@"[残] 诊断 prepare 失败 err=%s", sqlite3_errmsg(db));
             return;
         }
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        sqlite3_bind_double(st, 1, scanTs);
         int idx = 0;
         while (sqlite3_step(st) == SQLITE_ROW) {
             idx++;
@@ -1801,11 +1811,9 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
             const char *cs = (const char *)sqlite3_column_text(st, 1);
             double ts = sqlite3_column_double(st, 2);
             const char *ct = (const char *)sqlite3_column_text(st, 3);
-            const char *cm = (const char *)sqlite3_column_text(st, 4);
             NSString *bundle = cb ? [NSString stringWithUTF8String:cb] : nil;
             NSString *sysId  = cs ? [NSString stringWithUTF8String:cs] : nil;
             NSString *title  = ct ? [NSString stringWithUTF8String:ct] : @"";
-            NSString *msg    = cm ? [NSString stringWithUTF8String:cm] : @"";
 
             NSMutableArray *parts = [NSMutableArray array];
             NSInteger hit = 0;
@@ -1827,17 +1835,11 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
             for (NSUInteger i = 0; sample && i < sample.count && sv.count < 2; i++)
                 [sv addObject:NBShortId(sample[i])];
 
-            // v0.0.111：**现算**内容哈希（用两侧共享的 NBContentHash），再看快照里有没有。
-            // 🔴 不用库里 `hash` 列：那一列是**老算法**（`[[NSData description] UTF8String]`）写的，
-            //    拿它比会全不中，而原因是"算法不同"不是"内容不同" —— 正好是要排除的干扰项。
-            NSString *h = NBContentHash(bundle, title, msg);
-            BOOL hIn = [hashes containsObject:h];
-
-            NBStoreLog(@"[残] #%d %@ %@ ｜库ID(段=%lu 命中=%ld): %@ ｜hash=%@(%@) ｜同段键: %@ ｜title=%@",
+            // v0.0.112：这里原来还对每条现算一次内容哈希，已撤（扫描侧恒等于 `bundle||`）。
+            NBStoreLog(@"[残] #%d %@ %@ ｜库ID(段=%lu 命中=%ld): %@ ｜同段键: %@ ｜title=%@",
                        idx, bundle.length ? bundle : @"(空bundle)", age,
                        (unsigned long)parts.count, (long)hit,
                        parts.count ? [parts componentsJoinedByString:@" "] : @"（sys_id 拆不出段）",
-                       [h substringToIndex:8], hIn ? @"中" : @"否",
                        sv.count ? [sv componentsJoinedByString:@" "] : @"（该段快照里没有条目）",
                        NBShortId(title));
         }
@@ -1884,7 +1886,8 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
     }
     // v0.0.110：顺手做一次「为什么命中这么低」的只读诊断（一个进程只打一次，内部幂等）。
     // 🔴 必须放在 close 之前：它要用同一个 db 句柄。
-    // v0.0.111：改成传整份 `snap`（诊断要同时看 keys / hashes / hcol 三样）。
+    // v0.0.112：仍然传整份 `snap` —— 现在要用的是它的 `scan`（快照时刻），
+    //    没有这个时刻就没法把取样卡在「ts <= 快照时刻」，那 5 行又会变回恒否判据。
     NBDiagAliveMatchOnce(db, snap);
     sqlite3_close(db);
     // 🔴 v0.0.100 自证：这一行是"匹配到底成不成立"的唯一直接证据。
@@ -1893,10 +1896,18 @@ static void NBDiagAliveMatchOnce(sqlite3 *db, NSDictionary *snap) {
     //    有了这一行，「全库 4 / 界面 0」当场就能定位到列表那一侧。
     // 🔴 `带ID行` 是**分母**：它等于 0 说明库里根本没有可比对的 ID（等于没数据），
     //    它很大而残留 0 才是"键对不上"（等于匹配规则有问题）。两个数缺一个就判不了。
+    // 🔴🔴 v0.0.112：**读这个数之前必须先看「扫描于 N 秒前」**。
+    //    2026-11-02 就是这里骗了我一次：respring 后 40 秒量到「残留 4 / 带ID 2154」，
+    //    看着像"匹配全坏"，其实是那会儿通知中心只加载出 4 条；同一份代码在重启前的快照上是
+    //    254 / 2154，而当时通知中心总共 296 条 ⇒ 匹配率 ≈86%。
+    //    ⇒ **这个数是"相对当前通知中心里有多少条"的比值，不是绝对值。分母要先读 `快照 nc=`。**
+    // 🔴 没扫过就报 -1（本项目铁律：没算出来用 -1，不用 0 —— 0 会被读成"算出来是零"）。
+    double scanTs2 = [snap[@"scan"] doubleValue];
+    double snapAge = (scanTs2 > 0) ? ([[NSDate date] timeIntervalSince1970] - scanTs2) : -1.0;
     NBStoreLog(@"全库残留 %ld 条 ｜ 带ID行 %ld ｜ 快照 nc=%@ 键 %lu 个 ｜ 扫描于 %.0f 秒前",
                (long)still, (long)scanned, snap[@"nc"] ?: @"?",
                (unsigned long)[(NSSet *)snap[@"keys"] count],
-               [[NSDate date] timeIntervalSince1970] - [snap[@"scan"] doubleValue]);
+               snapAge);
     return still;
 }
 

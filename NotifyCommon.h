@@ -447,35 +447,26 @@ static inline BOOL NBBoolValue(id v) {
     return NO;
 }
 
-// ---------- v0.0.111：内容哈希（tweak 与 App **共用同一份实现**） ----------
-// 干什么用的：真机定案（2026-11-01）——「还在通知中心」的标记一直几乎全灰，根因不是 ID 变了，
-//   而是**两侧各存一半、且两半不重叠**：
-//     · 库里的 `sys_id` 只有 `BBBulletin.bulletinID`（写入时 `notificationIdentifier` 恒 nil）；
-//     · 快照里的键是 `NCNotificationRequest.notificationIdentifier` + `NCNotificationRequest.uuid`。
-//   注意 `NCNotificationRequest.uuid` **不是** bulletinID —— 两个都是 UUID 长相的不同字段，
-//   所以"快照里有 UUID 形态的键"这件事一直没能对上号。
-// ⇒ 换一把不依赖 ID 的尺子：**内容**。ID 会被系统重投换掉，内容不会。
+// ---------- v0.0.112：这里曾经有过一个「内容哈希」，已删除，**不要再加回来** ----------
+// 🔴 为什么删（真机证伪，2026-11-02）：
+//   ① **前提是假的**。当初加它是因为「全库残留 2 条 / 带ID行 2141」看着像 ID 完全不重叠。
+//      但那个 2 条是在 **respring 后 40 秒**量的 —— 那时通知中心只加载出 4 条。
+//      换成重启前那份快照，同一个指标是 **254 / 2154**，而当时通知中心总共才 296 条
+//      ⇒ ID 匹配率 ≈ 86%，**ID 这条路本来就是好的**。
+//   ② **它在扫描侧恒等于 `bundle||`**。真机日志：
+//        [哈希] 样本 #1 section=com.apple.MobileSMS hash=772f6a0790a4a733 ｜title=(nil) ｜msg=(nil)
+//        [哈希] 样本 #2 section=com.apple.MobileSMS hash=772f6a0790a4a733 ｜title=(nil) ｜msg=(nil)
+//      `NCNotificationRequest` 上 `title`/`message` 取不到（正确路径是 `req.content.*`），
+//      于是同一个 App 的**所有**通知算出来是同一个哈希。
+//      🔴🔴 这种字段比没有更危险：一旦拿它当匹配依据，同一个 App 的任意两条会互相"命中"
+//      ⇒ 橙框标错（把 A 标成还在、把 B 也标成还在），而且**不报错**。
+//   ③ 它还复刻了一个老坑：`[NC-ID#]` 里 `nID=(nil)` 是 **BBBulletinRequest**（发布时那个对象），
+//      而 `[扫][诊]` 里 `nid=__NSCFString` 是 **NCNotificationRequest**（扫描时那个对象）。
+//      两个不同对象，前者的结论不能套到后者身上。
+// ⇒ 真要重做，必须先把「扫描时那个对象上内容到底怎么读」量清楚，再动匹配。
 //
-// 🔴🔴 这个函数**必须在共享头里只有一份**：两侧各写一份必然走岔，
-//     而走岔的表现是「一条都匹配不上」——和现在的病一模一样，且**不报错**（最难查的一类）。
-//     判据也不许各算一遍：谁要哈希就调它。
-// 🔴 为什么不用库里现有的写法（`[[NSData description] UTF8String]`）：那是 Apple 的实现细节
-//     （带尖括号和空格），拿它当"协议"等于把匹配逻辑押在别人随时能改的字符串格式上。
-//     FNV-1a 是十行、确定性、只看字节。
-// 🔴 不用 `uint64_t`（要拉 stdint），直接 `unsigned long long` —— 在 arm64 上就是 64 位。
-// 🔴 分隔符仍用 `|`：标题里含 `|` 也不会歧义，因为三段的**顺序固定**，
-//     而哈希是整体算的（不是逐段比较），含多少 `|` 都只影响这一条的哈希值。
-static inline NSString *NBContentHash(NSString *bundle, NSString *title, NSString *message) {
-    NSString *s = [NSString stringWithFormat:@"%@|%@|%@",
-                   bundle ?: @"", title ?: @"", message ?: @""];
-    NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
-    const unsigned char *p = (const unsigned char *)d.bytes;
-    unsigned long long h = 1469598103934665603ULL;      // FNV-1a offset basis
-    for (NSUInteger i = 0; i < d.length; i++) {
-        h ^= (unsigned long long)p[i];
-        h *= 1099511628211ULL;                          // FNV-1a prime
-    }
-    return [NSString stringWithFormat:@"%016llx", h];   // 固定 16 位小写 hex
-}
+// 判据侧的血账也记一句：v0.0.111 的 `[残]` 诊断取的是「库里最新 5 条」，而快照比它们旧
+//   ⇒ 那 5 行**结构上永远不可能命中**，恒为"否"。它是把上面①的错误结论坐实的主因。
+//   v0.0.112 已改成 `ts <= 快照时刻`。**凡是"拿最新数据比旧快照"的判据，天生恒否。**
 
 #endif /* NotifyCommon_h */
