@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.100"
+#define NB_VER_STR @"0.0.101"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -1488,19 +1488,41 @@ static int NBMapCountOf(id source) {
 }
 
 // 返回 1=认 / 0=不认 / -1=没测到（**没测到不等于不认**，输出必须是三个值之一）
-static int NBDestKnowsRaw(id req) {
-    if (!req || !gCSDestination) return -1;
+// ================= v0.0.101：把 CS 侧那**一个对象**取出来 =================
+// 🔴🔴 为什么必须改：`⑦t` 从上版一直递的是 **NC 侧**的 `NCNotificationRequest`(req7)，
+//    而 `CSNotificationDispatcher -withdrawNotificationRequest:` 认的是**它自己家的**对象。
+//    参数是 `id`，所以类型不对**不会抛**，只会静默什么都不做 ——
+//    真机「⑦t 干净 8/8 无效」正是这个形态。
+//    v0.0.97 章末已经把这条写成待查项：「问题不在门槛，而在 CS 那一侧认的不是我们手里这个对象」。
+// 🔴 真机证据（`nc_diag95.txt` 的 CS 全量方法表，52 个）：CS **没有任何清单 getter**，
+//    它唯一能"按 uuid 取回自己那条 request"的入口就是
+//    `- destination:notificationRequestForUUID:`（dest = `listDestination`）。
+//    这个方法早就在用 —— 但只用它读回一个布尔当**尺子**，取回来的对象被丢掉了。
+//    ⇒ 本版把它真的用上。
+// 🔴 不新增任何挂点：`listDestination` / `destination:notificationRequestForUUID:` /
+//    `withdrawNotificationRequest:` 三个都是真机方法表里已经证明存在的。
+// 🔴 不遍历、不 description：只读已知 KVC 键 `uuid`，只问 `class`（安全）。
+// 🔴 不用 `id *` 出参：ARC 下间接 `id` 参数默认是 `__autoreleasing`，
+//    和 `__strong` 局部变量之间要走一次写回临时量 —— 能编过，但没必要引入这个歧义。
+//    改成「返回对象 + 一个文件内静态三态」，非 ARC/ARC 两种模型下行为完全一致。
+static int gDestProbeStatus = -1;      // 上一次探测的三态：1=认 / 0=不认 / -1=没测到
+
+// 🔴 返回 CS 侧那**一个** request 对象（可能 nil）；三态见 `gDestProbeStatus`。
+//    ⚠️ 这两个必须在**同一个线程**上连续用（本项目的 ⑦ 段全在 SpringBoard 主队列上串行跑）。
+static id NBDestProbeObj(id req) {
+    gDestProbeStatus = -1;
+    if (!req || !gCSDestination) return nil;
     if (![gCSDestination respondsToSelector:@selector(destination:notificationRequestForUUID:)])
-        return -1;
+        return nil;
     id uuid = nil;
     @try { uuid = NBSafeValue(req, @"uuid"); } @catch (__unused NSException *e) { }
-    if (!uuid) return -1;
+    if (!uuid) return nil;
     id dest = nil;
     @try {
         if ([gCSDestination respondsToSelector:@selector(listDestination)])
             dest = [gCSDestination listDestination];
     } @catch (__unused NSException *e) { }
-    if (!dest) return -1;
+    if (!dest) return nil;
     if (!gDestRulerTried) {
         gDestRulerTried = YES;
         NBDiagStep(@"  [尺] 首次调用 CSNotificationDispatcher -destination:notificationRequestForUUID:"
@@ -1508,9 +1530,16 @@ static int NBDestKnowsRaw(id req) {
     }
     @try {
         id got = [gCSDestination destination:dest notificationRequestForUUID:uuid];
-        return got ? 1 : 0;
+        gDestProbeStatus = got ? 1 : 0;
+        return got;
     } @catch (__unused NSException *e) { }
-    return -1;
+    return nil;
+}
+
+// 只要三态读数（原来的语义完全不变，调用点一个都不用改）
+static int NBDestKnowsRaw(id req) {
+    (void)NBDestProbeObj(req);
+    return gDestProbeStatus;
 }
 
 static NSString *NBDestKnowsStr(id req) {
@@ -2813,10 +2842,22 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
                             } else {
                                 [[[NSString stringWithFormat:@"%@ ⑦t %@ %@", NB_VER_STR, [NSDate date], nid7 ?: @"?"]
                                   dataUsingEncoding:NSUTF8StringEncoding] writeToFile:kNBGuardCSWs atomically:YES];
-                                NBDiagStep(@"  ⑦t 将要调用 CSNotificationDispatcher -withdrawNotificationRequest:\n");
+                                // ---------- v0.0.101：递给 CS 的必须是 **CS 自己的那个对象** ----------
+                                // 🔴 上一版递的是 `req7`（NC 侧 NCNotificationRequest）。参数是 `id`
+                                //    ⇒ 类型不对**不抛**，只静默什么都不做。这是"7t 干净 8/8 无效"最省事的解释。
+                                // 🔴 取不到 CS 侧对象时**退回** req7（不能让这一刀凭空消失），
+                                //    但必须在日志里说清用的哪一侧 —— 否则下一轮又分不清
+                                //    「刀没出手」和「出手了但不是它家的对象」。
+                                id csReq7 = NBDestProbeObj(req7);
+                                int csp7 = gDestProbeStatus;
+                                id blade7 = csReq7 ?: req7;
+                                NBDiagStep(@"  ⑦t 用 %@ 侧对象（CS 探测=%d ｜ CS 侧类=%@ ｜ 与 NC 侧%@同一指针）\n",
+                                           csReq7 ? @"CS" : @"NC", csp7,
+                                           csReq7 ? NSStringFromClass([csReq7 class]) : @"(nil)",
+                                           (csReq7 && csReq7 == req7) ? @"是" : @"不是");
                                 gCSDirectWithdraw++;
                                 @try {
-                                    [gCSDestination withdrawNotificationRequest:req7];
+                                    [gCSDestination withdrawNotificationRequest:blade7];
                                     NBDiagStep(@"  ⑦t 已返回\n");
                                 } @catch (NSException *e) {
                                     NBDiagStep(@"  ⑦t 抛: %@\n", e.reason);
