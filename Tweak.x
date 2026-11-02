@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.120"
+#define NB_VER_STR @"0.0.121"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2042,13 +2042,35 @@ static NSTimeInterval sSnapSuspectSince = 0;   // 首次判为"没读全"而抑�
 // 🔴 用途只有一个：给"本次这个数是不是可疑"提供**上一份的基数**（v0.0.115 起判的是比值，
 //    不再是"是不是 0"）。返回 0 时保护不触发 —— 也就是"读不到上一份"会退化成旧行为（照写），
 //    这是**故意**的：宁可漏保护，也不要因为读不到一个诊断数就把快照永远卡住。
+// 🔴 v0.0.121：只读**文件头部**，不再把整份快照读进内存。
+//    真机快照是 637 行 / 40~55 KB，而这里要的只是**第一行**里的一个数 ——
+//    以前每次扫描都白读白解析一遍整份文件（每次触发都算，用户频繁下拉就是很多遍）。
+// 🔴 为什么 1 KB 就够：表头一行是 `#scan=…|nc=…|cs=…|…|seq=…`，不到 200 字节；
+//    1 KB 是留的余量（以后加字段也不会一下就超）。
+// 🔴 为什么按 `\n` 截断一定安全：`\n`(0x0A) 是单字节，而 UTF-8 多字节序列里
+//    **不会出现 0x0A** ⇒ 在 `\n` 处切开的 data 永远是一个合法的 UTF-8 前缀，
+//    不会把某个汉字切成半个（那种情况会让下面这句转字符串直接返回 nil）。
+// 🔴 找不到 `\n` 时（文件只有一行 / 还没有表头）就用这 1 KB 原样解析，行为同旧版。
 static NSUInteger NBPrevSnapshotNc(void) {
     @try {
-        NSString *body = [NSString stringWithContentsOfFile:NOTIFYBOX_NC_SNAPSHOT
-                                                  encoding:NSUTF8StringEncoding error:NULL];
-        if (!body.length) return 0;
-        NSRange nl = [body rangeOfString:@"\n"];
-        NSString *h0 = (nl.location == NSNotFound) ? body : [body substringToIndex:nl.location];
+        NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:NOTIFYBOX_NC_SNAPSHOT];
+        if (!fh) return 0;
+        NSData *head = nil;
+        @try {
+            head = [fh readDataOfLength:1024];
+        } @finally {
+            // 🔴 `closeFile` 放 finally：读失败时句柄也必须关掉，否则每次扫描漏一个 fd。
+            [fh closeFile];
+        }
+        if (head.length == 0) return 0;
+        // 截到第一个 `\n` 之前（不含）；没有就整段用。
+        const char *p = (const char *)head.bytes;
+        NSUInteger cut = head.length;
+        for (NSUInteger i = 0; i < head.length; i++) {
+            if (p[i] == '\n') { cut = i; break; }
+        }
+        NSData *lineData = [head subdataWithRange:NSMakeRange(0, cut)];
+        NSString *h0 = [[NSString alloc] initWithData:lineData encoding:NSUTF8StringEncoding];
         if (![h0 hasPrefix:@"#"]) return 0;
         for (NSString *f in [h0 componentsSeparatedByString:@"|"]) {
             if ([f hasPrefix:@"nc="]) return (NSUInteger)[[f substringFromIndex:3] integerValue];

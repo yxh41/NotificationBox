@@ -408,6 +408,14 @@ static inline NSArray<NSString *> *NBStringArray(id v) {
 // 🔴 10 分钟：通知中心是**随时会变**的东西（用户手动划掉、系统自动清理），
 //    拿十分钟前的结论当现状，性质和"拿删除台账当现状"是一样的。
 #define NB_NC_SNAPSHOT_FRESH_SEC 600.0
+// v0.0.121：**自动**触发扫描的最小间隔（秒）。
+// 🔴 为什么需要它：v0.0.121 起多了 `UIApplicationDidBecomeActiveNotification` 这第四个触发点
+//    —— 下拉通知中心/控制中心再收起，状态是 background/inactive → active，
+//    **不发 `WillEnterForeground`** ⇒ 那条路以前根本不重扫（用户只能杀掉 App 重进）。
+//    但 `DidBecomeActive` 还会被"来电横幅消失 / 从 App 切换器回来 / 解锁"等等触发，
+//    密集时一分钟十几次 ⇒ 每次都遍历一遍全部 NC request（真机 637 条）是纯浪费。
+// 🔴 只挡**自动**触发：用户手动点提示条要求「重新扫描」时不许节流（点了不动 = 按钮像坏的）。
+#define NB_NC_SCAN_MIN_GAP 2.0
 // `sys_id` 里两个候选 ID 的分隔符（写入侧 `bID|nID`，见 Tweak.x 的 sysId 拼装处）。
 // 🔴 App 侧匹配**必须按它拆开逐段查** —— 拿整串去查单个键是这个功能最大的坑。
 #define NB_SYSID_SEP @"|"

@@ -190,6 +190,20 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    和 `searchGen`（防抖代次）同一条理由。
 @property (nonatomic, copy)   NSString *ncScanSeq;
 @property (nonatomic, assign) BOOL ncScanPending;
+// v0.0.121：上次读到的快照**内容**，以及自动触发扫描的节流时刻。
+// 🔴 为什么必须比内容：v0.0.120 及以前 `ncWaitAndReload:` 的判据是
+//    `got > aliveScanTs + 0.5`，而 `got` 是**这次扫描新写的时间戳** ⇒ 这个条件恒真
+//    ⇒ **每扫一次就整表 `loadData` 一次**（6~8 条 SQL + 2000 行重建），哪怕通知中心一条都没变。
+//    现在改成剔掉 `scan`（扫描时刻）/ `seq`（请求序号）这两个必然变的字段，比剩下的内容。
+// 🔴 存的是**已经剔掉那两个字段的那份**，下次直接 `isEqual:`（`keys` 是 NSSet，深比较很便宜）。
+@property (nonatomic, strong) NSDictionary *lastSnapContent;
+@property (nonatomic, assign) NSTimeInterval lastNCSnapReqTs;
+// v0.0.121：`applyAliveFilter:` 的**输入**（关键词规则 + 同内容归并之后、残留筛选之前）。
+// 🔴 为什么要单独留一份：残留筛选的结果只取决于「快照 + 这一份 items」。
+//    库没变、只有通知中心变了的时候，前面那一大串（图标栏重建 / 最高 2000 行主查询 /
+//    关键词规则 / 同内容归并 / 三条未读计数）结果**一定相同** ⇒ 不必重跑，
+//    直接从这一份再筛一遍就行。这是本版省掉的主要开销。
+@property (nonatomic, strong) NSArray<NSDictionary *> *itemsBeforeAlive;
 // v0.0.42：bundle -> App 显示名。**同时给两件事用**：
 //   ① 列表每一行显示「这条是哪个 App 的」—— 以前只有图标，图标加载失败就只剩一个字母；
 //   ② 搜索时把「微信」「招商银行」这种词匹配成 bundle 列表，再传给 NotifyStore。
@@ -237,8 +251,21 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)doMarkAllRead;
 // v0.0.38：库里变了才重查（保住滚动位置）；以及那个"保住滚动位置的重查"本身
 - (void)refreshIfChanged;
+// v0.0.121：把「库/规则变没变」这一条判据单独抽出来 —— `refreshIfChanged`
+// 和 `ncWaitAndReload:` 都要问同一个问题，而它们的动作完全不同
+// （一个自己重查、一个决定走完整路还是轻路）⇒ 判据必须只有一份。
+- (BOOL)dbFingerprintChanged;
 - (void)reloadKeepingOffset;
+// v0.0.121：库没变、只有通知中心现状变了时走的**轻路**（不跑主查询/规则/归并/未读计数）。
+- (void)refreshItemsKeepingOffset;
+// v0.0.121：完整路与轻路的**共用尾部**（items → 残留筛选 → 未读书签 → 列表 → 空视图 → 橙条）。
+// 🔴 抽出来是为了让"两条路做的事一定一样"落成**代码结构**，而不是靠注释提醒。
+- (void)applyItemsAndRefreshUI;
+// 重查之后按原 offset 归位（两条路共用，原来这段只写在 `reloadKeepingOffset` 里）。
+- (void)clampContentOffset:(CGPoint)off;
 - (void)onForeground:(NSNotification *)note;
+// v0.0.121：inactive → active（下拉通知中心/控制中心收起走的就是这条）
+- (void)onBecameActive:(NSNotification *)note;
 // v0.0.40：筛选之外未读的条数（`loadData` 里算，`viewDidLayoutSubviews` 用它决定占不占位）
 - (void)updateHiddenUnread;
 // v0.0.40：提示文案的**唯一来源**（顶部提示条 + 空列表正中那句都用它产出）
@@ -265,7 +292,15 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // 🔴 声明顺序 = 调用顺序（`loadAliveSnapshot` → `applyAliveFilter` → `updateAliveHint`），
 //    项目开 -Werror，靠"定义在前面"解析选择器太脆（v0.0.48 setStarred 那次就是这么炸的）。
 - (void)loadAliveSnapshot;
+// v0.0.121：`loadAliveSnapshot` 拆成两半 —— 只负责"取哪份快照"和"用这份快照"。
+// 🔴 为什么：`ncWaitAndReload:` 手上已经有一份 `ncSnapshot` 了，再读一次等于
+//    把 55 KB / 637 行的快照文件读+解析两遍。两处必须用**同一份**才是同一个时刻的数。
+- (void)applyAliveSnapshot:(NSDictionary *)snap;
+// v0.0.121：这份快照和上次读到的**内容**是不是一样（剔掉 `scan`/`seq` 后比）。
+- (BOOL)snapshotContentChanged:(NSDictionary *)snap;
 - (void)requestNCSnapshot;
+// v0.0.121：**自动**触发扫描的唯一出口（带 `NB_NC_SCAN_MIN_GAP` 节流）。
+- (void)requestNCSnapshotIfDue;
 - (void)ncWaitAndReload:(NSInteger)left;
 - (NBAliveState)aliveStateForRow:(NSDictionary *)row;
 - (NSArray<NSDictionary *> *)applyAliveFilter:(NSArray<NSDictionary *> *)rows;
@@ -389,6 +424,14 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
                                              selector:@selector(onForeground:)
                                                  name:UIApplicationWillEnterForegroundNotification
                                                object:nil];
+    // v0.0.121：下拉通知中心 / 控制中心再收起，**不走** `WillEnterForeground` ——
+    //    那条路的状态是 active → inactive → active，只有 `DidBecomeActive` 会发。
+    //    不接这个通知的话，"在通知中心里划掉几条 → 收起 → 回到盒子"标记不刷新，
+    //    用户只能杀掉 App 重进才看得到变化。
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onBecameActive:)
+                                                 name:UIApplicationDidBecomeActiveNotification
+                                               object:nil];
 }
 
 // v0.0.38：从详情页/设置页返回。`viewWillAppear:` 在**首次显示**时也会调用，
@@ -401,13 +444,25 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
     // 🔴 放在 `refreshIfChanged` **之后**：那个只在库变了才重查，而"通知中心变了"
     //    跟库一点关系都没有（用户手动划掉几条，库里的记录一条没少）。
     //    ⇒ 这两个刷新是**正交**的，谁也不能替谁。
-    [self requestNCSnapshot];
+    // v0.0.121：改走 `IfDue` —— 从详情页返回也会走这里，而 `DidBecomeActive` 那条路
+    //    常常紧跟其后，两条叠在几百毫秒内发两次请求没有任何意义。
+    [self requestNCSnapshotIfDue];
 }
 
 - (void)onForeground:(NSNotification *)note {
     [self refreshIfChanged];
     // v0.0.99：回前台同样要重扫（用户在通知中心里划掉了几条，这里必须跟上）。
-    [self requestNCSnapshot];
+    [self requestNCSnapshotIfDue];
+}
+
+// v0.0.121：App 从 inactive 回到 active。
+// 🔴 什么时候会来：下拉通知中心/控制中心收起、Siri 关掉、来电横幅消失、
+//    从 App 切换器返回、锁屏解锁后回到这个 App……**最需要它的就是第一个**。
+- (void)onBecameActive:(NSNotification *)note {
+    // 🔴 先 `refreshIfChanged`：tweak 写库是**另一个进程**干的，App 收不到任何通知，
+    //    库里真变了只能靠这种时机补上；而"通知中心变没变"是另一件事，两者正交。
+    [self refreshIfChanged];
+    [self requestNCSnapshotIfDue];
 }
 
 - (void)onSettings:(id)sender {
@@ -1388,23 +1443,23 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                                searchBundles:searchBundles
                                    unreadOnly:self.unreadOnly];
     // v0.0.48：给查询结果套关键词规则（标星 + 折叠）。**无规则时原样返回 ⇒ 行为零变化。**
-    self.items = [self applyKeywordRulesToRows:queried];
+    NSArray<NSDictionary *> *ruled = [self applyKeywordRulesToRows:queried];
     // v0.0.95：同内容同日的行归并成一条（×N）。
     // 🔴 位置不能动：必须在 `applyKeywordRulesToRows:` 之后（它决定哪些行进列表），
     //    在 `rebuildBundleUnread` 之前（未读书签要按**最终可见的 items**数）。
-    self.items = [self applyGroupCollapse:self.items];
-    // v0.0.98：残留筛选。**必须排在归并之后**：
-    //    归并保留下来的那条是"最新那条"，而 `aliveStillCount` 是给提示条报数的 ——
-    //    如果放在归并之前，一个 ×5 的组会被数 5 次，提示条说"12 条仍在"而列表里只有 3 张卡，
-    //    用户按这个数去找必然找不到（本项目"分母自己会变"的同款）。
-    self.items = [self applyAliveFilter:self.items];
-    // v0.0.72：未读书签的计数必须紧跟 `self.items` 重建（见方法注释里的顺序要求）。
-    [self rebuildBundleUnread];
-    [self.table reloadData];
-    [self updateEmptyView];
+    // v0.0.121：归并结果**存进 `itemsBeforeAlive`** —— 它是残留筛选的输入，
+    //    库没变的时候（轻路）直接拿它再筛一遍，不必把上面这一整串重跑。
+    self.itemsBeforeAlive = [self applyGroupCollapse:ruled];
+    // v0.0.98：残留筛选 + 未读书签 + 列表刷新 —— 全部收进共用尾部。
+    // 🔴 为什么不在这里写一遍：轻路（`refreshItemsKeepingOffset`）要做**完全一样**的事，
+    //    写两遍迟早走岔，而走岔的表现是"下拉一次通知中心，某些提示条不动了"这种
+    //    只在特定操作序列下出现的问题。顺序必须落成代码结构，注释守不住。
+    [self applyItemsAndRefreshUI];
 
     // 🔴 标题里直接报 DB 总记录数：这个数不依赖列表渲染，
     //    即使列表因为取图标崩了，用户也能从标题看出「库里到底有没有东西」。
+    // v0.0.121：以下四行 + 后面三条提示条只属于**完整重查**（它们要么查库、
+    //    要么依赖 `queriedCount` 这类只在 SQL 那一半才更新的量）。
     NSInteger total = [NotifyStore count];
     self.title = [NSString stringWithFormat:@"消息盒子 (%ld)", (long)total];
 
@@ -1428,9 +1483,34 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self updateHiddenUnread];
     // v0.0.48：折叠提示条紧随其后刷新（它出现/消失同样改变起始 y，靠下面那句 setNeedsLayout）。
     [self updateFoldedHint];
-    // v0.0.98：残留提示条（同上，出现/消失也改起始 y）。
-    [self updateAliveHint];
     [self.view setNeedsLayout];
+}
+
+// v0.0.121：完整路与轻路的**共用尾部**。
+// 🔴 为什么必须共用：残留筛选的结果只取决于「快照 + 筛之前的 items」，
+//    和"那批 items 是怎么来的"无关。两条路各写一遍 = 迟早一边改了另一边没改。
+// 🔴 这里**不许**出现任何查库动作：轻路的价值就在"零 SQL"。要查库的东西一律留在
+//    `loadData` 里（`updateMoreFooter` / `updateHiddenUnread` 各要查 1~2 次）。
+- (void)applyItemsAndRefreshUI {
+    // v0.0.98：残留筛选。**必须排在归并之后**：
+    //    归并保留下来的那条是"最新那条"，而 `aliveStillCount` 是给提示条报数的 ——
+    //    如果放在归并之前，一个 ×5 的组会被数 5 次，提示条说"12 条仍在"而列表里只有 3 张卡，
+    //    用户按这个数去找必然找不到（本项目"分母自己会变"的同款）。
+    // 🔴 用两行而不是 `self.itemsBeforeAlive ?: @[]`：三元表达式里 `@[]` 是裸 `NSArray *`，
+    //    而 `applyAliveFilter:` 的形参带轻量泛型 —— 项目开 `-Werror`，
+    //    这种"可能报警告"的写法不值得赌一次 CI。
+    NSArray<NSDictionary *> *base = self.itemsBeforeAlive;
+    if (!base) base = @[];
+    self.items = [self applyAliveFilter:base];
+    // v0.0.72：未读书签的计数必须紧跟 `self.items` 重建（见方法注释里的顺序要求）。
+    [self rebuildBundleUnread];
+    [self.table reloadData];
+    [self updateEmptyView];
+    // v0.0.98：残留提示条。放在这里是因为它依赖 `applyAliveFilter` 刚算出来的
+    //    `aliveStillCount` / `aliveAllCount`；起始 y 的更新由调用方最后那句
+    //    `setNeedsLayout` 负责（完整路在 `loadData` 尾部，轻路在 `clampContentOffset:` 里的
+    //    `layoutIfNeeded`）。
+    [self updateAliveHint];
 }
 
 // v0.0.42：底部「下面还有 N 条更早记录」。
@@ -1773,7 +1853,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 // 🔴🔴 v0.0.99 换数据源：读的是**通知中心现状**（`ncSnapshot`），不再是删除台账。
 //    v0.0.98 那套回答的是"上次清理时哪些还在"，只在删记录后刷新 ⇒ 用户不删就永远空白。
 - (void)loadAliveSnapshot {
-    NSDictionary *snap = [NotifyStore ncSnapshot];
+    [self applyAliveSnapshot:[NotifyStore ncSnapshot]];
+}
+
+// v0.0.121：把「取哪份快照」和「用这份快照」拆开。
+// 🔴 为什么：`ncWaitAndReload:` 手上**已经有一份** `ncSnapshot` 了（它要用 `seq` 判归属）。
+//    再调一次 `loadAliveSnapshot` 等于把 55 KB / 637 行的快照文件读+解析两遍；
+//    更要紧的是——两次读之间 tweak 可能又写了一份，那样"判归属用的 seq"和
+//    "真正拿来打标记的 keys"就不是同一份数据了（本项目"三个不同时刻的数"同款）。
+- (void)applyAliveSnapshot:(NSDictionary *)snap {
     // 🔴 防御一行：`ncSnapshot` 自己的每条路径都返回字典，但这里是**跨文件契约**，
     //    对面以后改成一个 nil 返回值也不会崩 —— 崩在凌晨三点的推送页面上是最贵的。
     if (![snap isKindOfClass:[NSDictionary class]]) snap = @{};
@@ -1792,6 +1880,28 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     self.aliveStale = (self.aliveScanTs > 0 &&
                        (now - self.aliveScanTs) > NB_NC_SNAPSHOT_FRESH_SEC);
+}
+
+// v0.0.121：这份快照和上次读到的**内容**一样吗？
+// 🔴🔴 为什么不能用"扫描时刻变大"当判据：那是 v0.0.120 的做法
+//    （`got > aliveScanTs + 0.5`），而 `got` 是**这一轮刚写进去的**时间戳 ⇒ **恒真**
+//    ⇒ 通知中心一条都没变，也要整表 `loadData` 一遍（6~8 条 SQL + 最高 2000 行重建）。
+//    「判据恒真」在本项目是熟面孔，这次它伪装成了一条性能问题。
+// 🔴 剔掉两个字段：
+//    ① `scan` —— 每次扫描都变，是"什么时候扫的"，不是"扫到了什么"；
+//    ② `seq`  —— 每次请求都变（毫秒时间戳），同理。
+//    留着它们比出来的结论永远是"变了"，这次优化就等于没做。**新增字段不用改这里** ——
+//    除了这两个，字典里其余的键一律参与比较（结构性防漏，不靠谁能记得住清单）。
+- (BOOL)snapshotContentChanged:(NSDictionary *)snap {
+    NSDictionary *src = [snap isKindOfClass:[NSDictionary class]] ? snap : @{};
+    NSMutableDictionary *now = [NSMutableDictionary dictionaryWithDictionary:src];
+    [now removeObjectForKey:@"scan"];
+    [now removeObjectForKey:@"seq"];
+    NSDictionary *prev = self.lastSnapContent;
+    self.lastSnapContent = now;
+    // prev 为 nil（第一次到这个方法）⇒ `isEqual:nil` 为 NO ⇒ 返回 YES
+    // ⇒ 第一轮必定走一次重刷。这是对的：那时候屏幕上还什么都没有。
+    return ![now isEqual:prev];
 }
 
 // ================= v0.0.99：主动请求扫描 =================
@@ -1815,6 +1925,21 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self ncWaitAndReload:2];       // 最多两轮
 }
 
+// v0.0.121：**自动**触发的唯一出口（带节流）。
+// 🔴 为什么必须有它：v0.0.121 加了第四个触发点 `onBecameActive:`，而 `DidBecomeActive`
+//    还会被"来电横幅消失 / 从 App 切换器回来 / 解锁"等触发，密集时一分钟十几次
+//    ⇒ 每次都让 SpringBoard 遍历全部 NC request（真机 637 条）是纯浪费。
+// 🔴 三个自动触发点（`viewWillAppear:` / `onForeground:` / `onBecameActive:`）一律走这里；
+//    只有用户**手动点**提示条要求「重新扫描」时才调 `requestNCSnapshot`（不许被节流挡掉 ——
+//    点了不动，用户只会当成按钮坏了）。
+// 🔴 节流判断放在这**一个出口**里，不散落到三个调用点：散开以后再加第五个触发点就一定会漏。
+- (void)requestNCSnapshotIfDue {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (self.lastNCSnapReqTs > 0 && (now - self.lastNCSnapReqTs) < NB_NC_SCAN_MIN_GAP) return;
+    self.lastNCSnapReqTs = now;
+    [self requestNCSnapshot];
+}
+
 // 等一轮再读。`left` = 还能等几轮。
 - (void)ncWaitAndReload:(NSInteger)left {
     __weak typeof(self) ws = self;
@@ -1824,18 +1949,47 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         if (!self2) return;
         NSDictionary *snap = [NotifyStore ncSnapshot];
         BOOL mine = [snap[@"seq"] isEqualToString:(self2.ncScanSeq ?: @"")];
-        if (mine || left <= 1) {
-            self2.ncScanPending = NO;
-            // 读到的就是这次要的（或已经没有轮次了）⇒ 整表重刷一次把标记刷出来。
-            // 🔴 只在"内容真的变了"时 reload，否则每次进列表都会白刷一遍
-            //    （`loadData` 要跑 6~8 条 SQL，见 scheduleLoadData 的注释）。
-            NSTimeInterval got = [snap[@"scan"] doubleValue];
-            if (got > self2.aliveScanTs + 0.5 || !mine) {
-                [self2 loadData];
+        if (!mine && left > 1) {
+            [self2 ncWaitAndReload:left - 1];
+            return;
+        }
+        self2.ncScanPending = NO;
+
+        // ---------- ① 这一轮到底改变了什么 ----------
+        // 🔴 v0.0.121：判据从「扫描时刻变大」换成「内容变了」。
+        //    旧判据 `got > aliveScanTs + 0.5` 里 `got` 是**这一轮刚写的**时间戳
+        //    ⇒ 只要两轮间隔超过 0.5 秒就恒真 ⇒ 通知中心一条没变也整表重查一遍。
+        // 🔴 顺序不能换：`aliveStale` 必须在 `applyAliveSnapshot:` **之前**读 ——
+        //    过期↔新鲜的翻转会让所有行从 Unknown 变成真标记（或反过来），
+        //    那是**看得见**的变化，内容一个字没变也必须重刷列表。
+        BOOL staleWas = self2.aliveStale;
+        BOOL contentChanged = [self2 snapshotContentChanged:snap];
+        NSTimeInterval scanNew = [snap[@"scan"] doubleValue];
+        BOOL scanAdvanced = (scanNew > self2.aliveScanTs + 0.001);
+        [self2 applyAliveSnapshot:snap];
+        BOOL staleFlipped = (staleWas != self2.aliveStale);
+
+        if (!contentChanged && !staleFlipped) {
+            // ---------- ② 什么都没变 ----------
+            // 唯一可能变的是提示条上那句"扫描于 X 前" ⇒ 只刷它。
+            // 🔴 这里**不做** `reloadData`、**不跑任何 SQL** —— "没变化也重刷一遍"
+            //    正是这次要消掉的那笔开销；顺手刷一下等于这次改动白做。
+            if (scanAdvanced) {
+                [self2 updateAliveHint];
+                [self2.view setNeedsLayout];
             }
             return;
         }
-        [self2 ncWaitAndReload:left - 1];
+        // ---------- ③ 通知中心真的变了 ----------
+        // 库也变了 ⇒ 走完整重查（SQL + 规则 + 归并）；库没变 ⇒ 只重算残留这一层。
+        // 🔴 两条都保住滚动位置：以前这里调的是**裸 `loadData`**，而"保住位置"只写在
+        //    `reloadKeepingOffset` 里 ⇒ 每扫一次列表就弹回顶部，用户滑到中间看记录时
+        //    正好下拉一次通知中心，回来位置就没了。
+        if ([self2 dbFingerprintChanged]) {
+            [self2 reloadKeepingOffset];
+        } else {
+            [self2 refreshItemsKeepingOffset];
+        }
     });
 }
 
@@ -2025,6 +2179,17 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 
 // v0.0.38：库里变了才重查一次。给「从详情页/设置页返回」和「App 回前台」用。
 - (void)refreshIfChanged {
+    if (![self dbFingerprintChanged]) return;
+    [self reloadKeepingOffset];
+}
+
+// v0.0.121：判据单独一份 —— 「库 / 关键词规则变了没变」。
+// 🔴 为什么抽出来：`refreshIfChanged`（库变了 ⇒ 自己整表重查）和 `ncWaitAndReload:`
+//    （决定走完整路还是轻路）问的是**同一个问题**，但动作完全不同。
+//    判据写两份，迟早改了一份漏另一份，而那种走岔的表现是"某条路径下死活不刷新"、
+//    "某条路径又多刷一遍"—— 都是最难查的一类。
+// 🔴 这里**只判不查**：不调 `reloadKeepingOffset`，由调用方决定用哪条路。
+- (BOOL)dbFingerprintChanged {
     NSInteger total = [NotifyStore count];
     NSInteger topId = [NotifyStore maxRowId];
     // v0.0.49：关键词规则的指纹也参与"要不要重查"的判定。
@@ -2039,11 +2204,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     BOOL rulesChanged = ![rulesNow isEqual:self.lastRules];
     // 🔴 两个都得比：库满之后新增记录不会让条数变大（tweak 先裁掉一条最旧的），
     //    只有 `MAX(id)` 会变；反过来，删记录通常只让条数变小。
-    if (total == self.lastTotal && topId == self.lastMaxId && !rulesChanged) return;
-    self.lastRules = rulesNow;
-    // 🔴 DB 打不开时 `count` / `maxRowId` 双双回 -1，和上一次的 -1 相等 ⇒ 这里直接返回，
+    // 🔴 DB 打不开时 `count` / `maxRowId` 双双回 -1，和上一次的 -1 相等 ⇒ 返回 NO，
     //    列表保持原样。这是**故意的**：打不开库的时候"刷新"只会把好数据换成空列表。
-    [self reloadKeepingOffset];
+    if (total == self.lastTotal && topId == self.lastMaxId && !rulesChanged) return NO;
+    self.lastRules = rulesNow;
+    return YES;
 }
 
 // v0.0.38：整表重查，但保住滚动位置。
@@ -2052,13 +2217,40 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 //    清零 —— v0.0.35 的注释里已经写明"滚到中间点开一条再返回，列表跳回顶部"。
 //    这段逻辑原来只写在 `didSelectRow:` 的「只看未读」分支里，现在抽出来当**唯一来源**：
 //    `refreshIfChanged` 和它共用一份。
-// 🔴 顺序不能换：存 offset → 重查 → `layoutIfNeeded` → 写回。
-//    少了 `layoutIfNeeded`，`contentSize` 还是旧值，clamp 会按旧高度算 ⇒ 位置仍然错。
-// 🔴 这里**保持 `off.y` 不变**是有意的：新记录插在最前面，用户会看到内容整体下移一行、
-//    新行出现在原来的位置 —— 这比"位置纹丝不动、新行藏在上面要自己往上滚"更符合直觉。
 - (void)reloadKeepingOffset {
     CGPoint off = self.table.contentOffset;
     [self loadData];
+    [self clampContentOffset:off];
+}
+
+// v0.0.121：轻路 —— **库没变、只有通知中心现状变了**。
+// 🔴 跳过的东西（每一样都是钱）：图标栏重建、最高 2000 行的主查询、
+//    关键词规则匹配、同内容归并、`count` / `MAX(id)` / 关键词规则三条读库、
+//    两次未读计数、底部「还有 N 条更早」的计数。
+//    这些的输入（`filterBundle` / `since` / `search` / `unreadOnly` / 库内容）
+//    在这条路上一个字都没变 ⇒ 结果必然相同，重跑纯属浪费。
+// 🔴 保留的东西：重读快照 → 重算残留筛选 → 重建未读书签 → 刷列表 → 空视图 → 橙条。
+//    听起来不少，但真正花钱的只有 `applyAliveFilter` 里的那次全库扫描
+//    （`countStillInDBWithSnapshot:`，只在列表内一条残留都没有时才跑），
+//    而完整路要跑的那 6~8 条 SQL + 2000 行重建全都省掉了。
+- (void)refreshItemsKeepingOffset {
+    // 🔴 没跑过完整重查就没有 `itemsBeforeAlive`（理论上不会：`viewDidLoad` 里
+    //    `loadData` 先跑）。回落到完整路 —— ⛔ **不许**拿空数组顶替，
+    //    那会让列表瞬间清空，用户看到的是"记录没了"。
+    if (!self.itemsBeforeAlive) {
+        [self reloadKeepingOffset];
+        return;
+    }
+    CGPoint off = self.table.contentOffset;
+    [self applyItemsAndRefreshUI];
+    [self clampContentOffset:off];
+}
+
+// 🔴 顺序不能换：重查 → `layoutIfNeeded` → 写回。
+//    少了 `layoutIfNeeded`，`contentSize` 还是旧值，clamp 会按旧高度算 ⇒ 位置仍然错。
+// 🔴 这里**保持 `off.y` 不变**是有意的：新记录插在最前面，用户会看到内容整体下移一行、
+//    新行出现在原来的位置 —— 这比"位置纹丝不动、新行藏在上面要自己往上滚"更符合直觉。
+- (void)clampContentOffset:(CGPoint)off {
     // 🔴 v0.0.39：从 `[self.table layoutIfNeeded]` 改成 `[self.view layoutIfNeeded]`。
     //    原因：这一版起 `loadData` 可能让「更早未读提示条」出现/消失 ⇒ **table 自己的
     //    frame 也会变**（起始 y 和高度都跟着变）。只给 table 做 layoutIfNeeded
