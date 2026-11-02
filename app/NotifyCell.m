@@ -867,25 +867,35 @@ static void NBHapticFire(NBHapticKind kind) {
 //    于是长按瞬间"啪"地盖上一块白、松手又"啪"地撤掉 ⇒ 用户看到的就是"先白色底再消失"。
 //
 // 🔴🔴 修法**不是**去调动画（dismiss 的曲线/时长系统一律不给改，没有任何 API），
-//    而是**把这层垫底换成列表自己的底色**：颜色和背后完全一致 ⇒ 那块矩形从第一帧起
-//    就没有色差，视觉上等于不存在；动画里剩下的只有卡片自己在缩放 ⇒ 自然。
-//    ⇒ 判据：`backgroundColor` 必须和 `ViewController` 里 `self.table.backgroundColor` **同源**
-//      （那边是 `NBPageBG()`，见 ViewController.m:1055），任一处换了另一边必须跟着换。
+//    而是要处理这层垫底。
 //
-// 🔴 为什么不用 `clearColor`（更"彻底"的那个解法）：透明垫底在 iOS 16 上有被系统按
-//    黑/灰渲染的已知风险（尤其 preview 层自己合成时），而"同色"和"透明"在这里的
-//    视觉效果是一模一样的 ⇒ 没必要为了同一个结果去冒那个险。
+// 🔴🔴🔴 v0.0.119 的判断错在哪（真机反馈："深色模式下会有灰块"）：
+//    那一版把垫底换成了**列表底色** `NBPageBG()`，理由是"同色 ⇒ 看不见"。
+//    浅色下确实骗过去了，深色下暴露了 —— 因为 `backgroundColor` 填的是
+//    **view.bounds 的全部**，而 iOS 15+ 长按浮起时会给整个 preview 叠一层**提亮**
+//    （把它从被 dim 的背景里提出来）：
+//      深色：#000 提亮到 ≈#1C1C1E~#2C2C2E ⇒ 那圈矩形明显比 #000 背景亮 ⇒ 灰块；
+//      浅色：#F2F2F7 提亮后≈纯白，和背景差得少 ⇒ 没被注意到。
+//    ⇒ **只要那圈矩形存在，提亮就会把它显出来。同色这条路在深色下走不通。**
+//
+// ⇒ v0.0.120 改成 `clearColor`（用户拍板）：**透明被提亮之后还是透明**，
+//    提亮对它完全无效 ⇒ 那块矩形从"颜色不对"变成"根本不存在"。
+//    可见内容（卡片/图标）的阴影仍由系统按快照 alpha 自动推导，形状逻辑一概不碰。
+//    ⚠️ v0.0.119 曾以"透明垫底在 iOS 16 上可能被渲染成黑/灰"为由否掉这条 ——
+//       那个判断与真机现象矛盾：真被渲染成黑/灰的话，浅色下也该很明显，而实际没有。
+//       教训：**"我担心 X 会发生"不是结论，只有量到的现象才是。**
 - (UITargetedPreview *)nbPreviewForMenu {
     UIPreviewParameters *p = [[UIPreviewParameters alloc] init];
-    // 🔴 显式 resolve 一次再赋值：`NBPageBG()` 是**动态色**（浅色 #F2F2F7 / 深色 #000），
-    //    而 preview 环境可能按**窗口**的 traitCollection 去解析它，列表底色却是按列表自己的
-    //    trait 解析的 —— 两边一旦落在不同的 style 上，"同色"就不成立，白底会以灰底的形式回来。
-    p.backgroundColor = [NBPageBG() resolvedColorWithTraitCollection:self.traitCollection];
+    // 🔴 透明垫底：系统那层提亮对透明无效，所以"那块矩形"根本不会出现。
+    //    ⛔ 不要改回 `NBPageBG()`（v0.0.119 的做法）：深色下它会被提亮成灰块。
+    //    ⛔ 也不要改成 `NBCardBG()`：那等于"卡片放大成一整块矩形"，圆角外面多出四个直角，更糟。
+    p.backgroundColor = [UIColor clearColor];
     // 🔴 故意**不设** `visiblePath`：让它按快照的 alpha 反推轮廓。
     //    ⛔ 设成矩形路径 ⇒ 卡片左边那条图标槽（iconBox 挂在卡**外面**）被整个裁掉；
     //    ⛔ 设成卡片的圆角路径 ⇒ 图标同样被裁掉。
     //    只有"按 alpha 反推"能同时保住卡片圆角和槽里的图标 —— 这也是系统默认在做的事，
     //    我们只是把垫底色换掉，形状逻辑一概不碰。
+    //    （若将来透明垫底仍出问题，下一步才是给 visiblePath，代价 = 丢图标。）
     return [[UITargetedPreview alloc] initWithView:self parameters:p];
 }
 
