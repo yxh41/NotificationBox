@@ -858,7 +858,8 @@ static void NBHapticFire(NBHapticKind kind) {
 // v0.0.119：长按浮起的那份「预览」长什么样，归我们自己管。
 //
 // 🔴🔴 为什么必须有这个方法（v0.0.118 的原始症状：松开时"先一块白色底，然后白底消失"）：
-//    `previewProvider:nil` ⇒ 系统用它**自己**的兜底预览；而我们的 cell 是**全透明**的
+//    v0.0.118 只给了 `previewProvider:nil`、**且没实现下面那两个 delegate 方法**
+//    ⇒ 系统用它**自己**的兜底预览；而我们的 cell 是**全透明**的
 //    （`self.backgroundColor = clearColor`，看得见的只有里面那张 cardView 和卡片左边槽里的
 //    iconBox）。系统拍完这份透明快照后，会在它**底下垫一层** `UIPreviewParameters.backgroundColor`
 //    的默认值 —— 浅色模式下那个默认值就是**纯白**。
@@ -899,18 +900,18 @@ static void NBHapticFire(NBHapticKind kind) {
     //    而且这时用户长按的本意多半不是继续左滑。
     if ([self nbIsSwiped]) [self nbCloseSwipeAnimated:YES];
 
+    // 🔴🔴 `previewProvider` 这里**只能**是 nil。它的类型是
+    //    `UIContextMenuContentPreviewProvider` = `UIViewController * _Nullable (^)(void)` ——
+    //    要的是"一整块内容预览"（老的 peek 风格），**不是** `UITargetedPreview`。
+    //    v0.0.119 我第一版就往这里塞了 `^UITargetedPreview *(void)`，编译直接报
+    //    "incompatible block pointer types: sending 'UITargetedPreview *(^)(void)' to
+    //     parameter of type 'UIViewController *(^)(void)'"（CI run 41374788894）。
+    //    ⇒ 「浮起/收回用哪份预览」唯一正确的位置是**下面那两个 delegate 方法**；
+    //      它们一旦实现，系统就不会再退回它自己的兜底预览（= 那块白底）。
     __weak typeof(self) weakSelf = self;
     return [UIContextMenuConfiguration
         configurationWithIdentifier:nil
-                    previewProvider:^UITargetedPreview * _Nullable(void) {
-        // 🔴 这里**只能** weak：configuration 被 interaction 持有、interaction 被 cell 持有，
-        //    在 block 里强引用 self 就是一个环 ⇒ cell 永远不释放，复用池越滚越大。
-        //    真取不到 self（cell 已被回收）就返回 nil，交回系统的兜底预览 ——
-        //    那种情况下这一行早就滚出屏幕了，没人会看到它长什么样。
-        NotifyCell *s = weakSelf;
-        if (!s) return nil;
-        return [s nbPreviewForMenu];
-    }
+                    previewProvider:nil
                      actionProvider:^UIMenu * _Nullable(NSArray<UIMenuElement *> *suggestedActions) {
         // 🔴 **弹的那一刻现问列表**，绝不在 cell 里缓存一个 UIMenu：
         //    缓存下来就会带着上一行的动作（上一行的 App 名、上一行的 rowId）跑 ——
@@ -919,14 +920,15 @@ static void NBHapticFire(NBHapticKind kind) {
     }];
 }
 
-// 🔴🔴 上面 configuration 里的 `previewProvider` **只覆盖"浮起来"那一下**。
-//    系统在菜单要收起时会**再问一次**"收回时用哪份预览"（尤其手势取消这条路径），
-//    不实现它就退回**系统兜底预览** —— 也就是同一块白底又回来了。
-//    ⇒ 下面两个必须都指向同一个 `nbPreviewForMenu`：用户看到的永远是
-//      "同一张卡片放大"和"同一张卡片缩回"，中间没有任何东西被换掉。
-// 🔴 已经给了 `previewProvider` 还补这两个，是有意的**冗余**：不同 iOS 版本在
-//    "provider 优先还是 delegate 优先"上有过差异，两条路都给同一份结果，
-//    就不用去赌当前系统走的是哪条。代价只有一次方法调用。
+// 🔴🔴 这两个方法是「长按预览长什么样」的**唯一**入口
+//    （`previewProvider` 给不了 UITargetedPreview，类型对不上，见上面那段注释）。
+//    系统会问两次：
+//      · highlighting —— 长按浮起来那一下；
+//      · dismissing  —— 菜单收起时飞回去那一下（选中某项，或者用户点空白取消）。
+//    ⛔ 只实现前一个的话，"浮起"是我们的卡片、"收回"退回**系统兜底预览**
+//       ⇒ 症状就是"松手时忽然出现一块白底再消失"。
+//    ⇒ 两个都返回同一份：用户看到的永远是"同一张卡片放大 / 同一张卡片缩回"，
+//      中间没有任何东西被换掉。
 - (UITargetedPreview *)contextMenuInteraction:(UIContextMenuInteraction *)interaction
         previewForHighlightingMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {
     return [self nbPreviewForMenu];
