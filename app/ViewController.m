@@ -19,6 +19,49 @@
 // 两处各写一个数字的话，改了其中一个就会出现"按钮压住分段控件"。
 static const CGFloat kNBMarkAllWidth = 88;
 
+// ============================================================================
+// v0.0.122：`[刷新]` 状态行 —— 「为什么刷 / 为什么没刷」必须能在日志里读出来
+// ============================================================================
+// 🔴 为什么非要有它（v0.0.121 的真机日志账）：
+//    v0.0.121 给刷新链路加了两条新路径：**节流挡掉**、**快照内容没变**。两条都是
+//    "提前 return"，一个字的日志都不留 ⇒ 日志里只能看到 `[扫]` 一直在刷，
+//    而"App 到底有没有刷新、为什么没刷新"完全读不出来。
+//    ⇒ 「该发生的没发生的理由，也必须打出来」—— 静默的提前返回，在日志上
+//      和"根本没触发"长得**一模一样**，这是本项目反复栽的一类（探针没弹 ≠ 没生效）。
+// 🔴 为什么是五个计数而不是一行流水：
+//    每次动作打一行会在密集触发时把日志窗口（~50 行）占满，反而更看不清；
+//    而按分钟汇总的五个数，能同时回答"有没有被叫醒"和"叫醒后走了哪条路"。
+//    计数清零 = 这一行说的是**上一个区间**，所以文案必须带区间（`-1` = 首次，从启动算）。
+// 🔴 ⛔ 不许在这里写「叫醒 = 节流挡 + 快照没变 + 轻路 + 完整」这种等式：
+//    `完整重查` 除了扫描链路，还会被 `onBecameActive` 里的库指纹变化**单独**触发
+//    （那条根本不经过扫描），两边不同步 ⇒ 这个等式是假的，写上去就是一条恒假的判据。
+typedef NS_ENUM(NSInteger, NBRefKind) {
+    NBRefKindTrigger = 0,    // 被叫醒：`viewWillAppear` / `onForeground` / `onBecameActive`
+    NBRefKindBlocked,        // 被节流挡掉（没有真的请求扫描）
+    NBRefKindNoSnapChange,   // 扫描回来了、快照内容没变 ⇒ 只轻刷提示条，不重查
+    NBRefKindLight,          // 快照变了、库没变 ⇒ 只重算残留层（轻路）
+    NBRefKindFull,           // 完整重查（SQL + 规则 + 归并）
+    NBRefKindCount
+};
+
+static NSTimeInterval sNBRefLogTs = 0;
+static NSInteger sNBRefCnt[NBRefKindCount] = {0};
+
+static void NBRefNote(NBRefKind kind) {
+    if ((NSInteger)kind >= 0 && (NSInteger)kind < (NSInteger)NBRefKindCount) sNBRefCnt[kind]++;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    double span = (sNBRefLogTs > 0) ? (now - sNBRefLogTs) : -1.0;
+    // `span < 0`（首次）必须立刻打，否则第一分钟的读数永远看不到。
+    if (span >= 0 && span < NB_REF_LOG_GAP) return;
+    sNBRefLogTs = now;
+    NBSharedLog(@"=== [刷新] 区间 %.0f 秒（-1 = 首次，计数从启动累计）：叫醒 %ld ｜ 节流挡 %ld ｜ 快照没变(只轻刷提示条) %ld ｜ 轻路(重算残留层) %ld ｜ 完整(重查SQL) %ld ｜ ⚠️ 这五个数不构成等式（完整重查还会被库指纹变化单独触发，与扫描不同步）｜ 读法：叫醒>0 而后面全 0 ⇒ 链路在某个提前返回处死掉了；节流挡占多数 ⇒ 2 秒闸门在正常工作（真机密集时 12 次/79 秒）",
+               span,
+               (long)sNBRefCnt[NBRefKindTrigger], (long)sNBRefCnt[NBRefKindBlocked],
+               (long)sNBRefCnt[NBRefKindNoSnapChange], (long)sNBRefCnt[NBRefKindLight],
+               (long)sNBRefCnt[NBRefKindFull]);
+    for (NSInteger i = 0; i < (NSInteger)NBRefKindCount; i++) sNBRefCnt[i] = 0;
+}
+
 // 🔴🔴 v0.0.70：顶部控件的**统一规格**。
 //    以前每个控件各写各的数字：分段 30、按钮 30、圆角 7、上下间距 6、左右边距 12。
 //    改一个尺寸就得记住另外四处，漏一处就是"某一排比别的排高 2pt"——
@@ -1934,8 +1977,14 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 //    点了不动，用户只会当成按钮坏了）。
 // 🔴 节流判断放在这**一个出口**里，不散落到三个调用点：散开以后再加第五个触发点就一定会漏。
 - (void)requestNCSnapshotIfDue {
+    // v0.0.122：**叫醒**先记，再判节流 —— 顺序反过来就数不出"被挡掉多少次"（
+    // 那正是要观察的量：真机 79 秒叫醒 12 次，如果全是节流挡的，链路其实没跑）。
+    NBRefNote(NBRefKindTrigger);
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (self.lastNCSnapReqTs > 0 && (now - self.lastNCSnapReqTs) < NB_NC_SCAN_MIN_GAP) return;
+    if (self.lastNCSnapReqTs > 0 && (now - self.lastNCSnapReqTs) < NB_NC_SCAN_MIN_GAP) {
+        NBRefNote(NBRefKindBlocked);
+        return;
+    }
     self.lastNCSnapReqTs = now;
     [self requestNCSnapshot];
 }
@@ -1978,6 +2027,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                 [self2 updateAliveHint];
                 [self2.view setNeedsLayout];
             }
+            // v0.0.122：**这条提前返回必须留痕**。它是 v0.0.121 省下来的那笔主要开销，
+            //    但静默的话，"省下来"和"根本没跑"在日志上完全一样。
+            NBRefNote(NBRefKindNoSnapChange);
             return;
         }
         // ---------- ③ 通知中心真的变了 ----------
@@ -2001,6 +2053,19 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 //    ⇒ 两个指标同口径。`sys_id` 原键继续保留原义（别处还有读者）。
 - (NBAliveState)aliveStateForRow:(NSDictionary *)row {
     if (self.aliveStale) return NBAliveUnknown;
+    // ---------- v0.0.122：「快照没覆盖到」必须判 Unknown，不许判 Gone ----------
+    // 🔴 一个**真 bug**（v0.0.121 及以前一直存在）：快照是某一瞬间的存档，而库里
+    //    一直在进新记录。凡是 `ts` **晚于**快照那一刻发布的行，**结构上不可能**出现在
+    //    快照里 —— 拿它去查当然是"查不到"，然后被判定成"不在通知中心了"。
+    //    真机账（2026-11-02）：`窗内残留 15/418` 里那 418 行的分母就混着这类行；
+    //    用户看到的现象是"刚收到的推送马上被标成已不在通知中心"，而通知还好好的躺在那里。
+    // 🔴 这正是本项目那条铁律的又一次复现：**「读不到」≠「不存在」**。
+    //    `aliveStateOfSysId:` 返回 Unknown 的语义是"不知道"，返回的是布尔式判断时
+    //    调用方会把"不在 keys 里"当成"不在系统里" —— 两件事必须在入口处就分开。
+    // 🔴 判据取 `>` 而不是 `>=`：同一秒内发布的行允许它在快照里（保存不了就不判），
+    //    宁可漏判成 Gone 也不能把真在的行判成 Unknown（Unknown 会显示成"未确认"）。
+    double rowTs = [row[@"ts"] doubleValue];
+    if (rowTs > 0 && self.aliveScanTs > 0 && rowTs > self.aliveScanTs) return NBAliveUnknown;
     NSString *cand = row[@"sys_id_cand"];
     if (![cand isKindOfClass:[NSString class]] || cand.length == 0) cand = row[@"sys_id"];
     return [NotifyStore aliveStateOfSysId:cand inSnapshot:self.aliveSnap];
@@ -2218,6 +2283,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 //    这段逻辑原来只写在 `didSelectRow:` 的「只看未读」分支里，现在抽出来当**唯一来源**：
 //    `refreshIfChanged` 和它共用一份。
 - (void)reloadKeepingOffset {
+    // v0.0.122：**唯一**的「完整重查」计数点。所有走完整路的路径最终都落到这里
+    // （`refreshIfChanged` / `ncWaitAndReload:` 的库变了分支 / 轻路的回落分支）
+    // ⇒ 计数点选在这里，才不会出现"某条路重查了但没数到"。
+    NBRefNote(NBRefKindFull);
     CGPoint off = self.table.contentOffset;
     [self loadData];
     [self clampContentOffset:off];
@@ -2241,6 +2310,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         [self reloadKeepingOffset];
         return;
     }
+    // v0.0.122：计数点排在回落分支**之后** —— 回落时已经由 `reloadKeepingOffset`
+    // 记成「完整」，这里再记一次就会把同一次动作数两遍（本项目「比例型分母会变」那族）。
+    NBRefNote(NBRefKindLight);
     CGPoint off = self.table.contentOffset;
     [self applyItemsAndRefreshUI];
     [self clampContentOffset:off];

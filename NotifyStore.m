@@ -2032,7 +2032,8 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     if (![snap isKindOfClass:[NSDictionary class]]) return 0;
     // 没有可用快照 ⇒ 一条都判不了，返回 0 但调用方**不许**把它当"都不在"
     // （`aliveHintText` 里 `aliveScanTs <= 0` / `aliveStale` 两个分支已经先把它挡掉了）。
-    if ([snap[@"scan"] doubleValue] <= 0) return 0;
+    double snapTs0 = [snap[@"scan"] doubleValue];
+    if (snapTs0 <= 0) return 0;
     sqlite3 *db = [self openDB];
     if (!db) return 0;
     NSInteger still = 0;
@@ -2057,7 +2058,20 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     static BOOL sAgeLogged = NO;
     NSInteger hitAge[4] = {0, 0, 0, 0};
     NSInteger allAge[4] = {0, 0, 0, 0};
-    double nowTs = [[NSDate date] timeIntervalSince1970];
+    // ---------- v0.0.122：「未覆盖」必须单独数出来，不许混进分母 ----------
+    // 🔴 真 bug（v0.0.121 及以前）：这个函数的分母是**全部带 ID 的行**，其中包含
+    //    「快照写下之后才发布」的那些 —— 它们结构上不可能出现在快照里，拿它们当分母
+    //    必然算成"不在"。真机账：`窗内残留 15/418`（3.6%）看着像匹配全坏，
+    //    其实那 418 行里混着快照之后才进来的新记录。
+    // 🔴 这是本项目「读不到 ≠ 不存在」的第 N 次复现，也是那条铁律的镜像：
+    //    **分母里混进"根本不可能成立"的样本，比分子算错更隐蔽** —— 它不报错，
+    //    只把百分比做小，然后把一次"正常"读成"坏了"。
+    NSInteger uncovered = 0;
+    // 🔴 年龄分档的基准时刻。v0.0.121 用的是 `nowTs`（"现在"），而快照可能写于
+    //    6339 秒前 ⇒ `<1h` 那一档的条件等价于 `ts > 快照时刻 + 2739`，
+    //    落在这一档的行**全部在快照之后才发布** ⇒ 命中必然 0。真机量到 0/29，
+    //    而日志里那句读法写着"三档都接近 0 才是真 bug" ⇒ 差点把"口径错"读成"代码错"。
+    //    ⇒ 年龄一律按**快照时刻**算：`snapTs0 − ts`，与"这一行相对快照有多老"同义。
     // ---------- v0.0.116：「窗内残留」—— 分母只取**可能活着**的行 ----------
     // 🔴 真机血账（2026-11-02 18:10:12）：`全库残留 179 ／ 带ID行 2163` 读成"匹配只有 8.3%"，
     //    但按年龄并排一看：<1h 2/6、1-6h 27/70、6-24h 149/312、**>24h 1/1775**。
@@ -2087,6 +2101,11 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
         while (sqlite3_step(st) == SQLITE_ROW) {
             const char *t = (const char *)sqlite3_column_text(st, 0);
             if (!t) continue;
+            // v0.0.122：`ts` 必须**在决定这一行算不算分母之前**读出来。
+            // 🔴 顺序不是风格问题：先 `scanned++` 再判覆盖，就等于"未覆盖的行也算进了分母"，
+            //    而那正是这一版要修的那个 bug —— 顺序错了会伪装成"改法没用"。
+            double ts = sqlite3_column_double(st, 1);
+            if (ts > 0 && ts > snapTs0) { uncovered++; continue; }
             scanned++;
             NSString *sid0 = [NSString stringWithUTF8String:t];
             const char *ta = (const char *)sqlite3_column_text(st, 2);
@@ -2108,8 +2127,9 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
             if (p8) stillP8++;
             // 年龄分档：`ts` 读成 0/负数（老库没写时间）一律并进最后一档，不另设「未知」档
             // —— 多一个档就多一个可以被读错的口径，而且这类行本来就该按"老"处理。
-            double ts = sqlite3_column_double(st, 1);
-            double age = (ts > 0) ? (nowTs - ts) : -1.0;
+            // 🔴 v0.0.122：基准改 `snapTs0`（快照时刻），**不是** `nowTs2`（现在）。
+            //    走到这里 `ts <= snapTs0` 已经保证，所以 age >= 0，`<1h` 档终于有真实样本。
+            double age = (ts > 0) ? (snapTs0 - ts) : -1.0;
             int bi = (age < 0)      ? 3
                    : (age < 3600)   ? 0
                    : (age < 21600)  ? 1
@@ -2147,8 +2167,14 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     // 🔴 没扫过就报 -1（本项目铁律：没算出来用 -1，不用 0 —— 0 会被读成"算出来是零"）。
     double scanTs2 = [snap[@"scan"] doubleValue];
     double snapAge = (scanTs2 > 0) ? ([[NSDate date] timeIntervalSince1970] - scanTs2) : -1.0;
-    NBStoreLog(@"全库残留 %ld 条 ｜ 忽略大小写 %ld ｜ 前8位同 %ld ｜ 带ID行 %ld ｜ 快照 nc=%@ 键 %lu 个 ｜ 扫描于 %.0f 秒前",
+    // 🔴 v0.0.122：`带ID行` 与 `未覆盖` 必须**并排**打出来。
+    //    只报残留数和分母（旧格式）时，读不出"分母里混着不可能成立的行" —— 那正是
+    //    v0.0.121 把 3.6% 读成"匹配全坏"的原因。`未覆盖 N 条` 就是那个分母的**净额**：
+    //    `带ID行` 从此只算**被快照覆盖到**的行（`ts <= 快照时刻`），口径与 App 侧
+    //    `aliveStateForRow:` 的「未覆盖判 Unknown」完全一致（两个指标必须同源）。
+    NBStoreLog(@"全库残留 %ld 条 ｜ 忽略大小写 %ld ｜ 前8位同 %ld ｜ 带ID行(已覆盖) %ld ｜ 未覆盖 %ld（快照之后才发布，结构上不可能在快照里，已排除出分母）｜ 快照 nc=%@ 键 %lu 个 ｜ 扫描于 %.0f 秒前",
                (long)still, (long)stillCI, (long)stillP8, (long)scanned,
+               (long)uncovered,
                snap[@"nc"] ?: @"?",
                (unsigned long)[(NSSet *)snap[@"keys"] count],
                snapAge);
@@ -2160,9 +2186,10 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     //    没算出来（旧快照没有 tmin/tmax）一律报 -1，**不许报 0**（0 会被读成"算出来是零"）。
     if (winOk && winRows > 0) {
         double winSpanMin = (winMax - ((winMin > 0) ? winMin : winMax)) / 60.0;
-        NBStoreLog(@"窗内残留 %ld 条 / %ld 行（%.1f%%）｜ 窗 = 通知中心跨度 %.0f 分 ｜ 全库那个 %.1f%% 被「结构上不可能活着」的老记录稀释，别拿它下结论",
+        NBStoreLog(@"窗内残留 %ld 条 / %ld 行（%.1f%%）｜ 窗 = 通知中心跨度 %.0f 分 ｜ 分母只含 ts<=快照时刻的行（已排除未覆盖 %ld 条）｜ 全库那个 %.1f%% 被「结构上不可能活着」的老记录稀释，别拿它下结论",
                    (long)winStill, (long)winRows,
                    (double)winStill * 100.0 / (double)winRows, winSpanMin,
+                   (long)uncovered,
                    (scanned > 0) ? (double)still * 100.0 / (double)scanned : -1.0);
     } else {
         NBStoreLog(@"窗内残留 -1 / -1（快照里没有 tmin/tmax ⇒ 这个口径算不出来；不是 0）");
@@ -2188,7 +2215,15 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
         //    真实答案是第三种：命中率在三档里大致相同（33%/39%/48%），只有 **>24h 那档是 0**，
         //    因为那 1775 行比通知中心最老的（23.9 小时）还老，结构上不可能活着。
         //    ⇒ 判据的分类不全，就会把一次"正常"读成"没结论"，甚至读成"bug"。
-        NBStoreLog(@"残留按年龄读法：>24h 那档几乎必然是 0 —— 比通知中心最老的还老，结构上不可能活着，不是 bug、也不许拿它算百分比；要看就看 <1h/1-6h/6-24h 三档的命中率，三档都接近 0 才是键对不上（真 bug）");
+        // 🔴🔴 v0.0.122：这一句的**前半段以前是错的**（v0.0.116~v0.0.121），必须改。
+        //    旧口径的年龄是「现在 − ts」，而快照写于几千秒前 ⇒ `<1h` 档里那些行
+        //    全部是"快照之后才发布"的 ⇒ 结构上不可能命中 ⇒ 恒 0。
+        //    旧读法却写「<1h/1-6h/6-24h 三档都接近 0 才是真 bug」⇒ 一次正常的读数
+        //    （0/29）会被读成"键对不上"。**读法写错，比没有读数更贵**。
+        //    ⇒ 现在年龄基准是**快照时刻**，`<1h` 档 = 快照前 1 小时内发布的行，
+        //      是有真实分母的档，必须参与判断。
+        //    `>24h` 那段不变：那批行比通知中心最老的还老，结构上不可能活着。
+        NBStoreLog(@"残留按年龄读法：年龄 = 快照时刻 − ts（**不是**「现在 − ts」），分母已排除快照之后才发布的行 ⇒ <1h 档 = 快照前 1 小时内发布那些，与 1-6h/6-24h 一起看；>24h 那档几乎必然是 0 —— 比通知中心最老的还老，结构上不可能活着，不是 bug、也不许拿它算百分比；已覆盖的三档都接近 0 才是键对不上（真 bug）");
         // 🔴 v0.0.116：这个数**不是稳定量**，必须写进日志，否则下次又会被当成"匹配坏了"。
         //    实测（同一份快照、同一批 2163 行、22 秒内）：179 → 91 → 2。
         //    机制：NC 成批重投时，库里那些行的 `sys_id` 正被成批改写成新 ID（同内容去重那条路），

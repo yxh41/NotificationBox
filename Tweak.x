@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.121"
+#define NB_VER_STR @"0.0.122"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2546,10 +2546,29 @@ static void NBDumpNCSnapshot(NSString *seq) {
             writeState = ok ? @"成功"
                             : [NSString stringWithFormat:@"失败(%@)", err.localizedDescription ?: @"?"];
         }
-        NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld｜严格 %ld / 可读uuid %ld（可量=%d）seq=%@ 写入=%@",
-              (unsigned long)all.count, (unsigned long)withKeys,
-              (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
-              (csDest ? 1 : 0), seq ?: @"", writeState);
+        // ---------- v0.0.122：`[扫]` 汇总行节流 ----------
+        // 🔴 血账：v0.0.121 这一行**每次扫描都打**，真机 79 秒写了 60 行，把 `[残]`
+        //    那几条一次性诊断（一个进程只打一次）整个挤出日志窗口 —— 现象和
+        //    "探针没生效"一模一样。日志窗口只有 ~50 行，行数预算必须主动分配。
+        // 🔴 例外：`!ok`（写入失败 / 快照写入保护跳过）**必须立刻打**，不许被节流吞掉：
+        //    异常信息比统计信息值钱，而它恰恰不会每 30 秒才发生一次。
+        // 🔴 区间用 `-1` 表示"首条/未知"，**不许**用 0（0 会被读成"刚打过"）。
+        static NSTimeInterval sScanLogTs = 0;
+        static NSUInteger sScanLogSkip = 0;
+        NSTimeInterval scanNow = [[NSDate date] timeIntervalSince1970];
+        BOOL scanLogDue = (sScanLogTs <= 0) || ((scanNow - sScanLogTs) >= NB_SCAN_LOG_GAP);
+        if (scanLogDue || !ok) {
+            double scanSpan = (sScanLogTs > 0) ? (scanNow - sScanLogTs) : -1.0;
+            NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld｜严格 %ld / 可读uuid %ld（可量=%d）seq=%@ 写入=%@ ｜ 距上条 %.0f 秒（-1=首条）｜ 期间省略 %lu 条",
+                  (unsigned long)all.count, (unsigned long)withKeys,
+                  (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
+                  (csDest ? 1 : 0), seq ?: @"", writeState,
+                  scanSpan, (unsigned long)sScanLogSkip);
+            sScanLogTs = scanNow;
+            sScanLogSkip = 0;
+        } else {
+            sScanLogSkip++;
+        }
         if (snapSkip) {
             NBLog(@"=== [扫] 快照写入保护：本次 %lu 条 / 上一份 %lu 条（低于上一份的 %d%%）⇒ 判为「还没读全」，本轮不覆盖快照"
                   @"（已抑制 %.0f 秒 / 上限 %.0f 秒；超时会照写，用户真清空才反映得出来）",
