@@ -31,7 +31,10 @@ static const CGFloat kNBMarkAllWidth = 88;
 // 🔴 为什么是五个计数而不是一行流水：
 //    每次动作打一行会在密集触发时把日志窗口（~50 行）占满，反而更看不清；
 //    而按分钟汇总的五个数，能同时回答"有没有被叫醒"和"叫醒后走了哪条路"。
-//    计数清零 = 这一行说的是**上一个区间**，所以文案必须带区间（`-1` = 首次，从启动算）。
+//    计数清零 = 这一行说的是**上一个区间**。
+// 🔴 v0.0.123：**首次**（进程启动后第一次）单独一种文案，不是"区间 -1"。
+//    因为首行必然长成「叫醒≥1、其余多为 0」（就是它自己触发的打印），
+//    混在区间行里会被它自己的读法判成 bug —— 那是 v0.0.122 真机日志暴露的。
 // 🔴 ⛔ 不许在这里写「叫醒 = 节流挡 + 快照没变 + 轻路 + 完整」这种等式：
 //    `完整重查` 除了扫描链路，还会被 `onBecameActive` 里的库指纹变化**单独**触发
 //    （那条根本不经过扫描），两边不同步 ⇒ 这个等式是假的，写上去就是一条恒假的判据。
@@ -54,11 +57,54 @@ static void NBRefNote(NBRefKind kind) {
     // `span < 0`（首次）必须立刻打，否则第一分钟的读数永远看不到。
     if (span >= 0 && span < NB_REF_LOG_GAP) return;
     sNBRefLogTs = now;
-    NBSharedLog(@"=== [刷新] 区间 %.0f 秒（-1 = 首次，计数从启动累计）：叫醒 %ld ｜ 节流挡 %ld ｜ 快照没变(只轻刷提示条) %ld ｜ 轻路(重算残留层) %ld ｜ 完整(重查SQL) %ld ｜ ⚠️ 这五个数不构成等式（完整重查还会被库指纹变化单独触发，与扫描不同步）｜ 读法：叫醒>0 而后面全 0 ⇒ 链路在某个提前返回处死掉了；节流挡占多数 ⇒ 2 秒闸门在正常工作（真机密集时 12 次/79 秒）",
-               span,
-               (long)sNBRefCnt[NBRefKindTrigger], (long)sNBRefCnt[NBRefKindBlocked],
-               (long)sNBRefCnt[NBRefKindNoSnapChange], (long)sNBRefCnt[NBRefKindLight],
-               (long)sNBRefCnt[NBRefKindFull]);
+
+    NSInteger trig = sNBRefCnt[NBRefKindTrigger];
+    NSInteger blk  = sNBRefCnt[NBRefKindBlocked];
+    NSInteger light = sNBRefCnt[NBRefKindLight];
+    NSInteger full = sNBRefCnt[NBRefKindFull];
+    NSInteger noChg = sNBRefCnt[NBRefKindNoSnapChange];
+
+    // ---------- v0.0.123：把「自动请求扫描」算出来，并处理 off-by-one ----------
+    // 🔴 恒等式：`requestNCSnapshotIfDue` 是**唯一**自动出口，每次调用只走三条路之一
+    //    （被节流挡 / 通过节流去请求 / 就是触发本次打印的正这一次）。
+    //    触发本次打印的那一次**还没走到 `requestNCSnapshot`** ⇒
+    //      **自动请求扫描 = 叫醒 − 节流挡 − 1**
+    // 🔴 为什么非要把这个数打出来：v0.0.122 的真机日志里 `叫醒 10 ｜ 节流挡 5`，
+    //    读日志的人只能自己算出 "5 次执行"，还要自己去数 `已请求扫描` 有几行才敢确认。
+    //    「能自己算」不等于「该让读的人算」 —— 那正是这个字段存在的理由。
+    // 🔴 负数**不许**当普通数值打（本项目 `-1` 的约定是"没算出来"）⇒ 单独给一句话。
+    NSInteger req = trig - blk - 1;
+    NSString *reqStr = (req >= 0)
+        ? [NSString stringWithFormat:@"%ld", (long)req]
+        : @"不成立（叫醒−节流挡<1，说明有 requestNCSnapshot 绕过了 IfDue）";
+
+    if (span < 0) {
+        // ---------- 首次：**单独一句**，且不带任何"读法" ----------
+        // 🔴🔴 v0.0.123 修的真 bug：v0.0.122 首行必然长成 `叫醒 1 ｜ 其余全 0`
+        //    （那次叫醒就是触发本行打印的这一次），而同一行里写着
+        //    「叫醒>0 而后面全 0 ⇒ 链路在某个提前返回处死掉了」
+        //    ⇒ **一个必然出现的正常形态，被它自己的读法判成了 bug**。
+        //    这是"读法与判定分居"的又一个实例，而且我刚在上一版总结过这一条。
+        //    ⇒ 首次改成专门文案，把"必然如此"写在数字旁边，读法留到区间行之后一次性打。
+        NBSharedLog(@"=== [刷新] 首次（进程启动以来累计，**不是**区间）：叫醒 %ld ｜ 节流挡 %ld ｜ 自动请求扫描 %@ ｜ 快照没变 %ld ｜ 轻路 %ld ｜ 完整 %ld ｜ ⚠️ 这一行**必然**是「叫醒≥1、其余多为 0」—— 那次叫醒就是触发本行打印的这一次；它不是异常，也不许拿它判「链路死掉了」",
+                   (long)trig, (long)blk, reqStr, (long)noChg, (long)light, (long)full);
+    } else {
+        NBSharedLog(@"=== [刷新] 区间 %.0f 秒：叫醒 %ld ｜ 节流挡 %ld ｜ 自动请求扫描 %@ ｜ 快照没变 %ld ｜ 轻路 %ld ｜ 完整 %ld",
+                   span, (long)trig, (long)blk, reqStr, (long)noChg, (long)light, (long)full);
+    }
+
+    // ---------- 读法：**一个进程只打一次** ----------
+    // 🔴 v0.0.123：以前它跟在每一个区间行后面 —— 那段字每个区间一个字都不变，
+    //    重复打就是纯噪音。刚在 tweak 侧为"每次都打的行"付过代价（`[扫][诊]` 77 秒 18 行
+    //    把 `[残]` 挤出窗口），同一类问题不许在 App 侧再犯一次。
+    // 🔴 一次性的代价：日志窗口滚过去就看不到了。可它的出现点固定在**进程启动后的第一行之后**，
+    //    而用户拉日志的时机正是"刚出问题/刚启动" ⇒ 位置合理。
+    static BOOL sRefReadmeDone = NO;
+    if (!sRefReadmeDone) {
+        sRefReadmeDone = YES;
+        NBSharedLog(@"=== [刷新] 读法：①叫醒>0 而「自动请求扫描」=0 且后面三个也全 0 ⇒ 链路死在某个提前返回处；②后三个数**不构成等式** —— 完整重查还会被库指纹变化单独触发（根本不经过扫描），且上一次扫描的完成回调排在 0.45 秒后、可能落进**这个**区间 ⇒ 计数与请求**跨窗口**，别指望它们相加相等；③节流挡占多数 ⇒ 2 秒闸门在正常工作（真机密集时 12 次/79 秒）");
+    }
+
     for (NSInteger i = 0; i < (NSInteger)NBRefKindCount; i++) sNBRefCnt[i] = 0;
 }
 

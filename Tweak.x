@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.122"
+#define NB_VER_STR @"0.0.123"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2135,67 +2135,6 @@ static NSString *NBSecTop(NSDictionary *m, int top) {
     return [parts componentsJoinedByString:@" "];
 }
 
-// 🔴🔴🔴 v0.0.105：**本 TU 只 import Foundation，没有 UIKit**。
-//    `NotifyBox_FRAMEWORKS` 里也没有 UIKit（那是 App 侧才有的）。
-//    ⇒ 这里**一律用 `id` + runtime 拿**，绝不写 `UIApplication` / `UIWindow` / `UIView`
-//      这些类型名 —— 写类型名就是编译期 `undeclared identifier`，
-//      而八道文本自检会**全绿**（括号、宏、行尾都没问题）。
-//      这是「编译期才是硬闸门」的第 N 次实例。
-// ⚠️ 而往 `id` 上发**没在可见 `@interface` 里声明过**的选择器，同样是编译期硬错
-//    （v0.0.72 炸过一次：`no known instance method for selector`）⇒ 下面四个必须声明。
-@interface NSObject (NBViewRecon)
-+ (id)sharedApplication;   // UIApplication 的**类**方法
-- (id)windows;             // UIApplication → NSArray<UIWindow *>
-- (BOOL)isKeyWindow;       // UIWindow
-- (id)subviews;           // UIView → NSArray<UIView *>
-@end
-
-// 视图层侦察：**必须主线程**（扫描本身已经在主队列上，见 NBScanNCCallback）。
-// ⛔ 只读 `class` / `subviews.count`，绝不 `description`（v0.0.63 摸内部锁卡死过一次）。
-// ⛔ 限节点 400、限 12 个命中：视图树可能几千节点，无限遍历会拖住主线程 ⇒ 看门狗。
-static void NBViewRecon(void) {
-    @try {
-        if (![NSThread isMainThread]) {
-            NBLog(@"[视] 不在主线程 ⇒ 跳过（绝不在后台线程碰视图树）");
-            return;
-        }
-        Class appCls = NSClassFromString(@"UIApplication");
-        if (!appCls) { NBLog(@"[视] UIApplication 类取不到"); return; }
-        id app = [appCls sharedApplication];
-        if (!app) { NBLog(@"[视] sharedApplication 取不到"); return; }
-        id wins = [app windows];
-        if (![wins isKindOfClass:[NSArray class]]) {
-            NBLog(@"[视] windows 不是数组（%@）", NBClassName(wins));
-            return;
-        }
-        id kw = nil;
-        for (id w in (NSArray *)wins) {
-            if ([w respondsToSelector:@selector(isKeyWindow)] && [w isKeyWindow]) { kw = w; break; }
-        }
-        if (!kw) { NBLog(@"[视] keyWindow 取不到（扫描时可能没有前台窗口）"); return; }
-
-        NSMutableArray *found = [NSMutableArray array];
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:kw];
-        NSInteger visited = 0;
-        while (stack.count && visited < 400 && (NSInteger)found.count < 12) {
-            id v = [stack lastObject];
-            [stack removeLastObject];
-            visited++;
-            NSString *cn = NBClassName(v);
-            id subs = [v subviews];
-            NSUInteger subN = [subs isKindOfClass:[NSArray class]] ? [(NSArray *)subs count] : 0;
-            if ([cn rangeOfString:@"Notif"].location != NSNotFound) {
-                [found addObject:[NSString stringWithFormat:@"%@(%lu)", cn, (unsigned long)subN]];
-            }
-            if (subN) [stack addObjectsFromArray:(NSArray *)subs];
-        }
-        NBLog(@"[视] keyWindow=%@ 节点=%ld ｜含 Notif 的类 %lu 个：%@",
-              NBClassName(kw), (long)visited, (unsigned long)found.count,
-              found.count ? [found componentsJoinedByString:@" "] : @"（一个都没有）");
-    } @catch (NSException *e) {
-        NBLog(@"!!! [视] 抛: %@", e.reason);
-    }
-}
 
 // ---- v0.0.108：自动清「通知中心里超过 N 小时」的通知 ----
 // 🔴 默认关：`autoClearNCHours` 缺失 / 0 / 负数 ⇒ 第一行就返回，**装了不改任何行为**。
@@ -2313,7 +2252,15 @@ static void NBDumpNCSnapshot(NSString *seq) {
         // 🔴🔴 v0.0.103：再加一档「严格」口径（回来的那条 uuid 和我问的一样吗）
         NSInteger cseYes = 0, cseMeasured = 0;
         // v0.0.104：诊断只打前 2 例（几百条里打两行足够定性，且日志窗口只有 ~50 行）
-        NSInteger diagShown = 0;
+        // 🔴🔴 v0.0.123：这里原来是一个**局部**变量 `NSInteger diagShown = 0;` ——
+        //    那是这一行变成噪音的直接原因：局部变量每次扫描都归零，
+        //    所以"只打 2 例"实际是"**每次扫描打 2 例**"。真机 77 秒写了 18 行，
+        //    占那份日志的 29%，而同一份日志里被我节流掉的 `[扫]` 汇总只有 3 行。
+        //    ⇒ 改成 `static`（进程级），这一辈子总共只打 2 次。
+        // 🔴 注意 `static` 局部变量的寿命是**进程**，不是"这一次调用" ——
+        //    和 `sScanLogTs` / `sScanLogSkip` 同一个口径（它们一直是对的）。
+        //    以后写"只打 N 次"的守卫，先问一句：**这个 N 是按进程算还是按调用算？**
+        static NSInteger sScanDiagShown = 0;
         // v0.0.105：账本溯源统计（只读，不参与任何判据、不进快照文件）
         NSMutableDictionary *secCount = [NSMutableDictionary dictionary];
         NSMutableSet *curUUIDs = [NSMutableSet set];
@@ -2406,16 +2353,27 @@ static void NBDumpNCSnapshot(NSString *seq) {
                         if (NBIdEqual(gu, qu)) cseYes++;
                     }
                     // 自证：**不管读没读到**都要打前 2 例 —— 「读不到」正是这些行的用途。
-                    //    把四个候选键的**类型**一起打出来：一眼能看出该用哪把键。
+                    //    把候选键的**类型**一起打出来：一眼能看出该用哪把键。
                     // ⛔ 只打类名，绝不 `description`（未知对象摸内部锁 ⇒ 卡死）。
-                    if (diagShown < 2) {
-                        diagShown++;
+                    // ---------- v0.0.123：进程级只打 2 次 + 删两个恒 nil 字段 ----------
+                    // 🔴🔴 血账（v0.0.122 真机日志，77 秒）：`[扫]` 汇总行被我节流到 3 条，
+                    //    而**这一行每扫描一次打 2 行、一行没省** ⇒ 9 次扫描写了 18 行，
+                    //    占那份日志的 **29%**。等于「把小的节流了，把大的留下了」。
+                    //    根因：`diagShown` 原来是**函数内局部变量**（每次扫描归零），
+                    //    看着像"只打 2 次"，实际是"每次扫描打 2 次"。
+                    //    ⇒ 改成 `static`（进程级），这辈子就打 2 次。
+                    // 🔴 为什么留 2 次而不是全删：它证明的是「`uuid` 该用哪把键读」，
+                    //    这个结论会随系统版本变（v0.0.103 就因为 `NBStringish` 只认
+                    //    NSString/NSNumber 而恒 nil）。留 2 例当锚，换系统版本时一眼能看出。
+                    // 🔴 删 `identifier` / `bulletinID`：**恒为 nil**（每份日志、每次都是 nil）
+                    //    ⇒ 按「恒为定值的字段 = 死探针」删掉。留着只会让下一个人
+                    //    以为"这俩键有时能读到"，再去试一遍。
+                    if (sScanDiagShown < 2) {
+                        sScanDiagShown++;
                         NBLog(@"=== [扫][诊] 界面对象 类=%@ ｜ uuid=%@(req)/%@(got) ｜ "
-                              @"nid=%@ ｜ ident=%@ ｜ bid=%@ ｜ 相等=%d",
+                              @"nid=%@ ｜ 相等=%d（进程内只打 2 次；`identifier`/`bulletinID` 恒 nil 已删）",
                               NBClassName(got), NBClassName(qu), NBClassName(gu),
                               NBClassName(NBSafeValue(got, @"notificationIdentifier")),
-                              NBClassName(NBSafeValue(got, @"identifier")),
-                              NBClassName(NBSafeValue(got, @"bulletinID")),
                               NBIdEqual(gu, qu) ? 1 : 0);
                     }
                 }
@@ -2457,7 +2415,8 @@ static void NBDumpNCSnapshot(NSString *seq) {
                 //    ② `curUUIDs.count` = 从每条 req 的 `uuid` 读出来再**去重**的数
                 //    ③ `d.count` = `uuidsToRequests` 的字典键数（字典天然去重）
                 //    判读：①≈②≈③ 三者相等 ⇒ 账本没虚胖，nc 就是真条数（用户看到的少是因为
-                //          通知中心**按 App 分组显示**，`[视]` 里 NCNotificationListView(9) 是 9 组不是 9 条）；
+                //          通知中心**按 App 分组显示** —— 这个解释当年是靠已删的 `[视]` 证实过的，
+                //          v0.0.123 起没有那行日志了，但结论不变：**分组显示 ≠ 条数少**）；
                 //          ① 明显大于 ②/③ ⇒ 展平时重复收了 ⇒ nc 虚胖，标记逻辑得按去重后算。
                 NBLog(@"[源] nc=%lu 有ts=%ld ｜去重uuid=%lu ｜字典键=%lu ｜跨度 %@",
                       (unsigned long)all.count, (long)tsGot,
@@ -2488,7 +2447,18 @@ static void NBDumpNCSnapshot(NSString *seq) {
                     NBLog(@"[自动清] 开=%ld 小时 ｜本轮超时=%lu 条%@",
                           (long)autoHours, (unsigned long)oldReqs.count, acState);
                 }
-                NBViewRecon();
+                // 🔴 v0.0.123：原来这里有一行 `NBViewRecon();`（`[视] keyWindow=… 节点=N ｜含 Notif
+                //    的类 M 个`），**已整块删除**（连 `NSObject (NBViewRecon)` 那个 category 声明）。
+                //    判死依据 = 铁律「**恒为定值的字段 = 死探针 ⇒ 删掉并连声明一起删**」：
+                //    v0.0.103 起的每一份真机日志里它都是 `含 Notif 的类 0 个：（一个都没有）`，
+                //    从未出现过非 0 —— 也就是说它想证的"视图树能不能当界面数据的来源"这件事，
+                //    答案早就有了（不能，改用 `destination:notificationRequestForUUID:`），
+                //    而它每次扫描还要遍历最多 400 个节点、写一行日志。
+                // 🔴 别只注释掉、别留空函数：死函数在 `__text` 里照样占位，
+                //    而且下一个人会以为"它还能用"。
+                // 🔴 连带删掉的理由：那个 category 里的四个选择器（`sharedApplication` /
+                //    `windows` / `isKeyWindow` / `subviews`）**只被这个函数用过**（已 grep 确认），
+                //    留着就是四条没有任何调用者的声明 —— 下一轮改"删掉的刀要连声明一起删"时又要来一遍。
             }
         } @catch (NSException *e) {
             NBLog(@"!!! [源] 诊断抛: %@", e.reason);
@@ -2546,26 +2516,50 @@ static void NBDumpNCSnapshot(NSString *seq) {
             writeState = ok ? @"成功"
                             : [NSString stringWithFormat:@"失败(%@)", err.localizedDescription ?: @"?"];
         }
-        // ---------- v0.0.122：`[扫]` 汇总行节流 ----------
-        // 🔴 血账：v0.0.121 这一行**每次扫描都打**，真机 79 秒写了 60 行，把 `[残]`
+        // ---------- v0.0.122 起：`[扫]` 汇总行节流（v0.0.123 补完整）----------
+        // 🔴 血账 1（v0.0.121）：这一行**每次扫描都打**，真机 79 秒写了 60 行，把 `[残]`
         //    那几条一次性诊断（一个进程只打一次）整个挤出日志窗口 —— 现象和
         //    "探针没生效"一模一样。日志窗口只有 ~50 行，行数预算必须主动分配。
-        // 🔴 例外：`!ok`（写入失败 / 快照写入保护跳过）**必须立刻打**，不许被节流吞掉：
-        //    异常信息比统计信息值钱，而它恰恰不会每 30 秒才发生一次。
+        // 🔴 血账 2（v0.0.122 真机复量）：只按时间节流到 30 秒**还是不够** ——
+        //    30 秒一条 = 一小时 120 行，而窗口只有 ~50 行 ⇒ 静止时两分钟就滚完一轮。
+        //    「按时间节流」挡的是频率，挡不住"内容一个字没变也照打"。
+        //    ⇒ v0.0.123 改成 **内容变了才打 + 保底**：
+        //       · 签名（条数/有键/严格/可读uuid/写入状态）变了 ⇒ 打，但最小间隔
+        //         `NB_SCAN_LOG_GAP` 秒（防止 NC 重投时每 2 秒抖一条）；
+        //       · 一直不变 ⇒ `NB_SCAN_LOG_GAP_IDLE` 秒保底打一条
+        //         （否则"没日志"会被读成"扫描停了"，那是更贵的误读）；
+        //       · `!ok`（写入失败 / 快照写入保护跳过）**立刻打**，不参与任何节流 ——
+        //         异常信息比统计信息值钱，且它不会每 30 秒才发生一次。
         // 🔴 区间用 `-1` 表示"首条/未知"，**不许**用 0（0 会被读成"刚打过"）。
         static NSTimeInterval sScanLogTs = 0;
+        static NSString *sScanLogSig = nil;
         static NSUInteger sScanLogSkip = 0;
         NSTimeInterval scanNow = [[NSDate date] timeIntervalSince1970];
-        BOOL scanLogDue = (sScanLogTs <= 0) || ((scanNow - sScanLogTs) >= NB_SCAN_LOG_GAP);
-        if (scanLogDue || !ok) {
+        // 内容签名：只要这几项有一个变了，这就是"值得打一行"的事。
+        // 🔴 只挑**能变**的那几项（`csMeasured` / `cseMeasured` 与条数同源，放进来是多余；
+        //    `seq` 每次扫描都变 ⇒ 放进签名就退化成"每次都打"，等于没节流）。
+        NSString *scanSig = [NSString stringWithFormat:@"%lu|%lu|%ld|%ld|%@",
+                             (unsigned long)all.count, (unsigned long)withKeys,
+                             (long)csYes, (long)cseYes, writeState ?: @"?"];
+        BOOL sigChanged = ![scanSig isEqualToString:(sScanLogSig ?: @"")];
+        BOOL dueByChange = sigChanged
+            && ((sScanLogTs <= 0) || ((scanNow - sScanLogTs) >= NB_SCAN_LOG_GAP));
+        BOOL dueByIdle = (sScanLogTs <= 0)
+            || ((scanNow - sScanLogTs) >= NB_SCAN_LOG_GAP_IDLE);
+        if (dueByChange || dueByIdle || !ok) {
             double scanSpan = (sScanLogTs > 0) ? (scanNow - sScanLogTs) : -1.0;
-            NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld｜严格 %ld / 可读uuid %ld（可量=%d）seq=%@ 写入=%@ ｜ 距上条 %.0f 秒（-1=首条）｜ 期间省略 %lu 条",
+            // 🔴 把「为什么打这条」也写出来：`变化` / `保底` / `异常` 三种原因，
+            //    否则读的人分不清"它变了"和"它只是到点了"。
+            NSString *whyLog = !ok ? @"异常(必打)"
+                                   : (dueByChange ? @"内容变了" : @"保底(内容没变)");
+            NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld｜严格 %ld / 可读uuid %ld（可量=%d）seq=%@ 写入=%@ ｜ 距上条 %.0f 秒（-1=首条）｜ 期间省略 %lu 条 ｜ 本条因为：%@",
                   (unsigned long)all.count, (unsigned long)withKeys,
                   (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
                   (csDest ? 1 : 0), seq ?: @"", writeState,
-                  scanSpan, (unsigned long)sScanLogSkip);
+                  scanSpan, (unsigned long)sScanLogSkip, whyLog);
             sScanLogTs = scanNow;
             sScanLogSkip = 0;
+            sScanLogSig = scanSig;
         } else {
             sScanLogSkip++;
         }
