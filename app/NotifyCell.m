@@ -855,6 +855,39 @@ static void NBHapticFire(NBHapticKind kind) {
 
 #pragma mark - v0.0.118 长按菜单
 
+// v0.0.119：长按浮起的那份「预览」长什么样，归我们自己管。
+//
+// 🔴🔴 为什么必须有这个方法（v0.0.118 的原始症状：松开时"先一块白色底，然后白底消失"）：
+//    `previewProvider:nil` ⇒ 系统用它**自己**的兜底预览；而我们的 cell 是**全透明**的
+//    （`self.backgroundColor = clearColor`，看得见的只有里面那张 cardView 和卡片左边槽里的
+//    iconBox）。系统拍完这份透明快照后，会在它**底下垫一层** `UIPreviewParameters.backgroundColor`
+//    的默认值 —— 浅色模式下那个默认值就是**纯白**。
+//    那块白的几何是「整个 cell 的 bounds、方角、比卡片四周各宽一圈」，
+//    于是长按瞬间"啪"地盖上一块白、松手又"啪"地撤掉 ⇒ 用户看到的就是"先白色底再消失"。
+//
+// 🔴🔴 修法**不是**去调动画（dismiss 的曲线/时长系统一律不给改，没有任何 API），
+//    而是**把这层垫底换成列表自己的底色**：颜色和背后完全一致 ⇒ 那块矩形从第一帧起
+//    就没有色差，视觉上等于不存在；动画里剩下的只有卡片自己在缩放 ⇒ 自然。
+//    ⇒ 判据：`backgroundColor` 必须和 `ViewController` 里 `self.table.backgroundColor` **同源**
+//      （那边是 `NBPageBG()`，见 ViewController.m:1055），任一处换了另一边必须跟着换。
+//
+// 🔴 为什么不用 `clearColor`（更"彻底"的那个解法）：透明垫底在 iOS 16 上有被系统按
+//    黑/灰渲染的已知风险（尤其 preview 层自己合成时），而"同色"和"透明"在这里的
+//    视觉效果是一模一样的 ⇒ 没必要为了同一个结果去冒那个险。
+- (UITargetedPreview *)nbPreviewForMenu {
+    UIPreviewParameters *p = [[UIPreviewParameters alloc] init];
+    // 🔴 显式 resolve 一次再赋值：`NBPageBG()` 是**动态色**（浅色 #F2F2F7 / 深色 #000），
+    //    而 preview 环境可能按**窗口**的 traitCollection 去解析它，列表底色却是按列表自己的
+    //    trait 解析的 —— 两边一旦落在不同的 style 上，"同色"就不成立，白底会以灰底的形式回来。
+    p.backgroundColor = [NBPageBG() resolvedColorWithTraitCollection:self.traitCollection];
+    // 🔴 故意**不设** `visiblePath`：让它按快照的 alpha 反推轮廓。
+    //    ⛔ 设成矩形路径 ⇒ 卡片左边那条图标槽（iconBox 挂在卡**外面**）被整个裁掉；
+    //    ⛔ 设成卡片的圆角路径 ⇒ 图标同样被裁掉。
+    //    只有"按 alpha 反推"能同时保住卡片圆角和槽里的图标 —— 这也是系统默认在做的事，
+    //    我们只是把垫底色换掉，形状逻辑一概不碰。
+    return [[UITargetedPreview alloc] initWithView:self parameters:p];
+}
+
 // 长按卡片 ⇒ 出菜单。**内容不由 cell 决定**，只向列表要（`nbMenuBuilder`）。
 - (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction
                         configurationForMenuAtLocation:(CGPoint)location {
@@ -869,13 +902,39 @@ static void NBHapticFire(NBHapticKind kind) {
     __weak typeof(self) weakSelf = self;
     return [UIContextMenuConfiguration
         configurationWithIdentifier:nil
-                    previewProvider:nil
+                    previewProvider:^UITargetedPreview * _Nullable(void) {
+        // 🔴 这里**只能** weak：configuration 被 interaction 持有、interaction 被 cell 持有，
+        //    在 block 里强引用 self 就是一个环 ⇒ cell 永远不释放，复用池越滚越大。
+        //    真取不到 self（cell 已被回收）就返回 nil，交回系统的兜底预览 ——
+        //    那种情况下这一行早就滚出屏幕了，没人会看到它长什么样。
+        NotifyCell *s = weakSelf;
+        if (!s) return nil;
+        return [s nbPreviewForMenu];
+    }
                      actionProvider:^UIMenu * _Nullable(NSArray<UIMenuElement *> *suggestedActions) {
         // 🔴 **弹的那一刻现问列表**，绝不在 cell 里缓存一个 UIMenu：
         //    缓存下来就会带着上一行的动作（上一行的 App 名、上一行的 rowId）跑 ——
         //    复用池里最爱串的正是这种"存下来的行为"，而且症状是"删错了行"这种最贵的错。
         return weakSelf.nbMenuBuilder ? weakSelf.nbMenuBuilder() : nil;
     }];
+}
+
+// 🔴🔴 上面 configuration 里的 `previewProvider` **只覆盖"浮起来"那一下**。
+//    系统在菜单要收起时会**再问一次**"收回时用哪份预览"（尤其手势取消这条路径），
+//    不实现它就退回**系统兜底预览** —— 也就是同一块白底又回来了。
+//    ⇒ 下面两个必须都指向同一个 `nbPreviewForMenu`：用户看到的永远是
+//      "同一张卡片放大"和"同一张卡片缩回"，中间没有任何东西被换掉。
+// 🔴 已经给了 `previewProvider` 还补这两个，是有意的**冗余**：不同 iOS 版本在
+//    "provider 优先还是 delegate 优先"上有过差异，两条路都给同一份结果，
+//    就不用去赌当前系统走的是哪条。代价只有一次方法调用。
+- (UITargetedPreview *)contextMenuInteraction:(UIContextMenuInteraction *)interaction
+        previewForHighlightingMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {
+    return [self nbPreviewForMenu];
+}
+
+- (UITargetedPreview *)contextMenuInteraction:(UIContextMenuInteraction *)interaction
+        previewForDismissingMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {
+    return [self nbPreviewForMenu];
 }
 
 // 🔴 只在"水平主导"时才开始，而且必须在**手势开始之前**答
