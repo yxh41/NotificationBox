@@ -96,7 +96,9 @@ void NBSharedLog(NSString *fmt, ...) {
     const char *sql = "CREATE TABLE IF NOT EXISTS notifications ("
                       "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                       "bundle TEXT, title TEXT, message TEXT, subtitle TEXT, "
-                      "ts REAL, read INTEGER DEFAULT 0, hash TEXT, sys_id TEXT, sys_id_alt TEXT);"
+                      "ts REAL, read INTEGER DEFAULT 0, hash TEXT, sys_id TEXT, sys_id_alt TEXT, "
+                      // v0.0.133：通知原始 userInfo 的 JSON（有界，见 NotifyStore.h 说明）。
+                      "payload TEXT);"
                       "CREATE INDEX IF NOT EXISTS idx_bundle ON notifications(bundle);"
                       "CREATE INDEX IF NOT EXISTS idx_ts ON notifications(ts);"
                       // v0.0.45：App 显示名表。**SpringBoard 写、盒子 App 读**。
@@ -120,7 +122,7 @@ void NBSharedLog(NSString *fmt, ...) {
     //    再加一列时那种写法必然漏（第二次 ALTER 会被跳过，然后整版按"有这一列"去读写 ⇒
     //    运行期 `no such column`，而且只在老库上升级才炸）。
     {
-        BOOL hasSysId = NO, hasAlt = NO;
+        BOOL hasSysId = NO, hasAlt = NO, hasPayload = NO;
         sqlite3_stmt *p = NULL;
         if (sqlite3_prepare_v2(db, "PRAGMA table_info(notifications)", -1, &p, NULL) == SQLITE_OK) {
             while (sqlite3_step(p) == SQLITE_ROW) {
@@ -128,6 +130,10 @@ void NBSharedLog(NSString *fmt, ...) {
                 if (!nm) continue;
                 if (strcmp(nm, "sys_id") == 0) hasSysId = YES;
                 if (strcmp(nm, "sys_id_alt") == 0) hasAlt = YES;
+                // v0.0.133：同上，第三个待补列。**同一个 PRAGMA 一起探** —— 分两次探
+                //   就会重演 v0.0.117 那个坑（第二次 ALTER 被跳过 ⇒ 运行期 no such column，
+                //   而且只在老库升级时炸）。
+                if (strcmp(nm, "payload") == 0) hasPayload = YES;
             }
             sqlite3_finalize(p);
         }
@@ -136,6 +142,9 @@ void NBSharedLog(NSString *fmt, ...) {
         }
         if (!hasAlt) {
             sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN sys_id_alt TEXT;", NULL, NULL, NULL);
+        }
+        if (!hasPayload) {
+            sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN payload TEXT;", NULL, NULL, NULL);
         }
     }
     return db;
@@ -439,12 +448,24 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
     return out;
 }
 
+// v0.0.133：旧签名退化成**薄封装**（见 NotifyStore.h 的理由：唯一实现只写一遍）。
 + (void)recordWithBundle:(NSString *)bundle
                    title:(NSString *)title
                  message:(NSString *)message
                subtitle:(NSString *)subtitle
                     date:(NSDate *)date
                   sysId:(NSString *)sysId {
+    [self recordWithBundle:bundle title:title message:message subtitle:subtitle
+                      date:date sysId:sysId payload:nil];
+}
+
++ (void)recordWithBundle:(NSString *)bundle
+                   title:(NSString *)title
+                 message:(NSString *)message
+               subtitle:(NSString *)subtitle
+                    date:(NSDate *)date
+                  sysId:(NSString *)sysId
+                 payload:(NSString *)payload {
     if (!bundle.length) return;
     sqlite3 *db = [self openDB];
     if (!db) {
@@ -574,8 +595,8 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         }
     }
 
-    const char *ins = "INSERT INTO notifications (bundle,title,message,subtitle,ts,hash,sys_id) "
-                      "VALUES (?,?,?,?,?,?,?)";
+    const char *ins = "INSERT INTO notifications (bundle,title,message,subtitle,ts,hash,sys_id,payload) "
+                      "VALUES (?,?,?,?,?,?,?,?)";
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(db, ins, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, [bundle UTF8String], -1, SQLITE_TRANSIENT);
@@ -588,6 +609,14 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         NSData *hd = [h dataUsingEncoding:NSUTF8StringEncoding];
         sqlite3_bind_text(stmt, 6, [[hd description] UTF8String], -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 7, [sysId ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
+        // v0.0.133：payload 允许为 nil（读不到 userInfo 的通知是大多数情况）。
+        // 🔴 nil 存 NULL 而不是空串：空串会让"有 payload 但解析不出链接"和
+        //    "压根没有 payload"在库里长得一样，以后想统计命中率就分不开。
+        if (payload.length) {
+            sqlite3_bind_text(stmt, 8, [payload UTF8String], -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 8);
+        }
         int rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE) {
             NBStoreLog(@"INSERT 失败 rc=%d err=%s bundle=%@", rc, sqlite3_errmsg(db), bundle);
@@ -811,6 +840,11 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     NSString *sid7 = d[@"sys_id"] ?: @"";
     NSString *salt8 = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 8) ?: ""];
     d[@"sys_id_cand"] = NBSysIdWithAlt(sid7, salt8);
+    // 🔴🔴 v0.0.133：第 10 列（列号 9）`payload`。
+    //    **跨文件契约的第三边**：SELECT 里的顺序 ↔ 这里的列号 ↔ 消费端键名
+    //    （`ViewController -nbMenuForRow:` 读 `row[@"payload"]`）。
+    //    漏了这一边 = 消费端恒 nil、**恒 0 且不报错** —— v0.0.99 那次的同一个坑。
+    d[@"payload"]  = [NSString stringWithUTF8String:(const char *)sqlite3_column_text(st, 9) ?: ""];
     [res addObject:d];
 }
 
@@ -832,8 +866,8 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     //    ⇒ 残留标记恒 0，而且不报错。加/删列时**四个** SELECT（列表两条 + 导出两条）
     //    和 `NBAppendRow` 的列号必须一起改。
     NSString *head = unreadOnly
-        ? @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,'') FROM notifications WHERE read=0"
-        : @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,'') FROM notifications WHERE 1=1";
+        ? @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,''),IFNULL(payload,'') FROM notifications WHERE read=0"
+        : @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,''),IFNULL(payload,'') FROM notifications WHERE 1=1";
     NSString *tail = [NSString stringWithFormat:@" ORDER BY ts DESC LIMIT %ld", (long)kNBListLimit];
     sqlite3_stmt *st = NBPrepareScope(db, head, tail, bundle, since, q, searchBundles);
     if (st) {
@@ -860,8 +894,8 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
     sqlite3 *db = [self openDB];
     if (!db) return res;
     NSString *head = unreadOnly
-        ? @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,'') FROM notifications WHERE read=0"
-        : @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,'') FROM notifications WHERE 1=1";
+        ? @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,''),IFNULL(payload,'') FROM notifications WHERE read=0"
+        : @"SELECT id,bundle,title,message,subtitle,ts,read,sys_id,IFNULL(sys_id_alt,''),IFNULL(payload,'') FROM notifications WHERE 1=1";
     sqlite3_stmt *st = NBPrepareScope(db, head, @" ORDER BY ts DESC", bundle, since, q, searchBundles);
     if (st) {
         while (sqlite3_step(st) == SQLITE_ROW) NBAppendRow(st, res);

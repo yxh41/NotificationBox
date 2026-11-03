@@ -42,6 +42,23 @@ typedef NS_OPTIONS(NSUInteger, NBKeywordAction) {
                      title:(nullable NSString *)title
                    message:(nullable NSString *)message;
 
+// v0.0.133：多一个 `payload`（通知原始 `userInfo` 的 JSON 串，可为 nil）。
+// 🔴 为什么要存它：长按卡片的「打开」要能尽量**直达那条内容**，而 iOS 没有
+//    "跳到某条通知"的通用能力，唯一线索就是 payload 里带的链接。
+//    ⚠️ 提取链接的逻辑**故意放在 App 侧**（`AppLauncher deeplinkFromPayload:`），
+//    tweak 只做"哑存" —— 这样以后想扩大识别范围不用重编 tweak（和关键词规则同一个偏好）。
+// 🔴 存的是**有界**的（tweak 侧截断 2048 字符）：一条通知不许把库撑大。
++ (void)recordWithBundle:(NSString *)bundle
+                   title:(nullable NSString *)title
+                 message:(nullable NSString *)message
+               subtitle:(nullable NSString *)subtitle
+                    date:(nullable NSDate *)date
+                  sysId:(nullable NSString *)sysId
+                 payload:(nullable NSString *)payload;
+
+// 旧签名：**薄封装**，转调上面那个 `payload:nil`。
+// 🔴 保留它不是为了兼容，而是"同一个语义不许有两份实现"——已有调用点不必改语义，
+//    但插入逻辑只写一遍（照抄一份改个参数，以后加列必然漏一处）。
 + (void)recordWithBundle:(NSString *)bundle
                    title:(nullable NSString *)title
                  message:(nullable NSString *)message

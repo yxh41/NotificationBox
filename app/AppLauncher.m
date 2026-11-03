@@ -177,6 +177,115 @@
     return NBOpenAppResultNoWay;
 }
 
+#pragma mark - v0.0.133：从 payload 里找深链
+
+// 只认 `scheme://` 这种。`NSURL` 对 "abc:def" 也会给一个 scheme，太宽。
+static NSURL *NBLinkURL(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length < 5) return nil;
+    if ([s rangeOfString:@"://"].location == NSNotFound) return nil;
+    NSURL *u = [NSURL URLWithString:s];
+    if (!u || !u.scheme.length) return nil;
+    return u;
+}
+
+// 已知"这是跳转链接"的键名（小写比较）。
+static BOOL NBKeyLooksLikeLink(NSString *k) {
+    if (![k isKindOfClass:[NSString class]] || !k.length) return NO;
+    static NSSet *S = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        S = [NSSet setWithArray:@[
+            @"url", @"link", @"deeplink", @"deep_link", @"deeplinkurl", @"deeplink_url",
+            @"jumpurl", @"jump_url", @"openurl", @"open_url",
+            @"targeturl", @"target_url", @"weburl", @"web_url",
+            @"redirect", @"redirecturl", @"redirect_url",
+            @"scheme", @"route", @"router", @"path", @"page",
+            @"contenturl", @"content_url", @"detailurl", @"detail_url"
+        ]];
+    });
+    return [S containsObject:[k lowercaseString]];
+}
+
+// 递归收集候选。**有界**：深度 ≤3 —— payload 是外部数据，
+// 没有上限的话一个畸形结构就能把主线程拖住（而这是长按菜单的回调里同步跑的）。
+static void NBCollectLinks(id node, NSString *key, NSInteger depth, NSMutableArray *out) {
+    if (!node || depth > 3) return;
+    if ([node isKindOfClass:[NSString class]]) {
+        NSURL *u = NBLinkURL((NSString *)node);
+        if (!u) return;
+        NSString *sch = [u.scheme lowercaseString];
+        BOOL isHttp = [sch isEqualToString:@"http"] || [sch isEqualToString:@"https"];
+        BOOL keyish = NBKeyLooksLikeLink(key);
+        NSInteger score = 0;
+        // 🔴 打分就是为了"别把图片地址当跳转"：
+        //    自定义 scheme（`app://…`）几乎只可能来自"让你点进去"的意图 ⇒ 优先；
+        //    http(s) 太常见（图标/封面/统计上报都是）⇒ **只认已知键名**。
+        if (!isHttp)      score = keyish ? 100 : 80;
+        else if (keyish)  score = 60;
+        if (score > 0) [out addObject:@[@(score), (NSString *)node]];
+        return;
+    }
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        [(NSDictionary *)node enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+            NBCollectLinks(v, [k isKindOfClass:[NSString class]] ? (NSString *)k : nil, depth + 1, out);
+        }];
+        return;
+    }
+    if ([node isKindOfClass:[NSArray class]]) {
+        for (id v in (NSArray *)node) NBCollectLinks(v, key, depth + 1, out);
+    }
+}
+
++ (nullable NSString *)deeplinkFromPayload:(nullable NSString *)payload {
+    if (![payload isKindOfClass:[NSString class]] || !payload.length) return nil;
+    NSData *d = [payload dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d) return nil;
+    id root = nil;
+    @try {
+        root = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
+    } @catch (__unused NSException *e) {
+        root = nil;
+    }
+    if (!root) return nil;
+
+    NSMutableArray *cands = [NSMutableArray array];
+    NBCollectLinks(root, nil, 0, cands);
+    if (!cands.count) return nil;
+    [cands sortUsingComparator:^NSComparisonResult(id a, id b) {
+        NSInteger sa = [((NSArray *)a)[0] integerValue];
+        NSInteger sb = [((NSArray *)b)[0] integerValue];
+        if (sa == sb) return NSOrderedSame;
+        return (sa > sb) ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    NSArray *best = (NSArray *)cands.firstObject;
+    id v = (best.count > 1) ? best[1] : nil;
+    return [v isKindOfClass:[NSString class]] ? (NSString *)v : nil;
+}
+
++ (NBOpenAppResult)openBundle:(nullable NSString *)bundleId deeplink:(nullable NSString *)deeplink {
+    NSURL *u = NBLinkURL(deeplink);
+    if (!u) {
+        if (deeplink.length) {
+            NBSharedLog(@"[直开] 链接不可用(%@) ⇒ 兜底只打开 App", deeplink);
+        }
+        return [self openBundle:bundleId];
+    }
+    NSString *sch = [u.scheme lowercaseString];
+    BOOL isHttp = [sch isEqualToString:@"http"] || [sch isEqualToString:@"https"];
+    // 🔴 completion 的 YES 只说明"系统收下了请求"，**不是**"App 起来了"
+    //    ⇒ 只有 NO（连请求都没被收下）才拿来兜底。同 `openBundle:` 里那条纪律。
+    [[UIApplication sharedApplication] openURL:u options:@{}
+                            completionHandler:^(BOOL ok) {
+        if (!ok) {
+            NBSharedLog(@"[直开] %@ 打不开 ⇒ 兜底只打开 App", deeplink);
+            [AppLauncher openBundle:bundleId];
+        }
+    }];
+    NBSharedLog(@"[直开] bundle=%@ via=%@ scheme=%@", bundleId,
+                isHttp ? @"universal" : @"custom", sch);
+    return NBOpenAppResultSent;
+}
+
 + (nullable NSString *)textForResult:(NBOpenAppResult)r {
     switch (r) {
         case NBOpenAppResultSent:

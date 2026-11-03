@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.132"
+#define NB_VER_STR @"0.0.133"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -4130,6 +4130,81 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
     }
 }
 
+// ---------- v0.0.133：把通知原始 payload 存下来（长按「直达内容页」的**唯一线索**） ----------
+// 🔴 为什么由 tweak 存、App 解析：
+//    `userInfo` 只在**这一刻**（SpringBoard 收到通知时）拿得到，盒子 App 那边永远拿不到
+//    （它没有原始请求）。而"从 userInfo 里认哪个键是跳转链接"是会变的知识
+//    ⇒ 原始 payload 落库、由 App 侧解析，以后扩大识别范围**不用重编 tweak**
+//    （和「关键词规则改动即时生效」同一个偏好）。
+// 🔴 三条安全线（少一条就可能拖累录制热路径）：
+//    ① 全程走 `NBSafeValue`（内部 @try）：`content` / `userInfo` 在 iOS 16 上
+//       到底叫什么、会不会抛都没人保证 —— 读不到就当没有，**绝不影响记录本身**；
+//    ② `isValidJSONObject` 先判：userInfo 里可能有 NSDate/NSData，直接序列化会抛；
+//    ③ 截断 2048：payload 是**附加**信息，一条通知不许把库撑大。
+static NSString *NBExtractPayload(id obj) {
+    if (!obj) return nil;
+
+    // 🔴 有界诊断（封顶 5 行）：这功能失败的样子是"永远只打开 App、不直达"，
+    //    和"payload 里本来就没链接"在屏幕上**长得一模一样** ⇒ 必须留痕，
+    //    否则真机上分不清「没抓到」与「抓到了但 App 侧认不出」。
+    //    和 `[无ID]` 那套同一个写法：static 计数 + 上限，绝不刷屏。
+    static int gPlLog = 0;
+    BOOL wantLog = (gPlLog < 5);
+
+    // obj 可能是 NCNotificationRequest，也可能是 BBBulletin；两条路都试一遍。
+    id content = NBSafeValue(obj, @"content");
+    id ui = content ? NBSafeValue(content, @"userInfo") : nil;
+    id inner = NBSafeValue(obj, @"bulletin");
+    if (inner == obj) inner = nil;
+    BOOL uiOK = ([ui isKindOfClass:[NSDictionary class]] && [(NSDictionary *)ui count] > 0);
+    if (!uiOK) {
+        id c2 = inner ? NBSafeValue(inner, @"content") : nil;
+        id u2 = c2 ? NBSafeValue(c2, @"userInfo") : nil;
+        if ([u2 isKindOfClass:[NSDictionary class]] && [(NSDictionary *)u2 count]) {
+            ui = u2;
+            uiOK = YES;
+        }
+    }
+
+    NSMutableDictionary *wrap = [NSMutableDictionary dictionary];
+    // 🔴 只有 userInfo 本身是合法 JSON 才放进去。放不进去也别整包丢掉 ——
+    //    target/thread 可能仍然有用（见下）。
+    if (uiOK && [NSJSONSerialization isValidJSONObject:ui]) {
+        wrap[@"userInfo"] = ui;
+    }
+    // `targetContentIdentifier`（iOS 13+）是系统给"这张通知该深链到哪儿"的官方字段，
+    // 有些 App 会填。读不到就不放这个键（不写空串：空串会被解析端当"有值但没链接"）。
+    NSString *tci = content ? NBSafeStr(content, @"targetContentIdentifier") : nil;
+    if (!tci.length) tci = NBSafeStr(obj, @"targetContentIdentifier");
+    if (!tci.length && inner) tci = NBSafeStr(inner, @"targetContentIdentifier");
+    if (tci.length) wrap[@"target"] = tci;
+    NSString *thread = content ? NBSafeStr(content, @"threadIdentifier") : nil;
+    if (!thread.length) thread = NBSafeStr(obj, @"threadIdentifier");
+    if (thread.length) wrap[@"thread"] = thread;
+
+    // ---------- 单一出口：所有失败都落到这里，才能保证诊断一定打出来 ----------
+    NSString *s = nil;
+    if (wrap.count > 0 && [NSJSONSerialization isValidJSONObject:wrap]) {
+        NSData *d = [NSJSONSerialization dataWithJSONObject:wrap options:0 error:NULL];
+        if (d) s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    }
+    if (s.length > 2048) s = [s substringToIndex:2048];
+
+    if (wantLog) {
+        gPlLog++;
+        if (!s.length) {
+            // 把"断在哪一层"直接写出来：content 有没有、userInfo 是不是字典。
+            NBLog(@"[payload#%d] 无 cls=%@ content=%@ userInfo%@ ⇒ 本条不存 payload",
+                  gPlLog, NBClassName(obj), content ? @"Y" : @"N",
+                  uiOK ? @"有JSON不合法" : @"=N");
+        } else {
+            NSString *sample = s.length > 60 ? [s substringToIndex:60] : s;
+            NBLog(@"[payload#%d] len=%lu sample=%@", gPlLog, (unsigned long)s.length, sample);
+        }
+    }
+    return s.length ? s : nil;
+}
+
 static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
                               int *counter, BOOL *firstTime) {
     if (firstTime) *firstTime = NO;
@@ -4266,7 +4341,10 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
               title.length ? title : @"(nil)",
               msg.length ? (msg.length > 40 ? [[msg substringToIndex:40] stringByAppendingString:@"..."] : msg) : @"(nil)");
     }
-    [NotifyStore recordWithBundle:bid title:title message:msg subtitle:sub date:date sysId:sysId];
+    // v0.0.133：顺带把原始 payload 存下来（长按「打开」用它尽量直达那条内容）。
+    // 🔴 放在**记录那一刻**取，而不是之后补 —— 通知对象过后就没了。
+    [NotifyStore recordWithBundle:bid title:title message:msg subtitle:sub date:date sysId:sysId
+                           payload:NBExtractPayload(obj)];
     return bid;
 }
 

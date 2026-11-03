@@ -31,6 +31,22 @@ typedef NS_ENUM(NSInteger, NBOpenAppResult) {
 // （调用方往往正处在"菜单正在收起"的时刻，这里再 present 一个框会和收起的动画打架）。
 + (NBOpenAppResult)openBundle:(nullable NSString *)bundleId;
 
+// v0.0.133：**有深链就先直达内容页，没有/打不开就兜底只打开 App**。
+// 🔴 兜底是硬要求，不是"顺便"：iOS 没有「跳到某条通知」的通用能力，
+//    深链能命中的只是少数通知（很多 App 的推送压根不带链接）。
+//    ⇒ 这个方法的契约是「**永不比 openBundle: 更差**」：任何一步失败都退回它。
+// 🔴 只用 `openURL` 的 completion `NO`（连请求都没被系统收下）当兜底触发，
+//    **不拿 YES 当"打开了"的证据** —— 同 `openBundle:` 里那条纪律。
++ (NBOpenAppResult)openBundle:(nullable NSString *)bundleId deeplink:(nullable NSString *)deeplink;
+
+// v0.0.133：从库里存的 payload(JSON) 里找一条"能跳转"的 URL，找不到返回 nil。
+// 🔴 解析**故意放在 App 侧**（tweak 只哑存原始 payload）：
+//    "哪个键是跳转链接"是会变的知识，放这里改规则不用重编 tweak。
+// 🔴 选键策略（避免把图片地址当跳转）：
+//    自定义 scheme（`app://…`）优先；`http(s)` **只认已知键名**（url/link/jumpUrl…），
+//    否则 payload 里随便一个图片 URL 都会把用户送进浏览器。
++ (nullable NSString *)deeplinkFromPayload:(nullable NSString *)payload;
+
 // 给用户看的一句话。返回 nil = 不用提示（成功时静默：App 切走了本身就是反馈）。
 + (nullable NSString *)textForResult:(NBOpenAppResult)r;
 

@@ -492,6 +492,9 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // 「打开」的落点。🔴 只发请求 + toast，**绝不 present** ——
 //    这个动作是在菜单正在收起的瞬间执行的，此时 present 会被系统静默丢掉。
 - (void)nbOpenAppWithBundle:(NSString *)bundleId;
+// v0.0.133：带深链版本。`deeplink` 为 nil/不可用时**同一个方法内部**退回只打开 App
+// （契约见 AppLauncher.h：永不比 openBundle: 更差）。
+- (void)nbOpenAppWithBundle:(NSString *)bundleId deeplink:(NSString *)deeplink;
 // v0.0.118：浮层提示（1.4 秒淡出）。不走 `alertTitle:`：
 //    那个是 alert（要 present），而这里最常发生的时刻正是"菜单刚收起"，
 //    两条 present 撞在一起就是"点了没反应"。浮层只往视图上贴一个 label，不涉及 present。
@@ -3298,18 +3301,29 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     NSString *name = [self appNameForBundle:bid];
     // 🔴 标题里带上 App 名：列表里同一个 App 可能有好几张卡，
     //    光写「打开」用户不知道会跳到哪儿去。名字取不到时退回裸「打开」，不能留空标题。
-    NSString *openTitle = name.length
-                        ? [NSString stringWithFormat:@"打开「%@」", name]
-                        : @"打开";
+    // 🔴 v0.0.133：这条记录若能从 payload 里认出深链，标题就明说「直达…内容」——
+    //    用户点之前就该知道"是会跳到那条内容，还是只把 App 拉起来"。
+    //    认不出时**一字不改**（退回原「打开」），所以老记录的行为完全不变。
+    NSString *link = [AppLauncher deeplinkFromPayload:row[@"payload"]];
+    NSString *openTitle;
+    if (link.length) {
+        openTitle = name.length
+                  ? [NSString stringWithFormat:@"直达「%@」内容", name]
+                  : @"直达内容页";
+    } else {
+        openTitle = name.length
+                  ? [NSString stringWithFormat:@"打开「%@」", name]
+                  : @"打开";
+    }
 
     __weak typeof(self) weakSelf = self;
     NSMutableArray<UIMenuElement *> *acts = [NSMutableArray arrayWithCapacity:2];
 
     UIAction *openAct = [UIAction actionWithTitle:openTitle
-                                            image:[UIImage systemImageNamed:@"arrow.up.forward.app"]
+                                            image:[UIImage systemImageNamed:(link.length ? @"link" : @"arrow.up.forward.app")]
                                        identifier:nil
                                           handler:^(__kindof UIAction *a) {
-        [weakSelf nbOpenAppWithBundle:bid];
+        [weakSelf nbOpenAppWithBundle:bid deeplink:link];
     }];
     [acts addObject:openAct];
 
@@ -3336,7 +3350,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 }
 
 - (void)nbOpenAppWithBundle:(NSString *)bundleId {
-    NBOpenAppResult r = [AppLauncher openBundle:bundleId];
+    [self nbOpenAppWithBundle:bundleId deeplink:nil];
+}
+
+- (void)nbOpenAppWithBundle:(NSString *)bundleId deeplink:(NSString *)deeplink {
+    NBOpenAppResult r = [AppLauncher openBundle:bundleId deeplink:deeplink];
     NSString *text = [AppLauncher textForResult:r];
     // 成功时 `text` 是 nil ⇒ 静默（App 已经切到前台，那本身就是反馈）。
     if (!text.length) return;
