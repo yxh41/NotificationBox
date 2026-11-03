@@ -1484,8 +1484,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                     ? UIMenuElementStateOn : UIMenuElementStateOff;
         [timeActs addObject:a];
     }
+    // 🔴🔴 这里必须是**六参数**版本（`identifier:` + `options:`）。
+    //    写成三参数 `menuWithTitle:image:children:` 会直接编译失败 ——
+    //    `UIMenu` 根本没有那个重载（只有 `menuWithTitle:children:` 两参数版
+    //    和 `menuWithTitle:image:identifier:options:children:` 六参数版）。
+    //    这类"API 到底存不存在"的错，源码判据永远看不见，只有编译期能抓（v0.0.131 现场）。
     [out addObject:[UIMenu menuWithTitle:@"时间范围"
                                    image:[UIImage systemImageNamed:@"clock"]
+                              identifier:nil
+                                 options:0
                                 children:timeActs]];
 
     // ---------- 只看未读 ----------
