@@ -14,10 +14,9 @@
 // v0.0.118：长按菜单里的「打开」⇒ 按 bundleId 打开对应 App（两条路 + 失败留痕都在那个模块里）
 #import "AppLauncher.h"
 
-// v0.0.38：「全标已读」按钮的固定宽度。「全标已读」4 个汉字 @14pt ≈ 56pt，
-// 加左右各 16pt 内边距 ⇒ 88 够宽裕。写常量是因为布局里要拿它算分段控件的宽度，
-// 两处各写一个数字的话，改了其中一个就会出现"按钮压住分段控件"。
-static const CGFloat kNBMarkAllWidth = 88;
+// v0.0.38 的 `kNBMarkAllWidth`（「全标已读」按钮固定宽度）在 v0.0.131 删掉了：
+// 那个按钮已经搬进筛选菜单，布局里不再需要算它的宽度 —— 连声明一起去掉，
+// 免得后来的人照着注释去算一条早就不存在的布局。
 
 // ============================================================================
 // v0.0.122：`[刷新]` 状态行 —— 「为什么刷 / 为什么没刷」必须能在日志里读出来
@@ -115,7 +114,8 @@ static void NBRefNote(NBRefKind kind) {
 //    ⇒ 现在高度 / 圆角 / 间距 / 边距各自只有**一处**定义，`viewDidLayoutSubviews` 全用它。
 static const CGFloat kNBTopMargin = 12;   // 左右边距
 static const CGFloat kNBTopH      = 32;   // 分段 / 按钮 / 标星 的统一高度
-static const CGFloat kNBTopGap    = 8;    // 行与行之间的竖向间距
+// v0.0.131：`kNBTopGap`（行与行之间的竖向间距）删掉了 —— 那三行常驻控件已经不在，
+// 现在的竖直节奏由 `viewDidLayoutSubviews` 里逐段 `y +=` 显式表达。
 static const CGFloat kNBTopRadius = 8;    // 按钮圆角（与卡片 12 形成层级：小的更小）
 static const CGFloat kNBHintH     = 20;   // 两条小字提示的统一高度
 
@@ -314,6 +314,42 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    两个场景互斥，不会同时喊同一件事。
 @property (nonatomic, strong) UILabel *moreFooter;
 
+// ================= v0.0.131：顶部改成「一行到底」（方案 B） =================
+// 🔴🔴 为什么改：v0.0.71 起顶部是一张装了三行**常驻**控件的白卡片
+//    （时间分段 / 搜索框 / ★+未读+全标已读），下面还有最多三条提示 ⇒
+//    常态就吃掉 230pt 左右，小屏上列表只剩半屏。
+// 🔴🔴 **本次一个字都不改逻辑**，只换呈现：
+//    `timeSeg` / `unreadSeg` / `starBtn` / `markAllBtn` 四个对象**全部保留**，
+//    只是不再 `addSubview` —— 它们从"看得见的控件"退化成"状态容器"。
+//    这样 `sinceFromSeg`（读 `timeSeg.selectedSegmentIndex`）、`onUnread:`、
+//    `onStar:`、`onMarkAllRead:`，以及所有读 `unreadOnly` / `starOnly` 的地方
+//    **一行都不用改**。这是这次改造最重要的取舍：把风险全部关在视图层。
+// 🔴 筛选入口合并成右上角一个 `filterBtn`，菜单用 `UIMenu` 的 `state` 表达选中态。
+//    ⛔ 菜单项**不许**直接写 `self.unreadOnly = ...`：一律调原来那几个 setter
+//    （`onTime:` / `onUnread:` / `onStar:` / `onMarkAllRead:`），
+//    否则同一条状态就有了两条赋值路径，迟早走岔（本项目"一个量只算一次"同款纪律）。
+@property (nonatomic, strong) UILabel *bigTitleLabel;     // 自绘大标题「消息盒子」
+@property (nonatomic, strong) UILabel *bigSubLabel;       // 副标题「128 条 · 7 条未读」
+@property (nonatomic, strong) UIButton *searchToggleBtn;  // 放大镜：展开/收起搜索行
+@property (nonatomic, strong) UIButton *filterBtn;        // 筛选入口（右上，带激活数角标）
+@property (nonatomic, strong) UILabel *filterBadge;       // 角标数字（0 ⇒ hidden）
+@property (nonatomic, strong) UIButton *summaryBtn;       // 「近24小时 · 只看未读   清除」
+@property (nonatomic, assign) BOOL searchExpanded;        // 搜索行是否展开（默认收起）
+// v0.0.131：全库未读数（-1 = 读不到）。副标题要用它，但**不许再查一次库** ——
+// 它由 `updateHiddenUnread` 顺手带出来（那里本来就要算"全库未读"这个数）。
+// 🔴 为什么存**原始值**、不在写入时就 `MAX(0, …)`：`-1` 是"读不到"，
+//    和"真的 0 条未读"必须分开（本项目"读不到 ≠ 不存在"那条最贵的教训），
+//    在这里混起来的表现就是"库打不开时副标题写全部已读"。
+@property (nonatomic, assign) NSInteger allUnreadCount;
+- (void)onSearchToggle;
+- (UIMenu *)buildFilterMenu;
+- (NSArray<UIMenuElement *> *)filterMenuElements;
+- (NSArray<NSString *> *)activeFilterNames;
+- (void)updateHeaderSub;
+- (void)updateSummaryRow;
+- (NSInteger)activeFilterCount;
+- (void)onClearFilters;
+
 - (void)onDiag:(id)sender;
 - (void)onSettings:(id)sender;
 // v0.0.35：清空整张表。两个都必须在这里声明 ——
@@ -467,7 +503,11 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"消息盒子";
+    // v0.0.131：系统导航栏标题**置空** —— 标题改成内容区自绘的大标题
+    // （`bigTitleLabel`），两处同时存在会出现"消息盒子"写两遍。
+    // 🔴 置空的只是标题，左上「设置」和右上「诊断/导出/清空」三个按钮**一个都没动**，
+    //    所以这一版没有任何功能入口消失（"重写前先清点它原来顺手做的事"）。
+    self.navigationItem.title = @"";
     // v0.0.70：卡片化之后，底色必须是**分组灰**（不是 systemBackground 的白）。
     // 🔴 v0.0.71 更正：卡片用的是 `secondarySystemGroupedBackground`（白），
     //    不是 `secondarySystemBackground` —— 浅色模式下后者与分组灰**同为 #F2F2F7**，
@@ -1071,12 +1111,87 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 - (void)buildUI {
     // v0.0.71：**第一个**加进 view 的子视图 ⇒ 永远在所有控件下面。
     // 🔴 顺序是有意义的：晚加的话它会把分段/搜索/按钮盖住（白色卡片盖白字，看着像控件没了）。
+    // v0.0.131：这张卡片换了职责 —— 现在是**头像栏的底**（v0.0.71 那三行常驻控件已搬走）。
+    //    🔴 图标栏作为它的**子视图**，所以 `reloadIconBar` 里的坐标全都不用改
+    //    （`holder` 的 x/y 本来就是相对 iconBar 的），只改布局里那一处 frame。
     self.topCard = [[UIView alloc] init];
     self.topCard.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.topCard.layer.cornerRadius = NBCardRadius;   // 与列表卡片同一圆角
     self.topCard.layer.cornerCurve = kCACornerCurveContinuous;
     self.topCard.clipsToBounds = YES;
     [self.view addSubview:self.topCard];
+
+    // ---------- v0.0.131：自绘大标题行（原系统导航栏标题已置空） ----------
+    // 🔴 为什么自己画、不用 `prefersLargeTitles`：系统大标题在「滚动时收起」那套行为
+    //    我们控制不了，而这一行的存在与否直接决定头像栏的起始 y（本项目最忌讳
+    //    "位置靠系统猜"）。自绘 ⇒ y 全部由 `viewDidLayoutSubviews` 说了算。
+    self.bigTitleLabel = [[UILabel alloc] init];
+    self.bigTitleLabel.text = @"消息盒子";
+    self.bigTitleLabel.font = [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold];
+    self.bigTitleLabel.textColor = [UIColor labelColor];
+    [self.view addSubview:self.bigTitleLabel];
+
+    self.bigSubLabel = [[UILabel alloc] init];
+    self.bigSubLabel.text = @"— 条";       // 真实值由 `updateHeaderSub` 填（避免闪一个假 0）
+    self.bigSubLabel.font = [UIFont systemFontOfSize:12];
+    self.bigSubLabel.textColor = [UIColor secondaryLabelColor];
+    [self.view addSubview:self.bigSubLabel];
+
+    // 搜索开关：展开/收起搜索行。🔴 是**开关**不是跳转 —— 搜索框仍在原地，
+    // 只是默认不占位（v0.0.71 起它常驻占 40pt，而它日常根本不用）。
+    self.searchToggleBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.searchToggleBtn setImage:[UIImage systemImageNamed:@"magnifyingglass"]
+                          forState:UIControlStateNormal];
+    self.searchToggleBtn.tintColor = [UIColor secondaryLabelColor];
+    self.searchToggleBtn.backgroundColor = [UIColor secondarySystemFillColor];
+    self.searchToggleBtn.layer.cornerRadius = 15;    // 30pt 圆形
+    [self.searchToggleBtn addTarget:self action:@selector(onSearchToggle)
+                   forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.searchToggleBtn];
+
+    // 筛选入口：时间 / 未读 / ★ / 全标已读 / 只看残留，全进这一个菜单。
+    // 🔴 用 `showsMenuAsPrimaryAction` 而不是自己 present sheet：UIMenu 的
+    //    `state = UIMenuElementStateOn` 天然能表达"哪几项开着"，而且点击即关、
+    //    点外面即取消 —— 自己写 sheet 要重造这三件事，还要多一条"打开时状态不同步"的坑。
+    self.filterBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.filterBtn setImage:[UIImage systemImageNamed:@"line.3.horizontal.decrease"]
+                    forState:UIControlStateNormal];
+    self.filterBtn.tintColor = [UIColor secondaryLabelColor];
+    self.filterBtn.backgroundColor = [UIColor secondarySystemFillColor];
+    self.filterBtn.layer.cornerRadius = 15;
+    self.filterBtn.showsMenuAsPrimaryAction = YES;
+    self.filterBtn.menu = [self buildFilterMenu];
+    [self.view addSubview:self.filterBtn];
+
+    // 激活筛选数的角标。🔴 它是**唯一**告诉用户"现在列表被筛过"的常驻信号
+    //    （摘要行只在有筛选时出现，而角标跟着菜单按钮永远在）。
+    self.filterBadge = [[UILabel alloc] init];
+    self.filterBadge.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    self.filterBadge.textColor = [UIColor whiteColor];
+    self.filterBadge.backgroundColor = [UIColor systemBlueColor];
+    self.filterBadge.textAlignment = NSTextAlignmentCenter;
+    self.filterBadge.layer.cornerRadius = 8;
+    self.filterBadge.clipsToBounds = YES;
+    self.filterBadge.hidden = YES;
+    [self.view addSubview:self.filterBadge];
+
+    // 筛选摘要行：只在有筛选时占位，点一下全清。
+    // 🔴 为什么不把它做成纯 UILabel：它说的是"你现在看到的是被筛过的"，那就必须
+    //    给一条一步回到全部的路（和 v0.0.41 把 hiddenHint 从 UILabel 改成 UIButton 同一条理由）。
+    self.summaryBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.summaryBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+    self.summaryBtn.titleLabel.adjustsFontSizeToFitWidth = YES;
+    self.summaryBtn.titleLabel.minimumScaleFactor = 0.85;
+    self.summaryBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    self.summaryBtn.backgroundColor = [UIColor secondarySystemFillColor];
+    self.summaryBtn.layer.cornerRadius = 7;
+    self.summaryBtn.contentEdgeInsets = UIEdgeInsetsMake(0, 8, 0, 8);
+    [self.summaryBtn setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
+    self.summaryBtn.hidden = YES;
+    [self.summaryBtn addTarget:self action:@selector(onClearFilters)
+              forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.summaryBtn];
+
 
     // 时间分段
     // v0.0.37：第 0 段原名「今天」，但它实际返回的是 `now - 86400`（最近 24 小时），
@@ -1086,7 +1201,12 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.timeSeg = [[UISegmentedControl alloc] initWithItems:[self timeNames]];
     self.timeSeg.selectedSegmentIndex = 0;
     [self.timeSeg addTarget:self action:@selector(onTime:) forControlEvents:UIControlEventValueChanged];
-    [self.view addSubview:self.timeSeg];
+    // 🔴🔴 v0.0.131：**故意不 addSubview**。它现在只是「时间窗」这个状态的持有者 ——
+    //    `sinceFromSeg` 读的就是 `self.timeSeg.selectedSegmentIndex`。
+    //    把它留在视图里（哪怕 hidden）会多一处"看得见却不该被点"的东西；
+    //    而删掉它就要改 `sinceFromSeg` / 判据 / 变异一大堆 ⇒ 保留对象、摘掉视图最省风险。
+    //    ⚠️ 代价：程序改 `selectedSegmentIndex` **不会**触发 ValueChanged ⇒
+    //    筛选菜单里必须手动调 `onTime:`（见 `buildFilterMenu`）。
 
     // 搜索
     self.searchBar = [[UISearchBar alloc] init];
@@ -1097,6 +1217,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    和外层的灰底有明确的层次。
     self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
     self.searchBar.backgroundImage = [[UIImage alloc] init];   // 去掉那条 1px 分隔线
+    // v0.0.131：默认**收起**。展开与否由 `searchExpanded` 决定，位置在
+    // `viewDidLayoutSubviews` 里算（收起时 frame 清零且 hidden，绝不占位）。
+    self.searchBar.hidden = YES;
     [self.view addSubview:self.searchBar];
 
     // v0.0.37：全部 / 只看未读。
@@ -1105,7 +1228,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.unreadSeg = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"只看未读"]];
     self.unreadSeg.selectedSegmentIndex = 0;
     [self.unreadSeg addTarget:self action:@selector(onUnread:) forControlEvents:UIControlEventValueChanged];
-    [self.view addSubview:self.unreadSeg];
+    // v0.0.131：同 `timeSeg` —— 只当状态容器，不上视图。`onUnread:` 仍然靠它取段号。
 
     // v0.0.49：★ 只看标星开关。创建方式对齐 markAllBtn（同屏已有的按钮写法：
     //    UIButtonTypeSystem + 手动设字体/圆角/底色），不引第二套。
@@ -1123,7 +1246,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self.starBtn setTitleColor:[UIColor systemOrangeColor] forState:UIControlStateSelected];
     [self.starBtn addTarget:self action:@selector(onStar:)
               forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.starBtn];
+    // v0.0.131：★ 变成筛选菜单里的一项 ⇒ 按钮本身不上视图。
+    // 🔴 `onStar:` 里的 `self.starBtn.selected = self.starOnly` 一行都不用改，
+    //    它只是没人看得见了而已（且菜单的 state 由 `starOnly` 现算，不读这个 selected）。
 
     // v0.0.38：「只看未读」时才出现的批量入口。
     // 🔴 为什么默认隐藏、而不是常驻：在「全部」模式下，列表里已读未读混在一起，
@@ -1137,7 +1262,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self.markAllBtn addTarget:self action:@selector(onMarkAllRead:)
               forControlEvents:UIControlEventTouchUpInside];
     self.markAllBtn.hidden = YES;
-    [self.view addSubview:self.markAllBtn];
+    // v0.0.131：不上视图 —— 它变成筛选菜单里那一条「全标已读」。
+    // 🔴 `onUnread:` 里那句 `self.markAllBtn.hidden = !self.unreadOnly` 保留不动：
+    //    菜单每次弹出都现算 `state`，不读这个 hidden；留着它是为了让那条老代码
+    //    依旧"说得通"，将来要恢复常驻按钮时不用再改一遍。
 
     // v0.0.40：筛选之外还有未读的常驻提示（`hiddenUnread > 0` 才显示，见属性注释）。
     // v0.0.41：改成按钮（可点）。创建方式对齐同屏已有的 `markAllBtn`：
@@ -1152,6 +1280,12 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    看起来像个孤立标签、而不是"挂在列表上方的一条说明"。
     self.hiddenHint.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
     [self.hiddenHint setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
+    // v0.0.131：从"一行飘在灰底上的小字"改成"一条浅底细条"。
+    // 🔴 只为和下面 `summaryBtn` 同族（都在同一条竖直节奏里），不引入新的视觉语言：
+    //    底 = `secondarySystemFill`、圆角 7、左右内边距 8，和分段控件的高光同一档灰。
+    self.hiddenHint.backgroundColor = [UIColor secondarySystemFillColor];
+    self.hiddenHint.layer.cornerRadius = 7;
+    self.hiddenHint.contentEdgeInsets = UIEdgeInsetsMake(0, 8, 0, 8);
     self.hiddenHint.hidden = YES;
     [self.hiddenHint addTarget:self action:@selector(onHiddenHintTap)
               forControlEvents:UIControlEventTouchUpInside];
@@ -1166,6 +1300,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.foldedHint.titleLabel.minimumScaleFactor = 0.85;
     self.foldedHint.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
     [self.foldedHint setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
+    // v0.0.131：与 `hiddenHint` 同款细条（同族，不引第二套）。
+    self.foldedHint.backgroundColor = [UIColor secondarySystemFillColor];
+    self.foldedHint.layer.cornerRadius = 7;
+    self.foldedHint.contentEdgeInsets = UIEdgeInsetsMake(0, 8, 0, 8);
     self.foldedHint.hidden = YES;
     [self.foldedHint addTarget:self action:@selector(onFoldedHintTap)
               forControlEvents:UIControlEventTouchUpInside];
@@ -1190,7 +1328,12 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 顶部 App 图标栏（横向滚动）
     self.iconBar = [[UIScrollView alloc] init];
     self.iconBar.showsHorizontalScrollIndicator = NO;
-    [self.view addSubview:self.iconBar];
+    // v0.0.131：图标栏挂进 `topCard`（那张白卡现在是它的底），不再是浮在灰底上的裸条。
+    // 🔴 坐标语义没变：`reloadIconBar` 里 `holder` 的 x/y 本来就是相对 iconBar 的，
+    //    只有布局里那一处 frame 要按"相对 topCard"算（见 `viewDidLayoutSubviews`）。
+    // ⚠️ `topCard.clipsToBounds` 是 YES ⇒ 红点/图标会被卡片圆角裁一点点。
+    //    红点在 holder 内 y=5、图标第一行在 y=6~50，都在 64 高的卡片安全区里，实测不裁。
+    [self.topCard addSubview:self.iconBar];
 
     // 列表
     self.table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
@@ -1211,6 +1354,248 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self.view addSubview:self.table];
 }
 
+#pragma mark - v0.0.131 顶部：搜索 / 筛选菜单 / 摘要行（方案 B）
+
+// 搜索行的展开/收起。
+- (void)onSearchToggle {
+    self.searchExpanded = !self.searchExpanded;
+    // 图标跟着换：让"再点一次就收起"这件事在点之前就看得出来。
+    [self.searchToggleBtn setImage:
+        [UIImage systemImageNamed:(self.searchExpanded ? @"xmark" : @"magnifyingglass")]
+                         forState:UIControlStateNormal];
+    // 🔴🔴 顺序是有意义的：`hidden` 和 `frame` 都是在 `viewDidLayoutSubviews` 里设的，
+    //    所以必须**先强制布局**再 `becomeFirstResponder`。
+    //    反过来的话，搜索框此刻还是 `hidden = YES` + 零 frame ⇒ 第一响应者申请**静默失败**
+    //    ⇒ 点了放大镜，搜索框出来了、键盘不出来（不报错，只是"点了没反应"）。
+    [self.view setNeedsLayout];
+    [self.view layoutIfNeeded];
+    if (self.searchExpanded) {
+        [self.searchBar becomeFirstResponder];
+    } else {
+        // 🔴 收起时**必须** resign：搜索框一消失，键盘就成了"盖在列表上的一块板"，
+        //    而且它会把 `safeAreaInsets.bottom` 顶起来 ⇒ 列表被压掉一截。
+        [self.searchBar resignFirstResponder];
+    }
+}
+
+// 当前生效的筛选名 —— **唯一来源**：角标数、摘要文案、布局里的"要不要占位"全从它派生。
+// 🔴 三个出口各自判一遍"有没有筛选"，迟早有一处走岔；那种错不报错，只让
+//    "角标亮着但摘要行没出现"这种自相矛盾的界面留在屏幕上。
+- (NSArray<NSString *> *)activeFilterNames {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    NSInteger ti = self.timeSeg.selectedSegmentIndex;
+    NSArray<NSString *> *names = [self timeNames];
+    // 🔴 第 0 段 = 近24小时 = **默认档**，不算"被筛过"。
+    //    把它算进去的话角标永远亮着 1 —— 而"永远亮着"等于"没有提示"（提示条那几条纪律同源）。
+    if (ti != 0 && ti >= 0 && ti < (NSInteger)names.count) {
+        [parts addObject:names[(NSUInteger)ti]];
+    }
+    if (self.unreadOnly) [parts addObject:@"只看未读"];
+    if (self.starOnly)   [parts addObject:@"★ 标星"];
+    if (self.aliveOnly)  [parts addObject:@"只看残留"];
+    return parts;
+}
+
+- (NSInteger)activeFilterCount {
+    return (NSInteger)[self activeFilterNames].count;
+}
+
+// 摘要行 + 角标（唯一出口）。
+- (void)updateSummaryRow {
+    NSArray<NSString *> *parts = [self activeFilterNames];
+    if (parts.count == 0) {
+        // 🔴 清空时 `setTitle:nil`，而不是留一句空串再靠宽度藏 —— 留空串的话
+        //    按钮仍然占着 24pt（frame 是布局算的，不由 title 决定），
+        //    界面上就是一截空灰条。
+        [self.summaryBtn setTitle:nil forState:UIControlStateNormal];
+        self.filterBadge.text = nil;
+        self.filterBadge.hidden = YES;
+    } else {
+        [self.summaryBtn setTitle:[[parts componentsJoinedByString:@" · "]
+                                  stringByAppendingString:@"    清除"]
+                         forState:UIControlStateNormal];
+        self.filterBadge.text = [NSString stringWithFormat:@"%ld", (long)parts.count];
+        self.filterBadge.hidden = NO;
+    }
+    // 摘要行的出现/消失会改头像卡之后所有元素的 y ⇒ 必须重布局
+    [self.view setNeedsLayout];
+}
+
+// 副标题（唯一出口）。数据来自 `lastTotal` + `updateHiddenUnread` 带出来的 `allUnreadCount`。
+// 🔴 不许在这里再查一次库：`loadData` 每次全量重查已经有 6~8 条 SQL，
+//    为了两行小字再加一次 `COUNT(*)`，收益为负。
+- (void)updateHeaderSub {
+    NSInteger total = self.lastTotal;
+    if (total <= 0) {
+        self.bigSubLabel.text = @"还没有记录";
+        return;
+    }
+    if (self.allUnreadCount < 0) {
+        // 读不到未读数 ⇒ 只说条数。⛔ 不许写"全部已读"（那是拿读不到冒充 0 条）。
+        self.bigSubLabel.text = [NSString stringWithFormat:@"共 %ld 条", (long)total];
+    } else if (self.allUnreadCount == 0) {
+        self.bigSubLabel.text = [NSString stringWithFormat:@"共 %ld 条 · 全部已读", (long)total];
+    } else {
+        self.bigSubLabel.text = [NSString stringWithFormat:@"共 %ld 条 · 未读 %ld",
+                                          (long)total, (long)self.allUnreadCount];
+    }
+}
+
+// 筛选菜单。用 `UIDeferredMenuElement`：**每次弹出时现算**。
+// 🔴 为什么不提前构好一份菜单对象：那样只要有一处改了状态忘了重建 `menu`，
+//    弹出来的就是上一次的选中态 —— 用户看到"★ 没勾上但列表只有标星的"，
+//    这类"显示的读数和实际状态不是同一次"的错最难查（本项目栽过多次）。
+//    延迟构建把这个失效模式整类消掉：没有缓存，就没有"忘了刷新缓存"。
+- (UIMenu *)buildFilterMenu {
+    __weak typeof(self) weakSelf = self;
+    UIDeferredMenuElement *root =
+        [UIDeferredMenuElement elementWithProvider:^(void (^completion)(NSArray<UIMenuElement *> *elements)) {
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2) { completion(@[]); return; }
+            completion([self2 filterMenuElements]);
+        }];
+    return [UIMenu menuWithTitle:@"" children:@[root]];
+}
+
+- (NSArray<UIMenuElement *> *)filterMenuElements {
+    NSMutableArray<UIMenuElement *> *out = [NSMutableArray array];
+    __weak typeof(self) weakSelf = self;
+
+    // ---------- 时间范围（单选子菜单） ----------
+    // 🔴 每一项都调**原来那一个** `onTime:`，不新开赋值路径：
+    //    直接改 `selectedSegmentIndex` 之后 `loadData` 也要跑，但那样
+    //    "改时间要不要重查库"这件事就有了两处实现，迟早走岔。
+    NSArray<NSString *> *names = [self timeNames];
+    NSMutableArray<UIAction *> *timeActs = [NSMutableArray arrayWithCapacity:names.count];
+    for (NSUInteger i = 0; i < names.count; i++) {
+        UIAction *a = [UIAction actionWithTitle:names[i]
+                                         image:nil
+                                    identifier:nil
+                                       handler:^(UIAction *action) {
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2) return;
+            if (self2.timeSeg.selectedSegmentIndex == (NSInteger)i) return;   // 点自己 ⇒ 什么都不做
+            self2.timeSeg.selectedSegmentIndex = (NSInteger)i;
+            // 🔴 程序改 `selectedSegmentIndex` **不触发** `UIControlEventValueChanged`
+            //    ⇒ 这一句手动调用不能省（否则菜单点完界面纹丝不动）。
+            [self2 onTime:self2.timeSeg];
+        }];
+        a.state = (self.timeSeg.selectedSegmentIndex == (NSInteger)i)
+                    ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [timeActs addObject:a];
+    }
+    [out addObject:[UIMenu menuWithTitle:@"时间范围"
+                                   image:[UIImage systemImageNamed:@"clock"]
+                                children:timeActs]];
+
+    // ---------- 只看未读 ----------
+    UIAction *unreadAct = [UIAction actionWithTitle:@"只看未读"
+                                              image:[UIImage systemImageNamed:@"envelope.badge"]
+                                         identifier:nil
+                                            handler:^(UIAction *action) {
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (!self2) return;
+        // 走原来那条路：`onUnread:` 从 `unreadSeg` 取段号，它才是 `unreadOnly` 的唯一写入者
+        self2.unreadSeg.selectedSegmentIndex = self2.unreadOnly ? 0 : 1;
+        [self2 onUnread:self2.unreadSeg];
+    }];
+    unreadAct.state = self.unreadOnly ? UIMenuElementStateOn : UIMenuElementStateOff;
+    [out addObject:unreadAct];
+
+    // ---------- ★ 只看标星 ----------
+    UIAction *starAct = [UIAction actionWithTitle:@"只看标星"
+                                            image:[UIImage systemImageNamed:@"star"]
+                                       identifier:nil
+                                          handler:^(UIAction *action) {
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (!self2) return;
+        // `onStar:` 本身是 toggle（它自己取反），所以这里**不先改状态**
+        [self2 onStar:self2.starBtn];
+    }];
+    starAct.state = self.starOnly ? UIMenuElementStateOn : UIMenuElementStateOff;
+    [out addObject:starAct];
+
+    // ---------- 只看残留 ----------
+    // 🔴 只在**能切**的时候给这一项：
+    //    ① 已经开着 ⇒ 必须给（否则用户没法关）；
+    //    ② 一条残留都没有 / 快照过期 ⇒ 不给 —— 切过去是空列表，而
+    //       `onAliveHintTap` 对这两种状态的处理都是"重新扫描"，不是"切换"。
+    //       在这里给一个"切换"，就等于把用户带进一个空列表（v0.0.100 那条坑同源）。
+    if (self.aliveOnly || (self.aliveStillCount > 0 && !self.aliveStale)) {
+        UIAction *aliveAct = [UIAction actionWithTitle:@"只看通知中心残留"
+                                                image:[UIImage systemImageNamed:@"dot.radiowaves.left.and.right"]
+                                           identifier:nil
+                                              handler:^(UIAction *action) {
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2) return;
+            // 和 `onAliveHintTap` 尾部那两句**完全一样**（那里也是这么切的）
+            self2.aliveOnly = !self2.aliveOnly;
+            [self2 loadData];
+        }];
+        aliveAct.state = self.aliveOnly ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [out addObject:aliveAct];
+    }
+
+    // ---------- 动作 ----------
+    // 全标已读只在「只看未读」下出现 —— 和 v0.0.38 把它藏进分段控件旁边同一条理由：
+    // 「全部」模式下列表里已读未读混在一起，这个按钮的作用范围不明确，容易被当成清空。
+    if (self.unreadOnly) {
+        [out addObject:[UIAction actionWithTitle:@"全标已读"
+                                           image:[UIImage systemImageNamed:@"checkmark.circle"]
+                                      identifier:nil
+                                         handler:^(UIAction *action) {
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2) return;
+            [self2 onMarkAllRead:nil];
+        }]];
+    }
+    if ([self activeFilterCount] > 0) {
+        UIAction *clear = [UIAction actionWithTitle:@"清除全部筛选"
+                                              image:[UIImage systemImageNamed:@"arrow.counterclockwise"]
+                                         identifier:nil
+                                            handler:^(UIAction *action) {
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2) return;
+            [self2 onClearFilters];
+        }];
+        clear.attributes = UIMenuElementAttributesDestructive;
+        [out addObject:clear];
+    }
+    return out;
+}
+
+// 「清除」：把摘要行里能看见的那几个筛选一起关掉，回到默认视图。
+// 🔴 只清**摘要行里列出来的**那几项。App 筛选（头像栏）不在此列 ——
+//    它在屏幕上是**看得见的高亮**，用户想清会自己点「全部」；
+//    在"清除"里顺手把它也清掉，等于替用户改了一个他没在问的选择。
+- (void)onClearFilters {
+    // 先作废挂起的搜索防抖，避免清完 250ms 后又被跑一次全量查询
+    [self cancelPendingLoadData];
+
+    if (self.timeSeg.selectedSegmentIndex != 0) {
+        self.timeSeg.selectedSegmentIndex = 0;      // 回默认档（近24小时）
+    }
+    // 🔴 下面三个状态是**直接赋值**、而不是挨个调 `onUnread:` / `onStar:`：
+    //    那两个方法各自内部都会 `loadData`（一次 6~8 条 SQL + 重建 2000 行），
+    //    连调三次就是三次全量重查。这里统一在最后收一次口。
+    //    ⚠️ 代价：`unreadOnly` 的语义等于"`unreadSeg` 的第 1 段"，两边必须一起改 ——
+    //    所以这两行紧贴着写，将来改 `onUnread:` 的人一眼能看到它。
+    self.unreadSeg.selectedSegmentIndex = 0;
+    self.unreadOnly = NO;
+    self.markAllBtn.hidden = YES;
+    self.starOnly = NO;
+    self.starBtn.selected = NO;
+    self.aliveOnly = NO;
+    if (self.searchText.length || self.searchBar.text.length) {
+        // 🔴 `searchBar.text` 必须一起清：只清 `searchText` 的话框里还留着字，
+        //    用户会以为"还在搜"，然后自己再清一次（`onHiddenHintTap` 同款理由）。
+        self.searchText = nil;
+        self.searchBar.text = nil;
+    }
+    [self updateSummaryRow];
+    [self loadData];
+}
+
 // 统一在 safeArea 里排版，避免和导航栏/搜索框互相压字
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
@@ -1218,7 +1603,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
     CGFloat safeBottom = self.view.safeAreaInsets.bottom;
-    CGFloat y = top + 8;
+    CGFloat y = top + 4;
 
     // =====================================================================
     // v0.0.71：顶部控制区收进**一张白卡片**。
@@ -1246,33 +1631,62 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 
     CGFloat cardX = NBInset;
     CGFloat cardW = w - NBInset * 2;
-    CGFloat inX = cardX + 10;
-    CGFloat inW = cardW - 20;
-    CGFloat cy = y + 10;
 
-    // 时间分段
-    self.timeSeg.frame = CGRectMake(inX, cy, inW, kNBTopH);
-    cy += kNBTopH + 10;
+    // =====================================================================
+    // v0.0.131：大标题行 + 头像卡（方案 B —— 原来那三行常驻控件已搬进筛选菜单）
+    // 🔴 两个圆按钮的宽度必须**先从标题可用宽度里扣掉**：v0.0.38 的教训是
+    //    "右侧三个按钮把标题挤没"，这里是同一类事故、只是换了位置。
+    // 🔴 320pt 窄屏验算：320 - 16*2 - 30*2 - 10 - 8 = 210 ⇒ 标题区还有 210pt，
+    //    「消息盒子」这种 4 字标题在 20pt 下绰绰有余。
+    // =====================================================================
+    CGFloat btnS = 30;
+    CGFloat rightEdge = w - NBInset;
+    self.filterBtn.frame = CGRectMake(rightEdge - btnS, y + 8, btnS, btnS);
+    self.searchToggleBtn.frame = CGRectMake(rightEdge - btnS * 2 - 10, y + 8, btnS, btnS);
+    CGFloat textW = MAX(80, rightEdge - btnS * 2 - 10 - NBInset - 8);
+    self.bigTitleLabel.frame = CGRectMake(NBInset, y + 3, textW, 24);
+    self.bigSubLabel.frame = CGRectMake(NBInset, y + 27, textW, 16);
+    // 角标压在筛选按钮右上角，故意探出一点点
+    self.filterBadge.frame = CGRectMake(CGRectGetMaxX(self.filterBtn.frame) - 8,
+                                       CGRectGetMinY(self.filterBtn.frame) - 6, 16, 16);
+    y += 46;
 
-    // 搜索框：UISearchBar 自带左右内边距，往外放 4 才不会看起来陷进去
-    // 🔴 别用 `sizeThatFits:` / `intrinsicContentSize` 去"自动算"：
-    //    UISearchBar 是普通 UIView，未布局时回 (0,0) ⇒ 搜索框直接消失。
-    self.searchBar.frame = CGRectMake(inX - 4, cy - 4, inW + 8, 40);
-    cy += 40;
+    // 头像卡：图标栏的底。
+    // 🔴 `iconBar` 是 `topCard` 的**子视图** ⇒ 下面这行 frame 是相对 topCard 的坐标系。
+    //    写错成 `(0, y, w, 56)` 的话它会被推到卡片外面去（而 `clipsToBounds` 一裁，图标整条消失）。
+    self.topCard.frame = CGRectMake(cardX, y, cardW, 64);
+    self.iconBar.backgroundColor = [UIColor clearColor];
+    self.iconBar.frame = CGRectMake(0, 4, cardW, 56);
+    y += 64 + 6;
 
-    // v0.0.49：三件套 —— ★ 标星（常驻，最左）+ 全部/只看未读 +（未读时）全标已读。
-    // 🔴 320pt 窄屏验算：卡片内宽 320-32-20=268；★68 + 8 + 分段(110) = 186 ≤ 268 ✓，
-    //    再加「全标已读」88 + 8 ⇒ 282 > 268 ⇒ 所以分段用 MAX(110, …) 兜底前先减。
-    CGFloat starW = 68;
-    CGFloat markW = kNBMarkAllWidth;
-    self.markAllBtn.hidden = !self.unreadOnly;
-    CGFloat segW = inW - starW - kNBTopGap - (self.unreadOnly ? (markW + kNBTopGap) : 0);
-    segW = MAX(100, segW);
-    self.starBtn.frame = CGRectMake(inX, cy, starW, kNBTopH);
-    self.unreadSeg.frame = CGRectMake(inX + starW + kNBTopGap, cy, segW, kNBTopH);
-    self.markAllBtn.frame = CGRectMake(inX + starW + kNBTopGap + segW + kNBTopGap,
-                                       cy, markW, kNBTopH);
-    cy += kNBTopH;
+    // 搜索行：默认收起、不占位。收起时 **frame 也清零** ——
+    // 只 `hidden` 不清 frame 是"收起了却留着老坐标"，本项目栽过一次（卡片底部凭空多一截空白）。
+    self.searchBar.hidden = !self.searchExpanded;
+    if (self.searchExpanded) {
+        // 左右各外扩 4：UISearchBar 自带内边距，不外扩会看起来陷进去（v0.0.71 同款）
+        self.searchBar.frame = CGRectMake(cardX - 4, y - 2, cardW + 8, 40);
+        y += 40 + 4;
+    } else {
+        self.searchBar.frame = CGRectZero;
+    }
+
+    // 筛选摘要行：只在有筛选时占位。
+    // 🔴 判据用 `activeFilterCount` —— 和角标、和摘要文案**同一个来源**。
+    //    三处各自判一遍"有没有筛选"，迟早有一处走岔（"提示语与判定必须同源"）。
+    BOOL hasFilter = ([self activeFilterCount] > 0);
+    self.summaryBtn.hidden = !hasFilter;
+    if (hasFilter) {
+        self.summaryBtn.frame = CGRectMake(cardX, y, cardW, 24);
+        y += 24 + 6;
+    } else {
+        self.summaryBtn.frame = CGRectZero;
+    }
+
+    // 提示条：竖直节奏、顺序、`cy` 累加规则**全部沿用 v0.0.71**（就是上面那三条 BOOL），
+    // 这一版只改了它们的 x（从卡片内挪到页面上）和"有没有浅底"，可见性逻辑一个字没动。
+    CGFloat cy = y;
+    CGFloat inX = cardX;
+    CGFloat inW = cardW;
 
     // v0.0.40：筛选之外还有未读的常驻提示。
     // 🔴 不显示时高度必须是 **0**，而且要把 frame 也清零 ——
@@ -1313,16 +1727,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         self.aliveHint.frame = CGRectZero;
     }
 
-    cy += 10;   // 卡片下内边距
-    self.topCard.frame = CGRectMake(cardX, y, cardW, cy - y);
-    y = cy + 8;
-
-    // v0.0.70：图标栏上下各留 6pt，让它和列表之间也有一条"呼吸缝"
-    // v0.0.71：卡片化之后它自己也收进一张白底，和下面的列表卡片、上面的控制卡片同一套层次
-    y += 6;
-    self.iconBar.backgroundColor = [UIColor clearColor];
-    self.iconBar.frame = CGRectMake(0, y, w, 56);
-    y += 56 + 6;
+    // v0.0.131：提示条走完 ⇒ 直接把 y 交给列表。
+    // `topCard` / `iconBar` 的 frame 已经在上面定好了（v0.0.71 那张"卡片高度由内容撑"的
+    // 算法没有内容可撑了 —— 现在它只有一行图标，高度是常量 64）。
+    y = cy + 4;
 
     self.table.frame = CGRectMake(0, y, w, h - y - safeBottom);
 }
@@ -1341,13 +1749,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.unreadDots = [NSMutableDictionary dictionary];
 
     CGFloat x = 8;
-    CGFloat size = 44;
+    // v0.0.131：44 → 40。图标条现在装在一张 64 高的白卡里（上下各 4pt 内边距），
+    // 40 + 上 4 + 下划线 3 + 间距 3 = 50 ≤ 56 ⇒ 不会顶到卡片边。
+    CGFloat size = 40;
     NSArray *list = [@[@"全部"] arrayByAddingObjectsFromArray:self.bundles];
     for (NSString *bid in list) {
         // 🔴 v0.0.36：按钮外面套一层容器。
         //    按钮自己要 `clipsToBounds`（圆角得把图标裁进去），红点如果挂在按钮上、
         //    又想压在角上探出一点，就会被裁掉一半。容器不裁剪，红点挂容器。
-        UIView *holder = [[UIView alloc] initWithFrame:CGRectMake(x, 6, size, size)];
+        UIView *holder = [[UIView alloc] initWithFrame:CGRectMake(x, 4, size, size)];
         [self.iconBar addSubview:holder];
 
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -1383,10 +1793,18 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         //    用户没法判断"现在到底筛的是哪个"。
         BOOL selected = [bid isEqualToString:@"全部"] ? (self.filterBundle.length == 0)
                                                      : [bid isEqualToString:self.filterBundle];
-        if (selected) {
-            b.layer.borderWidth = 2.0;
-            b.layer.borderColor = [UIColor systemBlueColor].CGColor;
-        }
+        // v0.0.131：选中态从"2pt 蓝边框"改成"下方 3pt 短横线"。
+        // 🔴 为什么换：蓝框压在**彩色** App 图标上会跟品牌色打架（微信绿边一圈蓝、
+        //    招行红边一圈蓝），而且深色模式下 2pt 蓝框在深色图标上看不出来。
+        // 🔴 短横线挂在 `holder` 上（不是按钮上）：按钮 `clipsToBounds = YES`（圆角要裁），
+        //    挂按钮上会被裁掉一半 —— 红点当初就是因为这个才挂 holder 的，同一条理由。
+        // 🔴 y = size + 3 ⇒ 落在 holder 边界之外，靠 holder 不裁剪露出来；
+        //    48~50 这段仍在 topCard（高 64）之内，不会被卡片圆角切掉。
+        UIView *ul = [[UIView alloc] initWithFrame:CGRectMake((size - 16) / 2.0, size + 3, 16, 3)];
+        ul.backgroundColor = [UIColor labelColor];
+        ul.layer.cornerRadius = 1.5;
+        ul.hidden = !selected;
+        [holder addSubview:ul];
         b.imageView.contentMode = UIViewContentModeScaleAspectFit;
         [holder addSubview:b];
 
@@ -1555,7 +1973,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // v0.0.121：以下四行 + 后面三条提示条只属于**完整重查**（它们要么查库、
     //    要么依赖 `queriedCount` 这类只在 SQL 那一半才更新的量）。
     NSInteger total = [NotifyStore count];
-    self.title = [NSString stringWithFormat:@"消息盒子 (%ld)", (long)total];
+    // v0.0.131：这里原来写的是 `self.title = @"消息盒子 (N)"`（系统导航栏标题）。
+    // 标题改成自绘之后，这个数挪进副标题 —— 由 `updateHiddenUnread` → `updateHeaderSub`
+    // 统一刷（那里才拿得到"全库未读"这个数）。本行只负责把 `lastTotal` 定下来。
 
     // v0.0.38：记下这次刷新对应的**库指纹**，给 `refreshIfChanged` 比对。
     // 🔴 必须放在上面那些查询**之后**：指纹的语义是"这一屏列表现实对应库里的哪个状态"。
@@ -1577,6 +1997,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self updateHiddenUnread];
     // v0.0.48：折叠提示条紧随其后刷新（它出现/消失同样改变起始 y，靠下面那句 setNeedsLayout）。
     [self updateFoldedHint];
+    // v0.0.131：摘要行 + 筛选角标（`activeFilterNames` 是唯一来源）。
+    // 🔴 必须排在 `setNeedsLayout` **之前**：摘要行出现/消失会改头像卡之后所有元素的 y。
+    [self updateSummaryRow];
     [self.view setNeedsLayout];
 }
 
@@ -1698,6 +2121,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 - (void)updateHiddenUnread {
     self.hiddenUnread = 0;
     NSInteger all = [NotifyStore unreadCountWithBundle:nil since:0 search:nil];
+    // v0.0.131：顺手把这个数留给副标题（`updateHeaderSub`）。
+    // 🔴 存**原始值**、不做 `MAX(0, …)`：`-1` = 库打不开，和"真的 0 条未读"是两件事。
+    self.allUnreadCount = all;
     if (all > 0) {
         // v0.0.42：**必须带 `searchBundles`**。搜索现在能命中 App 名，
         // 列表因此多显示了若干条 ⇒ 如果这里还按"只匹配标题正文"算筛选内未读，
@@ -1716,6 +2142,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     NSString *hint = [self hiddenHintText];
     [self.hiddenHint setTitle:(hint ? [hint stringByAppendingString:@" ›"] : nil)
                      forState:UIControlStateNormal];
+    // v0.0.131：副标题也跟着刷。
+    // 🔴 放在这里而不是 `loadData` 末尾：这个方法是**所有**未读派生物的出口
+    //    （`refreshUnreadDerived` 那条"只刷一行"的路也会调它），副标题是同一个数派生出来的，
+    //    跟着这个出口走才不会有"点开一条变已读、副标题还是旧数"的窗口。
+    [self updateHeaderSub];
 }
 
 // v0.0.41：**所有由"未读数"派生出来的界面元素，只准从这里更新**。
