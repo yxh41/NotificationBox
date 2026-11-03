@@ -330,18 +330,23 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    否则同一条状态就有了两条赋值路径，迟早走岔（本项目"一个量只算一次"同款纪律）。
 @property (nonatomic, strong) UILabel *bigTitleLabel;     // 自绘大标题「消息盒子」
 @property (nonatomic, strong) UILabel *bigSubLabel;       // 副标题「128 条 · 7 条未读」
-@property (nonatomic, strong) UIButton *searchToggleBtn;  // 放大镜：展开/收起搜索行
 @property (nonatomic, strong) UIButton *filterBtn;        // 筛选入口（右上，带激活数角标）
 @property (nonatomic, strong) UILabel *filterBadge;       // 角标数字（0 ⇒ hidden）
-@property (nonatomic, strong) UIButton *summaryBtn;       // 「近24小时 · 只看未读   清除」
-@property (nonatomic, assign) BOOL searchExpanded;        // 搜索行是否展开（默认收起）
+@property (nonatomic, strong) UIButton *summaryBtn;       // 「未读 · 标星   清除」（有筛选时显示）
+// v0.0.132（方案 B）：时间范围**提到明面**做成常驻胶囊行，不再只藏在筛选菜单里。
+//   `timePillRow` 是容器，`timePills` 是 N 个胶囊（与 `timeNames` 一一对应）。
+//   🔴 它只反映 `timeSeg.selectedSegmentIndex` 并调用 `onTime:`；状态仍由 `timeSeg` 持有，
+//      不引第二份"当前时间档"状态（和 v0.0.131 把 timeSeg 当状态容器同一条理由）。
+@property (nonatomic, strong) UIView *timePillRow;
+@property (nonatomic, strong) NSArray<UIButton *> *timePills;
 // v0.0.131：全库未读数（-1 = 读不到）。副标题要用它，但**不许再查一次库** ——
 // 它由 `updateHiddenUnread` 顺手带出来（那里本来就要算"全库未读"这个数）。
 // 🔴 为什么存**原始值**、不在写入时就 `MAX(0, …)`：`-1` 是"读不到"，
 //    和"真的 0 条未读"必须分开（本项目"读不到 ≠ 不存在"那条最贵的教训），
 //    在这里混起来的表现就是"库打不开时副标题写全部已读"。
 @property (nonatomic, assign) NSInteger allUnreadCount;
-- (void)onSearchToggle;
+- (void)updateTimePills;
+- (void)onTimePillTapped:(UIButton *)sender;
 - (UIMenu *)buildFilterMenu;
 - (NSArray<UIMenuElement *> *)filterMenuElements;
 - (NSArray<NSString *> *)activeFilterNames;
@@ -1137,17 +1142,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.bigSubLabel.textColor = [UIColor secondaryLabelColor];
     [self.view addSubview:self.bigSubLabel];
 
-    // 搜索开关：展开/收起搜索行。🔴 是**开关**不是跳转 —— 搜索框仍在原地，
-    // 只是默认不占位（v0.0.71 起它常驻占 40pt，而它日常根本不用）。
-    self.searchToggleBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.searchToggleBtn setImage:[UIImage systemImageNamed:@"magnifyingglass"]
-                          forState:UIControlStateNormal];
-    self.searchToggleBtn.tintColor = [UIColor secondaryLabelColor];
-    self.searchToggleBtn.backgroundColor = [UIColor secondarySystemFillColor];
-    self.searchToggleBtn.layer.cornerRadius = 15;    // 30pt 圆形
-    [self.searchToggleBtn addTarget:self action:@selector(onSearchToggle)
-                   forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.searchToggleBtn];
+    // v0.0.132：放大镜开关已移除 —— 搜索框改为**常驻**（见下方 searchBar），不再有展开/收起状态机。
 
     // 筛选入口：时间 / 未读 / ★ / 全标已读 / 只看残留，全进这一个菜单。
     // 🔴 用 `showsMenuAsPrimaryAction` 而不是自己 present sheet：UIMenu 的
@@ -1217,10 +1212,27 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    和外层的灰底有明确的层次。
     self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
     self.searchBar.backgroundImage = [[UIImage alloc] init];   // 去掉那条 1px 分隔线
-    // v0.0.131：默认**收起**。展开与否由 `searchExpanded` 决定，位置在
-    // `viewDidLayoutSubviews` 里算（收起时 frame 清零且 hidden，绝不占位）。
-    self.searchBar.hidden = YES;
+    // v0.0.132：搜索框**常驻**显示，不再 hidden（去掉放大镜开关后它始终占位）。
     [self.view addSubview:self.searchBar];
+
+    // v0.0.132（方案 B）：时间胶囊行。
+    // 🔴 容器 + N 个胶囊用 `timeNames` 动态生成（和分段控件、sinceFromSeg 同一份段名）。
+    //    胶囊只当"看得见的时间档"，状态仍由 `timeSeg` 持有（见属性注释）。
+    self.timePillRow = [[UIView alloc] init];
+    [self.view addSubview:self.timePillRow];
+    NSArray<NSString *> *tn = [self timeNames];
+    NSMutableArray<UIButton *> *pills = [NSMutableArray arrayWithCapacity:tn.count];
+    for (NSUInteger i = 0; i < tn.count; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        b.tag = (NSInteger)i;                                 // tag = 时间档序号
+        [b setTitle:tn[i] forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont systemFontOfSize:13];
+        b.layer.cornerRadius = 15;                            // 30pt 胶囊形
+        [b addTarget:self action:@selector(onTimePillTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [self.timePillRow addSubview:b];
+        [pills addObject:b];
+    }
+    self.timePills = pills;
 
     // v0.0.37：全部 / 只看未读。
     // 🔴 不用 `searchBar.showsScopeBar` 了 —— v0.0.36 实测 iOS 16 上不显示（见属性注释）。
@@ -1352,30 +1364,37 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self.table registerClass:[NotifyCell class] forCellReuseIdentifier:@"c"];
     self.table.rowHeight = [NotifyCell height];
     [self.view addSubview:self.table];
+
+    // v0.0.132：首帧前先给时间胶囊上色（样式只由 `updateTimePills` 管，loadData 也会调）。
+    [self updateTimePills];
 }
 
-#pragma mark - v0.0.131 顶部：搜索 / 筛选菜单 / 摘要行（方案 B）
+#pragma mark - v0.0.132 顶部：常驻搜索 / 时间胶囊 / 筛选菜单 / 摘要行（方案 B）
 
-// 搜索行的展开/收起。
-- (void)onSearchToggle {
-    self.searchExpanded = !self.searchExpanded;
-    // 图标跟着换：让"再点一次就收起"这件事在点之前就看得出来。
-    [self.searchToggleBtn setImage:
-        [UIImage systemImageNamed:(self.searchExpanded ? @"xmark" : @"magnifyingglass")]
-                         forState:UIControlStateNormal];
-    // 🔴🔴 顺序是有意义的：`hidden` 和 `frame` 都是在 `viewDidLayoutSubviews` 里设的，
-    //    所以必须**先强制布局**再 `becomeFirstResponder`。
-    //    反过来的话，搜索框此刻还是 `hidden = YES` + 零 frame ⇒ 第一响应者申请**静默失败**
-    //    ⇒ 点了放大镜，搜索框出来了、键盘不出来（不报错，只是"点了没反应"）。
-    [self.view setNeedsLayout];
-    [self.view layoutIfNeeded];
-    if (self.searchExpanded) {
-        [self.searchBar becomeFirstResponder];
-    } else {
-        // 🔴 收起时**必须** resign：搜索框一消失，键盘就成了"盖在列表上的一块板"，
-        //    而且它会把 `safeAreaInsets.bottom` 顶起来 ⇒ 列表被压掉一截。
-        [self.searchBar resignFirstResponder];
+// v0.0.132（方案 B）：时间胶囊行的样式同步 —— **唯一出口**。
+// 🔴 只根据 `timeSeg.selectedSegmentIndex` 设每个胶囊的选中态（蓝底白字 / 灰底灰字），
+//    不在这里改任何状态、不查库。改状态只发生在 `onTimePillTapped:` 里。
+// 🔴 通过 `updateSummaryRow` 调用（它在 `loadData` 每轮刷新都跑）⇒ 菜单/清除改了时间档，
+//    胶囊色也会跟着翻，不会出现"菜单里勾了、胶囊没亮"的失同步。
+- (void)updateTimePills {
+    NSInteger ti = self.timeSeg.selectedSegmentIndex;
+    for (NSUInteger i = 0; i < self.timePills.count; i++) {
+        UIButton *b = self.timePills[i];
+        BOOL on = ((NSInteger)i == ti);
+        b.selected = on;
+        b.backgroundColor = on ? [UIColor systemBlueColor] : [UIColor secondarySystemFillColor];
+        [b setTitleColor:(on ? [UIColor whiteColor] : [UIColor secondaryLabelColor])
+                 forState:UIControlStateNormal];
     }
+}
+
+// 点时间胶囊：走**原来的** `onTime:`（不新开赋值路径）。
+// 🔴 程序改 `selectedSegmentIndex` 不触发 ValueChanged ⇒ 必须手动调 `onTime:`（v0.0.131 同款）。
+- (void)onTimePillTapped:(UIButton *)sender {
+    NSInteger i = sender.tag;                              // tag = 时间档序号
+    if (self.timeSeg.selectedSegmentIndex == i) return;    // 点自己 ⇒ 什么都不做
+    self.timeSeg.selectedSegmentIndex = i;
+    [self onTime:self.timeSeg];
 }
 
 // 当前生效的筛选名 —— **唯一来源**：角标数、摘要文案、布局里的"要不要占位"全从它派生。
@@ -1417,6 +1436,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         self.filterBadge.text = [NSString stringWithFormat:@"%ld", (long)parts.count];
         self.filterBadge.hidden = NO;
     }
+    // v0.0.132：时间胶囊色同步（状态由 timeSeg 持有，样式只在这里翻）。
+    [self updateTimePills];
     // 摘要行的出现/消失会改头像卡之后所有元素的 y ⇒ 必须重布局
     [self.view setNeedsLayout];
 }
@@ -1640,23 +1661,41 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     CGFloat cardW = w - NBInset * 2;
 
     // =====================================================================
-    // v0.0.131：大标题行 + 头像卡（方案 B —— 原来那三行常驻控件已搬进筛选菜单）
-    // 🔴 两个圆按钮的宽度必须**先从标题可用宽度里扣掉**：v0.0.38 的教训是
-    //    "右侧三个按钮把标题挤没"，这里是同一类事故、只是换了位置。
-    // 🔴 320pt 窄屏验算：320 - 16*2 - 30*2 - 10 - 8 = 210 ⇒ 标题区还有 210pt，
-    //    「消息盒子」这种 4 字标题在 20pt 下绰绰有余。
+    // v0.0.132（方案 B）：大标题行 + 常驻搜索 + 时间胶囊 + 头像卡。
+    //    v0.0.131 的放大镜开关已移除 ⇒ 搜索框**常驻**；时间范围从筛选菜单里
+    //    提到明面做成胶囊行（最常见操作少点一层菜单）。
+    // 🔴 标题可用宽度只要给筛选按钮（1 个 30pt）留位，不再减两个按钮。
     // =====================================================================
     CGFloat btnS = 30;
     CGFloat rightEdge = w - NBInset;
     self.filterBtn.frame = CGRectMake(rightEdge - btnS, y + 8, btnS, btnS);
-    self.searchToggleBtn.frame = CGRectMake(rightEdge - btnS * 2 - 10, y + 8, btnS, btnS);
-    CGFloat textW = MAX(80, rightEdge - btnS * 2 - 10 - NBInset - 8);
+    CGFloat textW = MAX(80, rightEdge - btnS - NBInset - 8);
     self.bigTitleLabel.frame = CGRectMake(NBInset, y + 3, textW, 24);
     self.bigSubLabel.frame = CGRectMake(NBInset, y + 27, textW, 16);
     // 角标压在筛选按钮右上角，故意探出一点点
     self.filterBadge.frame = CGRectMake(CGRectGetMaxX(self.filterBtn.frame) - 8,
                                        CGRectGetMinY(self.filterBtn.frame) - 6, 16, 16);
     y += 46;
+
+    // v0.0.132：搜索框**常驻**（去掉放大镜开关后始终占位）。
+    // 🔴 左右各外扩 4 和 v0.0.71 同款：UISearchBar 自带内边距，不外扩会陷进去。
+    self.searchBar.hidden = NO;
+    self.searchBar.frame = CGRectMake(cardX - 4, y - 2, cardW + 8, 40);
+    y += 40 + 4;
+
+    // v0.0.132：时间胶囊行。N 个胶囊等分 `cardW`，**只在这里排 frame**（样式由 `updateTimePills` 管），
+    //    两个出口（frame 归布局、颜色归样式）互不抢。
+    // 🔴 `timePillRow` 容器只框住这一行高，不会盖住下面的列表 ⇒ 不抢触摸事件。
+    CGFloat pillH = 30;
+    CGFloat pillGap = 8;
+    CGFloat pillW = (cardW - pillGap * (self.timePills.count - 1)) / (CGFloat)self.timePills.count;
+    self.timePillRow.frame = CGRectMake(cardX, y, cardW, pillH);
+    CGFloat px = 0;
+    for (NSUInteger i = 0; i < self.timePills.count; i++) {
+        self.timePills[i].frame = CGRectMake(px, 0, pillW, pillH);
+        px += pillW + pillGap;
+    }
+    y += pillH + 6;
 
     // 头像卡：图标栏的底。
     // 🔴 `iconBar` 是 `topCard` 的**子视图** ⇒ 下面这行 frame 是相对 topCard 的坐标系。
@@ -1665,17 +1704,6 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.iconBar.backgroundColor = [UIColor clearColor];
     self.iconBar.frame = CGRectMake(0, 4, cardW, 56);
     y += 64 + 6;
-
-    // 搜索行：默认收起、不占位。收起时 **frame 也清零** ——
-    // 只 `hidden` 不清 frame 是"收起了却留着老坐标"，本项目栽过一次（卡片底部凭空多一截空白）。
-    self.searchBar.hidden = !self.searchExpanded;
-    if (self.searchExpanded) {
-        // 左右各外扩 4：UISearchBar 自带内边距，不外扩会看起来陷进去（v0.0.71 同款）
-        self.searchBar.frame = CGRectMake(cardX - 4, y - 2, cardW + 8, 40);
-        y += 40 + 4;
-    } else {
-        self.searchBar.frame = CGRectZero;
-    }
 
     // 筛选摘要行：只在有筛选时占位。
     // 🔴 判据用 `activeFilterCount` —— 和角标、和摘要文案**同一个来源**。
