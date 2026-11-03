@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.133"
+#define NB_VER_STR @"0.0.134"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -4149,22 +4149,43 @@ static NSString *NBExtractPayload(id obj) {
     //    否则真机上分不清「没抓到」与「抓到了但 App 侧认不出」。
     //    和 `[无ID]` 那套同一个写法：static 计数 + 上限，绝不刷屏。
     static int gPlLog = 0;
+    // v0.0.134：累计统计（二级诊断）。**必须是 static**：局部变量每次归零 ⇒
+    //   "每 100 条打一次"会退化成"每条都打"（本项目 §4.3 那条坑）。
+    static long gPlTotal = 0, gPlHit = 0, gPlNoContent = 0, gPlNoUI = 0, gPlBadJSON = 0;
     BOOL wantLog = (gPlLog < 5);
 
-    // obj 可能是 NCNotificationRequest，也可能是 BBBulletin；两条路都试一遍。
+    // obj 可能是 NCNotificationRequest，也可能是 BBBulletin。
     id content = NBSafeValue(obj, @"content");
-    id ui = content ? NBSafeValue(content, @"userInfo") : nil;
     id inner = NBSafeValue(obj, @"bulletin");
     if (inner == obj) inner = nil;
-    BOOL uiOK = ([ui isKindOfClass:[NSDictionary class]] && [(NSDictionary *)ui count] > 0);
-    if (!uiOK) {
-        id c2 = inner ? NBSafeValue(inner, @"content") : nil;
-        id u2 = c2 ? NBSafeValue(c2, @"userInfo") : nil;
-        if ([u2 isKindOfClass:[NSDictionary class]] && [(NSDictionary *)u2 count]) {
-            ui = u2;
-            uiOK = YES;
-        }
+    id innerContent = inner ? NBSafeValue(inner, @"content") : nil;
+
+    // v0.0.134：**四条候选路依次试**，读到第一个非空字典就停。
+    //   ① content.userInfo（v0.0.133 只试了这一条）
+    //   ② obj.userInfo（有些实现直接把它挂在请求上）
+    //   ③ bulletin.content.userInfo
+    //   ④ bulletin.userInfo
+    // 🔴 全程走 NBSafeValue（内部 @try），读不到返回 nil ⇒ **加路径是零风险的**：
+    //    最坏情况跟以前一样拿不到，绝不会让"记录"这件事失败。
+    //    （这也是上一版留下的问题：只押一条路，押错就整版不生效。）
+    id ui = nil;
+    {
+        id v1 = content ? NBSafeValue(content, @"userInfo") : nil;
+        if ([v1 isKindOfClass:[NSDictionary class]] && [(NSDictionary *)v1 count] > 0) ui = v1;
     }
+    if (!ui) {
+        id v2 = NBSafeValue(obj, @"userInfo");
+        if ([v2 isKindOfClass:[NSDictionary class]] && [(NSDictionary *)v2 count] > 0) ui = v2;
+    }
+    if (!ui && innerContent) {
+        id v3 = NBSafeValue(innerContent, @"userInfo");
+        if ([v3 isKindOfClass:[NSDictionary class]] && [(NSDictionary *)v3 count] > 0) ui = v3;
+    }
+    if (!ui && inner) {
+        id v4 = NBSafeValue(inner, @"userInfo");
+        if ([v4 isKindOfClass:[NSDictionary class]] && [(NSDictionary *)v4 count] > 0) ui = v4;
+    }
+    BOOL uiOK = (ui != nil);
 
     NSMutableDictionary *wrap = [NSMutableDictionary dictionary];
     // 🔴 只有 userInfo 本身是合法 JSON 才放进去。放不进去也别整包丢掉 ——
@@ -4190,18 +4211,49 @@ static NSString *NBExtractPayload(id obj) {
     }
     if (s.length > 2048) s = [s substringToIndex:2048];
 
+    // ---------- v0.0.134：诊断从「只有首 5 条」升级成「首 5 条细 + 累计统计」两级 ----------
+    // 🔴 为什么 v0.0.133 那版不够用（真机实测买到的）：`[payload#N]` 只有 5 个名额、
+    //    **按进程计**，respring 后几分钟就被用完 ⇒ 之后想再看一眼"到底抓没抓到"，
+    //    只能再 respring 一次去抢名额。诊断件不该有时效。
+    gPlTotal++;
+    if (s.length) {
+        gPlHit++;
+    } else if (!content) {
+        gPlNoContent++;
+    } else if (!uiOK) {
+        gPlNoUI++;
+    } else {
+        gPlBadJSON++;
+    }
+
     if (wantLog) {
         gPlLog++;
         if (!s.length) {
-            // 把"断在哪一层"直接写出来：content 有没有、userInfo 是不是字典。
-            NBLog(@"[payload#%d] 无 cls=%@ content=%@ userInfo%@ ⇒ 本条不存 payload",
-                  gPlLog, NBClassName(obj), content ? @"Y" : @"N",
-                  uiOK ? @"有JSON不合法" : @"=N");
+            // 🔴 失败时连**结构**一起打出来（只打 class 名与字典 keys）：
+            //    `content` / `userInfo` 在 iOS 16 的 NC 私有类上到底在哪一层，没人能保证。
+            //    与其在这里猜第二种读法，不如把现场量出来，下一版按实测改。
+            // ⚠️⚠️ **绝不打印未知对象**：`description` 会摸锁 ⇒ 直接卡死（本项目血账）。
+            NSString *uiKeys = @"-";
+            if ([ui isKindOfClass:[NSDictionary class]]) {
+                NSString *j = [[(NSDictionary *)ui allKeys] componentsJoinedByString:@","];
+                uiKeys = (j.length > 120) ? [j substringToIndex:120] : j;
+            }
+            NBLog(@"[payload#%d] 无 obj=%@ content=%@ ui=%@ keys=[%@] ⇒ 本条不存",
+                  gPlLog, NBClassName(obj),
+                  content ? NBClassName(content) : @"(nil)",
+                  uiOK ? @"dict" : (ui ? NBClassName(ui) : @"(nil)"), uiKeys);
         } else {
             NSString *sample = s.length > 60 ? [s substringToIndex:60] : s;
             NBLog(@"[payload#%d] len=%lu sample=%@", gPlLog, (unsigned long)s.length, sample);
         }
     }
+
+    // 累计统计：第 10 条打一次（低频用户也能看到），之后每 100 条一次（不刷屏）。
+    if (gPlTotal == 10 || (gPlTotal % 100) == 0) {
+        NBLog(@"[payload统计] 累计尝试 %ld ｜ 抓到 %ld ｜ 无content %ld ｜ 无userInfo %ld ｜ JSON不合法 %ld",
+              gPlTotal, gPlHit, gPlNoContent, gPlNoUI, gPlBadJSON);
+    }
+
     return s.length ? s : nil;
 }
 
