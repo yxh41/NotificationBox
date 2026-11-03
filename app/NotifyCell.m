@@ -110,8 +110,19 @@
 @property (nonatomic, strong) UIView *leadActionView;
 @property (nonatomic, strong) UILabel *leadLabel;
 @property (nonatomic, strong) UITapGestureRecognizer *leadTap;
+// v0.0.128：右滑「顶住」的视觉反馈遮罩（盖在**文案之上**）。
+// 🔴 它只表达"已经到底了"，**不参与任何几何**：位移 / 宽度 / 判定全在 `nbApplyOffset:` 里。
+//    之所以要它：v0.0.127 硬封顶之后手指继续往右拖时界面毫无反应 ⇒ 手感像"卡死"。
+//    留一层压在文案上的黑色遮罩（不透明度随超程增长），手指的"用力"就有回应，
+//    而卡片位置纹丝不动 —— 契约没变，只是不再是哑的。
+@property (nonatomic, strong) UIView *leadShade;
 // v0.0.93：当前是否处于「松手即删」态（只用来避免每帧重复设 label 文案）
 @property (nonatomic, assign) BOOL nbArmed;
+// v0.0.128：本次手势里「顶住」的触觉是否还没给过。
+// 🔴 同 `nbArmed` 的道理：haptic 只能在**状态变化那一下**震，不能每帧震（Changed 每帧都回调）。
+//    复位点特意放在手势 `Began`，而**不是**"超程回到 0"：后者会被 `layoutSubviews` 里那条
+//    `[self nbApplyOffset:self.nbOffset]` 反复触发 ⇒ 一次手势里震好几次。
+@property (nonatomic, assign) BOOL nbOverflowArmed;
 
 // ================= v0.0.98 / v0.0.106：通知中心残留标记 =================
 // 🔴 v0.0.106：用户要求把原来「卡片左缘一条 4pt 实心橙条」改成**整卡一圈细线**
@@ -140,6 +151,8 @@
 - (void)nbSettleTo:(CGFloat)target animated:(BOOL)animated;
 // v0.0.124：两个按钮的唯一隐藏出口（判据双向，见实现处注释）
 - (void)nbHideActionViewsIfClosed:(CGFloat)target;
+// v0.0.128：右滑「顶住」反馈的唯一入口（只碰遮罩 alpha + 触觉，**不碰几何**）
+- (void)nbApplyOverflow:(CGFloat)over;
 - (void)nbPan:(UIPanGestureRecognizer *)g;
 - (void)nbTapDelete:(UITapGestureRecognizer *)g;
 // v0.0.124：右滑蓝块的点击 = 翻转这一组的已读态（文案由 cell 按 isUnread 决定）
@@ -293,6 +306,19 @@ static const CGFloat kNBSwipeArmAt = 32.0;
 // 0.35 保留"到头了"的阻力感，又能滑出 32pt 进待删态。
 static const CGFloat kNBSwipeExtraDrag = 0.35;
 
+// ================= v0.0.128：右滑「顶住」反馈（不是位移，是"到底了"的表达） =================
+// 🔴 v0.0.127 把右滑做成硬封顶之后，用户反馈「确实硬」：卡片停在 52pt 是对的，
+//    但手指还在使劲、屏幕**一点反应都没有** ⇒ 读起来像"卡死"，而不是"到底了"。
+// ⇒ 封顶不动（多拖一点都不走），但给两个不参与几何的反馈：遮罩变深 + 一次触觉。
+//
+// 越过封顶线之后**再拖多少 pt 达到最深**（归一化用）。
+// 取 60：约一指宽，不用很使劲就能压到底；太小会"一闪就满"，太大又像没反应。
+static const CGFloat kNBSwipeOverflowFull = 60.0;
+// 遮罩最深的不透明度。遮罩是**纯黑** ⇒ 深色/浅色模式下都是"压暗"，语义一致
+// （这也是不直接用 `systemBlueColor` 变色的原因：那个颜色本身会随模式变，插值会跑偏）。
+// 0.30 是"看得见但不脏"的位置：再深蓝块会发黑，像是禁用态。
+static const CGFloat kNBSwipeOverflowMaxShade = 0.30;
+
 // ================= v0.0.94：触觉反馈（柔的那种） =================
 // 用户要求「给个震动反馈，比较舒服比较柔的」。选 `UIImpactFeedbackStyleSoft`：
 //   柔和（Soft）< 轻（Light）< 中（Medium）< 重（Heavy）
@@ -312,7 +338,8 @@ static const CGFloat kNBSwipeExtraDrag = 0.35;
 //    而 haptic 的 API 也要求主线程 —— 这里天然满足，别加 dispatch_async（加了反而慢一帧）。
 typedef NS_ENUM(NSInteger, NBHapticKind) {
     NBHapticKindArm = 0,    // 刚进入「松手删除」—— 柔
-    NBHapticKindDelete = 1  // 真的执行了删除 —— 稍实一点，但仍是 Light
+    NBHapticKindDelete = 1, // 真的执行了删除 —— 稍实一点，但仍是 Light
+    NBHapticKindStop = 2    // v0.0.128：右滑顶到封顶线那一下 —— 和 Arm 同档（柔）
 };
 
 static UIImpactFeedbackGenerator *NBHapticGen(NBHapticKind kind) {
@@ -328,7 +355,11 @@ static UIImpactFeedbackGenerator *NBHapticGen(NBHapticKind kind) {
         }
         light = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     });
-    return (kind == NBHapticKindArm) ? soft : light;
+    // 🔴 v0.0.128：判据从「是 Arm 就柔」改成「**只有 Delete 用轻**」。
+    //    原来是 `(kind == NBHapticKindArm) ? soft : light` —— 那样新增的 Stop 会**静默**
+    //    落到 light（比"顶住"该有的分量重一档），而且看不出是漏改还是故意的。
+    //    改成黑名单式之后，以后再加的档默认都是"柔"，要重就显式点名。
+    return (kind == NBHapticKindDelete) ? light : soft;
 }
 
 // 预热：进手势时调一次，把 TapticEngine 唤醒（不预热第一次会慢/不震）
@@ -410,6 +441,19 @@ static void NBHapticFire(NBHapticKind kind) {
     self.leadLabel.adjustsFontSizeToFitWidth = YES;
     self.leadLabel.minimumScaleFactor = 0.7;
     [self.leadActionView addSubview:self.leadLabel];
+
+    // ---------- v0.0.128：压在文案**之上**的「顶住」遮罩 ----------
+    // 🔴 addSubview 的顺序是判据，不是风格：遮罩必须在 `leadLabel` **之后**加，
+    //    否则它落在文案下面 ⇒ 只有底色变暗、字还是雪白，"按到底"的感觉整个没了。
+    // 🔴 `userInteractionEnabled = NO`：它铺满整个蓝块，若参与命中测试，
+    //    落在遮罩上的点击就到不了蓝块的 `leadTap`（表现 = "右滑出来之后点按钮没反应"，
+    //    而且只在蓝块中部点才复现，边上点又正常 —— 这类"有时候不灵"最难查）。
+    // 🔴 初始 `alpha = 0`：没滑的时候它必须完全不可见（哪怕蓝块是 hidden 的也不留隐患）。
+    self.leadShade = [[UIView alloc] init];
+    self.leadShade.backgroundColor = [UIColor blackColor];
+    self.leadShade.alpha = 0.0;
+    self.leadShade.userInteractionEnabled = NO;
+    [self.leadActionView addSubview:self.leadShade];
 
     self.leadTap =
         [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(nbTapToggleRead:)];
@@ -658,6 +702,13 @@ static void NBHapticFire(NBHapticKind kind) {
                                            card.size.height);
     self.leadLabel.frame = self.leadActionView.bounds;
 
+    // v0.0.128：「顶住」遮罩的 frame —— **唯一的来源就是这里**（同 red/label 一条规矩）。
+    // 🔴 为什么它不用像蓝块那样在 `nbApplyOffset:` 里跟着位移改宽度：右滑方向蓝块的宽度
+    //    **恒为 52**（`lw = offset` 而 offset 已被 v0.0.127 夹到 52，且不足 52 时也抬到 52）
+    //    ⇒ 尺寸根本不随位移变，铺一次就对。**只有尺寸会变的视图才需要"两个来源"**，
+    //    这里不是，多写一处就是白送一个双来源。
+    self.leadShade.frame = self.leadActionView.bounds;
+
     // ---------- 卡片外左侧槽：**只有图标**（contentView 坐标，要带 card.origin.y） ----------
     self.iconBox.frame = CGRectMake(NBListIconX, card.origin.y + NBListIconY,
                                     NBListIconSize, NBListIconSize);
@@ -861,6 +912,31 @@ static void NBHapticFire(NBHapticKind kind) {
     }];
 }
 
+// ================= v0.0.128：右滑「顶住」反馈的唯一入口 =================
+// 🔴 用户话：「确实硬，还是留点视觉反馈吧」。硬封顶**本身不改**（卡片就停在 52pt，
+//    多拖一点都不走），要改的是"界面不能是哑的"。
+// ⇒ 反馈只落在**不参与几何**的通道上：
+//    ① 压在文案上的黑色遮罩按超程变深（手指越使劲越暗，但卡片不动）；
+//    ② 越过封顶线的那一下给一次柔触觉（这是主要提示 —— 30% 黑很容易被忽略）。
+// ⛔ 别在这里改 frame / transform / 宽度：那些归 `nbApplyOffset:` 管。
+//    在这里动一笔就变成"两个地方都在定位同一个视图"，下次改布局必然有一处漏掉。
+- (void)nbApplyOverflow:(CGFloat)over {
+    CGFloat k = 0.0;
+    if (over > 0.0) {
+        k = over / kNBSwipeOverflowFull;
+        if (k > 1.0) k = 1.0;      // 拖过 60pt 之后不再加深 —— 到底就是到底，别一直变
+    }
+    self.leadShade.alpha = kNBSwipeOverflowMaxShade * k;
+
+    // 🔴 只在 `nbOverflowArmed` 为 YES 时震一次，随后立刻清掉：
+    //    本方法每帧都跑（`Changed` 每帧回调），不压成一次就震成马达。
+    // 松手时由 `nbPan:` 的 Ended/Cancelled/Failed 传负值把 k 归零（同一个入口，不另写一句）。
+    if (k > 0.0 && self.nbOverflowArmed) {
+        self.nbOverflowArmed = NO;
+        NBHapticFire(NBHapticKindStop);
+    }
+}
+
 // v0.0.124：两个按钮的**唯一隐藏出口**。
 // 🔴 为什么抽出来：原来 `target >= -0.001` 这个判据在 `nbSettleTo:` 里写了两遍
 //    （动画/非动画各一处），加右滑时又要两处都改 —— 两处判据只要有一处写歪，
@@ -871,6 +947,11 @@ static void NBHapticFire(NBHapticKind kind) {
     if (fabs(target) > 0.001) return;
     self.swipeActionView.hidden = YES;
     self.leadActionView.hidden = YES;
+    // v0.0.128：复位「顶住」遮罩 —— 这里同时是**复用路径的唯一清点处**。
+    // `prepareForReuse` → `nbSettleTo:0 animated:NO` → 本条；不清的话，下一条复用这个 cell
+    // 的行会让蓝块带着**上一条手势留下的暗度**进屏幕（症状："有时候蓝块看起来发暗"，
+    // 只有先前在那行上顶到底过才复现）。
+    self.leadShade.alpha = 0.0;
 }
 
 // v0.0.93：滑到底 —— 卡片整行滑出，滑完再执行删除。
@@ -920,6 +1001,11 @@ static void NBHapticFire(NBHapticKind kind) {
     switch (g.state) {
         case UIGestureRecognizerStateBegan:
             self.nbOffsetAtBegin = self.nbOffset;
+            // v0.0.128：每次新手势重新允许「顶住」震一次。
+            // 🔴 复位点必须在这里（手势开始），**不能**写在"超程回到 0 时复位"：
+            //    `layoutSubviews` 会用 `[self nbApplyOffset:self.nbOffset]` 重算位移，
+            //    那条路上超程恒为 0 ⇒ 一次手势里会被反复"复位"⇒ 震好几次。
+            self.nbOverflowArmed = YES;
             // v0.0.94：唤醒 TapticEngine（预热）。放这里而不是第一次要震的时候：
             // 预热有提前量，等到"进入待删态"那一下再 prepare 就晚了，手感慢半拍。
             NBHapticPrepare(NBHapticKindArm);
@@ -946,12 +1032,25 @@ static void NBHapticFire(NBHapticKind kind) {
                 x = -kNBSwipeActionW + (x + kNBSwipeActionW) * kNBSwipeExtraDrag;
             }
             [self nbApplyOffset:x];
+            // v0.0.128：「顶住」反馈。`x` 是**未夹**的原始位移（正方向 v0.0.127 起不再做阻尼），
+            //    所以 `x - kNBSwipeActionW` 恰好就是"越过封顶线多少"。
+            // 🔴 必须排在 `nbApplyOffset:` **之后**、并且用 x 而不是 `self.nbOffset`：
+            //    后者已被夹到 52，拿它减永远是 0 ⇒ 反馈一次都不会出现（而且看起来"代码写了"）。
+            [self nbApplyOverflow:(x - kNBSwipeActionW)];
             break;
         }
 
         case UIGestureRecognizerStateEnded:
         case UIGestureRecognizerStateCancelled:
         case UIGestureRecognizerStateFailed: {
+            // v0.0.128：松手立即让「顶住」反馈淡出（0.18s，和随后的回弹动画同长收尾）。
+            // 🔴 走**同一个入口**传负值，不在这里另写一句 `self.leadShade.alpha = 0`：
+            //    两个地方改同一个属性，下次加反馈必然漏一处。
+            // 🔴 放在三条"松手"分支的**最前面**：下面可能会 `nbFlyOutThenDelete`（滑走 + 删），
+            //    那时遮罩该跟着一起走，不能在删除动画里还亮着。
+            [UIView animateWithDuration:0.18 animations:^{
+                [self nbApplyOverflow:-1.0];
+            }];
             // v0.0.93：先判"滑到底了没有" —— 待删态松手就删。
             // 🔴 判据必须和 `nbApplyOffset:` 里切文案用的是**同一个数**，
             //    否则会出现"label 写着「松手删除」、松手却没删"这种最气人的情况。
