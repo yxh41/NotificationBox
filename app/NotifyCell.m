@@ -640,6 +640,24 @@ static void NBHapticFire(NBHapticKind kind) {
                                             card.size.height);
     self.swipeLabel.frame = self.swipeActionView.bounds;
 
+    // ---------- v0.0.126：蓝块的**完整** frame（这就是 v0.0.124「没有蓝块」的真因） ----------
+    // 🔴🔴 病根：蓝块的 frame **从来没有被完整赋过值**。
+    //    `nbApplyOffset:` 里只改了它的 `origin.x` 和 `size.width` 两格：
+    //        lf.origin.x = self.nbCardMinX;   lf.size.width = lw;
+    //    ⇒ `origin.y` 和 `size.height` 一直是 `CGRectZero` 的 **0**
+    //    ⇒ 宽度 52、高度 0 ⇒ `hidden = NO` 也什么都看不见，而卡片照常右移。
+    //    症状因此极其误导：**能滑、卡片动、没有蓝块、不报错**，往下查每一处都"写对了"。
+    // 🔴 红块没这个问题，靠的就是上面那段**无条件**赋值 —— 它给了完整四元组。
+    //    也就是说这不是"蓝块少画了一笔"，而是**红块有初始帧、蓝块没有**这个不对称。
+    // ⇒ 铁律：action view 的 `y` / `height` **只许有 layoutSubviews 这一个来源**；
+    //    `nbApplyOffset:` 只许动 `x` / `width`（"卡片走了多宽，按钮就补多宽"这件事）。
+    //    反过来说：任何"只改 frame 的一部分"的写法，都必须先有人在别处把它铺满。
+    self.leadActionView.frame = CGRectMake(self.nbCardMinX,
+                                           card.origin.y,
+                                           kNBSwipeActionW,
+                                           card.size.height);
+    self.leadLabel.frame = self.leadActionView.bounds;
+
     // ---------- 卡片外左侧槽：**只有图标**（contentView 坐标，要带 card.origin.y） ----------
     self.iconBox.frame = CGRectMake(NBListIconX, card.origin.y + NBListIconY,
                                     NBListIconSize, NBListIconSize);
