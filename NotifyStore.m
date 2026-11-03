@@ -2029,6 +2029,73 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     if (p8Out) *p8Out = p8;
 }
 
+// v0.0.130：残留统计的行数节流参数。**唯一出口** —— 别在函数体里另写秒数
+// （「同一界面里互相解释的两个指标必须同口径」，节流窗口同理：两处各写一个数必走岔）。
+#define NB_STILL_LOG_GAP       20.0
+#define NB_STILL_LOG_GAP_IDLE 120.0
+
+// ============= v0.0.130：`sys_id_alt` 撞车只读诊断（一次性） =============
+// 🔴🔴 这一版之前**从没量过**的一件事：`sys_id_alt` 里留的旧 ID，会不会正好是
+//    **库里另一行**的现役 `sys_id`？会的话，`NBSysIdWithAlt` 拼出的候选键就带着
+//    「别人家的 ID」⇒ 那一行被判成 Still 的原因**根本不是「它自己还在」**，
+//    而是「别人的 ID 还在」⇒ **`旧ID救回` 那个数对它们不成立**。
+//    这正是本项目「归因不排他」那一型：数是真的，但它证不了它被拿来证的那件事。
+// 🔴 判据三件套（缺一个就只剩八卦）：① 分子「撞车行」；② 分母（见下）；③ 净额「旧ID段」。
+// 🔴 一次进程只打一行 —— 日志窗口 ~50 行，这条是定性用的。
+// 🔴🔴 `sDone` 必须在**取样成功之后**才置位：v0.0.111 的血账是 `done` 写在最前面，
+//    第一次调用时库还空着，唯一一次机会就烧在那个 0 上了。
+static void NBDiagSysIdAltOnce(sqlite3 *db, NSInteger altRows) {
+    static BOOL sDone = NO;
+    static BOOL sErrLogged = NO;
+    static NSInteger sTries = 0;
+    if (sDone || !db) return;
+    // 🔴 分母直接用**主扫描算出来的那个数**，不在这里重算一遍：主扫描的 WHERE 是
+    //    `sys_id IS NOT NULL AND sys_id<>''`，这里只要差一个条件，两行日志上的
+    //    「带旧ID行」就会是两个数，而读的人只会以为「数据变了」。
+    if (altRows <= 0) {
+        sTries++;
+        // 没旧 ID 可查时**不许**把一次性机会烧掉；也不许无限重试（这个 EXISTS 是 O(n²)）
+        // ⇒ 3 次之后死心，并且**说出来**：「没打日志」必须能和「查过了、结果是 0」分开。
+        if (sTries < 3) return;
+        sDone = YES;
+        NBStoreLog(@"旧ID撞车 -1（查了 %ld 次，带ID行里带旧ID的一直是 0）｜ 这不是「撞车 0 行」，是「没有旧 ID 可查」⇒ 写入侧没在写 sys_id_alt（整版空转），不是匹配没用",
+                   (long)sTries);
+        return;
+    }
+    // 🔴 判据只有一条：某个旧 ID 段 == **另一行**的现役 `sys_id`。
+    //    `'|'||alt||'|'` 两头补竖线 + `LIKE '%|b.sys_id|%'` ⇒ 要求**整段**相等而不是
+    //    子串相同（前缀会被算进去 —— 本项目「反向判据必须精确到边界」那一条）。
+    //    `b.id<>a.id` 是排自己：被改写过的行自己的 `sys_id` 当然不再等于旧 ID，
+    //    但「同一行」必须显式排掉，否则将来某次写入不改 `sys_id` 就会被算成撞车。
+    const char *sql =
+        "SELECT "
+        " (SELECT COUNT(*) FROM notifications a "
+        "   WHERE IFNULL(a.sys_id_alt,'')<>'' AND a.sys_id IS NOT NULL AND a.sys_id<>'' "
+        "     AND EXISTS (SELECT 1 FROM notifications b "
+        "                  WHERE b.id<>a.id AND IFNULL(b.sys_id,'')<>'' "
+        "                    AND ('|'||a.sys_id_alt||'|') LIKE ('%|'||b.sys_id||'|%'))), "
+        " (SELECT IFNULL(SUM(LENGTH(sys_id_alt)-LENGTH(REPLACE(sys_id_alt,'|',''))+1),0) "
+        "   FROM notifications WHERE IFNULL(sys_id_alt,'')<>'' "
+        "     AND sys_id IS NOT NULL AND sys_id<>'');";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        if (!sErrLogged) {
+            sErrLogged = YES;   // 只报一次；但**不置 `sDone`** —— 查询坏了不是结论
+            NBStoreLog(@"!!! 旧ID撞车 查不动 err=%s（这条是查询坏了，不是撞车 0 行）",
+                       sqlite3_errmsg(db));
+        }
+        return;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        NSInteger crash = sqlite3_column_int(st, 0);
+        NSInteger segs  = sqlite3_column_int(st, 1);
+        sDone = YES;
+        NBStoreLog(@"旧ID撞车 %ld 行 / 带ID行里带旧ID的 %ld 行（旧ID段共 %ld 个）｜ 撞车 = 某行的旧ID正好是**另一行**的现役 sys_id ⇒ 这些行的「还在」可能是别人的 ID 顶出来的，`旧ID救回` 对它们不成立 ｜ 撞车 0 行才是净证据（一次性诊断）",
+                   (long)crash, (long)altRows, (long)segs);
+    }
+    sqlite3_finalize(st);
+}
+
 // ---------- v0.0.100：全库口径「此刻还在通知中心」的行数 ----------
 // 🔴🔴 为什么需要第二个数：`aliveStillCount` 是**当前列表**口径（受时间窗 / App 筛选 /
 //    未读筛选 / LIMIT 2000 影响）。拿它去说「盒子里的消息都不在通知中心了」，
@@ -2164,6 +2231,9 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     // v0.0.112：仍然传整份 `snap` —— 现在要用的是它的 `scan`（快照时刻），
     //    没有这个时刻就没法把取样卡在「ts <= 快照时刻」，那 5 行又会变回恒否判据。
     NBDiagAliveMatchOnce(db, snap);
+    // v0.0.130：`sys_id_alt` 撞车诊断。和上一条同理 —— 必须在 close 之前，用同一个句柄。
+    // 🔴 分母传的是主扫描已经算好的 `altRows`（不是这里再数一遍，理由见函数头）。
+    NBDiagSysIdAltOnce(db, altRows);
     sqlite3_close(db);
     // 🔴 v0.0.100 自证：这一行是"匹配到底成不成立"的唯一直接证据。
     //    v0.0.99 那个 bug（列表 SELECT 漏了 sys_id ⇒ 消费端恒 nil ⇒ 恒 0）全程**不报错**，
@@ -2179,39 +2249,101 @@ static void NBBuildLooseIndex(NSSet *keys, NSSet **lcOut, NSSet **p8Out) {
     // 🔴 没扫过就报 -1（本项目铁律：没算出来用 -1，不用 0 —— 0 会被读成"算出来是零"）。
     double scanTs2 = [snap[@"scan"] doubleValue];
     double snapAge = (scanTs2 > 0) ? ([[NSDate date] timeIntervalSince1970] - scanTs2) : -1.0;
+    // ============= v0.0.130：残留统计的**行数节流**（内容签名 + 保底） =============
+    // 🔴 现场：这个函数只在「列表里一条残留都没有」时跑，而那个状态恰恰是用户盯着空列表
+    //    反复刷新的状态 ⇒ 每刷一次就是 4 行长日志（全库残留 / 读法 / 窗内残留 / 旧ID救回），
+    //    其中**两行是散文**、两行的数字一个没变。真机一份日志里这块占 21%，
+    //    把「一个进程只打一次」那几条真诊断整个挤出窗口。
+    // ⇒ 照 v0.0.123 给 `[扫]` 行用的那套办法（**已经证过的**，不再另发明一套）：
+    //    ① **数值一个都不删** —— 它们是数据；散文压成一次性（见下面的 `sStillHintLogged`）；
+    //    ② 内容签名变了才打，且最小间隔 `NB_STILL_LOG_GAP` 秒（数字抖动时不刷屏）；
+    //    ③ 一直不变 ⇒ `NB_STILL_LOG_GAP_IDLE` 秒保底打一条 ——
+    //       「没日志」会被读成「这函数不跑了」，那是比多几行更贵的误读；
+    //    ④ 被节流掉几轮，下一行里必须写出来（`期间省略 N 轮`）。
+    // 🔴🔴 签名里**不许**放每次都变的字段：`snapAge`（秒数）放进去就等于没节流 ——
+    //    v0.0.129 刚在 `[扫]` 那边踩过同一形态（`seq` 每次都变）。
+    //    这里只放**业务量**：残留数 / 分母 / 未覆盖 / 窗内 / 旧ID / 快照条数与键数。
+    static NSTimeInterval sStillLogTs = 0;
+    static NSString *sStillLogSig = nil;
+    static NSUInteger sStillLogSkip = 0;
+    NSTimeInterval stillNow = [[NSDate date] timeIntervalSince1970];
+    // 🔴 键数一律取**已经校验过的** `snapKeys`：原来那行直接强转 `snap[@"keys"]`，
+    //    它如果不是 NSSet，打出来的数就和匹配实际用的那个集不是同一个（两套口径）。
+    NSString *stillSig = [NSString stringWithFormat:@"%ld|%ld|%ld|%ld|%ld|%ld|%ld|%ld|%ld|%@|%lu",
+                          (long)still, (long)stillCI, (long)stillP8,
+                          (long)scanned, (long)uncovered,
+                          (long)winStill, (long)winRows,
+                          (long)altSaved, (long)altRows,
+                          snap[@"nc"] ?: @"?", (unsigned long)snapKeys.count];
+    BOOL stillSigChanged = ![stillSig isEqualToString:(sStillLogSig ?: @"")];
+    BOOL stillDueChange = stillSigChanged
+        && ((sStillLogTs <= 0) || ((stillNow - sStillLogTs) >= NB_STILL_LOG_GAP));
+    BOOL stillDueIdle = (sStillLogTs <= 0)
+        || ((stillNow - sStillLogTs) >= NB_STILL_LOG_GAP_IDLE);
+    BOOL doStillLog = stillDueChange || stillDueIdle;
     // 🔴 v0.0.122：`带ID行` 与 `未覆盖` 必须**并排**打出来。
     //    只报残留数和分母（旧格式）时，读不出"分母里混着不可能成立的行" —— 那正是
     //    v0.0.121 把 3.6% 读成"匹配全坏"的原因。`未覆盖 N 条` 就是那个分母的**净额**：
     //    `带ID行` 从此只算**被快照覆盖到**的行（`ts <= 快照时刻`），口径与 App 侧
     //    `aliveStateForRow:` 的「未覆盖判 Unknown」完全一致（两个指标必须同源）。
-    NBStoreLog(@"全库残留 %ld 条 ｜ 忽略大小写 %ld ｜ 前8位同 %ld ｜ 带ID行(已覆盖) %ld ｜ 未覆盖 %ld（快照之后才发布，结构上不可能在快照里，已排除出分母）｜ 快照 nc=%@ 键 %lu 个 ｜ 扫描于 %.0f 秒前",
-               (long)still, (long)stillCI, (long)stillP8, (long)scanned,
-               (long)uncovered,
-               snap[@"nc"] ?: @"?",
-               (unsigned long)[(NSSet *)snap[@"keys"] count],
-               snapAge);
-    // 🔴 v0.0.114：把读法写在日志里，别指望下次还记得怎么解读这三档
-    //    （本项目最贵的一课：一个数被反复误读，比没有这个数更糟）。
-    NBStoreLog(@"全库残留读法：精确少、忽略大小写多 ⇒ 大小写问题｜两者都少、前8位多 ⇒ 格式/分隔符不同｜三个都少 ⇒ ID 真的换了（不是 bug）");
+    if (doStillLog) {
+        NBStoreLog(@"全库残留 %ld 条 ｜ 忽略大小写 %ld ｜ 前8位同 %ld ｜ 带ID行(已覆盖) %ld ｜ 未覆盖 %ld（快照之后才发布，结构上不可能在快照里，已排除出分母）｜ 快照 nc=%@ 键 %lu 个 ｜ 扫描于 %.0f 秒前 ｜ 期间省略 %lu 轮",
+                   (long)still, (long)stillCI, (long)stillP8, (long)scanned,
+                   (long)uncovered,
+                   snap[@"nc"] ?: @"?",
+                   (unsigned long)snapKeys.count,
+                   snapAge, (unsigned long)sStillLogSkip);
+    }
+    // ---------- v0.0.130：读法压成**一次性**（散文不是读数） ----------
+    // 🔴 v0.0.114 的初衷不变：「把读法写在日志里，别指望下次还记得怎么解读」
+    //    （一个数被反复误读，比没有这个数更糟）。变的是**次数**：
+    //    读法是一份说明书，不是测量值 —— 每轮重抄一遍说明书，等于把读数挤出窗口。
+    // ⇒ 一个进程打一次，两段读法合成一行（省一行窗口）；数字行照旧受节流门控。
+    static BOOL sStillHintLogged = NO;
+    if (!sStillHintLogged && scanned > 0) {
+        sStillHintLogged = YES;
+        NBStoreLog(@"残留读法（一次性，本进程不再重复）：① 全库三档 —— 精确少、忽略大小写多 ⇒ 大小写问题；两者都少、前8位多 ⇒ 格式/分隔符不同；三个都少 ⇒ ID 真的换了（不是 bug）｜② 旧ID —— 「旧ID救回」的分母是「带旧ID的行」：分母 0 时救回 0 说明的是「写入侧没在写 sys_id_alt」（整版空转），不是匹配没用");
+    }
     // 🔴 v0.0.116：「窗内残留」—— 这才是判断"匹配好不好"该看的百分比。
     //    全库那个百分比的分母里混着大批"比通知中心最老的还老"的行，本来就不可能命中。
     //    没算出来（旧快照没有 tmin/tmax）一律报 -1，**不许报 0**（0 会被读成"算出来是零"）。
     if (winOk && winRows > 0) {
-        double winSpanMin = (winMax - ((winMin > 0) ? winMin : winMax)) / 60.0;
-        NBStoreLog(@"窗内残留 %ld 条 / %ld 行（%.1f%%）｜ 窗 = 通知中心跨度 %.0f 分 ｜ 分母只含 ts<=快照时刻的行（已排除未覆盖 %ld 条）｜ 全库那个 %.1f%% 被「结构上不可能活着」的老记录稀释，别拿它下结论",
-                   (long)winStill, (long)winRows,
-                   (double)winStill * 100.0 / (double)winRows, winSpanMin,
-                   (long)uncovered,
-                   (scanned > 0) ? (double)still * 100.0 / (double)scanned : -1.0);
+        if (doStillLog) {
+            double winSpanMin = (winMax - ((winMin > 0) ? winMin : winMax)) / 60.0;
+            NBStoreLog(@"窗内残留 %ld 条 / %ld 行（%.1f%%）｜ 窗 = 通知中心跨度 %.0f 分 ｜ 分母只含 ts<=快照时刻的行（已排除未覆盖 %ld 条）｜ 全库那个 %.1f%% 被「结构上不可能活着」的老记录稀释，别拿它下结论",
+                       (long)winStill, (long)winRows,
+                       (double)winStill * 100.0 / (double)winRows, winSpanMin,
+                       (long)uncovered,
+                       (scanned > 0) ? (double)still * 100.0 / (double)scanned : -1.0);
+        }
     } else {
-        NBStoreLog(@"窗内残留 -1 / -1（快照里没有 tmin/tmax ⇒ 这个口径算不出来；不是 0）");
+        // 🔴 v0.0.130：「算不出来」是**恒定的异常形态**（快照里就是没有 tmin/tmax），
+        //    不是每轮都值得报一次的告警 ⇒ 一个进程打一次。但**必须打**：
+        //    不打就分不清「这个口径没实现」和「算出来是 0」（「没算用 -1」那条的配套）。
+        static BOOL sWinNAOnce = NO;
+        if (!sWinNAOnce) {
+            sWinNAOnce = YES;
+            NBStoreLog(@"窗内残留 -1 / -1（快照里没有 tmin/tmax ⇒ 这个口径算不出来；不是 0；本进程只打这一条）");
+        }
     }
-    // 🔴🔴 v0.0.117：**这一行是判断"这一版修好没有"的唯一直接证据**，必须每轮都打。
+    // 🔴🔴 v0.0.117：这一行是判断「这一版修好没有」的唯一直接证据 ——
     //    两个数缺一个就读不出结论：`带旧ID的行 0` ⇒ **写入侧压根没在写**（整版空转），
-    //    这时 `救回 0` 说明的是"没东西可救"，不是"匹配没用" —— 两种情况的修法完全不同。
+    //    这时 `救回 0` 说明的是「没东西可救」，不是「匹配没用」；反过来
     //    `带旧ID的行 > 0` 而 `救回 0` ⇒ 旧 ID 一条都没命中，才轮到怀疑匹配/快照时刻。
-    NBStoreLog(@"旧ID救回 %ld 条 / 带旧ID的行 %ld ｜ 这是「只靠旧 ID 才判成还在通知中心」的行数；带旧ID=0 ⇒ 写入侧没在写 sys_id_alt（整版空转），不是匹配没用",
-               (long)altSaved, (long)altRows);
+    // 🔴 v0.0.130：两个数**仍然每轮都算**，只是「打」跟着节流走（读法已挪进上面那行一次性的）。
+    if (doStillLog) {
+        NBStoreLog(@"旧ID救回 %ld 条 / 带旧ID的行 %ld ｜ 两个数必须同一轮一起读（读法见上面「残留读法」那行）",
+                   (long)altSaved, (long)altRows);
+    }
+    // 🔴 节流账本：打过的才刷新时间戳与签名；被省掉的累加，并且**在下一行里写出来**
+    //    （「省了几轮」看不见 ⇒ 读的人会以为这个函数停了，那是比多几行更贵的误读）。
+    if (doStillLog) {
+        sStillLogTs = stillNow;
+        sStillLogSig = stillSig;
+        sStillLogSkip = 0;
+    } else {
+        sStillLogSkip++;
+    }
 
     // 🔴 v0.0.115：年龄分档，一个进程只打一次（日志窗口只有 ~50 行，这条是定性用的）。
     //    `scanned > 0` 是必置位的前提：库是空的就打，会把唯一一次机会烧在与病因无关的轮次上

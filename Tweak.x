@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.129"
+#define NB_VER_STR @"0.0.130"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -2424,29 +2424,10 @@ static void NBDumpNCSnapshot(NSString *seq) {
                 NBLog(@"[源] 分桶 <1h=%ld 1-6h=%ld 6-24h=%ld 1-3d=%ld >3d=%ld ｜本轮新增 %@ 条 ｜section top5: %@",
                       (long)tb[0], (long)tb[1], (long)tb[2], (long)tb[3], (long)tb[4],
                       added, NBSecTop(secCount, 5));
-                // v0.0.108：自动清的**状态行**。为什么单独打一行：
-                // 🔴 「没看到 `[自动清] 触发`」有四种可能（没开 / 开了但这轮没超时的 /
-                //    开了有超时的但被节流挡了 / 撤了但没效果），只靠"没日志"分不清是哪一种 ——
-                //    这正是假绿的 ⑧ 型（否定式在对象不存在时恒真）。⇒ 开着就每轮摊一行「本轮超时几条」。
-                if (autoHours > 0) {
-                    // v0.0.109：被节流挡着的时候**必须说出来**，还要说出"还差几秒"。
-                    // 🔴 真机代价（2026-11-01 14:29~14:31）：三轮都报「超时=91~92 条」却一动不动，
-                    //    因为距上次只隔 18/97/170 秒、全在 180 秒窗口里 —— 用户只能读成"功能坏了"。
-                    //    这就是假绿第 ⑧ 型的反面：**该发生的没发生的理由，也必须打出来**。
-                    NSString *acState = @"";
-                    if (gAutoClearSuppressed) {
-                        acState = @" ｜本版自动清已熔断（上次调用没返回，见启动日志）";
-                    } else if (oldReqs.count > 0) {
-                        double left = 0;
-                        if (sLastAutoClearTs > 0)
-                            left = NBAutoClearGap() - (nowTs - sLastAutoClearTs);
-                        acState = (left > 0.5)
-                            ? [NSString stringWithFormat:@" ｜等节流 还需 %.0f 秒", left]
-                            : @" ｜下一轮就动手";
-                    }
-                    NBLog(@"[自动清] 开=%ld 小时 ｜本轮超时=%lu 条%@",
-                          (long)autoHours, (unsigned long)oldReqs.count, acState);
-                }
+                // ============= v0.0.130：原来的 `[自动清] 开=%ld 小时 ｜本轮超时=%lu 条…` 已搬走 =============
+                // 不是因为它不重要，是因为**位置不对**：它要说的四种状态里有一种是
+                // 「快照写入保护把这一轮挡掉了」，而 `snapSkip` 在这一行**之后**才算出来。
+                // ⇒ 整块搬到 `snapSkip` 之后，最终并进 `[扫]` 那一行（同一行：不漏看、也不多占窗口）。
                 // 🔴 v0.0.123：原来这里有一行 `NBViewRecon();`（`[视] keyWindow=… 节点=N ｜含 Notif
                 //    的类 M 个`），**已整块删除**（连 `NSObject (NBViewRecon)` 那个 category 声明）。
                 //    判死依据 = 铁律「**恒为定值的字段 = 死探针 ⇒ 删掉并连声明一起删**」：
@@ -2505,6 +2486,35 @@ static void NBDumpNCSnapshot(NSString *seq) {
             sSnapSuspectSince = 0;
         }
 
+        // ============= v0.0.130：自动清状态（搬出 `[源]` 块，并与 `[扫]` 合并成一行） =============
+        // 🔴 为什么非搬不可：`snapSkip`（快照写入保护）只有到这一行才算出来，而它决定
+        //    **这一轮许不许动手**。状态行原来在 `[源]` 块里，那里根本看不到 `snapSkip`
+        //    ⇒ 永远说不出「保护把自动清挡掉了」，用户只能读成「开了但不动」。
+        // 🔴 v0.0.108 的原话仍然成立：「没看到 `[自动清] 触发`」有四种可能（没开 / 开了但这轮
+        //    没超时的 / 开了有超时的但被节流挡了 / 撤了但没效果），只靠「没日志」分不清是哪一种
+        //    （假绿第 ⑧ 型：否定式在对象不存在时恒真）⇒ 开着就每轮摊出一条「本轮超时几条」。
+        //    现在这条挂在 `[扫]` 上，而那一行是**节流**的 ⇒ `超时条数` 必须进它的内容签名
+        //    （见下面的 `scanSig`），否则「超时数变了却看不见」会变成一种新的沉默。
+        // 🔴 `snapSkip` 那一轮一定看得见：`ok` 会是 NO ⇒ `[扫]` 行走「异常(必打)」那一支。
+        NSString *acState = @"";
+        if (autoHours > 0) {
+            NSTimeInterval acNow = [[NSDate date] timeIntervalSince1970];
+            if (gAutoClearSuppressed) {
+                acState = @" ｜本版自动清已熔断（上次调用没返回，见启动日志）";
+            } else if (snapSkip) {
+                // 这一轮读数已知不可信 ⇒ **不许**落下这个不可逆动作。两个理由：
+                // ① 别在坏读数上动手；② 归因 —— 这一轮要是既清了、读数又异常，
+                //    下一轮那个变小的 `nc` 是「清掉了」还是「没读全」，就永远分不开了。
+                acState = @" ｜快照保护中（本轮没读全）⇒ 本轮不许自动清";
+            } else if (oldReqs.count > 0) {
+                double left = 0;
+                if (sLastAutoClearTs > 0)
+                    left = NBAutoClearGap() - (acNow - sLastAutoClearTs);
+                acState = (left > 0.5)
+                    ? [NSString stringWithFormat:@" ｜等节流 还需 %.0f 秒", left]
+                    : @" ｜下一轮就动手";
+            }
+        }
         NSError *err = nil;
         BOOL ok = NO;
         NSString *writeState = nil;
@@ -2538,9 +2548,12 @@ static void NBDumpNCSnapshot(NSString *seq) {
         // 内容签名：只要这几项有一个变了，这就是"值得打一行"的事。
         // 🔴 只挑**能变**的那几项（`csMeasured` / `cseMeasured` 与条数同源，放进来是多余；
         //    `seq` 每次扫描都变 ⇒ 放进签名就退化成"每次都打"，等于没节流）。
-        NSString *scanSig = [NSString stringWithFormat:@"%lu|%lu|%ld|%ld|%@",
+        // 🔴 v0.0.130：`超时条数` 必须进签名 —— 自动清的状态行搬进 `[扫]` 之后，
+        //    「超时 91 条却一动不动」这件事能不能被看见，就取决于这个数变没变能不能触发一行。
+        NSString *scanSig = [NSString stringWithFormat:@"%lu|%lu|%ld|%ld|%lu|%@",
                              (unsigned long)all.count, (unsigned long)withKeys,
-                             (long)csYes, (long)cseYes, writeState ?: @"?"];
+                             (long)csYes, (long)cseYes,
+                             (unsigned long)oldReqs.count, writeState ?: @"?"];
         BOOL sigChanged = ![scanSig isEqualToString:(sScanLogSig ?: @"")];
         BOOL dueByChange = sigChanged
             && ((sScanLogTs <= 0) || ((scanNow - sScanLogTs) >= NB_SCAN_LOG_GAP));
@@ -2552,11 +2565,12 @@ static void NBDumpNCSnapshot(NSString *seq) {
             //    否则读的人分不清"它变了"和"它只是到点了"。
             NSString *whyLog = !ok ? @"异常(必打)"
                                    : (dueByChange ? @"内容变了" : @"保底(内容没变)");
-            NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld｜严格 %ld / 可读uuid %ld（可量=%d）seq=%@ 写入=%@ ｜ 距上条 %.0f 秒（-1=首条）｜ 期间省略 %lu 条 ｜ 本条因为：%@",
+            NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld｜严格 %ld / 可读uuid %ld（可量=%d）seq=%@ 写入=%@ ｜ 距上条 %.0f 秒（-1=首条）｜ 期间省略 %lu 条 ｜ 本条因为：%@ ｜ 自动清 开=%ld 小时 超时=%lu 条%@",
                   (unsigned long)all.count, (unsigned long)withKeys,
                   (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
                   (csDest ? 1 : 0), seq ?: @"", writeState,
-                  scanSpan, (unsigned long)sScanLogSkip, whyLog);
+                  scanSpan, (unsigned long)sScanLogSkip, whyLog,
+                  (long)autoHours, (unsigned long)oldReqs.count, acState);
             sScanLogTs = scanNow;
             sScanLogSkip = 0;
             sScanLogSig = scanSig;
@@ -2577,7 +2591,11 @@ static void NBDumpNCSnapshot(NSString *seq) {
         //    天然形成前后对照，不额外加判据就能验这一刀到底落没落下。
         // 🔴 也排在快照**之后**：快照是"我这一轮看到了什么"的存档，被清掉的条目在快照里留着，
         //    以后查"它为什么不见了"时有据可查。
-        NBAutoClearOldRequests(oldReqs, autoHours);
+        // 🔴 v0.0.130：`snapSkip` 那一轮**连调用都不发**（不是发出去再拦）。
+        //    调用里会写护栏文件、也会 `sLastAutoClearTs = now` 吃掉一个节流窗口 ——
+        //    在坏读数上白吃一次节流，等于让真正该清的那一轮多等 3 分钟。
+        //    「为什么没清」由 `acState` 打在 `[扫]` 那一行上（该发生的没发生的理由必须打出来）。
+        if (!snapSkip) NBAutoClearOldRequests(oldReqs, autoHours);
     } @catch (NSException *e) {
         NBLog(@"!!! [扫] 抛: %@", e.reason);
     }

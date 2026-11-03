@@ -499,9 +499,35 @@ static void NBDiagDumpValues(id obj, NSString *label) {
 
     // 🔴 三个入口的详细程度**故意不同**：日志/文件空间有限。
     //    最终交给系统的是 PB 那个 bulletin，完整观测只放它那儿。
+    // ============= v0.0.130：非 PB 入口不再「每条通知打一行」 =============
+    // 🔴 真机现场：这一支每来一条通知就打一行 `SD# PBR 发后 sound=nil cls=-`，
+    //    11 行/秒、占整份日志 13% —— 而它的信息量**第一行**就取完了：
+    //    「PBR / PBRS 这两个入口上 sound 是不是 nil」。之后再打一千遍同一个读数，
+    //    只是用同一句话把 50 行的窗口反复冲刷，把「一个进程只打一次」的真诊断挤出去
+    //    （v0.0.121 栽的同一形态，已经付过一次代价）。
+    // ⇒ 两条规则，缺一条都不行：
+    //    ① **每个 stage 只打第一次** —— 不打就分不清「入口没被调到」和「值一直是 nil」，
+    //       那正是 Z4 的第 ⑧ 型假绿（否定式在对象不存在时恒真）；
+    //    ② 之后**只在 sound 非 nil 时打** —— 异常行必打，那种行是真信息。
+    //    稳态下这一支**零行**，但「它被调到过」和「它有过值」两件事都还留得住证据。
     if (![st isEqualToString:@"PB"]) {
-        NBDiagLog(NO, @"SD# %@ 发后 sound=%@ cls=%@", st,
-                  s ? @"有" : @"nil", s ? NSStringFromClass([s class]) : @"-");
+        BOOL firstOfStage = NO;
+        // 🔴 `stage` 的实参只有 "PB" / "PBR" / "PBRS" 三个字面量（Tweak.x 三个调用点，
+        //    已 grep 确认）⇒ 这个集合最多 3 个元素，不会随通知数增长。
+        // 🔴 加锁不是为了性能，是因为 `probeAfterPublish:` 可能从不同线程进来：
+        //    `containsObject:` 与 `addObject:` 之间被切走，就会两边都判成「首次」、打两行。
+        @synchronized (self) {
+            static NSMutableSet *seenStages = nil;
+            if (!seenStages) seenStages = [NSMutableSet setWithCapacity:3];
+            if (![seenStages containsObject:st]) {
+                [seenStages addObject:st];
+                firstOfStage = YES;
+            }
+        }
+        if (!firstOfStage && !s) return;
+        NBDiagLog(NO, @"SD# %@ 发后 sound=%@ cls=%@%@", st,
+                  s ? @"有" : @"nil", s ? NSStringFromClass([s class]) : @"-",
+                  firstOfStage ? @" ｜本入口首次（之后只打非 nil）" : @" ｜非 nil 异常行");
         return;
     }
 
