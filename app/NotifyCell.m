@@ -88,9 +88,13 @@
 @property (nonatomic, strong) UIView *swipeActionView;
 @property (nonatomic, strong) UILabel *swipeLabel;
 @property (nonatomic, strong) UIPanGestureRecognizer *nbPan;
-// 当前位移（0 = 关闭，-kNBSwipeActionW = 全开）。
+// 当前位移（0 = 关闭；负 = 左滑打开删除；**正 = 右滑打开翻转已读**）。
 // 🔴 存**数值**而不是"从 transform 反推"：本项目反复栽在"拿视图状态反推数据状态"
 //    （attributedText 时序、标星、未读角标各一次）。transform 是它的**输出**。
+// 🔴🔴 v0.0.124：这里是**双向**的（原来只可能是 ≤0）。改口径时连带的地方一个都不能漏：
+//    `nbApplyOffset:` 的进度、`nbSettleTo:` 的隐藏判据、`nbIsSwiped`、
+//    `nbPan:` 的结束判定、`layoutSubviews` 里的"不在原位就重算"。
+//    漏一处就是一整个方向的滑动行为错乱（而且各自看都像是"另一边的问题"）。
 @property (nonatomic, assign) CGFloat nbOffset;
 // 手势开始那一刻的位移（跟手要用「起点 + 本次平移」，不能直接用本次平移）
 @property (nonatomic, assign) CGFloat nbOffsetAtBegin;
@@ -98,6 +102,14 @@
 // 但 `cardView.frame` 在 transform 非 identity 时是包络值、不能拿来算 ⇒
 // layoutSubviews 里把这一条记下来。
 @property (nonatomic, assign) CGFloat nbCardMaxX;
+// v0.0.124：卡片**未位移时**的**左缘**。右滑蓝块的左缘钉在这里、右缘跟着卡片走 ——
+// 和红块完全镜像（红块是右缘钉住、左缘跟着卡片走）。缺了它蓝块只能用猜的原点，
+// 症状是"蓝块比卡片左缘偏出几 pt"或者"露出一条灰缝"。
+@property (nonatomic, assign) CGFloat nbCardMinX;
+// v0.0.124：蓝色「翻转已读态」按钮（左侧）。结构和红块完全对称。
+@property (nonatomic, strong) UIView *leadActionView;
+@property (nonatomic, strong) UILabel *leadLabel;
+@property (nonatomic, strong) UITapGestureRecognizer *leadTap;
 // v0.0.93：当前是否处于「松手即删」态（只用来避免每帧重复设 label 文案）
 @property (nonatomic, assign) BOOL nbArmed;
 
@@ -126,8 +138,15 @@
 // v0.0.92：左滑三件套 —— 应用位移 / 收放到目标位 / 点删除
 - (void)nbApplyOffset:(CGFloat)offset;
 - (void)nbSettleTo:(CGFloat)target animated:(BOOL)animated;
+// v0.0.124：两个按钮的唯一隐藏出口（判据双向，见实现处注释）
+- (void)nbHideActionViewsIfClosed:(CGFloat)target;
 - (void)nbPan:(UIPanGestureRecognizer *)g;
 - (void)nbTapDelete:(UITapGestureRecognizer *)g;
+// v0.0.124：右滑蓝块的点击 = 翻转这一组的已读态（文案由 cell 按 isUnread 决定）
+- (void)nbTapToggleRead:(UITapGestureRecognizer *)g;
+// v0.0.124：按当前 isUnread 刷蓝块文案。**唯一入口** —— 别在滑动里现算，
+// 那会让按钮在手指底下变字（划到一半"标已读"变成"标未读"，用户会以为滑错了）。
+- (void)nbUpdateLeadLabel;
 // v0.0.93：滑到底 —— 卡片整行滑出之后再执行删除
 - (void)nbFlyOutThenDelete;
 @end
@@ -365,6 +384,37 @@ static void NBHapticFire(NBHapticKind kind) {
         [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(nbTapDelete:)];
     [self.swipeActionView addGestureRecognizer:tap];
 
+    // ---------- v0.0.124：蓝色「翻转已读态」按钮（必须在 cardView **之前** add） ----------
+    // 🔴 和红块完全对称，四条都对得上：挂 contentView、同高同圆角、cornerCurve 一致、
+    //    **在 cardView 下层**（卡片往右移才露出来）。
+    //    ⛔ 挂 cardView 会跟着卡片一起位移 ⇒ 蓝块永远露不出来，而且不报错（红块那条注释同理）。
+    // 🔴 用 systemBlueColor 而不是绿：绿色在这套卡片上已经有"成功/正常"的隐含语义
+    //    （残留橙框、关键词★、未读角标各占一色），而"翻转已读"是个中立动作，蓝最不抢戏。
+    self.leadActionView = [[UIView alloc] init];
+    self.leadActionView.backgroundColor = [UIColor systemBlueColor];
+    self.leadActionView.layer.cornerRadius = NBListCardRadius;
+    self.leadActionView.layer.cornerCurve = kCACornerCurveContinuous;
+    self.leadActionView.clipsToBounds = YES;
+    self.leadActionView.hidden = YES;           // 没滑动时彻底不参与显示
+    [self.contentView addSubview:self.leadActionView];
+
+    self.leadLabel = [[UILabel alloc] init];
+    // 初值给"标已读"：`setUnread:` 会在 cellForRow 里立刻刷成正确文案。
+    // 🔴 给个初值是必须的 —— 空串会让"第一次右滑"露出一个没有字的蓝块。
+    self.leadLabel.text = @"标已读";
+    self.leadLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    self.leadLabel.textColor = [UIColor whiteColor];
+    self.leadLabel.textAlignment = NSTextAlignmentCenter;
+    // 蓝块同样是 52pt 宽。「标已读」三个字在 14pt 下约 42pt，本来放得下，
+    // 但辅助功能大字体一开就溢出 ⇒ 和红块用同一条兜底（宁可缩字，不要截成"标已…"）。
+    self.leadLabel.adjustsFontSizeToFitWidth = YES;
+    self.leadLabel.minimumScaleFactor = 0.7;
+    [self.leadActionView addSubview:self.leadLabel];
+
+    self.leadTap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(nbTapToggleRead:)];
+    [self.leadActionView addGestureRecognizer:self.leadTap];
+
     self.cardView = [[UIView alloc] init];
     self.cardView.backgroundColor = NBCardBG();
     self.cardView.layer.cornerRadius = NBListCardRadius;   // v0.0.88：12 → 14
@@ -580,6 +630,10 @@ static void NBHapticFire(NBHapticKind kind) {
     //    与卡片右缘严丝合缝，不会出现"卡片走了、红块旁边留一条缝"。
     // v0.0.93：记住卡片**未位移**时的右缘，红块宽度要按位移往左扩（见 nbApplyOffset:）
     self.nbCardMaxX = CGRectGetMaxX(card);
+    // v0.0.124：同时记左缘 —— 右滑蓝块要把它钉在这里（镜像红块"钉右缘"的算法）。
+    // 🔴 必须和 `nbCardMaxX` 在**同一处**赋值：两个都是"卡片未位移时的几何事实"，
+    //    分两处取就会有一处用到上一轮布局的旧值（表现为第一次滑、或转屏后偏几 pt）。
+    self.nbCardMinX = CGRectGetMinX(card);
     self.swipeActionView.frame = CGRectMake(CGRectGetMaxX(card) - kNBSwipeActionW,
                                             card.origin.y,
                                             kNBSwipeActionW,
@@ -667,7 +721,10 @@ static void NBHapticFire(NBHapticKind kind) {
     // v0.0.93：上面写死的红块宽是 52，而"滑到底"时它应该按位移变宽。
     // 布局重算会把宽度打回 52 ⇒ 若当前不在原位，立刻按当前位移重算一次。
     // （改的是子视图 frame，不会再触发本方法的布局，不会递归。）
-    if (self.nbOffset < -0.5) [self nbApplyOffset:self.nbOffset];
+    // 🔴 v0.0.124：判据从 `< -0.5` 改成 `fabs(...) > 0.5` —— 右滑（正值）同样要重算，
+    //    只认负值的话，右滑到一半遇到布局重算（比如刚滚进屏幕、或大字体下重排），
+    //    蓝块宽度会被打回 52 而卡片还停在几十 pt 外 ⇒ 露出一条灰缝。
+    if (fabs(self.nbOffset) > 0.5) [self nbApplyOffset:self.nbOffset];
 }
 
 // ================= v0.0.92：左滑删除 =================
@@ -676,7 +733,10 @@ static void NBHapticFire(NBHapticKind kind) {
 // 症状是"滑到一半图标不缩了"或者"收起了但图标还是半透明"，而且两处代码各自看都对。
 - (void)nbApplyOffset:(CGFloat)offset {
     self.nbOffset = offset;
-    CGFloat p = (kNBSwipeActionW > 0.0) ? (-offset / kNBSwipeActionW) : 0.0;   // 进度 0~1
+    // 🔴 v0.0.124：进度改成**绝对值**。原来只认负值（`-offset / W`），右滑时 `p` 会是负数
+    //    再被夹成 0 ⇒ 图标不缩不隐、停在原地顶着蓝色按钮，看着像"按钮压住了 App 图标"。
+    //    两个方向共用同一个进度，左右的"图标让位"手感才一致。
+    CGFloat p = (kNBSwipeActionW > 0.0) ? (fabs(offset) / kNBSwipeActionW) : 0.0;   // 进度 0~1
     if (p < 0.0) p = 0.0;
     if (p > 1.0) p = 1.0;
 
@@ -695,7 +755,11 @@ static void NBHapticFire(NBHapticKind kind) {
     //    （见 `nbSettleTo:animated:` 的 completion）——
     //    `hidden` 不是可动画属性，在动画块里设 YES 会**立刻**生效：
     //    表现为"红块先啪一下消失，卡片还在回弹路上"，中间那一瞬露出灰底。
-    if (p > 0.001) self.swipeActionView.hidden = NO;
+    // 🔴 v0.0.124：两个按钮**按方向各自显隐**，互相不干涉。
+    //    写成"两个都显示"的话，右滑时右侧红块也会露出来（它贴在右边，卡片往右移之后
+    //    右边那片区域本该是卡片底色）⇒ 屏幕右侧莫名一块红。
+    if (offset < -0.001) self.swipeActionView.hidden = NO;
+    if (offset >  0.001) self.leadActionView.hidden = NO;
 
     // ④ v0.0.93：红块宽度**跟着位移长**，右缘钉在卡片未位移时的右缘。
     // 🔴 不加这一段的话，滑过 52 之后卡片继续左移、红块还是 52 宽 ⇒
@@ -705,12 +769,31 @@ static void NBHapticFire(NBHapticKind kind) {
     if (aw < kNBSwipeActionW) aw = kNBSwipeActionW;          // 没滑时不缩，保持 52 交给 hidden 管
     CGFloat capW = self.cardView.bounds.size.width;          // bounds 不受 transform 影响
     if (capW > 0.0 && aw > capW) aw = capW;
-    if (self.nbCardMaxX > 0.0) {
+    // 🔴 v0.0.124：只在**左滑方向**才摆红块。不卡方向的话，右滑时这段仍会用
+    //    `nbCardMaxX - aw` 把红块摆到右侧（宽度被上面那行夹回 52），虽然它是 hidden 的，
+    //    但"看不见的视图位置依赖另一个方向的值"是最容易在下次改动里翻车的那类耦合。
+    if (self.nbCardMaxX > 0.0 && offset < -0.001) {
         CGRect af = self.swipeActionView.frame;
         af.origin.x = self.nbCardMaxX - aw;
         af.size.width = aw;
         self.swipeActionView.frame = af;
         self.swipeLabel.frame = self.swipeActionView.bounds;
+    }
+
+    // ④b v0.0.124：蓝块 —— 红块的**镜像**。红块"右缘钉在卡片未位移时的右缘、宽度随位移长"，
+    //     蓝块则是"**左缘**钉在卡片未位移时的左缘、宽度随位移长"。
+    //     ⇒ 蓝块右缘恒等于卡片当前左缘（`nbCardMinX + offset`），两者严丝合缝，不会露灰缝。
+    //     v0.0.93 给红块补的那条教训在这里同样成立：不跟着长宽的话，滑过 52 之后
+    //     蓝块还是 52 宽，卡片右移留下的那条会被 contentView 底色（灰）露出来。
+    if (self.nbCardMinX > 0.0 && offset > 0.001) {
+        CGFloat lw = offset;
+        if (lw < kNBSwipeActionW) lw = kNBSwipeActionW;
+        if (capW > 0.0 && lw > capW) lw = capW;
+        CGRect lf = self.leadActionView.frame;
+        lf.origin.x = self.nbCardMinX;
+        lf.size.width = lw;
+        self.leadActionView.frame = lf;
+        self.leadLabel.frame = self.leadActionView.bounds;
     }
 
     // ⑤ v0.0.93：进入「松手即删」态时换文案。
@@ -731,7 +814,7 @@ static void NBHapticFire(NBHapticKind kind) {
 - (void)nbSettleTo:(CGFloat)target animated:(BOOL)animated {
     if (!animated) {
         [self nbApplyOffset:target];
-        if (target >= -0.001) self.swipeActionView.hidden = YES;
+        [self nbHideActionViewsIfClosed:target];
         return;
     }
     // 🔴 `BeginFromCurrentState` 不能省：跟手到一半松手时要从**当前**位置接着动画。
@@ -744,8 +827,20 @@ static void NBHapticFire(NBHapticKind kind) {
         [self nbApplyOffset:target];
     } completion:^(BOOL finished) {
         // 收起到位之后才隐藏：提前隐藏会看到"红块先消失、卡片还在路上"
-        if (target >= -0.001) self.swipeActionView.hidden = YES;
+        [self nbHideActionViewsIfClosed:target];
     }];
+}
+
+// v0.0.124：两个按钮的**唯一隐藏出口**。
+// 🔴 为什么抽出来：原来 `target >= -0.001` 这个判据在 `nbSettleTo:` 里写了两遍
+//    （动画/非动画各一处），加右滑时又要两处都改 —— 两处判据只要有一处写歪，
+//    症状就是"某个方向收起后按钮还在"，而且只在其中一个分支复现（动画 vs 复用复位）。
+// 🔴 收起判据用 `fabs(target) <= 0.001`：**双向**（左滑负、右滑正），
+//    只判 `>= -0.001` 的话右滑收起后蓝块不会隐藏 —— 它会留在卡片左边，下一行滚进来就露出来。
+- (void)nbHideActionViewsIfClosed:(CGFloat)target {
+    if (fabs(target) > 0.001) return;
+    self.swipeActionView.hidden = YES;
+    self.leadActionView.hidden = YES;
 }
 
 // v0.0.93：滑到底 —— 卡片整行滑出，滑完再执行删除。
@@ -779,7 +874,11 @@ static void NBHapticFire(NBHapticKind kind) {
     }];
 }
 
-- (BOOL)nbIsSwiped { return (self.nbOffset < -0.5); }
+// v0.0.124：**双向**。右滑打开时也算"swiped"——
+// 🔴 这一条不只是命名问题：`didSelectRow` 拿它判"该收起还是该进详情"。
+//    只判负值的话，右滑露出蓝块后点卡片会直接跳进详情页，
+//    而那一下点击本该是"收起"（用户想点蓝块、手抖点在卡片上的经典误触）。
+- (BOOL)nbIsSwiped { return (fabs(self.nbOffset) > 0.5); }
 
 - (void)nbCloseSwipeAnimated:(BOOL)animated {
     [self nbSettleTo:0.0 animated:animated];
@@ -802,8 +901,12 @@ static void NBHapticFire(NBHapticKind kind) {
             // 🔴 用「起点 + 累计平移」，不是只用「累计平移」：
             //    后者在"已经打开的行走再拖一次"时从 0 起算 ⇒ 卡片瞬间跳回原位再跟手。
             CGFloat x = self.nbOffsetAtBegin + t.x;
-            if (x > 0.0) {
-                x *= 0.2;                                   // 右滑越界给阻尼，别硬顶
+            // 🔴 v0.0.124：两个方向**同一套阻尼**。
+            //    原来只有正方向乘 0.2（那时右滑不是功能，纯粹是"别硬顶"）——
+            //    现在右滑是真功能了，正方向必须和负方向走同一条曲线，
+            //    否则一边滑得动、另一边拖不动，用户只会得出"右滑坏了"这一个结论。
+            if (x > kNBSwipeActionW) {
+                x = kNBSwipeActionW + (x - kNBSwipeActionW) * kNBSwipeExtraDrag;
             } else if (x < -kNBSwipeActionW) {
                 // v0.0.93：越过"全开"之后不再锁死 —— 要留出继续往左的空间，
                 // 用户才滑得到"待删"那条线。系数 0.35 比原来的 0.2 松一点，
@@ -826,21 +929,61 @@ static void NBHapticFire(NBHapticKind kind) {
             }
             // 判据 = "速度优先、位置兜底"：快速甩一下不管拖了多远都按方向收/放；
             // 慢慢拖超过一半才算打开。300pt/s 大致是"明显有甩的动作"。
+            // 🔴 v0.0.124：按**当前在哪一侧**分别判。两侧"打开"的位移符号相反
+            //    （右侧要 +52、左侧要 -52），而 v.x 的语义也跟着反过来：
+            //    右滑一侧"往右甩"才是打开，左滑一侧是"往左甩"。
+            //    合并成一个 open 再选 target 也能跑，但那个写法里每个 `v.x` 判据
+            //    都要额外记住"这是在判哪一侧"，读一遍就得推一遍 —— 拆两支只有一种解释。
+            CGFloat off = self.nbOffset;
             BOOL open;
-            if (v.x < -300.0) {
-                open = YES;
-            } else if (v.x > 300.0) {
-                open = NO;
+            if (off > 0.5) {
+                // 右滑一侧（蓝块）：往右甩 / 拖过一半 ⇒ 打开到 +52
+                if (v.x > 300.0) {
+                    open = YES;
+                } else if (v.x < -300.0) {
+                    open = NO;
+                } else {
+                    open = (off > kNBSwipeActionW * 0.5);
+                }
+                [self nbSettleTo:(open ? kNBSwipeActionW : 0.0) animated:YES];
             } else {
-                open = (self.nbOffset < -kNBSwipeActionW * 0.5);
+                // 左滑一侧（红块）：往左甩 / 拖过一半 ⇒ 打开到 -52
+                if (v.x < -300.0) {
+                    open = YES;
+                } else if (v.x > 300.0) {
+                    open = NO;
+                } else {
+                    open = (off < -kNBSwipeActionW * 0.5);
+                }
+                [self nbSettleTo:(open ? -kNBSwipeActionW : 0.0) animated:YES];
             }
-            [self nbSettleTo:(open ? -kNBSwipeActionW : 0.0) animated:YES];
             break;
         }
 
         default:
             break;
     }
+}
+
+- (void)nbTapToggleRead:(UITapGestureRecognizer *)g {
+    // 🔴 一次性动作必须判 state（同 `nbTapDelete:`：手势 action 在每个状态变化时都回调）。
+    if (g.state != UIGestureRecognizerStateEnded) return;
+    // 🔴 v0.0.124：**先收起，再回调** —— 顺序和 `nbFlyOutThenDelete` 的 completion 一致。
+    //    回调里会 `reloadRows`，那一瞬间这个 cell 可能已经被复用给别的行；
+    //    带着 +52 的位移被复用，症状是"滚一下某一行卡片歪在右边"。
+    [self nbSettleTo:0.0 animated:YES];
+    // 复用删除那一档轻震：翻转已读也是"一次确定的动作"，需要触觉确认。
+    // ⛔ 不为它单开一个 NBHapticKind —— 手感分不出差别，却多一处要维护的枚举。
+    NBHapticFire(NBHapticKindDelete);
+    // 🔴 这里**不再判断方向**（不读 isUnread）：文案已经由 `nbUpdateLeadLabel` 定好，
+    //    动作必须跟着文案走。判两处就会出现"按钮写着标已读、按下去却标成未读"。
+    if (self.nbOnToggleRead) self.nbOnToggleRead();
+}
+
+// v0.0.124：蓝块文案的**唯一出口**。未读 ⇒ 「标已读」；已读 ⇒ 「标未读」。
+// 🔴 和 `nbUpdatePin` 同一个纪律：文案由"原始 BOOL"派生，⛔ 不许去读视图当前显示了什么。
+- (void)nbUpdateLeadLabel {
+    self.leadLabel.text = self.isUnread ? @"标已读" : @"标未读";
 }
 
 - (void)nbTapDelete:(UITapGestureRecognizer *)g {
@@ -1072,6 +1215,10 @@ static void NBHapticFire(NBHapticKind kind) {
     _isUnread = unread;
     self.unreadCount = count;
     [self nbUpdatePin];
+    // v0.0.124：右滑蓝块的文案也跟着翻转（一个手势两种用途）。
+    // 🔴 必须在这里刷、⛔ 不许等到滑动中途再算：那会让按钮在手指底下变字
+    //    （划到一半"标已读"变成"标未读"，用户会以为自己滑错了方向）。
+    [self nbUpdateLeadLabel];
     // 🔴 必须重排：v0.0.88 起角标**会挤压正文宽度**（有角标时正文让出 26pt），
     //    只改 hidden 不重排的话，从"未读"翻成"已读"之后正文还是窄的
     //    —— 表现为"这一条读过之后，正文右边莫名空一块"。
@@ -1216,11 +1363,17 @@ static void NBHapticFire(NBHapticKind kind) {
     // v0.0.93：红块自己也会跑动画（滑出删除那 0.18s 的宽度/位置变化），一起掐掉。
     // 不掐的症状：复用池里刚被复用的那一行，红块宽度从上一行的整行宽度慢慢缩回 52。
     [self.swipeActionView.layer removeAllAnimations];
+    // v0.0.124：蓝块也会跑动画（收起那 0.25s 的宽度/位置），一起掐掉。
+    [self.leadActionView.layer removeAllAnimations];
     [self nbApplyOffset:0.0];
     // 🔴 block 也要清：不清就会留着上一行捕获的 rowId，
     //    万一这一行没走到 cellForRow 就被点了删除 ⇒ **删掉上一条**。
     self.nbOnDelete = nil;
     self.nbOnSwipeBegin = nil;
+    // v0.0.124：同一个理由 —— 留着上一组的 id，右滑一下就把**别的行**标成已读了。
+    // 🔴 这个 block 尤其危险：它改的是 `read`，删错行还能看出来少了一条，
+    //    标错行则是"某条莫名其妙的记录变成已读/未读"，很难联想到是复用残留。
+    self.nbOnToggleRead = nil;
 }
 
 @end

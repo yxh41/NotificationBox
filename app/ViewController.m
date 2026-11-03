@@ -329,6 +329,11 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)refreshUnreadDots;
 // v0.0.72：重建"每个 App 在当前列表里还有几条未读"（未读书签的唯一数据源）。
 - (void)rebuildBundleUnread;
+// ================= v0.0.124：已读态的唯一执行入口 =================
+// 点击卡片（标已读）和右滑蓝块（翻转）共用这一份实现。
+- (void)nbSetRead:(BOOL)read forRowIds:(NSArray<NSNumber *> *)ids;
+// 按 rowId 现查它在当前 items 里的行号（找不到返回 nil）。
+- (NSIndexPath *)nbIndexPathForRowId:(NSInteger)rowId;
 // v0.0.37：全部 / 只看未读（自己的分段控件，替掉没渲染出来的系统 scope bar）
 - (void)onUnread:(UISegmentedControl *)seg;
 // v0.0.49：★ 只看标星开关；以及"有没有任何规则带 ★ 动作"（★ 视图为空时区分
@@ -2639,6 +2644,22 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     __weak NotifyCell *weakCell = c;
     c.nbOnDelete = ^{ [weakSelf nbDeleteRowIds:groupIds]; };
     c.nbOnSwipeBegin = ^{ [weakSelf nbCloseOtherSwipesExcept:weakCell]; };
+    // ---------- v0.0.124：右滑蓝块 = 翻转**整组**的已读态 ----------
+    // 🔴 捕获 `groupIds`（整组 id 快照）而不是单条：×N 归并的行代表一组，
+    //    只翻一条会出现"组里一条变已读、其余 read 还是 0"，卡片状态自相矛盾。
+    // 🔴 方向按**cellForRow 那一刻**的状态算，⛔ 不在动作执行时现读：
+    //    蓝块的文案也是这一刻定的（`setUnread:` 里刷），两者必须同源。
+    //    执行时现读的话，在"滑开之后列表被刷新"的场景里会翻错方向 ——
+    //    用户看到按钮写着「标已读」，按下去却变成了未读。
+    BOOL rowIsUnread = ([d[@"read"] integerValue] == 0);
+    c.nbOnToggleRead = ^{
+        // 当前未读 ⇒ 这次要标成已读（YES）；当前已读 ⇒ 标成未读（NO）。
+        // 🔴 写成显式的 `makeRead` 而不是直接把 rowIsUnread 传进去：
+        //    那个写法数值上恰好对，但每个读到它的人都要在脑子里验算一遍
+        //    "传的是当前状态还是目标状态" —— 这类"碰巧对"的代码下次改动必翻车。
+        BOOL makeRead = rowIsUnread;
+        [weakSelf nbSetRead:makeRead forRowIds:groupIds];
+    };
     // ---------- v0.0.118：长按菜单 ----------
     // 🔴 每次 cellForRow 都重设一次（cell 会复用）：菜单里的 App 名 / 动作必须跟着**当前这一行**，
     //    留着上一次的就会"长按 A 行、菜单里写着 B 的 App 名"。
@@ -2663,6 +2684,80 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     self.nbOpenCell = keep;
 }
 
+// ================= v0.0.124：已读态的**唯一执行入口** =================
+// 两个入口共用：① 点击卡片（标已读，随后进详情）；② 右滑蓝块（按当前状态翻转）。
+// 🔴 为什么必须抽出来：这一套有三段（写库 → 改内存 → 重建派生量 + 刷行），
+//    原来内联在 `didSelectRow` 里。右滑若照抄一份，就是"两处各自看都对、改一处必漏一处"
+//    —— 本项目 v0.0.41 已经买过一次教训：红点跟着变了、顶部提示条没变。
+// 🔴 `ids` 是**整组**的 rowId（×N 归并后的那行代表一组）：只改一条会出现
+//    "组里一条变成已读、其余 read 还是 0"，卡片状态自相矛盾。
+// 🔴 参数里**没有 indexPath**，行号由 `nbIndexPathForRowId:` 现查。cell 的 block 拿到的是
+//    滑动那一刻的 rowId，而列表随时会变（搜索/筛选/删除/整表重查）——
+//    捕获 indexPath 就是"改错行"的定时炸弹（和 `nbOnDelete` 同一条纪律）。
+- (void)nbSetRead:(BOOL)read forRowIds:(NSArray<NSNumber *> *)ids {
+    if (![ids isKindOfClass:[NSArray class]] || ids.count == 0) return;
+
+    // ① 先写库。「库是事实、内存是它的投影」——这条顺序不能反。
+    for (NSNumber *rid in ids) {
+        if (![rid isKindOfClass:[NSNumber class]]) continue;
+        if ([rid integerValue] > 0) [NotifyStore setRead:read rowId:[rid integerValue]];
+    }
+
+    // ② 「只看未读」模式下**数量会变**（标成已读的那条要从列表里消失）
+    //    ⇒ 必须整表重查；`reloadRowsAtIndexPaths:` 要求内存下标与行严格对应，数量一变就错位。
+    if (self.unreadOnly) {
+        [self reloadKeepingOffset];
+        return;
+    }
+
+    // ③ 普通模式：数量不变 ⇒ 只改内存 + 刷受影响的那几行
+    NSIndexPath *ip = [self nbIndexPathForRowId:[ids[0] integerValue]];
+    if (!ip) {
+        // 这一行已经不在当前列表里了（被筛选掉 / 上一次 loadData 之后没了）。
+        // ⛔ 不许"尽力而为"地猜一个下标去改内存 —— 那改的是别的行。
+        [self loadData];
+        return;
+    }
+    NSDictionary *row = self.items[ip.row];
+    if (![row isKindOfClass:[NSMutableDictionary class]]) {
+        [self loadData];          // 兜底：万一哪天 query 改成返回不可变字典
+        return;
+    }
+    [(NSMutableDictionary *)row setObject:@(read ? 1 : 0) forKey:@"read"];
+    // 未读计数必须在这里手动重建（这一步不重查库），否则整屏书签停在改动之前的数
+    [self rebuildBundleUnread];
+    // 🔴 书签上的数是**该 App** 的未读条数 ⇒ 同一个 App 的**其它可见行**也得一起刷，
+    //    否则改掉一条之后，屏幕上同 App 的另外几张卡片还写着旧数。
+    //    仍然用 `reloadRows` 而不是整表 `reloadData`：**数量没变**，滚动位置不动
+    //    （"数量变不变"才是这个 API 的判据，见删除场景）。
+    NSString *bid = row[@"bundle"];
+    NSMutableArray<NSIndexPath *> *paths = [NSMutableArray arrayWithObject:ip];
+    for (NSIndexPath *other in [self.table indexPathsForVisibleRows]) {
+        if (other.section != ip.section || other.row == ip.row) continue;
+        if (other.row >= (NSInteger)self.items.count) continue;   // 越界就当没有这一行
+        NSString *o = self.items[other.row][@"bundle"];
+        if (bid.length && [o isEqualToString:bid]) [paths addObject:other];
+    }
+    [self.table reloadRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationNone];
+    // 🔴 红点**和顶部提示条**一起重算：这一行变了已读，影响的是**两个**派生量
+    //    （该 App 的未读数、以及"筛选之外还有多少"）。
+    [self refreshUnreadDerived];
+}
+
+// 按 rowId 现查行号。找不到 ⇒ nil（调用方据此走"整表重查"这条安全路）。
+// 🔴 线性扫一遍 items 是**故意的**：列表长度 = 当前筛选下的条数（几十到几百），
+//    而这里只在用户点一下 / 滑一下时调一次。相比之下"捕获 indexPath 再校验它还有效"
+//    需要的判据更多、也更容易漏（本项目删错行那几版全是这个形态）。
+- (NSIndexPath *)nbIndexPathForRowId:(NSInteger)rowId {
+    if (rowId <= 0) return nil;
+    for (NSInteger i = 0; i < (NSInteger)self.items.count; i++) {
+        NSDictionary *r = self.items[i];
+        if (![r isKindOfClass:[NSDictionary class]]) continue;
+        if ([r[@"id"] integerValue] == rowId) return [NSIndexPath indexPathForRow:i inSection:0];
+    }
+    return nil;
+}
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     // 🔴 v0.0.92：左滑打开状态下点这一行 = **先收起，不进详情**。
     //    这是系统列表的既定行为，也是必须做的：不然"左滑露出删除"和"点一下进详情"
@@ -2681,53 +2776,12 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 否则会出现"点开过、卡片还是未读"（组内其它几条的 read 全是 0）。
     NSArray<NSNumber *> *gids = [d[@"nbGroupIds"] isKindOfClass:[NSArray class]]
                               ? d[@"nbGroupIds"] : @[d[@"id"] ?: @0];
-    for (NSNumber *rid in gids) {
-        if ([rid integerValue] > 0) [NotifyStore markRead:[rid integerValue]];
-    }
-
-    // v0.0.35：把「已读」同步回内存并只刷这一行。
-    // 🔴 为什么不在 `viewWillAppear:` 里 `loadData`（这是最容易想到的做法）：
-    //    整表 reload 会让**滚到中间点开一条再返回，列表跳回顶部** —— 真机上一碰就发现。
-    // 🔴 为什么这里用 `reloadRowsAtIndexPaths:` 是安全的（v0.0.33 删除场景里它是禁忌）：
-    //    判据从来不是"这个 API 好不好"，而是**数量变不变**。这里只把一个字段 0→1，
-    //    行数不变 ⇒ 内存下标和 row 仍然一一对应；而删除会改数量 ⇒ 必须整表重查。
-    // 🔴 顺序不能反：先 markRead（写库），再改内存，再刷新 —— 反了刷出来的还是旧值。
-    if (self.unreadOnly) {
-        // 🔴 v0.0.36：「只看未读」模式下点开一条，它变已读后**不该再出现在列表里**。
-        //    这是**数量会变**的场景 ⇒ 禁用 `reloadRowsAtIndexPaths:`（它要求内存下标
-        //    与行严格对应，少一行之后就对不上了），必须整表重查。
-        // v0.0.38：那套「存 offset → 重查 → 恢复」抽成了 `reloadKeepingOffset`，
-        //    这里改成调它 —— 同一个动作只留一份实现（原来有两处，改一处必然漏另一处）。
-        [self reloadKeepingOffset];
-    } else if ([d isKindOfClass:[NSMutableDictionary class]]) {
-        [(NSMutableDictionary *)d setObject:@1 forKey:@"read"];
-        // v0.0.72：这一步只改一行、**不重查库**，所以未读计数必须在这里手动重建，
-        // 否则整屏的未读书签会停在"标已读之前"的数 —— 而那条记录的书签明明已经消失了，
-        // 剩下的同 App 卡片却还写着同一个数（同一个界面里两个数互相矛盾）。
-        // 🔴 顺序：改内存 → 重建计数 → reloadRows（cellForRow 读的是重建后的字典）。
-        [self rebuildBundleUnread];
-        // 🔴 v0.0.72：书签上的数是**该 App** 的未读条数 ⇒ 同一个 App 的**其它可见行**
-        //    也得一起刷，否则读掉一条之后，屏幕上同 App 的另外几张卡片还写着旧数。
-        //    仍然用 `reloadRows` 而不是整表 `reloadData`：**数量没变**，
-        //    它只重排这几行、滚动位置不动（"数量变不变"才是这个 API 的判据，见删除场景）。
-        NSString *bid = d[@"bundle"];
-        NSMutableArray<NSIndexPath *> *paths = [NSMutableArray arrayWithObject:indexPath];
-        for (NSIndexPath *ip in [tableView indexPathsForVisibleRows]) {
-            if (ip.section != indexPath.section || ip.row == indexPath.row) continue;
-            if (ip.row >= (NSInteger)self.items.count) continue;   // 越界就当没有这一行
-            NSString *other = self.items[ip.row][@"bundle"];
-            if ([other isEqualToString:bid]) [paths addObject:ip];
-        }
-        [tableView reloadRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationNone];
-        // v0.0.41：红点**和顶部提示条**一起重算。
-        // 🔴 原来这里只调了 `refreshUnreadDots` —— 红点跟着变了，提示条没变。
-        //    "这行刚变已读"影响的正是**两个**派生量：该 App 的未读数（红点）、
-        //    以及"筛选之外还有多少"（提示条，筛选内的未读少了一条）。
-        [self refreshUnreadDerived];
-    } else {
-        // 兜底：万一哪天 query 改成返回不可变字典，退回整表重查（会丢滚动位置，但不会错）
-        [self loadData];
-    }
+    // v0.0.124：标已读 + 改内存 + 重建派生量 + 刷行的整套动作，抽到 `nbSetRead:forRowIds:`，
+    // 和右滑蓝块的「翻转」共用**同一份实现**（原来这一段是内联在这里的）。
+    // 🔴 抽方法不是为了好看：右滑若照抄一份，就成了两处各自看都对、改一处必漏一处
+    //    —— v0.0.41 已经买过一次教训（红点跟着变了、顶部提示条没变）。
+    // 🔴 三段顺序一个字都没挪：先写库（`nbSetRead:` 的第一段），再改内存，再刷新派生量。
+    [self nbSetRead:YES forRowIds:gids];
 
     // v0.0.33：点开看**全文**。列表 cell 的正文 `numberOfLines = 2`、超了截断，
     // 而在这之前点一行只做 markRead ⇒ 长通知永远看不全、也复制不了。

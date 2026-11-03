@@ -97,6 +97,14 @@ typedef NS_OPTIONS(NSUInteger, NBKeywordAction) {
 + (NSInteger)maxRecords;                           // 从 prefs 读上限
 
 // 维护
+// v0.0.124：把一行的已读态设成**任意值**（`read` 写 1 或 0）。
+// 🔴 为什么要新开一个而不是改 `markRead:`：v0.0.123 及以前 `markRead:` 的 SQL 里
+//    `read=1` 是**硬编码**的 —— 右滑「标为未读」要的是 `read=0`，照抄一份改个数字，
+//    就成了两处 SQL 各写一遍（各自看都对，以后加列/加条件必然漏一处）。
+//    ⇒ 只留一个写入口，`markRead:` 退化成 `setRead:YES`（调用点不动，签名不变）。
+// 🔴 `rowId <= 0` 直接返回：库里 id 从 1 开始，0/负数是"没拿到 id"的哨兵
+//    （`d[@"id"]` 取不到时是 0），拿它去 UPDATE 会命中 0 行且**不报错**。
++ (void)setRead:(BOOL)read rowId:(NSInteger)rowId;
 + (void)markRead:(NSInteger)rowId;
 // v0.0.38：把「当前筛选范围内」的未读**批量**标为已读，返回真正改动的行数
 // （-1 = DB 打不开）。不删记录，只把 read 从 0 改成 1。

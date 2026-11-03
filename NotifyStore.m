@@ -944,18 +944,30 @@ static void NBAppendRow(sqlite3_stmt *st, NSMutableArray *res) {
 //    的注释里写着「一处拼串、一处绑参，以后有人把某个参数换成字符串时就会在拼串那处出事」
 //    —— 同文件里注释和代码自相矛盾了五版。删除和标记都是「按 id 改一行」，
 //    写法应该只有一种。
-+ (void)markRead:(NSInteger)rowId {
+// v0.0.124：已读态的**唯一写入口**。`read` 绑参（不拼串），`rowId <= 0` 直接返回。
+// 🔴 为什么两个 id 参数都用 `sqlite3_bind_int64`：`read` 在表里是 INTEGER，
+//    但这里传的是 BOOL ⇒ 显式绑 1/0 比依赖 BOOL→int 的隐式转换安全
+//    （BOOL 在 64 位下是 signed char，绑错类型不会报错，只会写进 0 或 1 之外的值）。
++ (void)setRead:(BOOL)read rowId:(NSInteger)rowId {
+    if (rowId <= 0) return;
     sqlite3 *db = [self openDB];
     if (!db) return;
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, "UPDATE notifications SET read=1 WHERE id=?", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, (sqlite3_int64)rowId);
+    if (sqlite3_prepare_v2(db, "UPDATE notifications SET read=? WHERE id=?", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, read ? 1 : 0);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)rowId);
         if (sqlite3_step(st) != SQLITE_DONE) {
-            NBStoreLog(@"markRead 失败 id=%ld err=%s", (long)rowId, sqlite3_errmsg(db));
+            // 日志带 `read=` 的值：标记"失败"本身不够，得知道当时想写成什么
+            NBStoreLog(@"setRead 失败 id=%ld read=%d err=%s",
+                       (long)rowId, (int)(read ? 1 : 0), sqlite3_errmsg(db));
         }
         sqlite3_finalize(st);
     }
     sqlite3_close(db);
+}
+
++ (void)markRead:(NSInteger)rowId {
+    [self setRead:YES rowId:rowId];
 }
 
 // v0.0.38：批量标记 / 批量计数的共用条件 → **v0.0.40 起并入 `NBPrepareScope`**。
