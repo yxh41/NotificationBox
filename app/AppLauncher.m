@@ -210,13 +210,80 @@ static BOOL NBKeyLooksLikeLink(NSString *k) {
     return [S containsObject:[k lowercaseString]];
 }
 
-// 递归收集候选。**有界**：深度 ≤3 —— payload 是外部数据，
-// 没有上限的话一个畸形结构就能把主线程拖住（而这是长按菜单的回调里同步跑的）。
-static void NBCollectLinks(id node, NSString *key, NSInteger depth, NSMutableArray *out) {
-    if (!node || depth > 3) return;
+// v0.0.149：图片/头像类地址**不配当跳转目标**。
+// 🔴 真机样本（v0.0.148 自检）长这样：
+//     {"userInfo":{"ext":"{\"msg_id\":\"0\",\"product_code\":\"workbuddy\",…}"}}
+//   一旦把双层 JSON 拆开，里面会冒出头像、图标、封面这些 URL —— 它们键名常常就叫
+//   `url` / `image`，光靠"键名像链接"根本拦不住，命中后用户点「直达」会打开一张图。
+// ⇒ 两条判据一起用：**键名黑名单** + **扩展名**（只看路径部分，忽略 ?query）。
+static BOOL NBURLIsAsset(NSString *s, NSString *key) {
+    static NSSet *badKeys = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        badKeys = [NSSet setWithArray:@[@"avatar", @"avatarurl", @"icon", @"iconurl",
+                                        @"image", @"imageurl", @"img", @"imgurl",
+                                        @"head", @"headurl", @"logo", @"logourl",
+                                        @"pic", @"picurl", @"picture", @"photo",
+                                        @"thumb", @"thumbnail", @"cover", @"banner",
+                                        @"backgroundimage", @"sticker"]];
+    });
+    if ([key isKindOfClass:[NSString class]] && key.length
+        && [badKeys containsObject:[key lowercaseString]]) return YES;
+
+    static NSArray *exts = nil;
+    static dispatch_once_t once2;
+    dispatch_once(&once2, ^{
+        exts = @[@".png", @".jpg", @".jpeg", @".gif", @".webp", @".bmp",
+                 @".heic", @".svg", @".ico", @".tiff"];
+    });
+    NSString *low = [s lowercaseString];
+    NSRange q = [low rangeOfString:@"?"];
+    NSString *pathPart = (q.location == NSNotFound) ? low : [low substringToIndex:q.location];
+    for (NSString *e in exts) {
+        if ([pathPart hasSuffix:e]) return YES;
+    }
+    return NO;
+}
+
+// 递归收集候选。**有界**：
+//   · 深度 ≤5（v0.0.149 从 3 提到 5：多了一层"字符串里再套 JSON"要拆）
+//   · 拆 JSON 的次数 ≤4（`decodes` 预算）—— 畸形结构不许把主线程拖住
+//     （这段是在长按菜单的回调里**同步**跑的）
+static void NBCollectLinks(id node, NSString *key, NSInteger depth,
+                           NSMutableArray *out, int *decodes) {
+    if (!node || depth > 5) return;
     if ([node isKindOfClass:[NSString class]]) {
-        NSURL *u = NBLinkURL((NSString *)node);
+        NSString *str = (NSString *)node;
+        // 🔴🔴 v0.0.149：**字符串里可能再套一层 JSON**。真机就是这样：
+        //    `userInfo.ext = "{\"msg_id\":…}"` —— 不拆开，埋在里面的链接完全看不见。
+        //    拆之前先看首字符，避免对每个普通字符串都跑一次 JSON 解析。
+        if (decodes && *decodes < 4 && str.length > 8 && str.length <= 4096) {
+            unichar c0 = [str characterAtIndex:0];
+            if (c0 == '{' || c0 == '[') {
+                NSData *jd = [str dataUsingEncoding:NSUTF8StringEncoding];
+                id sub = nil;
+                if (jd) {
+                    @try {
+                        sub = [NSJSONSerialization JSONObjectWithData:jd options:0 error:NULL];
+                    } @catch (__unused NSException *e) {
+                        sub = nil;
+                    }
+                }
+                if (sub) {
+                    (*decodes)++;
+                    // 用同一个 key 往下走：外层键名（如 `ext`）通常不像链接，
+                    // 内层的键名在下一轮迭代里才会用上，这正是我们要的。
+                    NBCollectLinks(sub, key, depth + 1, out, decodes);
+                    // 🔴🔴 拆开之后**立刻返回**，别让这坨 JSON 原文再当链接去试：
+                    //    它里面必然含 `://`，而 iOS 16 的 `URLWithString:` 非常宽松，
+                    //    会给它造出一个 scheme 乱码的"候选"去和真链接抢分。
+                    return;
+                }
+            }
+        }
+        NSURL *u = NBLinkURL(str);
         if (!u) return;
+        if (NBURLIsAsset(str, key)) return;      // 见 NBURLIsAsset 的注释
         NSString *sch = [u.scheme lowercaseString];
         BOOL isHttp = [sch isEqualToString:@"http"] || [sch isEqualToString:@"https"];
         BOOL keyish = NBKeyLooksLikeLink(key);
@@ -231,13 +298,25 @@ static void NBCollectLinks(id node, NSString *key, NSInteger depth, NSMutableArr
     }
     if ([node isKindOfClass:[NSDictionary class]]) {
         [(NSDictionary *)node enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
-            NBCollectLinks(v, [k isKindOfClass:[NSString class]] ? (NSString *)k : nil, depth + 1, out);
+            NBCollectLinks(v, [k isKindOfClass:[NSString class]] ? (NSString *)k : nil,
+                           depth + 1, out, decodes);
         }];
         return;
     }
     if ([node isKindOfClass:[NSArray class]]) {
-        for (id v in (NSArray *)node) NBCollectLinks(v, key, depth + 1, out);
+        for (id v in (NSArray *)node) NBCollectLinks(v, key, depth + 1, out, decodes);
     }
+}
+
+// v0.0.149：链接进日志前先截断。
+// 🔴 理由很现实：这段是在长按回调里跑的，日志窗口只有 ~50 行，而拆开双层 JSON 后
+//    候选里可能躺着 4KB 的长链接 —— 一条就能把整屏证据挤掉。
+//    只留前 72 字 + 总长度，足够分清"认的是哪条"，又不吃行数。
+static NSString *NBLinkForLog(NSString *s) {
+    if (![s isKindOfClass:[NSString class]]) return @"(非字符串)";
+    if (s.length <= 72) return s;
+    return [NSString stringWithFormat:@"%@…(共%lu字)", [s substringToIndex:72],
+            (unsigned long)s.length];
 }
 
 + (nullable NSString *)deeplinkFromPayload:(nullable NSString *)payload {
@@ -253,8 +332,14 @@ static void NBCollectLinks(id node, NSString *key, NSInteger depth, NSMutableArr
     if (!root) return nil;
 
     NSMutableArray *cands = [NSMutableArray array];
-    NBCollectLinks(root, nil, 0, cands);
-    if (!cands.count) return nil;
+    int decodes = 0;
+    NBCollectLinks(root, nil, 0, cands, &decodes);
+    if (!cands.count) {
+        // 🔴 这条日志是"为什么长按没有直达"的唯一证据：
+        //    拆了几次能区分「压根没链接」和「链接埋得太深没拆到」。
+        NBSharedLog(@"[直达] 候选 0 条 ｜ 拆 JSON %d 次 ⇒ 退回只打开 App", decodes);
+        return nil;
+    }
     [cands sortUsingComparator:^NSComparisonResult(id a, id b) {
         NSInteger sa = [((NSArray *)a)[0] integerValue];
         NSInteger sb = [((NSArray *)b)[0] integerValue];
@@ -263,6 +348,11 @@ static void NBCollectLinks(id node, NSString *key, NSInteger depth, NSMutableArr
     }];
     NSArray *best = (NSArray *)cands.firstObject;
     id v = (best.count > 1) ? best[1] : nil;
+    // 🔴 只打"选中了哪条 + 打分"，不打全部候选：候选数已经给了，
+    //    需要看细节时再放开。日志行数是预算。
+    NBSharedLog(@"[直达] 候选 %lu 条 ｜ 拆 JSON %d 次 ｜ 选中(%ld)=%@",
+                (unsigned long)cands.count, decodes,
+                (long)[best[0] integerValue], NBLinkForLog((NSString *)v));
     return [v isKindOfClass:[NSString class]] ? (NSString *)v : nil;
 }
 

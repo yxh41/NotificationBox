@@ -980,8 +980,11 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // （v0.0.141 加的「INSERT 降级 7 列」「SELECT 降级」两条保命日志）。
 // 🔴 又是同一个病：那几条留痕 v0.0.141 就打出来了，但**过不了这张筛子**
 //    ⇒ 界面上「只看结论行」永远是干净的，等于没打。这病本项目已经犯过三次。
+// v0.0.149：补 `直达` / `直开` —— AppLauncher 新打的 `[直达] 候选 N 条 ｜ 拆 JSON M 次 ｜ 选中(…)`
+// 正是「长按到底认了哪条链接」的唯一证据，而表里没有任何词能匹配它（`直开` 那条从 v0.0.118
+// 起也一直被筛掉）。若不加，验证长按时会看到"一条都没有"，误判成"压根没走直达"。**第四次。**
 static NSString * const kNBKeyLineTable =
-    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级";
+    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级|直达|直开";
 
 static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [kNBKeyLineTable componentsSeparatedByString:@"|"];
