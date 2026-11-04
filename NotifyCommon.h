@@ -12,7 +12,7 @@
 //    只能靠"三处相等"来保证一致，改版时漏一处就分不清"装的哪一版"（v0.0.56 已经踩过）。
 //    现在这里是**唯一**来源：Tweak.x 的 `NB_VER_STR` 只是它的别名，NotifyStore.m（tweak 与 App
 //    共用）也直接用它 —— 探针文件里报的版本号因此不可能和控件里的不一致。
-#define NOTIFYBOX_VER_STR @"0.0.138"
+#define NOTIFYBOX_VER_STR @"0.0.139"
 
 // ---------- v0.0.137：数据目录回到**编译期常量**，不再运行时解析 ----------
 // 三版三次反复，把结论钉在这里：
@@ -80,6 +80,26 @@ BOOL     NBHealDataDirOwnership(void);
 // 也会体现在返回值与 NSLog 里（否则又是同一个坑：探针自己静默失败）。
 // 返回可写目录个数（0 = 一个都写不进）。
 int      NBWriteBootProbe(void);
+
+// ---------- v0.0.139：**不经过文件系统**的第三条通道 ----------
+//
+// 2026-11-04 下午的处境：所有基于文件的判据全部为绿 ——
+//   大小 346320 ✓ 权限 root:wheel 755 ✓ 版本串/探针串在 ✓ 依赖库全满足 ✓
+//   无缺失符号 ✓ 过滤器 springboard+backboardd ✓ 其他 SpringBoard 插件有效 ✓
+//   两个进程在新版装好后各重启过一次 ✓ /tmp 可写 ✓
+// 却**一个字节都没被写出来**。⇒ 问题不再是"文件对不对"，而是"代码到底有没有执行"。
+// 而这个问题的答案是**文件系统答不了的**（沙箱、信任缓存、注入层都能让它无声消失）。
+//
+// ⇒ 加一条与文件无关的通道：SpringBoard 起来若干秒后，把探针内容**直接显示在屏幕上**。
+//   弹了 = 代码跑了（框里还带着写失败的 errno）；不弹 = 代码没跑。
+//   这条通道不受沙箱、权限、信任缓存影响，因为它不碰文件。
+//
+// 🔴 两条硬约束：
+//   ① 全部走 NSClassFromString + objc_msgSend，**不许硬引用 UIKit 符号**
+//      （tweak 没链 UIKit，硬引用会在加载期变成 undefined symbol ⇒ 又一个"静默不加载"）；
+//   ② 只弹一次、只对能取到 UIApplication 的进程弹（backboardd 是 root 守护进程，没有 UI）。
+NSString *NBLastProbeReport(void);   // ctor 里那次探针的原文，供屏幕提示复用
+void      NBShowBootAlert(void);     // 延迟若干秒后把上面那段原文显示在屏幕上
 
 #define NOTIFYBOX_DB_PATH       [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:NOTIFYBOX_DB_NAME]
 #define NOTIFYBOX_LOG_PATH      [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:NOTIFYBOX_LOG_NAME]

@@ -199,6 +199,17 @@ static NSString *NBProbeOneDir(NSString *dir, NSMutableString *out) {
     return nil;
 }
 
+// v0.0.139：把 ctor 那次探针的**原文**留一份，供屏幕提示（NBShowBootAlert）复用。
+// 🔴 为什么留原文而不是让弹窗自己再探一遍：再探一遍会**重复做写入测试**（每个候选目录
+//    两个测试文件），而"写不进去"恰恰是被观察的对象 —— 多写一次等于干扰现场。
+//    留一份只读副本，屏幕上的数字和 /tmp 文件里的数字**必然同源**，不会出现两个版本。
+// 🔴 只在 ctor 里写一次、之后全进程只读 ⇒ 不需要加锁。
+static NSString *gNBProbeReport = nil;
+
+NSString *NBLastProbeReport(void) {
+    return gNBProbeReport;
+}
+
 int NBWriteBootProbe(void) {
     NSMutableString *out = [NSMutableString string];
     NSString *proc = NBProbeProcName();
@@ -250,6 +261,7 @@ int NBWriteBootProbe(void) {
               proc, errno, strerror(errno), dstAll);
     }
     NSLog(@"[NotifyBox/probe] ===== 探针结果（%@）=====\n%@", proc, out);
+    gNBProbeReport = [out copy];
     return (int)writable.count;
 }
 

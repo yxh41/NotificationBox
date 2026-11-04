@@ -1,6 +1,11 @@
 #import "NotifyProbe.h"
 #import "NotifyCommon.h"
 #import <objc/runtime.h>
+// 🔴 v0.0.139：objc_msgSend 在 objc/message.h（runtime.h 不含它）；
+//    dispatch_after/NSEC_PER_SEC 在 dispatch/dispatch.h。
+//    Foundation 一般会带进来，但 tweak 侧不赌 re-export —— 显式引入。
+#import <objc/message.h>
+#import <dispatch/dispatch.h>
 
 // 探针实现。设计口径：**一次说清楚，而不是每条都刷**。
 //
@@ -213,3 +218,98 @@ static void NBDumpClassMethods(Class c, NSString *label) {
 }
 
 @end
+
+#pragma mark - v0.0.139：屏幕通道（完全不经过文件系统）
+
+// 为什么要有这一条：2026-11-04 那天，所有基于文件的判据全部为绿
+//   （大小/权限/版本串/依赖库/符号/过滤器/对照插件/两个进程都重启过/tmp 可写），
+//   却一个字节都没被写出来。⇒「文件对不对」已经问完了，剩下的是「代码有没有执行」，
+//   而这个问题**文件系统答不了**：沙箱、信任缓存、注入层，每一种都能让它无声消失。
+//   ⇒ 换一条与文件无关的通道：把结果**显示在屏幕上**。
+//     弹了 = 代码跑了（框里带着写失败的 errno）；不弹 = 代码没跑。
+//
+// 🔴 两条硬约束（都是为了避免把"诊断"变成"新的静默失败"）：
+//   ① 全部走 NSClassFromString + objc_msgSend，**绝不硬引用 UIKit 符号**：
+//      tweak 没有链 UIKit，硬引用会在加载期变成 undefined symbol ⇒
+//      直接表现为"插件静默不加载"，正好是这次要排查的那个形态。
+//   ② 取不到 UI 的进程（backboardd 是 root 守护进程）静默退出：
+//      它本来就没有界面，不该在这里产生任何行为。
+
+typedef id   (*NBPMsg0)(id, SEL);
+typedef id   (*NBPMsg1)(id, SEL, id);
+typedef id   (*NBPMsg3a)(id, SEL, id, id, NSInteger);   // alertControllerWithTitle:message:preferredStyle:
+typedef id   (*NBPMsg3b)(id, SEL, id, NSInteger, id);   // actionWithTitle:style:handler:
+typedef void (*NBPVMsg1)(id, SEL, id);
+typedef void (*NBPVMsg3)(id, SEL, id, BOOL, id);
+typedef BOOL (*NBPMsgBool)(id, SEL);
+
+void NBShowBootAlert(void) {
+    static int gAlertArmed = 0;
+    if (gAlertArmed) return;
+
+    Class appCls   = NSClassFromString(@"UIApplication");
+    Class alertCls = NSClassFromString(@"UIAlertController");
+    Class actCls   = NSClassFromString(@"UIAlertAction");
+    if (!appCls || !alertCls || !actCls) return;   // 没有 UI 的进程，静静退出
+    gAlertArmed = 1;
+
+    NSString *msg = NBLastProbeReport();
+    if (!msg.length) msg = @"探针没有产出文本（NBLastProbeReport 返回空）";
+    // 太长会被系统截断；前 8 行是身份 + dylib 路径，正是最要紧的部分
+    if (msg.length > 1500) msg = [msg substringToIndex:1500];
+
+    NSString *title = [NSString stringWithFormat:@"NotifyBox 探针 v%@", NOTIFYBOX_VER_STR];
+
+    // 🔴 为什么要重试：ctor 跑在 SpringBoard 启动的很早阶段，6 秒后界面未必就绪；
+    //    一次弹不出来就永远看不到 —— 那又会变成"没弹 = 没跑"的误判。
+    //    ⇒ 最多试 8 轮、每轮隔 3 秒，成功即停。只有 8 轮全失败才是真的弹不出来。
+    __block int tries = 0;
+    void (^attempt)(void) = ^{
+        tries++;
+        @try {
+            id app = ((NBPMsg0)objc_msgSend)((id)appCls, @selector(sharedApplication));
+            if (!app) return;
+
+            id win = nil;
+            id wins = ((NBPMsg0)objc_msgSend)(app, @selector(windows));
+            if ([wins isKindOfClass:[NSArray class]]) {
+                for (id w in (NSArray *)wins) {
+                    if (((NBPMsgBool)objc_msgSend)(w, @selector(isKeyWindow))) { win = w; break; }
+                }
+                if (!win && [(NSArray *)wins count]) win = [(NSArray *)wins objectAtIndex:0];
+            }
+            if (!win) return;
+
+            id vc = ((NBPMsg0)objc_msgSend)(win, @selector(rootViewController));
+            for (int i = 0; i < 8 && vc; i++) {
+                id p = ((NBPMsg0)objc_msgSend)(vc, @selector(presentedViewController));
+                if (!p) break;
+                vc = p;
+            }
+            if (!vc) return;
+            if (((NBPMsg0)objc_msgSend)(vc, @selector(presentedViewController))) return;
+
+            id alert = ((NBPMsg3a)objc_msgSend)((id)alertCls,
+                @selector(alertControllerWithTitle:message:preferredStyle:),
+                title, msg, (NSInteger)1);
+            if (!alert) return;
+            id ok = ((NBPMsg3b)objc_msgSend)((id)actCls,
+                @selector(actionWithTitle:style:handler:), @"知道了", (NSInteger)0, nil);
+            if (ok) ((NBPVMsg1)objc_msgSend)(alert, @selector(addAction:), ok);
+            ((NBPVMsg3)objc_msgSend)(vc, @selector(presentViewController:animated:completion:),
+                                     alert, YES, nil);
+            NBSharedLog(@"!! [屏幕探针] 已弹出（第 %d 次尝试）", tries);
+        } @catch (__unused NSException *e) {
+            // 弹不出来就下一轮，绝不因为 UI 异常影响 tweak 本身
+        }
+    };
+
+    // 8 轮 × 3 秒，超出就不再试（避免用户几十分钟后又看到一个框，误以为是别的东西）
+    for (int i = 0; i < 8; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((6 + i * 3) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (tries >= 8) return;
+            attempt();
+        });
+    }
+}
