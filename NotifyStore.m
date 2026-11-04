@@ -1936,8 +1936,8 @@ static NSString *NBAppendMarker(NSMutableString *s, NSString *label, NSString *p
             }
         }
         if (!anyRead) {
-            [s appendString:@"\n  🔴 一个探针文件都没有 ⇒ 两个可能，靠"App 能否看到 /tmp"区分：\n"
-                          @"     · 上一行说了"看不到 /private/var/tmp" ⇒ 是沙箱，本条不作证据；\n"
+            [s appendString:@"\n  🔴 一个探针文件都没有 ⇒ 两个可能，靠「App 能否看到 /tmp」区分：\n"
+                          @"     · 上一行说了「看不到 /private/var/tmp」⇒ 是沙箱，本条不作证据；\n"
                           @"     · 能看到 /tmp 却一个文件都没有 ⇒ tweak 与 App 都没跑起来/没写成功，\n"
                           @"       去终端用 root 跑：cat /private/var/tmp/nb_boot_*.txt\n"];
         }
