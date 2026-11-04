@@ -192,6 +192,7 @@
 #import <dlfcn.h>
 #include <pthread.h>          // v0.0.96：诊断文件追加要加锁（多线程写同一文件会互相盖掉行首）
 #include <unistd.h>           // v0.0.136：getuid()（区分 root 进程）+ chown()（修数据目录属主）
+#include <string.h>           // v0.0.137：memset()（struct stat 先清零再 stat）
 #include <sys/stat.h>         // v0.0.136：stat() 读目录属主，诊断里要打出来
 #import "NotifyStore.h"
 #import "NotifyCommon.h"
@@ -232,7 +233,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.136"
+#define NB_VER_STR @"0.0.137"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -5286,6 +5287,23 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
             NSString *p = [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:k];
             chown([p fileSystemRepresentation], 501, 501);
         }
+
+        // 🔴 v0.0.137：**root 侧的装载标记**，单独一个文件名，绝不和 SpringBoard 那个混用。
+        //   为什么必须分开：「`.tweak_ctor` 存在」只能证明**某个非 root 进程跑过**；
+        //   而「属主到底修好了没有」只有 root 这一侧能证明。两个事实混进一个文件 ⇒
+        //   只能知道其中之一，而上一轮恰恰就栽在「只知道一半」上。
+        //   两道守卫，缺一不可：
+        //     ① 目录必须**已经存在** —— root 一旦 createDirectory 就把目录变成 root 所有，
+        //        那正是这次事故的根因；**不许在"修它"的代码里再造一次**。
+        //     ② chown 必须**真的成**（st_uid == 501）—— 所以「有 root 标记」这件事本身
+        //        就等于「属主已经修好了」，不需要读者再去比对另一行。
+        struct stat rst; memset(&rst, 0, sizeof(rst));
+        if (stat(legacy, &rst) == 0 && rst.st_uid == 501) {
+            NSString *m = [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:@".tweak_ctor_root"];
+            NSString *body = [NSString stringWithFormat:@"%@ %@ %@ chown=OK uid=%d",
+                              [NSDate date], NBProc(), NB_VER_STR, (int)rst.st_uid];
+            [body writeToFile:m atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
     }
 
     // 🔴 与 tweak.log 独立的「我跑过」证据：
@@ -5338,18 +5356,30 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
         //   库到底在哪个目录、那个目录 App 能不能写。判据要能直接答这个问题。
         //   与 App 侧 didFinishLaunching 打的那行**同一格式**，两边一对就知道一不一致。
         {
+            // 🔴 v0.0.137：先做非 root 侧的属主自愈，再打路径行 —— 顺序不能反：
+            //   反了就会打出一行"不可写"，然后才修好，读者拿到的是**修好之前**的快照。
+            BOOL healed = NBHealDataDirOwnership();
             NSString *dir = NBDataDir();
-            NSString *src = [dir isEqualToString:NOTIFYBOX_LEGACY_DIR] ? @"老路径" : @"App容器";
             struct stat st = {0};
             BOOL hasStat = (stat([dir fileSystemRepresentation], &st) == 0);
-            NBLog(@"=== [路径] SpringBoard 数据目录=%@ 来源=%@ 属主=%d:%d 可写=%@ uid=%d",
-                  dir, src,
-                  hasStat ? (int)st.st_uid : -1, hasStat ? (int)st.st_gid : -1,
-                  (access([dir fileSystemRepresentation], W_OK) == 0) ? @"是" : @"否",
-                  (int)getuid());
+            BOOL dwok = (hasStat && access([dir fileSystemRepresentation], W_OK) == 0);
+            // 🔴 删掉「来源」字段：v0.0.136 那版这里会打出 `App容器` / `老路径`，
+            //   看着像"两个进程协商过的结果"，其实**两个进程各算各的** —— 那正是 bug 本身。
+            //   路径现在是常量，这一行只回答两个真问题：**目录归谁**、**我能不能写**。
+            NBLog(@"=== [路径] SpringBoard 数据目录=%@ 属主=%d:%d 可写=%@ 自愈=%@ uid=%d",
+                  dir, hasStat ? (int)st.st_uid : -1, hasStat ? (int)st.st_gid : -1,
+                  dwok ? @"是" : @"否", healed ? @"是" : @"否", (int)getuid());
+            // 不可写时必须再喊一次 NSLog：上面那行要写进这个目录的文件里，
+            // 目录不可写 ⇒ 它自己就写不进去 ⇒ 静默 ⇒ 现场看起来像"没跑到"。
+            if (!dwok) {
+                NSLog(@"[NotifyBox] ⚠️ 数据目录不可写 dir=%@ 属主=%d:%d uid=%d "
+                      @"（backboardd 的 chown 没跑到？目录非空时无法自愈，见 NBHealDataDirOwnership）",
+                      dir, hasStat ? (int)st.st_uid : -1, hasStat ? (int)st.st_gid : -1, (int)getuid());
+            }
         }
-        // 老路径 → 容器的**一次性**迁移（幂等；目标已存在就跳过，只拷不删）
-        NBMigrateLegacyDataIfNeeded();
+        // 🔴 v0.0.137：原来这里调 `NBMigrateLegacyDataIfNeeded()`（老路径 → App 容器）。
+        //   那个方向**整个撤掉了**：路径回到常量，没有"新位置"可迁。
+        //   留着不删会比不写更糟 —— 它会把老库往一个两个进程都算不出来的地方搬。
 
         // v0.0.52：注册 Darwin 通知观察者（盒子 App 删记录时唤醒我们清通知中心）。
         // 🔴 只在 SpringBoard 注册：tweak 主逻辑都在 SpringBoard；backboardd 不处理通知中心。

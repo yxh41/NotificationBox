@@ -2,7 +2,7 @@
 #import "ViewController.h"
 #import "NotifyFilter.h"
 #import "NotifyStore.h"
-// 🔴 v0.0.136：NBDataDir() / NBSharedLog() / NBMigrateLegacyDataIfNeeded() 都在这份头里。
+// 🔴 v0.0.137：NBDataDir() / NBAltDataDir() / NBSharedLog() / NBHealDataDirOwnership() 都在这份头里。
 //    NotifyStore.h **不** import 它（tweak 与 App 的公共契约单独一份，避免头文件互相牵连），
 //    所以这里必须显式引 —— 少一行就是 "implicit declaration of function NBSharedLog"。
 #import "NotifyCommon.h"
@@ -10,19 +10,22 @@
 @implementation AppDelegate
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    // 🔴🔴 v0.0.136：**第一件事**就是定数据目录 + 迁移老数据。
+    // 🔴🔴 v0.0.137：**第一件事**就是属主自愈 + 打「我在哪个目录」。
     //
-    // 为什么排在最前面、且必须在这里：
-    //   ① 后面每一步（读设置、runAutoClean、合并重复、读列表）都要先知道库在哪；
-    //      晚一步就是"用错的路径做了一次迁移"，比不做更糟（§1 顺序必须落成代码结构）。
-    //   ② 迁移是**幂等**的（目标已存在就跳过），每次启动都调没有代价。
-    //   ③ 这是**唯一**能拿到自己 Documents 的进程 —— tweak 那边是扫容器扫出来的，
-    //      只有 App 这边是系统亲口告诉的 ⇒ 必须在这里落一次日志，两边好对比。
-    NBMigrateLegacyDataIfNeeded();
+    // 为什么排在最前面：后面每一步（读设置、runAutoClean、合并重复、读列表）都要先能写盘；
+    //   晚一步就是"用错的权限做了一次操作"，比不做更糟。
+    //
+    // ① `NBHealDataDirOwnership()`：目录存在但当前身份写不进、且**为空**时，删掉重建。
+    //    这是**不依赖 root 注入**的那条腿（root 那条在 Tweak.x 的 ctor 里 chown）。
+    //    删目录看的是**父目录**（/var/mobile/Library，归 mobile）的写权限 ⇒ 这里删得掉。
+    // ⚠️ 非空目录它**绝不**动 —— 里面有记录就是用户的全部历史，宁可不自愈也不赌。
+    //
+    // ② 路径是**常量**，不再有"来源"可打。v0.0.136 那行 `来源=老路径兜底/App容器`
+    //    看着像"判断结果"，实际是两个进程各算各的 —— 那个 bug 就是被这行字藏起来的。
+    BOOL healed = NBHealDataDirOwnership();
     NSString *dataDir = NBDataDir();
-    NSString *dataSrc = [dataDir isEqualToString:NOTIFYBOX_LEGACY_DIR] ? @"老路径兜底" : @"App容器";
-    NBSharedLog(@"[路径] 盒子App 数据目录=%@ 来源=%@ DB存在=%@",
-                dataDir, dataSrc,
+    NBSharedLog(@"[路径] 盒子App 数据目录=%@ 自愈=%@ DB存在=%@",
+                dataDir, healed ? @"是" : @"否",
                 [[NSFileManager defaultManager] fileExistsAtPath:NOTIFYBOX_DB_PATH] ? @"是" : @"否");
 
     // 🔴🔴 v0.0.28：旧格式（soundApps 名单 + 全局音）→ soundMap 的**唯一**迁移时机。

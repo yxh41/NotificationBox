@@ -19,17 +19,19 @@
 //    界面上不许再写一个 2000。
 static const NSInteger kNBListLimit = 2000;
 
-// ---------- v0.0.136：数据目录的**单点出口**（App 容器优先，老路径兜底） ----------
-// 🔴 为什么必须是「一个函数」而不是「两个进程各写一份」：
-//    库/日志/设置分散在 40 处调用点，只要有一处解析结果不同，就会出现
-//    「tweak 记了、App 看不到」——这次真机买到的就是这一类（只是根因在沙箱，不在解析）。
-//    ⇒ 两个进程调**同一个实现**，只有"怎么拿到自己的容器"这一步分叉。
-//
-// 🔴 为什么扫 metadata 而不是用 LSApplicationWorkspace 的 dataContainerURL：
-//    ① 纯 Foundation，tweak 侧不多链一个私有框架（多链一个就多一份加载期风险）；
-//    ② SpringBoard 以 root 视角读 metadata 一定成功；
-//    ③ 代价是每次要读 N 个 plist ⇒ 结果必须缓存。
-// 🔴 为什么不能把容器 UUID 写死：App **每重装一次 UUID 就变**（每次装包都在变）。
+// ---------- v0.0.137：数据目录 = 常量（v0.0.136 的"运行时解析"已撤销） ----------
+// 🔴🔴 v0.0.136 的错假设，逐条记下来，别再犯：
+//    它以为「tweak 有 root 权限，能写进 App 容器」。**只有 backboardd 是 root**，
+//    SpringBoard 是 mobile 且受沙箱约束：列不出 `/var/mobile/Containers/Data/Application`
+//    （读不了别人容器的父目录），也写不进别人的容器（那是 **那个 App 的** profile 放行的）。
+//    ⇒ 真机结果 = split-brain：App 在自己容器里读写（记录数 0），SpringBoard 落回老路径
+//      记到别处；而 App 只在**自己的**目录里找 `.tweak_ctor` ⇒ 报「tweak 从未注入」。
+//    ⇒ 两条铁律：
+//      ① **路径只能是常量**（NOTIFYBOX_LEGACY_DIR）。常量算不出两个答案。
+//      ② 老路径的真问题只有**属主**，而属主只有 root 能改 ⇒ 由 backboardd 的 ctor chown。
+// 🔴 下面这个 `NBFindAppDocsDir()` 现在**只服务诊断**（NBAltDataDir），
+//    **绝不**参与写入路径决策 —— 它拿到的路径在 SpringBoard 里恒为 nil，
+//    在 App 里恒为自己的容器，两边不一致本身就是这个 bug 的源头。
 static NSString *NBFindAppDocsDir(void) {
     NSString *base = @"/var/mobile/Containers/Data/Application";
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -49,74 +51,60 @@ static NSString *NBFindAppDocsDir(void) {
     return nil;
 }
 
-static NSString *gNBDataDir = nil;          // 进程内缓存（容器变了用 NBRefreshDataDir() 清）
-
-void NBRefreshDataDir(void) {
-    @synchronized ([NotifyStore class]) { gNBDataDir = nil; }
-}
-
+// v0.0.137：数据目录就是那个常量。留成函数只为「有个名字可以打日志」。
+// 🔴 这里**不许**再加任何 if/else 去选路径 —— 一旦路径能在运行时变，
+//    两个进程就会算出两个答案，那就是 v0.0.136 的 split-brain（记录写在一边、读在另一边）。
+// 只保留一个副作用：目录不在就建一次。**只许非 root 建**（见 NBCanWriteSharedFiles）。
+static BOOL gNBDirTried = NO;
 NSString *NBDataDir(void) {
-    @synchronized ([NotifyStore class]) {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        // 🔴 缓存必须**带存在性检查**：App 重装后 UUID 变了，旧路径还躺在缓存里 ⇒
-        //    写入会失败，而且失败得很安静（目录不存在 ⇒ sqlite3_open 报 unable to open）。
-        if (gNBDataDir.length && [fm fileExistsAtPath:gNBDataDir]) return gNBDataDir;
-
-        // App 自己的 Documents（两个进程都算得出来：App 直接问系统，SpringBoard 扫容器）
-        NSString *docs = nil;
-        if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:NOTIFYBOX_APP_BUNDLE]) {
-            NSArray *u = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask];
-            if (u.count) docs = [[u firstObject] path];
-        } else {
-            docs = NBFindAppDocsDir();
+    if (!gNBDirTried) {
+        gNBDirTried = YES;
+        if (NBCanWriteSharedFiles()) {
+            [[NSFileManager defaultManager] createDirectoryAtPath:NOTIFYBOX_LEGACY_DIR
+                                      withIntermediateDirectories:YES attributes:nil error:nil];
         }
-
-        // 🔴🔴 **粘性降级**：路径只能被决定一次，之后不许随运行状态来回漂。
-        //   为什么必须这样：legacy 现在不可写（属主被 root 占了）⇒ 本次降级到容器；
-        //   而 backboardd 那边的 chown 修好之后，下一次 respring legacy 又变可写 ⇒
-        //   如果每次都按"当前可写"重新选，就会出现「这次写 A、下次写 B」，
-        //   两边的数据各自增长、互相看不见 —— 那正是这次事故的同型 bug，不能再造一次。
-        //   所以：一旦降级，就在容器里留一个 `.nb_dir_pinned` 标记，**永久**用容器。
-        //   （想回到老路径：删掉这个标记文件即可，见 README/设置页说明。）
-        NSString *pin = docs ? [docs stringByAppendingPathComponent:@".nb_dir_pinned"] : nil;
-        BOOL pinned = (pin.length && [fm fileExistsAtPath:pin]);
-
-        NSString *dir = nil;
-        if (pinned) {
-            dir = docs;                                     // 已固定：无条件用容器
-        } else if (access([NOTIFYBOX_LEGACY_DIR fileSystemRepresentation], W_OK) == 0) {
-            dir = NOTIFYBOX_LEGACY_DIR;                     // 正常情况：老路径可写 ⇒ 用它
-        } else if (docs.length) {
-            // 首次降级：写下标记（固定住），历史数据由 NBMigrateLegacyDataIfNeeded() 拷过来
-            [fm createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
-            [@"" writeToFile:pin atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            dir = docs;
-        } else {
-            dir = NOTIFYBOX_LEGACY_DIR;                     // 兜底（App 没装 / 扫不到容器）
-        }
-
-        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        gNBDataDir = dir;
-        return dir;
     }
+    return NOTIFYBOX_LEGACY_DIR;
 }
 
-// 老路径 → 新位置的一次性迁移。
-// 🔴 三条规矩（少一条就会丢数据或反复覆盖）：
-//    ① **只拷不删**：老文件留着当备份。删掉就再也回不了头（这次用户已经手删过一次，血账）；
-//    ② 目标已存在就跳过：否则每次启动都拿老库盖新库 ⇒ 新记录全被冲掉；
-//    ③ 库和设置**各判各的**：少迁一个就会出现「库对了、设置全没了」的半废状态。
-void NBMigrateLegacyDataIfNeeded(void) {
-    NSString *dir = NBDataDir();
-    if (!dir.length || [dir isEqualToString:NOTIFYBOX_LEGACY_DIR]) return;
+// v0.0.137：属主自愈的**非 root 那条腿**。
+//   能改属主的只有 root（在 Tweak.x 的 ctor 里做），但那条腿依赖 backboardd 真被注入。
+//   这一条不依赖 root：目录被 root 建成 501 写不进时，只要它是**空的**，
+//   当前进程就能把它删掉重建 —— 删目录看的是**父目录**的写权限，而
+//   `/var/mobile/Library` 归 mobile ⇒ mobile 删得掉。
+// 🔴 三条限制，一条都不能松：
+//   ① **非空绝不删**：里面有记录就是用户全部历史，宁可不自愈也不赌；
+//   ② root 进程不许调：它会把自己刚建的那个目录再建一次，等于原地复活这个 bug；
+//   ③ 只在「存在但当前身份写不进」时动手 —— 可写时零动作（不碰就不会出事）。
+// 返回 YES = 这次真的动手且成功了（调用方要把这个事实打进日志）。
+BOOL NBHealDataDirOwnership(void) {
+    if (!NBCanWriteSharedFiles()) return NO;
+    const char *p = [NOTIFYBOX_LEGACY_DIR fileSystemRepresentation];
+    struct stat hst; memset(&hst, 0, sizeof(hst));
+    if (stat(p, &hst) != 0) return NO;              // 不存在：让 NBDataDir 正常建（归本进程所有）
+    if (access(p, W_OK) == 0) return NO;            // 可写：零动作
     NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *name in @[NOTIFYBOX_DB_NAME, NOTIFYBOX_SETTINGS_NAME]) {
-        NSString *dst = [dir stringByAppendingPathComponent:name];
-        NSString *src = [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:name];
-        if ([fm fileExistsAtPath:dst]) continue;
-        if (![fm fileExistsAtPath:src]) continue;
-        [fm copyItemAtPath:src toPath:dst error:nil];
+    NSArray *kids = [fm contentsOfDirectoryAtPath:NOTIFYBOX_LEGACY_DIR error:nil];
+    // 🔴 `kids == nil` 与 `count == 0` 必须分开判：读不出来（权限/异常）不等于"空"，
+    //    把 nil 当 0 会在读失败时删掉一个**可能有记录**的目录。
+    if (kids == nil || kids.count > 0) return NO;
+    if (![fm removeItemAtPath:NOTIFYBOX_LEGACY_DIR error:nil]) return NO;
+    return [fm createDirectoryAtPath:NOTIFYBOX_LEGACY_DIR
+             withIntermediateDirectories:YES attributes:nil error:nil];
+}
+
+// 诊断专用：盒子 App 的容器 Documents。**永远不许拿它当写入路径。**
+//   App 进程：直接问系统要自己那份（准确、零扫描）；
+//   其它进程：扫 metadata（SpringBoard 受沙箱限制基本扫不到 ⇒ 返回 nil 是正常现象，
+//            这恰恰是 v0.0.136 split-brain 的直接原因，诊断里要把这个 nil 显示出来）。
+NSString *NBAltDataDir(void) {
+    NSString *own = [[NSBundle mainBundle] bundleIdentifier];
+    if ([own isEqualToString:NOTIFYBOX_APP_BUNDLE]) {
+        NSArray *u = [[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
+                                                            inDomains:NSUserDomainMask];
+        return u.count ? [[u firstObject] path] : nil;
     }
+    return NBFindAppDocsDir();
 }
 
 // 🔴🔴🔴 v0.0.136 的**根因刀**：哪些进程可以碰共享数据目录
@@ -154,9 +142,14 @@ static void NBStoreLog(NSString *fmt, ...) {
   withIntermediateDirectories:YES attributes:nil error:nil];
     NSData *d = [[NSString stringWithFormat:@"[STORE %@] %@\n",
                   [NSDate date], msg] dataUsingEncoding:NSUTF8StringEncoding];
+    errno = 0;
+    BOOL wok = NO;
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:NOTIFYBOX_LOG_PATH];
-    if (fh) { @try { [fh seekToEndOfFile]; [fh writeData:d]; } @finally { [fh closeFile]; } }
-    else { [d writeToFile:NOTIFYBOX_LOG_PATH atomically:YES]; }
+    if (fh) { @try { [fh seekToEndOfFile]; [fh writeData:d]; wok = YES; } @finally { [fh closeFile]; } }
+    else { wok = [d writeToFile:NOTIFYBOX_LOG_PATH atomically:YES]; }
+    // v0.0.137：与 NBSharedLog 同一条规矩 —— 写不进去要当场喊，不许静默。
+    if (!wok) NSLog(@"[NotifyBox/写日志失败 STORE] errno=%d(%s) path=%@ | %@",
+                    errno, strerror(errno), NOTIFYBOX_LOG_PATH, msg);
 }
 
 // ---------- 统一日志（tweak / App / 新模块共用） ----------
@@ -191,12 +184,23 @@ void NBSharedLog(NSString *fmt, ...) {
     [fm createDirectoryAtPath:[NOTIFYBOX_LOG_PATH stringByDeletingLastPathComponent]
   withIntermediateDirectories:YES attributes:nil error:nil];
     NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+    // 🔴🔴 v0.0.137：**写不进去必须留痕**。
+    //   以前这里失败是完全静默的：日志文件不存在 ⇒ 用户看到的是「tweak 没生效」，
+    //   而真相是「写了、但一个字节都没落盘」。静默失败和"没触发"长得一模一样，
+    //   这类坑只能靠当场喊出来区分（NSLog 进系统日志，落哪里都能捞）。
+    errno = 0;
+    BOOL wok = NO;
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:NOTIFYBOX_LOG_PATH];
     if (fh) {
-        @try { [fh seekToEndOfFile]; [fh writeData:d]; }
+        @try { [fh seekToEndOfFile]; [fh writeData:d]; wok = YES; }
+        @catch (NSException *e) { wok = NO; }
         @finally { [fh closeFile]; }
     } else {
-        [d writeToFile:NOTIFYBOX_LOG_PATH atomically:YES];
+        wok = [d writeToFile:NOTIFYBOX_LOG_PATH atomically:YES];
+    }
+    if (!wok) {
+        NSLog(@"[NotifyBox/写日志失败] errno=%d(%s) path=%@ | %@",
+              errno, strerror(errno), NOTIFYBOX_LOG_PATH, msg);
     }
 }
 
@@ -1597,15 +1601,55 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     NBStoreLog(@"[APP-ALIVE] 盒子App 启动 v%@ · 说明此路径本 App 可写", ver);
 }
 
+// v0.0.137：把「某个位置的装载标记」打出来，返回其内容（没有就 nil）。
+// 🔴 为什么单独一个函数、而不是在 envCheck 里写一遍：
+//    现在有**三个**位置要查（老路径的 SpringBoard 标记、老路径的 root 标记、App 容器的旧标记），
+//    每个位置的判据必须**各自独立打印**。上一版只查了「当前数据目录」这一处 ⇒
+//    把「tweak 记到别处去了」误报成「tweak 从未注入」，方向错了整整一天。
+static NSString *NBAppendMarker(NSMutableString *s, NSString *label, NSString *path) {
+    if (!path.length) {
+        [s appendFormat:@"  ❔ %@：本进程算不出这个路径\n", label];
+        return nil;
+    }
+    NSFileManager *fm2 = [NSFileManager defaultManager];
+    NSDictionary *a = [fm2 attributesOfItemAtPath:path error:nil];
+    NSString *txt = [NSString stringWithContentsOfFile:path
+                                             encoding:NSUTF8StringEncoding error:nil];
+    NSString *t = [txt stringByTrimmingCharactersInSet:
+                   [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    // 🔴 三态必须分清，不许合并：「读到内容」「文件在但读不出」「不存在」是三件事。
+    //   上一版把前两个并成「不存在」⇒ 直接把排查方向带偏一整天。
+    if (txt != nil) {
+        [s appendFormat:@"  ✅ %@\n     %@\n     %@\n", label, path,
+            t.length ? t : @"（文件存在但内容为空）"];
+        return t.length ? t : nil;
+    }
+    if (a) {   // 文件在、但内容读不出（0 字节 / 权限）
+        [s appendFormat:@"  ⚠️ %@\n     %@\n     文件在但内容读不出（%llu B）\n", label, path,
+            [a[NSFileSize] unsignedLongLongValue]];
+        return nil;
+    }
+    [s appendFormat:@"  ❌ %@ 不存在\n     %@\n", label, path];
+    return nil;
+}
+
 + (NSString *)envCheck {
     NSMutableString *s = [NSMutableString string];
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dir = [NOTIFYBOX_DB_PATH stringByDeletingLastPathComponent];
 
-    [s appendFormat:@"── 路径 ──\n目录 %@\n", dir];
+    [s appendFormat:@"── 路径 ──\n目录 %@（v0.0.137 起是**常量**，两个进程必然一致）\n", dir];
     BOOL dirExists = [fm fileExistsAtPath:dir];
     [s appendFormat:@"  存在=%@  可写=%@\n", dirExists ? @"是" : @"否",
         [fm isWritableFileAtPath:dir] ? @"是" : @"否"];
+    // 🔴 v0.0.137：**属主单列一行**。
+    //   「存在 / 可读 / 可写」是**一个事实说三遍**（目录不在，后两个必然否），
+    //   看着像三条证据、其实只有一条 —— 上一轮真机排查就是被它带偏的。
+    //   属主才是那个独立信息量：不是 501:501 就直接指向「被 root 进程占过」。
+    struct stat dst; memset(&dst, 0, sizeof(dst));
+    BOOL hasSt = (stat([dir fileSystemRepresentation], &dst) == 0);
+    [s appendFormat:@"  属主=%d:%d（应为 501:501）\n",
+        hasSt ? (int)dst.st_uid : -1, hasSt ? (int)dst.st_gid : -1];
     if (!dirExists) {
         NSError *e = nil;
         BOOL ok = [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&e];
@@ -1666,17 +1710,41 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
         [s appendFormat:@"  最后修改=%@\n", la[NSFileModificationDate]];
     }
 
-    // 🔴 与日志独立的「tweak 跑过」标记：用来区分「没注入」和「写日志失败」
-    NSString *mark = [dir stringByAppendingPathComponent:@".tweak_ctor"];
-    NSString *mtxt = [NSString stringWithContentsOfFile:mark
-                                               encoding:NSUTF8StringEncoding error:nil];
-    if (mtxt.length) {
-        [s appendFormat:@"\n── tweak 装载标记 ──\n  ✅ %@\n  内容=%@\n", mark,
-            [mtxt stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]];
-        [s appendString:@"  ⇒ tweak 确实注入过；若日志缺失则是写日志环节的问题\n"];
+    // ── 装载标记：三个位置各查一次 ──
+    // 🔴 v0.0.137：这三个标记对应**三个不同的事实**，合并成一个就必然误判：
+    //      `.tweak_ctor`       非 root 进程（SpringBoard/mobile）跑过 —— 真·注入证据
+    //      `.tweak_ctor_root`  root 进程（backboardd）跑过**且 chown 成功** —— 属主自愈证据
+    //      旧位置里的 `.tweak_ctor`   v0.0.136 留下的 split-brain 残留
+    //    上一版只查了「当前数据目录」这一处 ⇒「tweak 记到别处去了」被误报成
+    //    「tweak 从未注入任何进程」。判据说得比证据宽，方向就错。
+    [s appendString:@"\n── tweak 装载标记 ──\n"];
+    NSString *altDir = NBAltDataDir();
+    NSString *txtSB  = NBAppendMarker(s, @"SpringBoard（mobile）",
+                                      [dir stringByAppendingPathComponent:@".tweak_ctor"]);
+    NSString *txtRt  = NBAppendMarker(s, @"backboardd（root，chown 成功才写）",
+                                      [dir stringByAppendingPathComponent:@".tweak_ctor_root"]);
+    NSString *txtOld = NBAppendMarker(s, @"旧位置（App 容器，v0.0.136 残留）",
+                                      altDir ? [altDir stringByAppendingPathComponent:@".tweak_ctor"] : nil);
+    if (txtSB.length && txtRt.length) {
+        [s appendString:@"  ⇒ 两个进程都注入过，属主自愈也跑过了\n"];
+    } else if (txtSB.length) {
+        [s appendString:@"  ⇒ SpringBoard 注入过；缺 root 标记 = backboardd 没跑到或 chown 没过\n"];
+    } else if (txtOld.length) {
+        [s appendString:@"  ⇒ ⚠️ 只有旧位置的标记：tweak 在跑，但**记到别处去了**（split-brain）\n"];
     } else {
-        [s appendFormat:@"\n── tweak 装载标记 ──\n  ❌ %@ 不存在\n", mark];
-        [s appendString:@"  ⇒ tweak 从未注入任何进程（或装了没 respring、或过滤器未命中）\n"];
+        [s appendString:@"  ⇒ 三处都没有：tweak 没注入（或装了没 respring、或过滤器未命中）\n"];
+    }
+
+    // ── 旧位置（App 容器，只读参考）──
+    // 🔴 存在的唯一意义：证明「记录到底写去了哪」。不参与任何决策，也不往那儿写。
+    [s appendString:@"\n── 旧位置（App 容器，只读参考）──\n"];
+    if (!altDir.length) {
+        [s appendString:@"  目录=（本进程算不出来）\n"];
+    } else {
+        NSString *altDB = [altDir stringByAppendingPathComponent:NOTIFYBOX_DB_NAME];
+        NSDictionary *aa = [fm attributesOfItemAtPath:altDB error:nil];
+        [s appendFormat:@"  目录=%@\n  DB 存在=%@  大小=%llu B\n", altDir,
+            aa ? @"是" : @"否", [aa[NSFileSize] unsignedLongLongValue]];
     }
 
     // dylib 装在哪：优先用 tweak 自己用 dladdr 报出来的路径（roothide 会重定向前缀，
@@ -1806,10 +1874,11 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     // 🔴 v0.0.136：把「目录是谁的」直接摆到界面上。
     //   旧的三行（存在/可读/可写）是**一个事实说三遍** —— 文件不在，后两个必然是否，
     //   看着像三条证据，其实只有一条。真机排查时它没能回答"为什么 App 进不去"。
-    //   现在改成：目录来源 + 属主 uid:gid + 目录可写（当前身份）——这三项各自独立，
+    //   现在改成：属主 uid:gid + 目录可写（当前身份）——各项独立，
     //   属主不是 501:501 就直接指向"被 root 进程占过"。
+    // 🔴 v0.0.137：删掉「来源」那一行 —— 路径已回常量，它恒等于「老路径」，
+    //   **恒为定值的字段就是死探针**（占界面一行、信息量为零，还让人以为在判断什么）。
     NSString *dir = NBDataDir();
-    NSString *src = [dir isEqualToString:NOTIFYBOX_LEGACY_DIR] ? @"老路径" : @"App容器";
     struct stat st; memset(&st, 0, sizeof(st));
     BOOL hasStat = (stat([dir fileSystemRepresentation], &st) == 0);
     BOOL exists = [fm fileExistsAtPath:NOTIFYBOX_DB_PATH];
@@ -1817,9 +1886,9 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
     unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
     NSInteger n = [self count];
     NSMutableString *s = [NSMutableString stringWithFormat:
-            @"数据目录：%@\n  来源：%@\n  属主：%d:%d（应为 501:501）  可写：%@\n"
+            @"数据目录：%@\n  属主：%d:%d（应为 501:501）  可写：%@\n"
             @"DB 文件：%@\n  存在：%@  大小：%llu B  可读：%@\n记录数：%ld  上限：%ld",
-            dir, src,
+            dir,
             hasStat ? (int)st.st_uid : -1, hasStat ? (int)st.st_gid : -1,
             (access([dir fileSystemRepresentation], W_OK) == 0) ? @"是" : @"否",
             NOTIFYBOX_DB_PATH,
