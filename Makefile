@@ -110,6 +110,23 @@ NotifyBoxApp_CFLAGS = -fobjc-arc -Wno-unused-parameter -Wno-unused-variable -Wno
 NotifyBoxApp_LIBRARIES = sqlite3
 NotifyBoxApp_INSTALL_PATH = /Applications
 
+# 🔴🔴🔴 v0.0.143：App 必须带 entitlements 签名，否则它读不到自己的数据库。
+#
+# 真机事实（2026-11-04）：数据目录是常量 /var/mobile/Library/NotifyBox
+# （tweak 与 App 必须同一个，否则就是 v0.0.136 的 split-brain），
+# 而 App 没有任何 entitlement ⇒ 系统按普通沙箱 App 处理 ⇒ 禁止访问容器外路径：
+#     目录 存在=是 属主=501:501    ← stat 能到（Unix 权限 755 mobile）
+#     可写=否 errno=1(EPERM)       ← 沙箱拒绝
+#     DB   存在=否                ← 文件明明在（root 看得见 28672 B）
+#     记录数=-1                   ← sqlite3_open 也打不开
+# ⇒ 用户看到的「记录全没了」其实是「App 看不见记录」。
+#
+# 🔴 `-S` 后面**必须紧跟文件名、不能有空格**（ldid 的语法），否则 ldid 会把
+#    `-S` 当成"用默认 adhoc"，entitlements 静默丢失 —— 那种失败**不会报错**，
+#    装完一切照旧，白跑一轮。所以判据不能只看这行写没写，
+#    必须**从 deb 里解出二进制、确认 entitlements 字符串真的在里面**（见 nb_ent143.py）。
+NotifyBoxApp_CODESIGN_FLAGS = -SResources/NotifyBoxApp.entitlements
+
 include $(THEOS_MAKE_PATH)/application.mk
 
 # 🔴🔴 v0.0.8：**不再往包里放 PreferenceLoader 载荷**。

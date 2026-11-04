@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      v0.0.143：盒子 App 的 entitlements。
+
+      🔴 为什么必须加（真机 2026-11-04 买到的）：
+        本插件的数据目录是常量 `/var/mobile/Library/NotifyBox`（tweak 与 App 必须同一个），
+        而盒子 App 装在 /Applications、**没有任何 entitlement** ⇒ 系统按普通沙箱 App 处理，
+        禁止它访问自己容器以外的路径。真机现象：
+            目录 存在=是  属主=501:501   ← stat 能到（Unix 权限是 755 mobile）
+            可写=否  errno=1(EPERM)      ← 沙箱拒绝，不是 Unix 权限
+            DB   存在=否                 ← 文件明明在（root 看得见 28672 B）
+            记录数=-1                    ← sqlite3_open 也打不开
+        ⇒ 「记录全没了」的真实含义是「App 看不见记录」，不是「tweak 没记」。
+        v0.0.136 当时用「降级到 App 容器」绕过，结果是 split-brain（App 读自己容器、
+        SpringBoard 写老路径，两边永远不同步）⇒ 那一版是错的，已撤销。
+        ⇒ 正解只有一条：**让 App 真的有权限访问那个目录**，而不是让它换个地方躲。
+
+      🔴 两个键的作用：
+        platform-application
+            把本条目标记为「平台应用」，不再按第三方 App 的严格 profile 处理。
+            越狱 App 的标准做法。
+        com.apple.private.security.no-container
+            不要求容器沙箱。App 不再被关进
+            /var/mobile/Containers/Data/Application/<UUID>/ 那一层，
+            因此可以正常读写 /var/mobile/Library/NotifyBox。
+        ⚠️ 副作用（可接受，已确认过）：
+            1) App 会**失去自己的数据容器**。旧容器里可能有 v0.0.136 时代留下的
+               一份 notifybox.sqlite，但那本来就是 split-brain 的产物，弃之无碍。
+            2) `NBFindAppDocsDir()` 这条路会算不出东西 —— 但它现在**只服务诊断**
+               （NBAltDataDir），不影响任何核心读写（见 NotifyStore.m 里那一段注释）。
+
+      🔴 这两个键不会让 App 变得「什么都能干」：iOS 上真正的写保护仍由 Unix 权限
+        （数据目录 0777 = 谁写都行，见 v0.0.142）与 roothide 的签名校验共同决定。
+    -->
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.private.security.no-container</key>
+    <true/>
+</dict>
+</plist>
