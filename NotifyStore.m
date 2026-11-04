@@ -2035,6 +2035,80 @@ static NSString *NBEnvPayloadSample(sqlite3 *db) {
     return out;
 }
 
+// v0.0.145：「样本里有没有链接」必须**先反转义再判**。
+// 🔴 这是 v0.0.144 那次真机自证里抓到的一把坏尺子：
+//    样本是 `{"action":"sms:\/\/open?groupid=…(smsft)"}` —— 明明有链接，
+//    我的判据在原始文本里找 `://` 却恒不命中，报了个「否」。
+//    原因：库里存的是 JSON，`/` 被序列化成了 `\/`。
+//    ⇒ 三态输出，把「原文就含」与「反转义后才含」分开 —— 后者正是本次的真身，
+//      合并成一个「是」就把"我的判据要反转义"这条信息抹掉了。
+static NSString *NBEnvLinkState(NSString *payload) {
+    if (![payload isKindOfClass:[NSString class]] || !payload.length) return @"(无样本)";
+    if ([payload rangeOfString:@"://"].location != NSNotFound) return @"是·原文";
+    NSString *un = [payload stringByReplacingOccurrencesOfString:@"\\/" withString:@"/"];
+    if (un && [un rangeOfString:@"://"].location != NSNotFound) return @"是·反转义后";
+    return @"否";
+}
+
+// 最近 N 条里带 payload 的条数 —— 这是把「5/500」拆开的唯一判据。
+// 🔴 为什么非要它：`5/500` 有两种完全相反的解释 ——
+//    ① 现在抓得挺好，那 495 条是**加列之前的库存**（永久补不回来，正常）；
+//    ② 现在也只抓得到 1%（真故障）。
+//    只看总数永远分不开；只看「最新一条」又会被一条巧合骗到。
+//    `ts DESC LIMIT N` 问的是"**最近这批**里命中多少"，直接回答"现在还在抓吗"。
+static long NBEnvPayloadRecent(sqlite3 *db, int n) {
+    if (!db || n <= 0) return -1;
+    // 用 NSString 拼而不是 char[256]+snprintf：SQL 一长就容易悄悄截断，
+    // 而截断后的 SQL 语法错 ⇒ prepare 失败 ⇒ 返回 -1，看起来像"库有问题"。
+    NSString *sql = [NSString stringWithFormat:
+        @"SELECT COUNT(*) FROM (SELECT payload FROM notifications "
+        @"ORDER BY ts DESC LIMIT %d) WHERE payload IS NOT NULL AND payload<>'';", n];
+    return NBEnvCount(db, [sql UTF8String]);
+}
+
+// 带 payload 的记录：条数、时间跨度、最新那条是谁。
+// 一次返回字典而不是三个函数：它们来自同一个"有 payload 的子集"，
+// 分成三个出口就会出现"三条读数各自成立、合起来却矛盾"（§4.6 那类自欺）。
+static NSDictionary *NBEnvPayloadStats(sqlite3 *db) {
+    if (!db) return nil;
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*), MIN(ts), MAX(ts) FROM notifications "
+            "WHERE payload IS NOT NULL AND payload<>'';", -1, &st, NULL) != SQLITE_OK) {
+        return nil;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        d[@"count"] = @((long long)sqlite3_column_int64(st, 0));
+        if (sqlite3_column_type(st, 1) != SQLITE_NULL) d[@"minTs"] = @(sqlite3_column_double(st, 1));
+        if (sqlite3_column_type(st, 2) != SQLITE_NULL) d[@"maxTs"] = @(sqlite3_column_double(st, 2));
+    }
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+            "SELECT bundle,title FROM notifications WHERE payload IS NOT NULL AND payload<>'' "
+            "ORDER BY ts DESC LIMIT 1;", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *b = (const char *)sqlite3_column_text(st, 0);
+            const char *t = (const char *)sqlite3_column_text(st, 1);
+            if (b) d[@"bundle"] = [NSString stringWithUTF8String:b];
+            if (t) d[@"title"] = [NSString stringWithUTF8String:t];
+        }
+        sqlite3_finalize(st);
+    }
+    return d;
+}
+
+static NSString *NBEnvClock(double ts) {
+    if (ts <= 0) return @"?";
+    static NSDateFormatter *f = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        f = [[NSDateFormatter alloc] init];
+        f.dateFormat = @"MM-dd HH:mm";
+    });
+    return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:ts]];
+}
+
 + (NSString *)envCheck {
     NSMutableString *s = [NSMutableString string];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -2085,9 +2159,10 @@ static NSString *NBEnvPayloadSample(sqlite3 *db) {
     NSTimeInterval latest = 0;
     // v0.0.144：payload（长按直达）的三个量，跟着这一次 openDB **一起量**。
     //   `plCol` 三态：在 / 不在（带 SQLite 原话）/ 打不开库 —— 三者不许合并。
-    long plTotal = -1, plHave = -1;
+    long plTotal = -1, plHave = -1, plRecent20 = -1;
     NSString *plCol = @"打不开库";
     NSString *plSample = nil;
+    NSDictionary *plStats = nil;
     sqlite3 *ldb = [self openDB];
     if (ldb) {
         sqlite3_stmt *st = NULL;
@@ -2112,6 +2187,9 @@ static NSString *NBEnvPayloadSample(sqlite3 *db) {
             // ③ 最新一条样本：它同时回答「抓到了什么形状」与「App 侧能不能认出链接」，
             //    是这三问里信息量最大的一条。
             plSample = NBEnvPayloadSample(ldb);
+            // ④ v0.0.145：「5 / 500 到底是库存还是抓不到」—— 只能靠最近这批来分。
+            plRecent20 = NBEnvPayloadRecent(ldb, 20);
+            plStats    = NBEnvPayloadStats(ldb);
         } else {
             // 🔴 先把 errmsg 拷成 NSString 再看：下一次任何 sqlite 调用都会覆盖内部缓冲。
             const char *m = sqlite3_errmsg(ldb);
@@ -2131,22 +2209,40 @@ static NSString *NBEnvPayloadSample(sqlite3 *db) {
 
     // ── payload：长按「直达内容页」的唯一线索 ──
     // 🔴 判定表（照这一屏就能定死病因，不用连电脑）：
-    //    列=不在                    ⇒ 走「补列」，功能与记录**都不该**受影响
-    //    列=在 但 0 / N（N>0）      ⇒ tweak 侧没抓到 ⇒ 去看 `[payload现场]` 的结构 dump
-    //    列=在 且有数、样本里没有 :// ⇒ 抓到了但里面确实没链接（正常，大部分通知如此）
-    //    列=在 且有数、样本里有 :// ⇒ 平台侧就该显示「直达」，若仍显示「打开」= App 侧解析问题
+    //    列=不在                      ⇒ 走「补列」，功能与记录**都不该**受影响
+    //    列=在，最近 20 条里 0 条     ⇒ tweak 侧现在也抓不到 ⇒ 看 `[payload现场]` 的结构 dump
+    //    列=在，最近 20 条里大半有    ⇒ 抓取正常，那批 0 的只是**加列之前的库存**
+    //    列=在，有数，样本「含链接」  ⇒ 平台就该显示「直达」；若仍显示「打开」= App 侧解析问题
     [s appendString:@"\n── payload（长按直达）──\n"];
     [s appendFormat:@"  列=%@   有 payload 的记录=%ld / %ld\n", plCol, plHave, plTotal];
     if (plTotal < 0) {
         [s appendString:@"  ⚠️ 分子分母是 -1 = **没算出来**（不是 0 条）⇒ 先解决上面那条\n"];
     }
+    // 🔴 这一行是本版的核心判据：「5/500」分不开库存与故障，最近 20 条能。
+    [s appendFormat:@"  最近 20 条里有 payload 的 = %ld 条\n", plRecent20];
+    if (plStats) {
+        NSNumber *cnt = plStats[@"count"];
+        NSNumber *mn  = plStats[@"minTs"];
+        NSNumber *mx  = plStats[@"maxTs"];
+        if (cnt) {
+            [s appendFormat:@"  带 payload 的 %@ 条，时间 %@ ~ %@\n",
+                cnt, NBEnvClock(mn ? mn.doubleValue : 0), NBEnvClock(mx ? mx.doubleValue : 0)];
+        }
+        // 「最新一条带 payload 的是谁」——用来在列表里**定位到那张卡**，
+        // 让"长按看菜单标题"这件事有个明确的靶子，而不是让用户随便挑一条试。
+        NSString *bid2 = plStats[@"bundle"] ?: @"?";
+        NSString *ttl  = plStats[@"title"] ?: @"(无标题)";
+        if (ttl.length > 24) ttl = [[ttl substringToIndex:24] stringByAppendingString:@"…"];
+        [s appendFormat:@"  其中最新一条 = %@ 「%@」%@\n", bid2, ttl,
+            NBEnvClock(mx ? mx.doubleValue : 0)];
+    }
     if (plSample.length) {
         NSString *head = plSample.length > 160
                        ? [[plSample substringToIndex:160] stringByAppendingString:@"…"]
                        : plSample;
-        [s appendFormat:@"  最新样本 %lu 字：%@\n", (unsigned long)plSample.length, head];
-        [s appendFormat:@"  样本含 \"://\" = %@\n",
-            ([plSample rangeOfString:@"://"].location != NSNotFound) ? @"是" : @"否"];
+        // 样本行与「含链接」合并成一行：屏幕篇幅是稀缺资源（用户明确抱怨过长）。
+        [s appendFormat:@"  最新样本 %lu 字（含链接=%@）：%@\n",
+            (unsigned long)plSample.length, NBEnvLinkState(plSample), head];
     } else {
         [s appendString:@"  最新样本=（还没有任何记录带 payload）\n"];
     }
