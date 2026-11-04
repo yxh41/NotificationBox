@@ -5307,8 +5307,18 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
     //   目录就归 root 所有 ⇒ App(mobile) 从此读不进也写不进。
     //   老代码只给「设置」堵过这个坑，**日志和标记文件这两处漏了**。
     // 修法两层：
-    //   ① 预防：NotifyStore.m 里 `NBCanWriteSharedFiles()` 让 root 进程彻底不碰这个目录；
+    //   ① 预防：**目录权限一律 0777，谁写都行**（对齐系统自己的
+    //      /var/mobile/Library/Preferences，它是 drwxrwxrwx）。
+    //      🔴🔴 v0.0.142 撤销了 v0.0.136 最初那一版做法（`NBCanWriteSharedFiles`
+    //      让 uid==0 一律不写）。那一版**把唯一在干活的进程关在了门外**：
+    //      `%hook BBServer` 的 4 个入口全跑在 backboardd(root)，记录本来就是他写的
+    //      ⇒ 闸门一落，数据库最后写入停在 09:55，之后 8 小时零写入，且连日志都没了
+    //      （root 的日志退化成 NSLog，tweak.log 干脆不出现）。
+    //      **「禁止某个身份写」这条规矩不该出现在多进程共享目录上** —— 你穷举不出
+    //      所有会来写的进程，禁谁都是赌，赌输的样子是「功能整体静默消失」。
+    //      要防属主错乱，就**放开权限**，不要**关掉写入者**。
     //   ② 治疗：**只有 root 能 chown** ⇒ 就在 backboardd（唯一以 root 注入的进程）里把属主修回 mobile。
+    //      注意：有了 ① 的 0777，② 现在只是"锦上添花"，属主是谁都不影响可写性。
     //      ⚠️ 只 chown 目录本身 + 目录里的直接子项，**不递归跟符号链接**（别改到别人家去）。
     if (getuid() == 0) {
         const char *legacy = [NOTIFYBOX_LEGACY_DIR fileSystemRepresentation];

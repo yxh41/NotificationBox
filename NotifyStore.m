@@ -56,15 +56,17 @@ static NSString *NBFindAppDocsDir(void) {
 // v0.0.137：数据目录就是那个常量。留成函数只为「有个名字可以打日志」。
 // 🔴 这里**不许**再加任何 if/else 去选路径 —— 一旦路径能在运行时变，
 //    两个进程就会算出两个答案，那就是 v0.0.136 的 split-brain（记录写在一边、读在另一边）。
-// 只保留一个副作用：目录不在就建一次。**只许非 root 建**（见 NBCanWriteSharedFiles）。
+// v0.0.142：建完目录立刻 **chmod 0777**（对齐系统自己的 /var/mobile/Library/Preferences，
+//   它是 drwxrwxrwx）。理由见 NBCanWriteSharedFiles 上方：共享目录必须「谁写都行」。
+//   ⚠️ chmod 是**幂等且无害**的：已存在就再设一次，权限本来就是 0777 时等于空操作。
+//   这一行失败也不要紧（下次进来还会设），但它成功就意味着**属主是谁都无所谓了**。
 static BOOL gNBDirTried = NO;
 NSString *NBDataDir(void) {
     if (!gNBDirTried) {
         gNBDirTried = YES;
-        if (NBCanWriteSharedFiles()) {
-            [[NSFileManager defaultManager] createDirectoryAtPath:NOTIFYBOX_LEGACY_DIR
-                                      withIntermediateDirectories:YES attributes:nil error:nil];
-        }
+        [[NSFileManager defaultManager] createDirectoryAtPath:NOTIFYBOX_LEGACY_DIR
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        chmod([NOTIFYBOX_LEGACY_DIR fileSystemRepresentation], 0777);
     }
     return NOTIFYBOX_LEGACY_DIR;
 }
@@ -86,18 +88,33 @@ NSString *NBDataDir(void) {
 //      目录就没了；返回值还是 NO ⇒ 调用方看不出发生了不可逆的事。
 //   ③ 2026-11-04 真机就出现过「11:38 还有 6 个文件、11:52 路径整个不存在」这一段，
 //      而**没有任何一行代码承认过自己删了东西**。这种形状不能再留。
-// ⇒ 现在只做一件事：**写不进就如实报出来**（`NBWriteBootProbe` 会把 errno 记全），目录留着。
+// ⇒ v0.0.138 起只做一件事：**写不进就如实报出来**，目录留着。
+// 🔴 v0.0.142：现在**真的能治了**，而且不需要删任何东西 —— 因为 v0.0.136 那个
+//   「root 不许写」的闸门已经撤销，当前进程可能就有 chmod 的资格（目录 owner 或 root
+//   都能 chmod）。所以自愈动作从「删了重建（不可逆）」改成「**chmod 0777（幂等、可逆）**」：
+//     ① 可逆：权限可以再改回去，数据一个字节都不动；
+//     ② 幂等：跑一百次和跑一次结果一样；
+//     ③ 不依赖不知道谁在拒 —— 它只是把「谁能写」这个前提**放宽**，而不是去猜凶手。
+//   这正是本次事故的正解：**不要禁止写入者，要放开目录权限。**
 BOOL NBHealDataDirOwnership(void) {
-    if (!NBCanWriteSharedFiles()) return NO;
     const char *p = [NOTIFYBOX_LEGACY_DIR fileSystemRepresentation];
     struct stat hst; memset(&hst, 0, sizeof(hst));
-    if (stat(p, &hst) != 0) return NO;              // 不存在：让 NBDataDir 正常建（归本进程所有）
+    if (stat(p, &hst) != 0) return NO;              // 不存在：让 NBDataDir 正常建（会顺带 chmod 0777）
     if (access(p, W_OK) == 0) return NO;            // 可写：零动作
-    NSLog(@"[NotifyBox] ⚠️ 数据目录存在但当前身份写不进 dir=%@ 属主=%d:%d uid=%d errno=%d(%s)"
-          @"（v0.0.138 起**不再删目录重建**，只报告。诊断见 /private/var/tmp/nb_boot_*.txt）",
-          NOTIFYBOX_LEGACY_DIR, (int)hst.st_uid, (int)hst.st_gid, (int)getuid(),
-          errno, strerror(errno));
-    return NO;
+
+    // 写不进 ⇒ 先试 chmod 0777。这就是「把前提放宽」，不猜凶手、不删数据。
+    errno = 0;
+    int rc = chmod(p, 0777);
+    int ec = errno;
+    BOOL nowOK = (rc == 0) && (access(p, W_OK) == 0);
+    NSLog(@"[NotifyBox] %@ 数据目录写不进 dir=%@ 属主=%d:%d uid=%d mode=%o ⇒ chmod 0777 rc=%d errno=%d(%s) 现在可写=%@",
+          nowOK ? @"✅" : @"⚠️", NOTIFYBOX_LEGACY_DIR,
+          (int)hst.st_uid, (int)hst.st_gid, (int)getuid(),
+          (unsigned)(hst.st_mode & 07777), rc, ec, strerror(ec),
+          nowOK ? @"YES" : @"NO");
+    NBSharedLog(@"数据目录自愈 chmod 0777 rc=%d errno=%d(%s) 现在可写=%@",
+                rc, ec, strerror(ec), nowOK ? @"YES" : @"NO");
+    return nowOK;
 }
 
 // ───────────────────────────── v0.0.138 启动探针 ─────────────────────────────
@@ -280,28 +297,30 @@ NSString *NBAltDataDir(void) {
     return NBFindAppDocsDir();
 }
 
-// 🔴🔴🔴 v0.0.136 的**根因刀**：哪些进程可以碰共享数据目录
+// 🔴🔴🔴 v0.0.142：**撤销** v0.0.136「uid==0 一律不许碰共享目录」那一刀。
 //
-// 事实链（真机买到的，不是推的）：
-//   ① 本 tweak 的过滤表是 `Bundles = (com.apple.springboard, com.apple.backboardd)`；
-//   ② **backboardd 以 root 运行**，而 SpringBoard 是 mobile；
-//   ③ 下面两个日志函数、以及 Tweak.x 的 `%ctor` 里那个 `.tweak_ctor` 标记，
-//      **全都有 `createDirectoryAtPath:`**，而且当时都**没有**进程保护；
-//   ④ ⇒ 只要 root 那个进程先跑一步，`/var/mobile/Library/NotifyBox` 就**归 root 所有**；
-//   ⑤ 之后 App（mobile）既读不进也写不进，现场长这样（真机环境自检）：
-//         目录 存在=是  可写=否
-//         写入测试=失败  errno=1(Operation not permitted)
-//         DB / tweak.log / settings.plist 全部「不存在」
-//      ——**长得完全不像权限问题**，所以能整整查一天。
-//   ⑥ Tweak.x 里早就为「**设置**」堵过这个坑（原话："backboardd 以 root 运行 ——
-//      它写出来的文件/目录会变成 root 所有，之后盒子 App（mobile）就写不动了……
-//      这种坑不能留"），**但日志和 .tweak_ctor 这两处漏了** ⇒ 这次就是在它们身上爆的。
-// ⇒ 规矩（从这版起当铁律）：**uid==0 的进程一律不碰共享数据目录**；
-//   它的日志退化成 NSLog（进系统日志），样本完全够用 —— backboardd 本来就不写库。
+// 它把**唯一在干活的进程关在了门外**，这是本次事故最贵的一课：
+//   ① `%hook BBServer` 有 4 处，而 BBServer 跑在 **backboardd（root）**；
+//      SpringBoard 里挂的是声音和通知中心（SBNCSoundController / NC*）。
+//      ⇒ **「记录一条通知」这件事，本来就是 root 在做的。**
+//   ② 装上 v0.0.136（11-04 09:47）之后，数据库最后一次写入停在 **09:55**，
+//      再往后 8 小时零写入 —— 不是写失败，是**根本没人去写**。
+//   ③ 而这条规则的**初衷是对的**（防止 root 建目录后 owner=root，mobile 从此读不了），
+//      错在**手段**：不该禁止某个身份写，而该让目录**谁写都行**。
+//
+// 🔴 正解 = 抄系统自己的做法。真机对照：
+//      /var/mobile/Library/Preferences   drwxrwxrwx  mobile mobile  ← 0777，从没出过这种事
+//      /var/mobile/Library/NotifyBox     drwxr-xr-x  mobile mobile  ← 0755，我建的
+//   系统把跨进程共享的目录设成 0777，所以 cfprefsd(root) / SpringBoard(mobile) / App
+//   都能写。⇒ 本目录一律 **0777**，属主是谁都无所谓。
+//
+// 🔴 铁律：**「禁止某个身份写」这条规矩，根本不该出现在多进程共享目录上。**
+//   你永远不可能穷举出所有会来写的进程（今天是 backboardd，明天可能是别的），
+//   禁谁都是在赌 —— 而且赌输的样子是「功能整体静默消失」，最难查。
+//   要防属主错乱，就**放开权限**，而不是**关掉写入者**。
 BOOL NBCanWriteSharedFiles(void) {
-    static int cached = -1;
-    if (cached < 0) cached = (getuid() == 0) ? 0 : 1;
-    return cached == 1;
+    // 恒 YES：保留这个函数只为不再改动各处调用点，语义已变成「所有进程都可以」。
+    return YES;
 }
 
 // 写库失败要留痕：区分「hook 没触发」与「触发了但写不进」
@@ -323,6 +342,9 @@ static void NBStoreLog(NSString *fmt, ...) {
     // v0.0.137：与 NBSharedLog 同一条规矩 —— 写不进去要当场喊，不许静默。
     if (!wok) NSLog(@"[NotifyBox/写日志失败 STORE] errno=%d(%s) path=%@ | %@",
                     errno, strerror(errno), NOTIFYBOX_LOG_PATH, msg);
+    // v0.0.142：同 NBSharedLog —— 文件权限也要放开，否则 root 先写一步，
+    //   mobile 之后就对同一个文件写不进了。
+    else chmod([NOTIFYBOX_LOG_PATH fileSystemRepresentation], 0666);
 }
 
 // ---------- 统一日志（tweak / App / 新模块共用） ----------
@@ -374,6 +396,13 @@ void NBSharedLog(NSString *fmt, ...) {
     if (!wok) {
         NSLog(@"[NotifyBox/写日志失败] errno=%d(%s) path=%@ | %@",
               errno, strerror(errno), NOTIFYBOX_LOG_PATH, msg);
+    } else {
+        // 🔴 v0.0.142：**文件本身也要「谁都能写」**。
+        //   目录放开到 0777 只解决「能不能新建文件」；已经存在的日志文件如果是
+        //   root 建的那份（rw-r--r-- root wheel），mobile 进程照样写不进 ——
+        //   症状和目录权限问题一模一样，又是一轮无从下手。
+        //   0666 是幂等的，每次写完设一次，开销一条 syscall。
+        chmod([NOTIFYBOX_LOG_PATH fileSystemRepresentation], 0666);
     }
 }
 
@@ -385,12 +414,30 @@ void NBSharedLog(NSString *fmt, ...) {
                               withIntermediateDirectories:YES
                                                attributes:nil
                                                     error:nil];
+    // v0.0.142：共享目录一律 0777（对齐系统自己的 /var/mobile/Library/Preferences）
+    chmod([dir fileSystemRepresentation], 0777);
 }
 
 + (sqlite3 *)openDB {
     [self ensureDir];
     sqlite3 *db = NULL;
-    if (sqlite3_open([NOTIFYBOX_DB_PATH UTF8String], &db) != SQLITE_OK) return NULL;
+    int orc = sqlite3_open([NOTIFYBOX_DB_PATH UTF8String], &db);
+    if (orc != SQLITE_OK) {
+        // 🔴 v0.0.142：**不许静默 return NULL**。
+        //   在调用方看来，「库打不开」和「库里没有记录」完全是同一个现象
+        //   —— 本次事故就是被这种出口藏住的。
+        NSLog(@"[NotifyBox/store] ⚠️ sqlite3_open 失败 rc=%d err=%s path=%@",
+              orc, db ? sqlite3_errmsg(db) : "(db=NULL)", NOTIFYBOX_DB_PATH);
+        NBStoreLog(@"sqlite3_open 失败 rc=%d path=%@", orc, NOTIFYBOX_DB_PATH);
+        if (db) sqlite3_close(db);      // open 失败时 handle 也可能已分配，不关就是泄漏
+        return NULL;
+    }
+    // 🔴 v0.0.142：库文件本身也放开到 0666。
+    //   两个进程（backboardd root 记通知 / SpringBoard·App 读写）共用同一个库，
+    //   哪一个先建，文件属主就是谁。若它是 rw-r--r-- 且属主不是当前进程，
+    //   另一方从此写不进 —— 而 SQLite 报的是 READONLY / BUSY，看着像"锁竞争"，
+    //   根本不像权限问题。0666 幂等，一条 syscall 换掉一整类事故。
+    chmod([NOTIFYBOX_DB_PATH fileSystemRepresentation], 0666);
     // 🔴🔴 v0.0.15：必须设 busy_timeout。
     //    真机日志里反复出现：
     //        INSERT 失败 rc=5 err=database is locked bundle=com.jd.jingmai / com.lemon.lv
