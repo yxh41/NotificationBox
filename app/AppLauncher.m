@@ -18,6 +18,38 @@
 // 🔴 绝不在这里弹任何界面：调用方（长按菜单）触发的那一刻，菜单正在收起，
 //    此时 present 一个 alert 属于「present 正在进行时又 present」——
 //    真机上表现为**被系统静默丢掉**，用户等不到任何提示。提示交给调用方用 toast 做。
+
+// v0.0.151：把「见过多少、丢了几个、被谁丢的」做成一本**能对上的账**。
+// 🔴 为什么从 struct 换成类：struct 里想放 NSMutableArray，在 ARC 下要么
+//    `__unsafe_unretained`（生命周期全靠人守，一不小心就是野指针），要么编不过。
+//    类别干净 —— 而且这段只在长按回调里跑，一个对象的开销可以忽略。
+// 🔴 为什么必须写在 `@implementation AppLauncher` **之前**：类声明不能嵌在别人的
+//    @implementation 里面（那个位置只允许 C 函数与全局变量）。
+//
+// 三段账，两处必须闭合：
+//    sawScheme == parsedOK + dropParse             （含 :// 的都去哪了）
+//    parsedOK  == out.count + dropAsset + dropHTTP （解析成功的都去哪了）
+@interface NBLinkDiag : NSObject
+@property (nonatomic) int decodes;      // 拆过几次「字符串里的 JSON」
+@property (nonatomic) int budgetHit;    // 想拆但预算用尽（1 = 还有东西没拆到）
+@property (nonatomic) int sawScheme;    // 含 :// 的字符串总数（不管能不能解析）
+@property (nonatomic) int parsedOK;     // NBLinkURL 解析通过的
+@property (nonatomic) int dropParse;    // 含 :// 却解析不出来
+@property (nonatomic) int dropAsset;    // 图片/头像
+@property (nonatomic) int dropHTTP;     // http(s) 且键名不认识
+@property (nonatomic, strong) NSMutableArray<NSString *> *notes;   // 「键(原因)」最多 6 条
+@property (nonatomic, copy) NSString *parseSample;                 // 解析失败的第一例
+@end
+
+@implementation NBLinkDiag
+- (void)note:(NSString *)s {
+    if (!s.length) return;
+    if (!self.notes) self.notes = [NSMutableArray array];
+    if (self.notes.count >= 6) return;      // 日志行是预算
+    [self.notes addObject:s];
+}
+@end
+
 @implementation AppLauncher
 
 #pragma mark - 路 ① 的前置：拿 workspace 单例
@@ -179,6 +211,19 @@
 
 #pragma mark - v0.0.133：从 payload 里找深链
 
+// v0.0.151：任何要进日志的外部字符串都必须先压成一行。
+// 🔴 解析失败的样本完全可能是带换行的 JSON 片段 —— 一旦带换行进日志，
+//    一条记录会被劈成两行，而「结论行」是按行筛的 ⇒ 后半截直接消失。
+//    这是"留痕自己把证据弄丢"，和 §4.9⑤ 是同一类。
+static NSString *NBOneLine(NSString *s, NSUInteger cap) {
+    if (![s isKindOfClass:[NSString class]] || !s.length) return @"";
+    NSString *t = [[s componentsSeparatedByCharactersInSet:
+                    [NSCharacterSet newlineCharacterSet]] componentsJoinedByString:@" "];
+    t = [t stringByReplacingOccurrencesOfString:@"\t" withString:@" "];
+    return (t.length > cap) ? [t substringToIndex:cap] : t;
+}
+
+
 // 只认 `scheme://` 这种。`NSURL` 对 "abc:def" 也会给一个 scheme，太宽。
 static NSURL *NBLinkURL(NSString *s) {
     if (![s isKindOfClass:[NSString class]] || s.length < 5) return nil;
@@ -208,6 +253,49 @@ static BOOL NBKeyLooksLikeLink(NSString *k) {
         ]];
     });
     return [S containsObject:[k lowercaseString]];
+}
+
+// v0.0.151：统计/上报类的地址**永远不配当跳转目标**。
+// 🔴 放宽键名匹配（下面那个「含 url/link」）会顺手把 `report_url` / `track_url` /
+//    `log_url` 一起收进来 —— 它们也是 http、键名也带 url，点了就是"直达"到一个统计页。
+//    宁可漏一条真链接，也不能让用户点出一张空白上报页。
+static BOOL NBKeyIsStatistic(NSString *k) {
+    if (![k isKindOfClass:[NSString class]] || !k.length) return NO;
+    static NSArray *bad = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        bad = @[@"track", @"report", @"log", @"stat", @"monitor", @"ping",
+                @"analytic", @"beacon", @"metric", @"exposure", @"impress",
+                @"trace", @"collect", @"event"];
+    });
+    NSString *low = [k lowercaseString];
+    for (NSString *b in bad) {
+        if ([low rangeOfString:b].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+// v0.0.151：http(s) 的认可范围从「精确表」放宽到「精确表 ∪ 词根」。
+// 🔴 依据是真机 150 的那一行：
+//      [直达] 候选 0 条 ｜ 拆 2 次 ｜ 见过 URL 2 个（http无名 2 / 图片 0）⇒ 全被丢
+//    ⇒ 有两条 http 链接，键名不在精确表里，被我的打分规则丢了。
+//    与其继续猜名字（`pushUrl`? `shareUrl`? `landing`?），不如按**词根**认 ——
+//    "键名里带 url/link 的 http 地址"本来就是这个意思。
+//    护栏：资产名单（NBURLIsAsset）在前、统计名单（NBKeyIsStatistic）在此，两道都过才收。
+static BOOL NBKeyLooksLikeLinkLoose(NSString *k) {
+    if (![k isKindOfClass:[NSString class]] || !k.length) return NO;
+    if (NBKeyLooksLikeLink(k)) return YES;
+    if (NBKeyIsStatistic(k)) return NO;
+    static NSArray *roots = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        roots = @[@"url", @"uri", @"link", @"jump", @"h5", @"scheme", @"redirect"];
+    });
+    NSString *low = [k lowercaseString];
+    for (NSString *r in roots) {
+        if ([low rangeOfString:r].location != NSNotFound) return YES;
+    }
+    return NO;
 }
 
 // v0.0.149：图片/头像类地址**不配当跳转目标**。
@@ -247,35 +335,35 @@ static BOOL NBURLIsAsset(NSString *s, NSString *key) {
 
 // 递归收集候选。**有界**：
 //   · 深度 ≤5（v0.0.149 从 3 提到 5：多了一层"字符串里再套 JSON"要拆）
-//   · 拆 JSON 的次数 ≤4（`scan->decodes` 预算）—— 畸形结构不许把主线程拖住
+//   · 拆 JSON 的次数 ≤6（`diag.decodes` 预算）—— 畸形结构不许把主线程拖住
 //     （这段是在长按菜单的回调里**同步**跑的）
 //
-// 🔴🔴 v0.0.150：**"候选 0 条"有四种完全不同的病因，原来它们长得一模一样**。
-//    真机 149 的日志里 24 行有 22 行是 `候选 0 条`，我一条都解释不了：
-//      ① payload 里压根没有 `://`            （tweak 侧没捞到）
-//      ② 有 `://` 但是 http(s) 且键名不认识  （我的打分规则丢了它）
-//      ③ 有 `://` 但被图片/头像名单误杀       （我的过滤丢了它）
-//      ④ 有 `://` 但埋得比预算更深            （预算不够）
-//    ⇒ 所以这里不只收「候选」，还要**记下每次"丢弃"的账**（seenURL / dropHTTP / dropAsset）。
-//    「见过几个 URL」与「最后剩几个」必须能对上，这是这一版唯一的判据来源。
-typedef struct {
-    int decodes;     // 拆过几次「字符串里的 JSON」
-    int seenURL;     // 见过的 URL 值总数（含后面被丢掉的）
-    int dropHTTP;    // http(s) 且键名不像链接 ⇒ 丢
-    int dropAsset;   // 图片/头像 ⇒ 丢
-} NBLinkScan;
-
+// 🔴🔴 v0.0.150：**"候选 0 条"有好几种完全不同的病因，原来它们长得一模一样**。
+//    真机 149 的日志里 24 行有 22 行是 `候选 0 条`，我一条都解释不了。
+// 🔴🔴🔴 v0.0.151：150 又暴露了第 ⑤ 种 —— 而且**我自己的标签在说谎**。
+//    真机那行是：`全文无 :// ｜ 形状 {…acts:[[s323://]]…}`
+//    形状明明标了 `s323://`（323 字、含 `://`），结论却说"全文无 ://"。
+//    原因：那个分支的条件是 `seenURL == 0`，而 seenURL 只统计**解析成功**的
+//    ⇒ 「含 :// 但 NSURL 解析不出来」全都被算进了"全文无 ://"。
+//    **分支条件与标签不同源** —— 和 §1.12「提示语与判定必须同源」是同一个病。
+//    ⇒ 拆成三段账：
+//        sawScheme == parsedOK + dropParse              （含 :// 的都去哪了）
+//        parsedOK  == out.count + dropAsset + dropHTTP  （解析成功的都去哪了）
+//      两段都必须闭合；标签只在 sawScheme == 0 时才敢说"全文无 ://"。
+//    五类病因：① 压根没有 ://  ② http 键名不认识  ③ 图片名单误杀
+//             ④ 埋得比预算更深  ⑤ 含 :// 但解析不出来
 static void NBCollectLinks(id node, NSString *key, NSInteger depth,
-                           NSMutableArray *out, NBLinkScan *scan) {
+                           NSMutableArray *out, NBLinkDiag *diag) {
     if (!node || depth > 5) return;
     if ([node isKindOfClass:[NSString class]]) {
         NSString *str = (NSString *)node;
         // 🔴🔴 v0.0.149：**字符串里可能再套一层 JSON**。真机就是这样：
         //    `userInfo.ext = "{\"msg_id\":…}"` —— 不拆开，埋在里面的链接完全看不见。
         //    拆之前先看首字符，避免对每个普通字符串都跑一次 JSON 解析。
-        if (scan && scan->decodes < 4 && str.length > 8 && str.length <= 4096) {
-            unichar c0 = [str characterAtIndex:0];
-            if (c0 == '{' || c0 == '[') {
+        unichar c0 = str.length ? [str characterAtIndex:0] : 0;
+        BOOL looksJSON = (c0 == '{' || c0 == '[') && str.length > 8 && str.length <= 4096;
+        if (looksJSON) {
+            if (diag.decodes < 6) {
                 NSData *jd = [str dataUsingEncoding:NSUTF8StringEncoding];
                 id sub = nil;
                 if (jd) {
@@ -286,48 +374,64 @@ static void NBCollectLinks(id node, NSString *key, NSInteger depth,
                     }
                 }
                 if (sub) {
-                    scan->decodes++;
+                    diag.decodes++;
                     // 用同一个 key 往下走：外层键名（如 `ext`）通常不像链接，
                     // 内层的键名在下一轮迭代里才会用上，这正是我们要的。
-                    NBCollectLinks(sub, key, depth + 1, out, scan);
+                    NBCollectLinks(sub, key, depth + 1, out, diag);
                     // 🔴🔴 拆开之后**立刻返回**，别让这坨 JSON 原文再当链接去试：
                     //    它里面必然含 `://`，而 iOS 16 的 `URLWithString:` 非常宽松，
                     //    会给它造出一个 scheme 乱码的"候选"去和真链接抢分。
                     return;
                 }
+            } else {
+                // 想拆、看着像、但预算没了 ⇒ 这一条必须留痕（病因④）
+                diag.budgetHit = 1;
             }
         }
+        // 🔴🔴 v0.0.151：「含不含 ://」和「能不能解析成 URL」是**两件事**，分开记。
+        if ([str rangeOfString:@"://"].location == NSNotFound) return;
+        diag.sawScheme++;                       // 先记「见过」——顺序不能反
         NSURL *u = NBLinkURL(str);
-        if (!u) return;
-        // 🔴 先记「见过」，再问「要不要」—— 顺序不能反。
-        //    反过来的话，被丢掉的 URL 就永远不进账本，那"0 候选"就退回到不可解释。
-        if (scan) scan->seenURL++;
+        if (!u) {                               // ⑤ 含 :// 却解析不出来
+            diag.dropParse++;
+            if (!diag.parseSample) diag.parseSample = NBOneLine(str, 70);
+            [diag note:[NSString stringWithFormat:@"%@(解析失败)", key.length ? key : @"?"]];
+            return;
+        }
+        diag.parsedOK++;
         if (NBURLIsAsset(str, key)) {
-            if (scan) scan->dropAsset++;
+            diag.dropAsset++;
+            [diag note:[NSString stringWithFormat:@"%@(图片)", key.length ? key : @"?"]];
             return;
         }
         NSString *sch = [u.scheme lowercaseString];
         BOOL isHttp = [sch isEqualToString:@"http"] || [sch isEqualToString:@"https"];
-        BOOL keyish = NBKeyLooksLikeLink(key);
+        BOOL keyish = NBKeyLooksLikeLinkLoose(key);
         NSInteger score = 0;
         // 🔴 打分就是为了"别把图片地址当跳转"：
         //    自定义 scheme（`app://…`）几乎只可能来自"让你点进去"的意图 ⇒ 优先；
-        //    http(s) 太常见（图标/封面/统计上报都是）⇒ **只认已知键名**。
+        //    http(s) 太常见（图标/封面/统计上报都是）⇒ 只认"键名像链接"的。
         if (!isHttp)      score = keyish ? 100 : 80;
         else if (keyish)  score = 60;
-        if (score > 0) [out addObject:@[@(score), (NSString *)node]];
-        else if (scan) scan->dropHTTP++;
+        // v0.0.151：把键名一起带进候选 —— 打日志时才知道"认的是哪个键"，
+        // 否则下次还是只能看到一个数字。
+        if (score > 0) {
+            [out addObject:@[@(score), str, key.length ? key : @""]];
+        } else {
+            diag.dropHTTP++;
+            [diag note:[NSString stringWithFormat:@"%@(http无名)", key.length ? key : @"?"]];
+        }
         return;
     }
     if ([node isKindOfClass:[NSDictionary class]]) {
         [(NSDictionary *)node enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
             NBCollectLinks(v, [k isKindOfClass:[NSString class]] ? (NSString *)k : nil,
-                           depth + 1, out, scan);
+                           depth + 1, out, diag);
         }];
         return;
     }
     if ([node isKindOfClass:[NSArray class]]) {
-        for (id v in (NSArray *)node) NBCollectLinks(v, key, depth + 1, out, scan);
+        for (id v in (NSArray *)node) NBCollectLinks(v, key, depth + 1, out, diag);
     }
 }
 
@@ -423,28 +527,39 @@ static NSString *NBLinkForLog(NSString *s) {
     if (!root) return nil;
 
     NSMutableArray *cands = [NSMutableArray array];
-    NBLinkScan scan = {0};
-    NBCollectLinks(root, nil, 0, cands, &scan);
+    NBLinkDiag *diag = [[NBLinkDiag alloc] init];
+    NBCollectLinks(root, nil, 0, cands, diag);
 
     // 去重只影响**打不打日志**，不影响返回值 —— 功能与留痕解耦。
     int quiet = NBLinkLogDedupe(payload);
     BOOL wantLog = (quiet >= 0);
-    NSString *tail = (quiet > 0)
-        ? [NSString stringWithFormat:@" ｜ 静默重复 %d", quiet] : @"";
+
+    NSMutableString *tail = [NSMutableString string];
+    if (quiet > 0) [tail appendFormat:@" ｜ 静默重复 %d", quiet];
+    if (diag.budgetHit) [tail appendString:@" ｜ 预算用尽"];
+
+    // 丢弃明细：三个数字 + 涉及的键名。键名才是"下次该改哪条规则"的唯一依据。
+    NSString *loss = [NSString stringWithFormat:@"丢 %d(图片)/%d(http无名)/%d(解析失败)",
+                      diag.dropAsset, diag.dropHTTP, diag.dropParse];
+    NSString *keys = diag.notes.count ? [diag.notes componentsJoinedByString:@","] : @"-";
 
     if (!cands.count) {
         if (wantLog) {
-            if (scan.seenURL > 0) {
-                // ② ③ 见过了但被丢 —— 说清是谁丢的，我才能改规则
-                NBSharedLog(@"[直达] 候选 0 条 ｜ 拆 JSON %d 次 ｜ 见过 URL %d 个"
-                            @"（http无名 %d / 图片 %d）⇒ 全被丢%@",
-                            scan.decodes, scan.seenURL, scan.dropHTTP, scan.dropAsset, tail);
-            } else {
-                // ① 一个 `://` 都没有 ⇒ 只能靠形状看键名，判断该不该去 tweak 侧捞
+            if (diag.sawScheme == 0) {
+                // ① 真的一个 `://` 都没有。🔴 这个标签现在**名副其实**了：
+                //    条件是 sawScheme == 0，而 sawScheme 统计的是"含 :// 的字符串"，
+                //    不是"能解析成 URL 的"。（v0.0.150 之前这两件事被混成一件，
+                //    于是含 :// 却解析失败的会被错报成"全文无 ://"。）
                 NSMutableString *sh = [NSMutableString string];
                 NBShapeAppend(sh, root, 0);
-                NBSharedLog(@"[直达] 候选 0 条 ｜ 拆 JSON %d 次 ｜ 全文无 :// ｜ 形状 %@%@",
-                            scan.decodes, sh, tail);
+                NBSharedLog(@"[直达] 候选 0 条 ｜ 拆 %d 次 ｜ 全文无 :// ｜ 形状 %@%@",
+                            diag.decodes, sh, tail);
+            } else {
+                // ② ③ ⑤ 见过了但全被丢 —— 说清是谁丢的、键叫什么
+                NSString *sample = diag.parseSample.length
+                    ? [NSString stringWithFormat:@" ｜ 样本 %@", diag.parseSample] : @"";
+                NBSharedLog(@"[直达] 候选 0 条 ｜ 拆 %d 次 ｜ 见过 :// %d 个 ｜ %@ ｜ 键 %@%@%@",
+                            diag.decodes, diag.sawScheme, loss, keys, sample, tail);
             }
         }
         return nil;
@@ -457,12 +572,14 @@ static NSString *NBLinkForLog(NSString *s) {
     }];
     NSArray *best = (NSArray *)cands.firstObject;
     id v = (best.count > 1) ? best[1] : nil;
-    // 🔴 只打"选中了哪条 + 打分"，不打全部候选：候选数已经给了，
-    //    需要看细节时再放开。日志行数是预算。
+    NSString *key = (best.count > 2 && [best[2] isKindOfClass:[NSString class]]) ? best[2] : @"";
+    // 🔴 只打"选中了哪条 + 打分 + 从哪个键认出来的"，不打全部候选：
+    //    候选数已经给了，需要看细节时再放开。日志行数是预算。
     if (wantLog) {
-        NBSharedLog(@"[直达] 候选 %lu 条 ｜ 拆 JSON %d 次 ｜ 选中(%ld)=%@%@",
-                    (unsigned long)cands.count, scan.decodes,
-                    (long)[best[0] integerValue], NBLinkForLog((NSString *)v), tail);
+        NBSharedLog(@"[直达] 候选 %lu 条 ｜ 拆 %d 次 ｜ 见过 :// %d 个 ｜ %@ ｜ 选中(%ld,%@)=%@%@",
+                    (unsigned long)cands.count, diag.decodes, diag.sawScheme, loss,
+                    (long)[best[0] integerValue], key.length ? key : @"?",
+                    NBLinkForLog((NSString *)v), tail);
     }
     return [v isKindOfClass:[NSString class]] ? (NSString *)v : nil;
 }
