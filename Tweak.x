@@ -4271,6 +4271,112 @@ static void NBDumpPayloadShape(id obj, id content, NSString *tag) {
           lsa ? NBClassName(lsa) : @"(nil)", lURL ?: @"(nil)");
 }
 
+// ---------- v0.0.146：按名字猜了两版都空 ⇒ 改「泛扫」----------
+// 🔴 真机量到的事实（v0.0.145 自检）：
+//     列=在  有 payload 的 5/500 ｜ **最近 20 条里有 payload 的 = 0 条** ｜ 最新一条停在 18:29
+//   ⇒ 不是"老库存没回填"，是**现在也抓不到**。而抓到的那 5 条样本长这样：
+//     `{"action":"sms:\/\/open?groupid=…"}` —— 只有 action，**没有 userInfo / target / thread**。
+//   ⇒ 生效的只有「系统点通知真要执行的 URL」这一条；凡是没有 launchURL 的 App 全空。
+//     `userInfo` / `threadIdentifier` / `targetContentIdentifier` 三条**都读不到**，
+//     它们全是走 KVC 的 —— 这几个私有类把 `+accessInstanceVariablesDirectly` 关了，
+//     所以 v0.0.135 换 ivar 名直扫的思路是对的，但**名字还是猜的**（userinfo/context/payload…），
+//     猜不中就永远空。这条路已经猜了两个版本，不猜了。
+//
+// ⇒ 改法：把 `content` 上**所有对象类型（类型编码首字符 `@`）的 ivar** 都收进来，
+//   键名用**ivar 原名**。不依赖它叫什么。三条安全线一条不少：
+//     ① 只碰对象类型（`object_getIvar` 对 BOOL/int 会返回垃圾指针 ⇒ 崩在 SpringBoard）；
+//     ② 每个值先过 `NBJSONSafeValue`：**逐个值**判 JSON 合法性。
+//        🔴 这条最关键：NSDate/NSData/NSURL 混进去会让**整个 wrap** 序列化失败
+//        ⇒ 一条 payload 都存不下（比"少一个键"糟得多，是整包丢失）；
+//     ③ 有界：键数 ≤ 20、单个字符串 ≤ 512 字、数组/字典元素 > 64 直接跳过
+//        （`isValidJSONObject` 会递归整棵结构，不设上限就是一个畸形 payload 拖住主线程）。
+//
+// 🔴 为什么"键名原样、不加前缀"：App 侧 `NBKeyLooksLikeLink` 是按**键名精确匹配**打分的
+//    （url/link/deeplink/action…）。加个 `c_` 前缀就把这个信号废了，http 链接会被当成
+//    图标地址丢掉。原样保留 ⇒ 老规则零改动就能认出来。
+
+static BOOL NBJSONSafeValue(id v) {
+    if (!v) return NO;
+    if ([v isKindOfClass:[NSString class]]) return YES;
+    if ([v isKindOfClass:[NSNumber class]]) return YES;
+    if ([v isKindOfClass:[NSArray class]]) {
+        if ([(NSArray *)v count] > 64) return NO;      // 见上面 ③
+    } else if ([v isKindOfClass:[NSDictionary class]]) {
+        if ([(NSDictionary *)v count] > 64) return NO;
+    } else {
+        return NO;                                     // NSDate/NSData/NSURL/私有对象一律不收
+    }
+    // 🔴 必须**逐值**判合法性：整包判的话，一个坏值就让整条 payload 消失。
+    @try {
+        return [NSJSONSerialization isValidJSONObject:@{@"k": v}];
+    } @catch (__unused NSException *e) {
+        return NO;
+    }
+}
+
+// ivar 名里带这些词的先收（链接/自定义数据最可能藏在这里），其余排后面 ——
+// 有界 20 个键，先收的才有位置。
+static BOOL NBIvarNameIsPriority(NSString *k) {
+    static NSArray *ws = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        ws = @[@"url", @"link", @"jump", @"target", @"route", @"page", @"scheme",
+               @"userinfo", @"extra", @"payload", @"context", @"meta", @"data", @"json", @"aps"];
+    });
+    NSString *low = [k lowercaseString];
+    for (NSString *w in ws) {
+        if ([low rangeOfString:w].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+// priorityOnly = YES 只收优先名，NO 收其余。分两趟而不是缓存 Ivar 指针：
+// `class_copyIvarList` 的数组要 free，但 Ivar 本身归类所有 —— 分两趟重取一遍更省心。
+static int NBHarvestPass(id obj, NSMutableDictionary *wrap, int maxDepth,
+                         BOOL priorityOnly, NSUInteger cap) {
+    if (!obj || !wrap) return 0;
+    int added = 0;
+    Class c = [obj class];
+    int depth = 0;
+    while (c && c != [NSObject class] && depth < maxDepth) {
+        unsigned int n = 0;
+        Ivar *ivs = class_copyIvarList(c, &n);
+        if (ivs) {
+            for (unsigned int i = 0; i < n; i++) {
+                if (wrap.count >= cap) break;
+                const char *nm = ivar_getName(ivs[i]);
+                const char *te = ivar_getTypeEncoding(ivs[i]);
+                if (!nm || !te || te[0] != '@') continue;         // ① 只碰对象类型
+                NSString *key = [NSString stringWithUTF8String:nm];
+                if (!key.length) continue;
+                // 剥前导下划线：`_userInfo` 与 `userInfo` 是同一个语义。
+                NSString *k2 = [key hasPrefix:@"_"] ? [key substringFromIndex:1] : key;
+                if (!k2.length) continue;
+                if (NBIvarNameIsPriority(k2) != priorityOnly) continue;
+                if (wrap[k2]) continue;
+                id v = nil;
+                @try { v = object_getIvar(obj, ivs[i]); } @catch (__unused NSException *e) { v = nil; }
+                if (!NBJSONSafeValue(v)) continue;                // ② 逐值判 JSON 合法性
+                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 512) {
+                    v = [[(NSString *)v substringToIndex:512] stringByAppendingString:@"…"];
+                }
+                wrap[k2] = v;
+                added++;
+            }
+            free(ivs);
+        }
+        c = class_getSuperclass(c);
+        depth++;
+    }
+    return added;
+}
+
+static int NBHarvestIvars(id obj, NSMutableDictionary *wrap, int maxDepth, NSUInteger cap) {
+    int a = NBHarvestPass(obj, wrap, maxDepth, YES, cap);   // 先收"像链接/像自定义数据"的
+    int b = NBHarvestPass(obj, wrap, maxDepth, NO,  cap);   // 再补其余的（键已存在的不覆盖）
+    return a + b;
+}
+
 static NSString *NBExtractPayload(id obj, NSString *tag) {
     if (!obj) return nil;
 
@@ -4365,6 +4471,29 @@ static NSString *NBExtractPayload(id obj, NSString *tag) {
             aURL = NBLaunchURLFrom(lsa);
         }
         if (aURL.length) wrap[@"action"] = aURL;
+    }
+
+    // v0.0.146：泛扫兜底（见上面那一段注释）。放在所有"按名字找"之后 ——
+    // 找到了的键不会被覆盖（`if (wrap[k2]) continue;`），只是在原来为空时才补上。
+    // 有界日志（封顶 5 行）：这功能失败的样子是"长按只有『打开』"，和"没链接"同形，
+    // 所以"泛扫收到了几个键"必须留痕，否则下一轮又只能猜。
+    int hvContent = 0, hvInner = 0;
+    if (content) hvContent = NBHarvestIvars(content, wrap, 3, 20);
+    if (innerContent && innerContent != content) hvInner = NBHarvestIvars(innerContent, wrap, 3, 20);
+    {
+        static int gHvLog = 0;
+        if (gHvLog < 5) {
+            gHvLog++;
+            // 拼一次就够，别在参数里算两遍（同一表达式求值两次是本项目写错过的地方）。
+            NSString *keys = wrap.count
+                           ? [[wrap allKeys] componentsJoinedByString:@","]
+                           : @"(空)";
+            if (keys.length > 120) keys = [[keys substringToIndex:120] stringByAppendingString:@"…"];
+            NBLog(@"[payload泛扫#%d] content[%@] 收 %d 键 ｜ inner[%@] 收 %d 键 ⇒ wrap 共 %lu 键 %@",
+                  gHvLog, content ? NBClassName(content) : @"(nil)", hvContent,
+                  innerContent ? NBClassName(innerContent) : @"(nil)", hvInner,
+                  (unsigned long)wrap.count, keys);
+        }
     }
 
     // ---------- 单一出口：所有失败都落到这里，才能保证诊断一定打出来 ----------
