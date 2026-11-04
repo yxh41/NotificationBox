@@ -230,7 +230,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.134"
+#define NB_VER_STR @"0.0.135"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -4141,7 +4141,130 @@ static void NBClearNCCallback(CFNotificationCenterRef center, void *observer,
 //       到底叫什么、会不会抛都没人保证 —— 读不到就当没有，**绝不影响记录本身**；
 //    ② `isValidJSONObject` 先判：userInfo 里可能有 NSDate/NSData，直接序列化会抛；
 //    ③ 截断 2048：payload 是**附加**信息，一条通知不许把库撑大。
-static NSString *NBExtractPayload(id obj) {
+// ---------- v0.0.135：绕开 KVC，直接按 **ivar 名**扫 ----------
+// 🔴🔴 为什么必须换读法（v0.0.134 真机实测买到的，不是猜的）：
+//   `[payload统计] 累计尝试 400 ｜ 抓到 0 ｜ 无content 0 ｜ 无userInfo 400`
+//   ⇒ `content` **一直在**（`无content 0`），但四条**走 KVC 的**候选路一条都没通。
+//   🔴 而 KVC 找 ivar 有个前提：类没有把 `+accessInstanceVariablesDirectly` 关掉。
+//      苹果的私有类**经常**关掉它 ⇒ **KVC 读不到 ≠ 那个 ivar 不存在**（本项目 §4.8①）。
+//   ⇒ 换成 `class_copyIvarList` + `object_getIvar` 直读，把 KVC 这一层整个绕过去。
+//   ⚠️ 两个必须守住的点：
+//      ① **只读对象类型的 ivar**（类型编码首字符 `@`）：`object_getIvar` 对 BOOL/int
+//         会返回垃圾指针 ⇒ 直接崩在 SpringBoard 里；
+//      ② 找不到就返回 nil —— 加路径是**零风险**的，最坏情况跟以前一样拿不到。
+static id NBFindIvarValue(id obj, NSString *kw, Class want, int maxDepth) {
+    if (!obj || !kw.length) return nil;
+    Class c = [obj class];
+    int depth = 0;
+    while (c && c != [NSObject class] && depth < maxDepth) {
+        unsigned int n = 0;
+        Ivar *ivs = class_copyIvarList(c, &n);
+        if (ivs) {
+            for (unsigned int i = 0; i < n; i++) {
+                const char *nm = ivar_getName(ivs[i]);
+                const char *te = ivar_getTypeEncoding(ivs[i]);
+                if (!nm || !te || te[0] != '@') continue;      // ⚠️ 只碰对象类型
+                NSString *s = [NSString stringWithUTF8String:nm];
+                if (!s.length) continue;
+                if ([[s lowercaseString] rangeOfString:kw].location == NSNotFound) continue;
+                id v = nil;
+                @try { v = object_getIvar(obj, ivs[i]); } @catch (__unused NSException *e) { v = nil; }
+                if (v && (!want || [v isKindOfClass:want])) { free(ivs); return v; }
+            }
+            free(ivs);
+        }
+        c = class_getSuperclass(c);
+        depth++;
+    }
+    return nil;
+}
+
+// 只为了诊断：把某个对象的 ivar 名字列出来（沿继承链最多 2 层）。
+// kw == nil ⇒ 全列（小类用，如 BBContent）；否则只列名字含关键词的（大类用，如 BBBulletin 有 100+ ivar）。
+static NSString *NBIvarNamesOf(id obj, NSArray<NSString *> *kw, NSUInteger cap) {
+    if (!obj) return @"-";
+    NSMutableArray *out = [NSMutableArray array];
+    Class c = [obj class];
+    int depth = 0;
+    while (c && c != [NSObject class] && depth < 2) {
+        unsigned int n = 0;
+        Ivar *ivs = class_copyIvarList(c, &n);
+        if (ivs) {
+            for (unsigned int i = 0; i < n; i++) {
+                const char *nm = ivar_getName(ivs[i]);
+                if (!nm) continue;
+                NSString *s = [NSString stringWithUTF8String:nm];
+                if (!s.length) continue;
+                if (kw) {
+                    NSString *low = [s lowercaseString];
+                    BOOL hit = NO;
+                    for (NSString *k in kw) {
+                        if ([low rangeOfString:k].location != NSNotFound) { hit = YES; break; }
+                    }
+                    if (!hit) continue;
+                }
+                if (![out containsObject:s]) [out addObject:s];
+            }
+            free(ivs);
+        }
+        c = class_getSuperclass(c);
+        depth++;
+    }
+    if (!out.count) return @"-";
+    NSString *j = [out componentsJoinedByString:@","];
+    if (j.length > cap) j = [[j substringToIndex:cap] stringByAppendingString:@"…"];
+    return j;
+}
+
+// 从「点这条通知会执行的动作」里把 URL 掏出来。
+// 🔴 这是**第二条独立线索**：`userInfo` 是 App 自己塞的自定义数据，但
+//    `defaultAction.launchURL` 是系统点通知时**真要执行**的东西 ——
+//    App 想让「点通知直达内容页」，就必须把地址填在这里。
+static NSString *NBLaunchURLFrom(id action) {
+    if (!action) return nil;
+    id v = NBSafeValue(action, @"launchURL");
+    if ([v isKindOfClass:[NSURL class]]) {
+        NSString *s = [(NSURL *)v absoluteString];
+        if (s.length) return s;
+    }
+    NSString *s = NBStringish(v);
+    if (s.length) return s;
+    v = NBFindIvarValue(action, @"launchurl", nil, 3);
+    if ([v isKindOfClass:[NSURL class]]) return [(NSURL *)v absoluteString];
+    return NBStringish(v);
+}
+
+// 一次性现场：把「payload 到底挂在哪」量出来（每个入口只打一行，3 个入口 ⇒ 最多 3 行）。
+// 🔴 不占 `[payload#N]` 那 5 个名额（那套是按进程计的，几分钟就用光 —— v0.0.134 的教训）。
+// ⚠️ 绝不打印未知对象：只打 class 名与 ivar/keys 名字，不碰 `description`。
+static void NBDumpPayloadShape(id obj, id content, NSString *tag) {
+    static NSMutableSet *seen = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+    NSString *t = tag.length ? tag : @"?";
+    @synchronized (seen) {
+        if ([seen containsObject:t]) return;
+        [seen addObject:t];
+    }
+    id ctx  = NBSafeValue(obj, @"context");
+    id dflt = NBSafeValue(obj, @"defaultAction");
+    if (!dflt) dflt = NBFindIvarValue(obj, @"defaultaction", nil, 4);
+    id lsa  = NBSafeValue(obj, @"launchSessionAction");
+    if (!lsa) lsa = NBFindIvarValue(obj, @"launchsessionaction", nil, 4);
+    NSString *dURL = NBLaunchURLFrom(dflt);
+    NSString *lURL = NBLaunchURLFrom(lsa);
+    NBLog(@"[payload现场] tag=%@ cls=%@ ｜ objIvar=[%@] ｜ content=%@ ivar=[%@] ｜ ctx=%@ ｜ dflt=%@ url=%@ ｜ lsa=%@ url=%@",
+          t, NBClassName(obj),
+          NBIvarNamesOf(obj, @[@"userinfo", @"payload", @"context", @"source", @"extra",
+                               @"action", @"meta", @"data", @"aps", @"json"], 400),
+          content ? NBClassName(content) : @"(nil)",
+          NBIvarNamesOf(content, nil, 260),
+          ctx ? NBClassName(ctx) : @"(nil)",
+          dflt ? NBClassName(dflt) : @"(nil)", dURL ?: @"(nil)",
+          lsa ? NBClassName(lsa) : @"(nil)", lURL ?: @"(nil)");
+}
+
+static NSString *NBExtractPayload(id obj, NSString *tag) {
     if (!obj) return nil;
 
     // 🔴 有界诊断（封顶 5 行）：这功能失败的样子是"永远只打开 App、不直达"，
@@ -4185,6 +4308,24 @@ static NSString *NBExtractPayload(id obj) {
         id v4 = NBSafeValue(inner, @"userInfo");
         if ([v4 isKindOfClass:[NSDictionary class]] && [(NSDictionary *)v4 count] > 0) ui = v4;
     }
+
+    // v0.0.135：⑤⑥⑦⑧ **按 ivar 名直扫**（KVC 可能被 `+accessInstanceVariablesDirectly=NO` 挡住，
+    //   而 BBContent / BBBulletinRequest 正是那种苹果私有类 —— 真机 400 次全空就是证据）。
+    if (!ui) ui = NBFindIvarValue(content,      @"userinfo", [NSDictionary class], 3);
+    if (!ui) ui = NBFindIvarValue(obj,          @"userinfo", [NSDictionary class], 4);
+    if (!ui) ui = NBFindIvarValue(innerContent, @"userinfo", [NSDictionary class], 3);
+    if (!ui) ui = NBFindIvarValue(inner,        @"userinfo", [NSDictionary class], 3);
+    // ⑨ `context`：有些实现把「App 自定义数据」直接放成一个 context 字典，而不是嵌一层 userInfo。
+    if (!ui) {
+        id v9 = NBSafeValue(obj, @"context");
+        if ([v9 isKindOfClass:[NSDictionary class]] && [(NSDictionary *)v9 count] > 0) ui = v9;
+    }
+    if (!ui && content) {
+        id v9b = NBSafeValue(content, @"context");
+        if ([v9b isKindOfClass:[NSDictionary class]] && [(NSDictionary *)v9b count] > 0) ui = v9b;
+    }
+    // ⑩ 最后兜一条：ivar 名里带 `payload` 的字典（少数实现这么叫）。
+    if (!ui) ui = NBFindIvarValue(obj, @"payload", [NSDictionary class], 4);
     BOOL uiOK = (ui != nil);
 
     NSMutableDictionary *wrap = [NSMutableDictionary dictionary];
@@ -4203,6 +4344,22 @@ static NSString *NBExtractPayload(id obj) {
     if (!thread.length) thread = NBSafeStr(obj, @"threadIdentifier");
     if (thread.length) wrap[@"thread"] = thread;
 
+    // v0.0.135：**第二条独立线索** —— 「点这条通知系统会打开哪个地址」。
+    //   `userInfo` 是 App 塞的自定义数据（可能整块被 BB 丢掉），而
+    //   `defaultAction.launchURL` 是系统点通知时**真要执行**的东西 ⇒ 它更接近真相。
+    //   读不到就不写这个键（同 tci 的理由：空串会被解析端当"有值但没链接"）。
+    {
+        id dflt = NBSafeValue(obj, @"defaultAction");
+        if (!dflt) dflt = NBFindIvarValue(obj, @"defaultaction", nil, 4);
+        NSString *aURL = NBLaunchURLFrom(dflt);
+        if (!aURL.length) {
+            id lsa = NBSafeValue(obj, @"launchSessionAction");
+            if (!lsa) lsa = NBFindIvarValue(obj, @"launchsessionaction", nil, 4);
+            aURL = NBLaunchURLFrom(lsa);
+        }
+        if (aURL.length) wrap[@"action"] = aURL;
+    }
+
     // ---------- 单一出口：所有失败都落到这里，才能保证诊断一定打出来 ----------
     NSString *s = nil;
     if (wrap.count > 0 && [NSJSONSerialization isValidJSONObject:wrap]) {
@@ -4210,6 +4367,9 @@ static NSString *NBExtractPayload(id obj) {
         if (d) s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
     }
     if (s.length > 2048) s = [s substringToIndex:2048];
+
+    // v0.0.135：抓不到时打一次「结构现场」（每个入口一行，自己限流，不占下面那 5 个名额）。
+    if (!s.length) NBDumpPayloadShape(obj, content, tag);
 
     // ---------- v0.0.134：诊断从「只有首 5 条」升级成「首 5 条细 + 累计统计」两级 ----------
     // 🔴 为什么 v0.0.133 那版不够用（真机实测买到的）：`[payload#N]` 只有 5 个名额、
@@ -4396,7 +4556,7 @@ static NSString *NBRecordItem(id obj, NSString *sectionHint, NSString *tag,
     // v0.0.133：顺带把原始 payload 存下来（长按「打开」用它尽量直达那条内容）。
     // 🔴 放在**记录那一刻**取，而不是之后补 —— 通知对象过后就没了。
     [NotifyStore recordWithBundle:bid title:title message:msg subtitle:sub date:date sysId:sysId
-                           payload:NBExtractPayload(obj)];
+                           payload:NBExtractPayload(obj, tag)];
     return bid;
 }
 

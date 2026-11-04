@@ -200,7 +200,11 @@ static BOOL NBKeyLooksLikeLink(NSString *k) {
             @"targeturl", @"target_url", @"weburl", @"web_url",
             @"redirect", @"redirecturl", @"redirect_url",
             @"scheme", @"route", @"router", @"path", @"page",
-            @"contenturl", @"content_url", @"detailurl", @"detail_url"
+            @"contenturl", @"content_url", @"detailurl", @"detail_url",
+            // v0.0.135：tweak 侧新塞的两类线索的固定键名
+            //   `action` = 系统点通知真要执行的 URL（defaultAction.launchURL / launchSessionAction）
+            //   `launchurl` / `actionurl` = 同一个东西在别处可能叫的名字
+            @"action", @"actionurl", @"action_url", @"launchurl", @"launch_url"
         ]];
     });
     return [S containsObject:[k lowercaseString]];
