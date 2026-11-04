@@ -236,6 +236,15 @@ static void NBDumpClassMethods(Class c, NSString *label) {
 //   那个 UIAlertController 弹出去之后点不掉，用户只能重启 ——
 //   诊断代码把设备变砖一角，比它要诊断的 bug 更严重。
 int NBWritePrefsProbe(void) {
+    // 🔴 不许用 `NBProc()`：它是 Tweak.x 里的 static 函数，本文件看不到。
+    //    2026-11-04 CI 就是这么挂的 —— 隐式声明返回 int ⇒ 连锁三条错：
+    //      call to undeclared function 'NBProc'
+    //      incompatible types casting 'int' to 'CFStringRef' with a __bridge cast
+    //      format specifies type 'id' but the argument has type 'int' (-Wformat)
+    //    这里没有共享声明，就用 Foundation 自己的进程名，别再跨文件借函数。
+    NSString *pname = [[NSProcessInfo processInfo] processName];
+    if (!pname.length) pname = @"?";
+
     NSString *rep = NBLastProbeReport();
     if (!rep.length) rep = @"（NBLastProbeReport 为空：ctor 里那次探针没产出文本）";
 
@@ -246,7 +255,7 @@ int NBWritePrefsProbe(void) {
         CFPreferencesSetAppValue(CFSTR("boot_report"), (__bridge CFStringRef)rep, appID);
         CFPreferencesSetAppValue(CFSTR("boot_at"),
             (__bridge CFStringRef)[NSString stringWithFormat:@"%@", [NSDate date]], appID);
-        CFPreferencesSetAppValue(CFSTR("boot_proc"), (__bridge CFStringRef)NBProc(), appID);
+        CFPreferencesSetAppValue(CFSTR("boot_proc"), (__bridge CFStringRef)pname, appID);
         CFPreferencesSetAppValue(CFSTR("boot_ver"),
             (__bridge CFStringRef)NOTIFYBOX_VER_STR, appID);
         // 🔴 同步这一步才是真正"交给 cfprefsd 去落盘"的动作。
@@ -258,6 +267,6 @@ int NBWritePrefsProbe(void) {
     }
 
     NSLog(@"[NotifyBox/prefs] cfprefsd 探针 进程=%@ sync=%@ report_len=%lu",
-          NBProc(), sync ? @"YES" : @"NO", (unsigned long)rep.length);
+          pname, sync ? @"YES" : @"NO", (unsigned long)rep.length);
     return sync ? 1 : 0;
 }
