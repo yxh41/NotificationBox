@@ -247,17 +247,33 @@ static BOOL NBURLIsAsset(NSString *s, NSString *key) {
 
 // 递归收集候选。**有界**：
 //   · 深度 ≤5（v0.0.149 从 3 提到 5：多了一层"字符串里再套 JSON"要拆）
-//   · 拆 JSON 的次数 ≤4（`decodes` 预算）—— 畸形结构不许把主线程拖住
+//   · 拆 JSON 的次数 ≤4（`scan->decodes` 预算）—— 畸形结构不许把主线程拖住
 //     （这段是在长按菜单的回调里**同步**跑的）
+//
+// 🔴🔴 v0.0.150：**"候选 0 条"有四种完全不同的病因，原来它们长得一模一样**。
+//    真机 149 的日志里 24 行有 22 行是 `候选 0 条`，我一条都解释不了：
+//      ① payload 里压根没有 `://`            （tweak 侧没捞到）
+//      ② 有 `://` 但是 http(s) 且键名不认识  （我的打分规则丢了它）
+//      ③ 有 `://` 但被图片/头像名单误杀       （我的过滤丢了它）
+//      ④ 有 `://` 但埋得比预算更深            （预算不够）
+//    ⇒ 所以这里不只收「候选」，还要**记下每次"丢弃"的账**（seenURL / dropHTTP / dropAsset）。
+//    「见过几个 URL」与「最后剩几个」必须能对上，这是这一版唯一的判据来源。
+typedef struct {
+    int decodes;     // 拆过几次「字符串里的 JSON」
+    int seenURL;     // 见过的 URL 值总数（含后面被丢掉的）
+    int dropHTTP;    // http(s) 且键名不像链接 ⇒ 丢
+    int dropAsset;   // 图片/头像 ⇒ 丢
+} NBLinkScan;
+
 static void NBCollectLinks(id node, NSString *key, NSInteger depth,
-                           NSMutableArray *out, int *decodes) {
+                           NSMutableArray *out, NBLinkScan *scan) {
     if (!node || depth > 5) return;
     if ([node isKindOfClass:[NSString class]]) {
         NSString *str = (NSString *)node;
         // 🔴🔴 v0.0.149：**字符串里可能再套一层 JSON**。真机就是这样：
         //    `userInfo.ext = "{\"msg_id\":…}"` —— 不拆开，埋在里面的链接完全看不见。
         //    拆之前先看首字符，避免对每个普通字符串都跑一次 JSON 解析。
-        if (decodes && *decodes < 4 && str.length > 8 && str.length <= 4096) {
+        if (scan && scan->decodes < 4 && str.length > 8 && str.length <= 4096) {
             unichar c0 = [str characterAtIndex:0];
             if (c0 == '{' || c0 == '[') {
                 NSData *jd = [str dataUsingEncoding:NSUTF8StringEncoding];
@@ -270,10 +286,10 @@ static void NBCollectLinks(id node, NSString *key, NSInteger depth,
                     }
                 }
                 if (sub) {
-                    (*decodes)++;
+                    scan->decodes++;
                     // 用同一个 key 往下走：外层键名（如 `ext`）通常不像链接，
                     // 内层的键名在下一轮迭代里才会用上，这正是我们要的。
-                    NBCollectLinks(sub, key, depth + 1, out, decodes);
+                    NBCollectLinks(sub, key, depth + 1, out, scan);
                     // 🔴🔴 拆开之后**立刻返回**，别让这坨 JSON 原文再当链接去试：
                     //    它里面必然含 `://`，而 iOS 16 的 `URLWithString:` 非常宽松，
                     //    会给它造出一个 scheme 乱码的"候选"去和真链接抢分。
@@ -283,7 +299,13 @@ static void NBCollectLinks(id node, NSString *key, NSInteger depth,
         }
         NSURL *u = NBLinkURL(str);
         if (!u) return;
-        if (NBURLIsAsset(str, key)) return;      // 见 NBURLIsAsset 的注释
+        // 🔴 先记「见过」，再问「要不要」—— 顺序不能反。
+        //    反过来的话，被丢掉的 URL 就永远不进账本，那"0 候选"就退回到不可解释。
+        if (scan) scan->seenURL++;
+        if (NBURLIsAsset(str, key)) {
+            if (scan) scan->dropAsset++;
+            return;
+        }
         NSString *sch = [u.scheme lowercaseString];
         BOOL isHttp = [sch isEqualToString:@"http"] || [sch isEqualToString:@"https"];
         BOOL keyish = NBKeyLooksLikeLink(key);
@@ -294,18 +316,87 @@ static void NBCollectLinks(id node, NSString *key, NSInteger depth,
         if (!isHttp)      score = keyish ? 100 : 80;
         else if (keyish)  score = 60;
         if (score > 0) [out addObject:@[@(score), (NSString *)node]];
+        else if (scan) scan->dropHTTP++;
         return;
     }
     if ([node isKindOfClass:[NSDictionary class]]) {
         [(NSDictionary *)node enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
             NBCollectLinks(v, [k isKindOfClass:[NSString class]] ? (NSString *)k : nil,
-                           depth + 1, out, decodes);
+                           depth + 1, out, scan);
         }];
         return;
     }
     if ([node isKindOfClass:[NSArray class]]) {
-        for (id v in (NSArray *)node) NBCollectLinks(v, key, depth + 1, out, decodes);
+        for (id v in (NSArray *)node) NBCollectLinks(v, key, depth + 1, out, scan);
     }
+}
+
+// v0.0.150：把一坨 JSON 的「形状」画成一行（键名 + 类型的速写）。
+// 🔴 只画形状，**不打值**：值可能是 4KB 的 JSON，而日志窗口只有 ~50 行。
+//    这一行的用处是回答「0 候选时，payload 里到底有些什么键」——
+//    没有它，我只能一直猜"是不是埋太深"。
+//    `j88` = 88 字的 JSON 字符串（我拆过）；`s12://` = 12 字且含 `://`；`n` = 数字。
+static void NBShapeAppend(NSMutableString *out, id node, int depth) {
+    if (out.length > 220) return;                 // 硬上限：一行最多 ~240 字
+    if (!node) { [out appendString:@"nil"]; return; }
+    if ([node isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)node;
+        unichar c0 = s.length ? [s characterAtIndex:0] : 0;
+        if ((c0 == '{' || c0 == '[') && s.length > 8) {
+            [out appendFormat:@"j%lu", (unsigned long)s.length];
+        } else if ([s rangeOfString:@"://"].location != NSNotFound) {
+            [out appendFormat:@"s%lu://", (unsigned long)s.length];
+        } else {
+            [out appendFormat:@"s%lu", (unsigned long)s.length];
+        }
+        return;
+    }
+    if ([node isKindOfClass:[NSNumber class]]) { [out appendString:@"n"]; return; }
+    if ([node isKindOfClass:[NSArray class]]) {
+        NSArray *a = (NSArray *)node;
+        [out appendFormat:@"a%lu[", (unsigned long)a.count];
+        if (a.count && depth < 3) NBShapeAppend(out, a.firstObject, depth + 1);
+        [out appendString:@"]"];
+        return;
+    }
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)node;
+        [out appendString:@"{"];
+        NSUInteger i = 0;
+        for (id k in d) {
+            if (i >= 6) { [out appendFormat:@"+%lu", (unsigned long)(d.count - 6)]; break; }
+            if (i) [out appendString:@","];
+            [out appendString:([k isKindOfClass:[NSString class]] ? (NSString *)k : @"?")];
+            [out appendString:@":"];
+            if (depth < 3) NBShapeAppend(out, d[k], depth + 1);
+            else [out appendString:@"…"];
+            i++;
+        }
+        [out appendString:@"}"];
+        return;
+    }
+    // NSDate / NSData / 私有对象 —— 只报告"有别的东西"，绝不 `description`（会摸锁卡死）
+    [out appendString:@"(其它)"];
+}
+
+// v0.0.150：同一份 payload 只留痕一次。
+// 🔴 为什么非加不可：149 装了之后，**结论行被这一行刷屏了** —— 用户贴回来的 24 行里
+//    22 行都是 `候选 0 条`，真正的新信息（payload 现场/统计）全被挤走。
+//    但「静默」又不能真的静默：那就退回到"没调用"与"0 候选"同形了。
+//    ⇒ 用**内容签名**去重（不是时间）：不同 payload 每条都打，同一条只在首次打，
+//      并把「上一批静默了几条」写进下一条 —— 两个方向都留了证据。
+//    🔴 签名里绝不放秒数/序号这类每次必变的量，否则等于没去重。
+//    🔴 只在主线程调用（长按菜单构建）；ARC 下这个静态变量会被 assign 保留。
+static int NBLinkLogDedupe(NSString *payload) {
+    static NSString *lastSig = nil;
+    static int suppressed = 0;
+    NSString *head = payload.length > 64 ? [payload substringToIndex:64] : payload;
+    NSString *sig = [NSString stringWithFormat:@"%lu|%@", (unsigned long)payload.length, head];
+    if (lastSig && [sig isEqualToString:lastSig]) { suppressed++; return -1; }
+    int q = suppressed;
+    suppressed = 0;
+    lastSig = sig;
+    return q;
 }
 
 // v0.0.149：链接进日志前先截断。
@@ -332,12 +423,30 @@ static NSString *NBLinkForLog(NSString *s) {
     if (!root) return nil;
 
     NSMutableArray *cands = [NSMutableArray array];
-    int decodes = 0;
-    NBCollectLinks(root, nil, 0, cands, &decodes);
+    NBLinkScan scan = {0};
+    NBCollectLinks(root, nil, 0, cands, &scan);
+
+    // 去重只影响**打不打日志**，不影响返回值 —— 功能与留痕解耦。
+    int quiet = NBLinkLogDedupe(payload);
+    BOOL wantLog = (quiet >= 0);
+    NSString *tail = (quiet > 0)
+        ? [NSString stringWithFormat:@" ｜ 静默重复 %d", quiet] : @"";
+
     if (!cands.count) {
-        // 🔴 这条日志是"为什么长按没有直达"的唯一证据：
-        //    拆了几次能区分「压根没链接」和「链接埋得太深没拆到」。
-        NBSharedLog(@"[直达] 候选 0 条 ｜ 拆 JSON %d 次 ⇒ 退回只打开 App", decodes);
+        if (wantLog) {
+            if (scan.seenURL > 0) {
+                // ② ③ 见过了但被丢 —— 说清是谁丢的，我才能改规则
+                NBSharedLog(@"[直达] 候选 0 条 ｜ 拆 JSON %d 次 ｜ 见过 URL %d 个"
+                            @"（http无名 %d / 图片 %d）⇒ 全被丢%@",
+                            scan.decodes, scan.seenURL, scan.dropHTTP, scan.dropAsset, tail);
+            } else {
+                // ① 一个 `://` 都没有 ⇒ 只能靠形状看键名，判断该不该去 tweak 侧捞
+                NSMutableString *sh = [NSMutableString string];
+                NBShapeAppend(sh, root, 0);
+                NBSharedLog(@"[直达] 候选 0 条 ｜ 拆 JSON %d 次 ｜ 全文无 :// ｜ 形状 %@%@",
+                            scan.decodes, sh, tail);
+            }
+        }
         return nil;
     }
     [cands sortUsingComparator:^NSComparisonResult(id a, id b) {
@@ -350,9 +459,11 @@ static NSString *NBLinkForLog(NSString *s) {
     id v = (best.count > 1) ? best[1] : nil;
     // 🔴 只打"选中了哪条 + 打分"，不打全部候选：候选数已经给了，
     //    需要看细节时再放开。日志行数是预算。
-    NBSharedLog(@"[直达] 候选 %lu 条 ｜ 拆 JSON %d 次 ｜ 选中(%ld)=%@",
-                (unsigned long)cands.count, decodes,
-                (long)[best[0] integerValue], NBLinkForLog((NSString *)v));
+    if (wantLog) {
+        NBSharedLog(@"[直达] 候选 %lu 条 ｜ 拆 JSON %d 次 ｜ 选中(%ld)=%@%@",
+                    (unsigned long)cands.count, scan.decodes,
+                    (long)[best[0] integerValue], NBLinkForLog((NSString *)v), tail);
+    }
     return [v isKindOfClass:[NSString class]] ? (NSString *)v : nil;
 }
 
