@@ -1999,6 +1999,42 @@ static NSString *NBAppendMarker(NSMutableString *s, NSString *label, NSString *p
     return nil;
 }
 
+// v0.0.144：环境自检里「payload 到底卡在哪」的三个量。
+// 🔴 为什么非要在这里量（而不是去看日志）：
+//    「长按直达」这个功能的失败形态是「长按只有『打开』、没有『直达』」，
+//    而它和「这条通知本来就没链接」在屏幕上**长得一模一样**。三条完全不同的故障
+//    （① 列根本没建上 ② 建上了但一条都没抓到 ③ 抓到了但 App 侧认不出链接）
+//    必须能在**同一屏**上区分开，否则又是一轮「猜一个改一版」。
+// 🔴 返回 -1 表示**没算出来**，绝不能返回 0 冒充「零条」（§4.17）。
+static long NBEnvCount(sqlite3 *db, const char *sql) {
+    if (!db || !sql) return -1;
+    sqlite3_stmt *st = NULL;
+    long n = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) n = (long)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    }
+    return n;
+}
+
+// 最新一条**非空** payload。全是 NULL/空串时返回 nil（= 还没抓到过任何一条）。
+static NSString *NBEnvPayloadSample(sqlite3 *db) {
+    if (!db) return nil;
+    sqlite3_stmt *st = NULL;
+    NSString *out = nil;
+    if (sqlite3_prepare_v2(db,
+            "SELECT payload FROM notifications "
+            "WHERE payload IS NOT NULL AND payload<>'' ORDER BY ts DESC LIMIT 1;",
+            -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) == SQLITE_TEXT) {
+            const char *p = (const char *)sqlite3_column_text(st, 0);
+            if (p) out = [NSString stringWithUTF8String:p];
+        }
+        sqlite3_finalize(st);
+    }
+    return out;
+}
+
 + (NSString *)envCheck {
     NSMutableString *s = [NSMutableString string];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -2047,6 +2083,11 @@ static NSString *NBAppendMarker(NSMutableString *s, NSString *label, NSString *p
     // 🔴 记录数被 maxRecords 顶在上限时，「数」是死的（永远等于上限），看不出还在不在收。
     //    「最新一条的时间」才看得出 —— 这也是判断「是不是早就断了」的唯一硬指标。
     NSTimeInterval latest = 0;
+    // v0.0.144：payload（长按直达）的三个量，跟着这一次 openDB **一起量**。
+    //   `plCol` 三态：在 / 不在（带 SQLite 原话）/ 打不开库 —— 三者不许合并。
+    long plTotal = -1, plHave = -1;
+    NSString *plCol = @"打不开库";
+    NSString *plSample = nil;
     sqlite3 *ldb = [self openDB];
     if (ldb) {
         sqlite3_stmt *st = NULL;
@@ -2055,6 +2096,27 @@ static NSString *NBAppendMarker(NSMutableString *s, NSString *label, NSString *p
                 latest = sqlite3_column_double(st, 0);
             }
             sqlite3_finalize(st);
+        }
+        // ① 列在不在：**故意用 prepare 试，而不是查 PRAGMA** ——
+        //    INSERT 走的就是 prepare，能让每条通知被丢掉的是这条判定；
+        //    `openDB` 里那次 PRAGMA+ALTER 是"尽力补上"，补没补上要看这里。
+        sqlite3_stmt *cs = NULL;
+        if (sqlite3_prepare_v2(ldb, "SELECT payload FROM notifications LIMIT 1;",
+                               -1, &cs, NULL) == SQLITE_OK) {
+            sqlite3_finalize(cs);
+            plCol = @"在";
+            // ② 分子分母一起给：只有分子（0）分不清「一条都没抓到」与「压根没记录」。
+            plTotal  = NBEnvCount(ldb, "SELECT COUNT(*) FROM notifications;");
+            plHave   = NBEnvCount(ldb, "SELECT COUNT(*) FROM notifications "
+                                       "WHERE payload IS NOT NULL AND payload<>'';");
+            // ③ 最新一条样本：它同时回答「抓到了什么形状」与「App 侧能不能认出链接」，
+            //    是这三问里信息量最大的一条。
+            plSample = NBEnvPayloadSample(ldb);
+        } else {
+            // 🔴 先把 errmsg 拷成 NSString 再看：下一次任何 sqlite 调用都会覆盖内部缓冲。
+            const char *m = sqlite3_errmsg(ldb);
+            NSString *mm = m ? [NSString stringWithUTF8String:m] : @"(null)";
+            plCol = [NSString stringWithFormat:@"不在（%@）", mm];
         }
         sqlite3_close(ldb);
     }
@@ -2065,6 +2127,28 @@ static NSString *NBAppendMarker(NSMutableString *s, NSString *label, NSString *p
             d, age / 60.0];
     } else {
         [s appendString:@"  最新一条=(读不到)\n"];
+    }
+
+    // ── payload：长按「直达内容页」的唯一线索 ──
+    // 🔴 判定表（照这一屏就能定死病因，不用连电脑）：
+    //    列=不在                    ⇒ 走「补列」，功能与记录**都不该**受影响
+    //    列=在 但 0 / N（N>0）      ⇒ tweak 侧没抓到 ⇒ 去看 `[payload现场]` 的结构 dump
+    //    列=在 且有数、样本里没有 :// ⇒ 抓到了但里面确实没链接（正常，大部分通知如此）
+    //    列=在 且有数、样本里有 :// ⇒ 平台侧就该显示「直达」，若仍显示「打开」= App 侧解析问题
+    [s appendString:@"\n── payload（长按直达）──\n"];
+    [s appendFormat:@"  列=%@   有 payload 的记录=%ld / %ld\n", plCol, plHave, plTotal];
+    if (plTotal < 0) {
+        [s appendString:@"  ⚠️ 分子分母是 -1 = **没算出来**（不是 0 条）⇒ 先解决上面那条\n"];
+    }
+    if (plSample.length) {
+        NSString *head = plSample.length > 160
+                       ? [[plSample substringToIndex:160] stringByAppendingString:@"…"]
+                       : plSample;
+        [s appendFormat:@"  最新样本 %lu 字：%@\n", (unsigned long)plSample.length, head];
+        [s appendFormat:@"  样本含 \"://\" = %@\n",
+            ([plSample rangeOfString:@"://"].location != NSNotFound) ? @"是" : @"否"];
+    } else {
+        [s appendString:@"  最新样本=（还没有任何记录带 payload）\n"];
     }
 
     [s appendFormat:@"\n── 日志 ──\n%@\n", NOTIFYBOX_LOG_PATH];
@@ -2148,17 +2232,12 @@ static NSString *NBAppendMarker(NSMutableString *s, NSString *label, NSString *p
         }
     }
 
-    // ── 旧位置（App 容器，只读参考）──
-    // 🔴 存在的唯一意义：证明「记录到底写去了哪」。不参与任何决策，也不往那儿写。
-    [s appendString:@"\n── 旧位置（App 容器，只读参考）──\n"];
-    if (!altDir.length) {
-        [s appendString:@"  目录=（本进程算不出来）\n"];
-    } else {
-        NSString *altDB = [altDir stringByAppendingPathComponent:NOTIFYBOX_DB_NAME];
-        NSDictionary *aa = [fm attributesOfItemAtPath:altDB error:nil];
-        [s appendFormat:@"  目录=%@\n  DB 存在=%@  大小=%llu B\n", altDir,
-            aa ? @"是" : @"否", [aa[NSFileSize] unsignedLongLongValue]];
-    }
+    // ── 旧位置（App 容器）那一节已删 ──
+    // 🔴 v0.0.144 删掉的理由：v0.0.143 之后盒子 App 带 `no-container` entitlement，
+    //    `NBAltDataDir()` 在 App 进程里**恒为 nil** ⇒ 这一节恒显示「（本进程算不出来）」，
+    //    是一条**恒为定值的死探针**：看起来总在报警，实际一条信息都不含。
+    //    它原来要证的事（split-brain：tweak 记到别处去了）已经由上面
+    //    「旧位置装载标记」那条覆盖 —— 那条留着，因为它读的是**文件**、不是进程能力。
 
     // dylib 装在哪：优先用 tweak 自己用 dladdr 报出来的路径（roothide 会重定向前缀，
     // App 侧猜路径基本猜不中），猜不到才退回逐个探测。

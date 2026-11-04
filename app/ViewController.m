@@ -976,8 +976,12 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //   ⇒ 「按 App 换提示音」等 PROBE 数据等了好几版，根因在这里。
 //   🔴 教训升级版：**加了新留痕，必须同时问"它能通过筛选吗"**；
 //      而"筛选表里有旧词"不等于"新留痕能被捞出来"。
+// v0.0.144：补两个词 —— `payload`（长按直达的现场/统计/样本行）与 `降级`
+// （v0.0.141 加的「INSERT 降级 7 列」「SELECT 降级」两条保命日志）。
+// 🔴 又是同一个病：那几条留痕 v0.0.141 就打出来了，但**过不了这张筛子**
+//    ⇒ 界面上「只看结论行」永远是干净的，等于没打。这病本项目已经犯过三次。
 static NSString * const kNBKeyLineTable =
-    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针";
+    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级";
 
 static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [kNBKeyLineTable componentsSeparatedByString:@"|"];
