@@ -36,6 +36,7 @@
 @property (nonatomic) int parsedOK;     // NBLinkURL 解析通过的
 @property (nonatomic) int dropParse;    // 含 :// 却解析不出来
 @property (nonatomic) int dropAsset;    // 图片/头像
+@property (nonatomic) int dropReport;   // 上报/统计（键名或路径自证）
 @property (nonatomic) int dropHTTP;     // http(s) 且键名不认识
 @property (nonatomic, strong) NSMutableArray<NSString *> *notes;   // 「键(原因)」最多 6 条
 @property (nonatomic, copy) NSString *parseSample;                 // 解析失败的第一例
@@ -259,16 +260,48 @@ static BOOL NBKeyLooksLikeLink(NSString *k) {
 // 🔴 放宽键名匹配（下面那个「含 url/link」）会顺手把 `report_url` / `track_url` /
 //    `log_url` 一起收进来 —— 它们也是 http、键名也带 url，点了就是"直达"到一个统计页。
 //    宁可漏一条真链接，也不能让用户点出一张空白上报页。
+//
+// 🔴🔴 v0.0.152：这套名单第一次上场就漏了 —— 真机：
+//      [直达] 候选 2 条 ｜ 选中(60,timpush_rpt_url)=
+//          https://apiyb.my-imcloud.com/v3/offline_push_report/apns
+//    `timpush_rpt_url` = 腾讯 IM 的离线推送**上报**地址。它避开了名单，因为名单里
+//    只有全拼 `report`，而这个键名用的是缩写 **`rpt`**。
+//    ⇒ 教训：黑名单要**把缩写一并列上**（rpt / stat / rpt_url / apns …），
+//      否则"同一件事的另一种写法"就是那个洞。
 static BOOL NBKeyIsStatistic(NSString *k) {
     if (![k isKindOfClass:[NSString class]] || !k.length) return NO;
     static NSArray *bad = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        bad = @[@"track", @"report", @"log", @"stat", @"monitor", @"ping",
+        bad = @[@"track", @"report", @"rpt", @"log", @"stat", @"monitor", @"ping",
                 @"analytic", @"beacon", @"metric", @"exposure", @"impress",
-                @"trace", @"collect", @"event"];
+                @"trace", @"collect", @"event", @"diag",
+                // 推送侧专有的上报名（timpush = 腾讯 IM push）
+                @"apns", @"timpush", @"offline_push"];
     });
     NSString *low = [k lowercaseString];
+    for (NSString *b in bad) {
+        if ([low rangeOfString:b].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+// v0.0.152：**路径也是证据，而且比键名可靠**。
+// 🔴 键名可以起得很随意（`timpush_rpt_url` / `pushUrl` / `ext`），但一条上报的 URL
+//    路径几乎一定自证：`/v3/offline_push_report/apns`。
+//    所以对"只靠词根认出来的 http"，再过一道路径检查。
+// 🔴 只查**安全词**：`log` 会误伤 `/login` 与 `/blog`，`ping` 会误伤 `shopping`，
+//    `stat` 会误伤 `status` —— 这三个一律不放。宁可漏，不可误伤真内容页。
+static BOOL NBURLIsReportPath(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || !s.length) return NO;
+    static NSArray *bad = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        bad = @[@"report", @"rpt", @"track", @"beacon", @"metric", @"analytic",
+                @"collect", @"impress", @"exposure", @"statistic", @"diag",
+                @"/apns", @"offline_push"];
+    });
+    NSString *low = [s lowercaseString];
     for (NSString *b in bad) {
         if ([low rangeOfString:b].location != NSNotFound) return YES;
     }
@@ -282,6 +315,8 @@ static BOOL NBKeyIsStatistic(NSString *k) {
 //    与其继续猜名字（`pushUrl`? `shareUrl`? `landing`?），不如按**词根**认 ——
 //    "键名里带 url/link 的 http 地址"本来就是这个意思。
 //    护栏：资产名单（NBURLIsAsset）在前、统计名单（NBKeyIsStatistic）在此，两道都过才收。
+// 🔴 v0.0.152：词根命中只是"像"，不是"是" ⇒ 调用方要把它和精确命中**分成两档打分**，
+//    并且对 http 再过一道路径检查（见 NBURLIsReportPath）。
 static BOOL NBKeyLooksLikeLinkLoose(NSString *k) {
     if (![k isKindOfClass:[NSString class]] || !k.length) return NO;
     if (NBKeyLooksLikeLink(k)) return YES;
@@ -404,15 +439,35 @@ static void NBCollectLinks(id node, NSString *key, NSInteger depth,
             [diag note:[NSString stringWithFormat:@"%@(图片)", key.length ? key : @"?"]];
             return;
         }
+        // 🔴🔴 v0.0.152：上报/统计在**打分之前**就拦掉，而且不问 scheme。
+        //    真机教训：`timpush_rpt_url` 打 60 分被选中，用户点「直达」等于触发一次
+        //    离线推送上报请求。上报就是上报 —— 自定义 scheme 也一样。
+        if (NBKeyIsStatistic(key)) {
+            diag.dropReport++;
+            [diag note:[NSString stringWithFormat:@"%@(上报键名)", key.length ? key : @"?"]];
+            return;
+        }
         NSString *sch = [u.scheme lowercaseString];
         BOOL isHttp = [sch isEqualToString:@"http"] || [sch isEqualToString:@"https"];
-        BOOL keyish = NBKeyLooksLikeLinkLoose(key);
+        BOOL exact = NBKeyLooksLikeLink(key);            // 精确表命中 = "是链接"
+        BOOL keyish = exact || NBKeyLooksLikeLinkLoose(key);   // 词根命中 = "像链接"
         NSInteger score = 0;
-        // 🔴 打分就是为了"别把图片地址当跳转"：
+        // 🔴 打分就是为了"别把图片/上报地址当跳转"：
         //    自定义 scheme（`app://…`）几乎只可能来自"让你点进去"的意图 ⇒ 优先；
         //    http(s) 太常见（图标/封面/统计上报都是）⇒ 只认"键名像链接"的。
-        if (!isHttp)      score = keyish ? 100 : 80;
-        else if (keyish)  score = 60;
+        if (!isHttp)      score = exact ? 100 : 80;
+        else if (exact)   score = 60;
+        else if (keyish)  score = 45;    // v0.0.152：词根只给 45，低精确一档
+        // 🔴🔴 v0.0.152：**只靠词根认出来的 http，还要过一道路径检查**。
+        //    例子：`https://apiyb.my-imcloud.com/v3/offline_push_report/apns`
+        //    键名可能起得人畜无害（`pushUrl`），但路径自证它是上报。
+        //    精确键名（`url`/`link`/`deeplink`）不过这一关 —— 那是"明确告诉你这是链接"，
+        //    不能被路径里的 report 字样误杀（`https://news/report/2026-…` 是真内容页）。
+        if (score == 45 && NBURLIsReportPath(str)) {
+            diag.dropReport++;
+            [diag note:[NSString stringWithFormat:@"%@(上报路径)", key.length ? key : @"?"]];
+            return;
+        }
         // v0.0.151：把键名一起带进候选 —— 打日志时才知道"认的是哪个键"，
         // 否则下次还是只能看到一个数字。
         if (score > 0) {
@@ -538,9 +593,9 @@ static NSString *NBLinkForLog(NSString *s) {
     if (quiet > 0) [tail appendFormat:@" ｜ 静默重复 %d", quiet];
     if (diag.budgetHit) [tail appendString:@" ｜ 预算用尽"];
 
-    // 丢弃明细：三个数字 + 涉及的键名。键名才是"下次该改哪条规则"的唯一依据。
-    NSString *loss = [NSString stringWithFormat:@"丢 %d(图片)/%d(http无名)/%d(解析失败)",
-                      diag.dropAsset, diag.dropHTTP, diag.dropParse];
+    // 丢弃明细：四个数字 + 涉及的键名。键名才是"下次该改哪条规则"的唯一依据。
+    NSString *loss = [NSString stringWithFormat:@"丢 %d(图片)/%d(上报)/%d(http无名)/%d(解析失败)",
+                      diag.dropAsset, diag.dropReport, diag.dropHTTP, diag.dropParse];
     NSString *keys = diag.notes.count ? [diag.notes componentsJoinedByString:@","] : @"-";
 
     if (!cands.count) {
