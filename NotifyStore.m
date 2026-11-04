@@ -444,14 +444,41 @@ void NBSharedLog(NSString *fmt, ...) {
             }
             sqlite3_finalize(p);
         }
+        // 🔴🔴🔴 v0.0.141：**ALTER 的返回值不许再丢。**
+        //   事故现场就是这三行：v0.0.133 加 `payload` 列时写的是
+        //   `sqlite3_exec(db, "...", NULL, NULL, NULL)` —— 失败与否没有任何人知道。
+        //   于是库结构停在旧版（没有 payload 列），而 INSERT 已经按新版（8 列）写死
+        //   ⇒ 每条通知在 prepare 阶段就被丢掉，**静默**，找了两天才找到这里。
+        //   🔴 「尽力而为」只对**可有可无**的步骤成立；对**建表结构**不成立 ——
+        //     结构没补上，后面所有读写全是错的，且错得无声。
+        //   🔴 还要同时打 NSLog：NBStoreLog 写的是 tweak.log，而它与数据库同目录，
+        //     目录不可写时**报错和故障会一起被吞掉**（正是本次事故的形态）。
         if (!hasSysId) {
-            sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN sys_id TEXT;", NULL, NULL, NULL);
+            char *e = NULL;
+            if (sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN sys_id TEXT;",
+                             NULL, NULL, &e) != SQLITE_OK) {
+                NSLog(@"[NotifyBox/store] ⚠️ ALTER sys_id 失败 err=%s", e ? e : "(null)");
+                NBStoreLog(@"ALTER sys_id 失败 err=%s", e ? e : "(null)");
+            }
+            sqlite3_free(e);
         }
         if (!hasAlt) {
-            sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN sys_id_alt TEXT;", NULL, NULL, NULL);
+            char *e = NULL;
+            if (sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN sys_id_alt TEXT;",
+                             NULL, NULL, &e) != SQLITE_OK) {
+                NSLog(@"[NotifyBox/store] ⚠️ ALTER sys_id_alt 失败 err=%s", e ? e : "(null)");
+                NBStoreLog(@"ALTER sys_id_alt 失败 err=%s", e ? e : "(null)");
+            }
+            sqlite3_free(e);
         }
         if (!hasPayload) {
-            sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN payload TEXT;", NULL, NULL, NULL);
+            char *e = NULL;
+            if (sqlite3_exec(db, "ALTER TABLE notifications ADD COLUMN payload TEXT;",
+                             NULL, NULL, &e) != SQLITE_OK) {
+                NSLog(@"[NotifyBox/store] ⚠️ ALTER payload 失败 err=%s", e ? e : "(null)");
+                NBStoreLog(@"ALTER payload 失败 err=%s", e ? e : "(null)");
+            }
+            sqlite3_free(e);
         }
     }
     return db;
@@ -579,7 +606,14 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
                                        NSTimeInterval beforeTs,
                                        NSDictionary *(^build)(sqlite3_stmt *st)) {
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) return @[];
+    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) {
+        // 🔴 v0.0.141：别静默返回空数组 —— 在调用方看来，「查不出来」和「本来就没有」
+        //    完全同形（统计数字恒 0、而且零报错）。本次「记录全没了」就是被这种出口藏了两天。
+        NSLog(@"[NotifyBox/store] ⚠️ 统计查询 prepare 失败 err=%s sql=%@",
+              sqlite3_errmsg(db), sql);
+        NBStoreLog(@"统计查询 prepare 失败 err=%s sql=%@", sqlite3_errmsg(db), sql);
+        return @[];
+    }
     // 🔴 两个时间边界**顺序绑定**：since 占第 1 个 `?`，beforeTs 占第 2 个。
     //    SQL 里 `AND ts>=? AND ts<?` 的顺序必须和这里一致。
     int p = 1;
@@ -902,10 +936,52 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         }
     }
 
-    const char *ins = "INSERT INTO notifications (bundle,title,message,subtitle,ts,hash,sys_id,payload) "
-                      "VALUES (?,?,?,?,?,?,?,?)";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db, ins, -1, &stmt, NULL) == SQLITE_OK) {
+    // 🔴🔴🔴 v0.0.141：**INSERT 必须能降级 —— 附加字段永远不许决定核心功能的生死。**
+    //
+    // 事故复盘（2026-11-03 晚 v0.0.133 → 11-04 真机「记录全没了」）：
+    //   v0.0.133 给这条 INSERT 加了第 8 个字段 `payload`（长按直达用的原始 userInfo）。
+    //   全新库没问题（CREATE TABLE 里就带这一列）；但**老库**要靠 ALTER TABLE 补，
+    //   而那条 ALTER 的返回值当时被丢掉了 —— 成没成功没人知道。
+    //   一旦它没补上（真机现场：`/var/mobile/Library/NotifyBox` 已不可写，ALTER 必然失败），
+    //   库结构里就永远没有 payload 列 ⇒ 这条 prepare 直接
+    //   `no such column: payload` ⇒ **每一条通知都在这里被丢掉**。
+    //   而失败日志写在同目录的 tweak.log 里 ⇒ **连报错都被一起吞了**。
+    //   ⇒ 症状长得像「整个插件全死了」，真实原因只是「附加字段存不了」。
+    //
+    // 🔴 所以判据不是「ALTER 写对」，而是「ALTER 没成功时这条记录还能不能存」。
+    //   写法：8 列 prepare 失败 → **退回 7 列**，功能自动降级成「没有 payload」，
+    //   而不是「没有记录」。这条降级路径**不依赖** ALTER 成功、也不依赖 PRAGMA 探测对不对
+    //   —— 它是自愈的：库长什么样，就走哪条路。
+    const char *ins8 = "INSERT INTO notifications (bundle,title,message,subtitle,ts,hash,sys_id,payload) "
+                       "VALUES (?,?,?,?,?,?,?,?)";
+    const char *ins7 = "INSERT INTO notifications (bundle,title,message,subtitle,ts,hash,sys_id) "
+                       "VALUES (?,?,?,?,?,?,?)";
+    sqlite3_stmt *stmt = NULL;
+    BOOL withPayload = YES;
+    if (sqlite3_prepare_v2(db, ins8, -1, &stmt, NULL) != SQLITE_OK) {
+        // 🔴 errmsg 必须先拷成 NSString：下一次任何 sqlite 调用都会覆盖这块内部缓冲。
+        const char *m1 = sqlite3_errmsg(db);
+        NSString *e1 = m1 ? [NSString stringWithUTF8String:m1] : @"(null)";
+        stmt = NULL;
+        withPayload = NO;
+        if (sqlite3_prepare_v2(db, ins7, -1, &stmt, NULL) != SQLITE_OK) {
+            const char *m2 = sqlite3_errmsg(db);
+            // 连 7 列都不行 ⇒ 这条真的存不了。**但绝不许静默**：
+            //   NBStoreLog 可能写不进去（正是本次事故的形态），所以 NSLog 也要打。
+            NSLog(@"[NotifyBox/store] ⚠️ INSERT 8列/7列 都 prepare 失败 err8=%@ err7=%s bundle=%@",
+                  e1, m2 ? m2 : "(null)", bundle);
+            NBStoreLog(@"INSERT 8列/7列 都 prepare 失败 err8=%@ err7=%s bundle=%@",
+                       e1, m2 ? m2 : "(null)", bundle);
+            stmt = NULL;
+        } else {
+            // 降级成功：记录保住了，只是没有 payload。
+            //   **必须留痕** —— 否则「长按没有直达」会表现为「新功能悄悄失灵」，
+            //   和「payload 里本来就没链接」长得一模一样，又是一轮无从下手。
+            NSLog(@"[NotifyBox/store] ⚠️ payload 列不可用，已降级 7 列写入（记录正常）err=%@", e1);
+            NBStoreLog(@"INSERT 降级 7 列（无 payload）err=%@", e1);
+        }
+    }
+    if (stmt) {
         sqlite3_bind_text(stmt, 1, [bundle UTF8String], -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, [title ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 3, [message ?: @"" UTF8String], -1, SQLITE_TRANSIENT);
@@ -919,18 +995,23 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         // v0.0.133：payload 允许为 nil（读不到 userInfo 的通知是大多数情况）。
         // 🔴 nil 存 NULL 而不是空串：空串会让"有 payload 但解析不出链接"和
         //    "压根没有 payload"在库里长得一样，以后想统计命中率就分不开。
-        if (payload.length) {
-            sqlite3_bind_text(stmt, 8, [payload UTF8String], -1, SQLITE_TRANSIENT);
-        } else {
-            sqlite3_bind_null(stmt, 8);
+        // 🔴🔴 v0.0.141：**只有真的用 8 列语句时才 bind 第 8 个参数。**
+        //   降到 7 列语句后还 bind(8) 会报 SQLITE_RANGE（参数越界），
+        //   等于把刚救回来的记录又丢一次。
+        if (withPayload) {
+            if (payload.length) {
+                sqlite3_bind_text(stmt, 8, [payload UTF8String], -1, SQLITE_TRANSIENT);
+            } else {
+                sqlite3_bind_null(stmt, 8);
+            }
         }
         int rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE) {
+            NSLog(@"[NotifyBox/store] ⚠️ INSERT 失败 rc=%d err=%s bundle=%@ cols=%d",
+                  rc, sqlite3_errmsg(db), bundle, withPayload ? 8 : 7);
             NBStoreLog(@"INSERT 失败 rc=%d err=%s bundle=%@", rc, sqlite3_errmsg(db), bundle);
         }
         sqlite3_finalize(stmt);
-    } else {
-        NBStoreLog(@"prepare 失败 err=%s", sqlite3_errmsg(db));
     }
 
     // 上限裁剪：保留最新的 maxRecords 条
@@ -1044,8 +1125,67 @@ static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nul
         [sql appendString:@")"];
     }
     if (tail.length)   [sql appendString:tail];
+
+    // 🔴🔴🔴 v0.0.141：**读路径也必须能降级** —— 这是「记录全没了」最直接的那一半。
+    //
+    // 事故现场（2026-11-03 晚 v0.0.133 → 真机「一条记录都没有」）：
+    //   老库没有 `payload` 列（ALTER 静默失败），而四条 SELECT 全把
+    //   `IFNULL(payload,'')` 写死在语句里 ⇒ 这里 prepare 失败 ⇒ 返回 NULL ⇒
+    //   调用处 `if (st) { while(...) }` 直接跳过 ⇒ **函数返回空数组、一条报错都没有**。
+    //   于是界面上「记录全没了」，而库里其实可能有几百条 —— 只是读不出来。
+    //   ⇒ 上一版修了写入（INSERT 降级）还不够：**写得进、读不出，用户看到的同样是空**。
+    //
+    // 🔴 降级写法固定为「把取不到的列换成空串常量 `,''`」：
+    //   ① **列数一律不变** ⇒ `NBAppendRow` 里写死的列号 9 仍然有效，
+    //      `row[@"payload"]` 拿到空串，与「没有 payload」同义（消费端本来就是这么理解的）；
+    //   ② 不需要在四条 SELECT 里各写一份降级分支（它们是同一个出口，改一处全覆盖）；
+    //   ③ 顺序不可反：先降 payload（v0.0.133 新增，最可能缺），再降 sys_id_alt。
+    //      **一次只降一列**，才知道到底是哪一列缺 —— 两列一起降会把病因抹掉。
+    NSString *finalSQL = sql;
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) return NULL;
+    int rc = sqlite3_prepare_v2(db, [finalSQL UTF8String], -1, &st, NULL);
+
+    if (rc != SQLITE_OK) {
+        const char *m0 = sqlite3_errmsg(db);
+        NSString *err0 = m0 ? [NSString stringWithUTF8String:m0] : @"(null)";
+        NSString *d1 = [sql stringByReplacingOccurrencesOfString:@",IFNULL(payload,'')"
+                                                     withString:@",''"];
+        if (![d1 isEqualToString:sql]) {
+            st = NULL;
+            rc = sqlite3_prepare_v2(db, [d1 UTF8String], -1, &st, NULL);
+            if (rc == SQLITE_OK) {
+                finalSQL = d1;
+                NSLog(@"[NotifyBox/store] ⚠️ SELECT 降级（payload 列缺失）原错误=%@", err0);
+                NBStoreLog(@"SELECT 降级：payload 列缺失，已用空串替代 err=%@", err0);
+            }
+        }
+    }
+    if (rc != SQLITE_OK) {
+        const char *m1 = sqlite3_errmsg(db);
+        NSString *err1 = m1 ? [NSString stringWithUTF8String:m1] : @"(null)";
+        NSString *d2 = [sql stringByReplacingOccurrencesOfString:@",IFNULL(payload,'')"
+                                                     withString:@",''"];
+        d2 = [d2 stringByReplacingOccurrencesOfString:@",IFNULL(sys_id_alt,'')"
+                                           withString:@",''"];
+        if (![d2 isEqualToString:sql]) {
+            st = NULL;
+            rc = sqlite3_prepare_v2(db, [d2 UTF8String], -1, &st, NULL);
+            if (rc == SQLITE_OK) {
+                finalSQL = d2;
+                NSLog(@"[NotifyBox/store] ⚠️ SELECT 降级（payload + sys_id_alt 都缺）原错误=%@", err1);
+                NBStoreLog(@"SELECT 降级：payload+sys_id_alt 都缺 err=%@", err1);
+            }
+        }
+    }
+    if (rc != SQLITE_OK) {
+        // 真的查不出来。**绝不许静默 return NULL** —— 那个 NULL 在调用处看起来
+        // 和「库里没有记录」完全一样，正是本次找了两天的原因。
+        const char *m2 = sqlite3_errmsg(db);
+        NSLog(@"[NotifyBox/store] ⚠️ SELECT 彻底失败（降级也没救回）err=%s sql=%@",
+              m2 ? m2 : "(null)", finalSQL);
+        NBStoreLog(@"SELECT 彻底失败 err=%s sql=%@", m2 ? m2 : "(null)", finalSQL);
+        return NULL;
+    }
     // 绑参顺序**必须**和上面 append 的顺序逐条对应。
     int i = 1;
     if (bundle.length) sqlite3_bind_text(st, i++, [bundle UTF8String], -1, SQLITE_TRANSIENT);
@@ -1561,7 +1701,13 @@ static sqlite3_stmt *NBPrepareDelete(sqlite3 *db, NSString *bundle, NSTimeInterv
     if (beforeTs > 0)  [sql appendString:@" AND ts<?"];
     if (readOnly)      [sql appendString:@" AND read=1"];
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) return NULL;
+    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &st, NULL) != SQLITE_OK) {
+        // 🔴 v0.0.141：同 NBRows —— 静默返回 NULL 会让「删不掉」看起来像「本来就没有」。
+        NSLog(@"[NotifyBox/store] ⚠️ 删除语句 prepare 失败 err=%s sql=%@",
+              sqlite3_errmsg(db), sql);
+        NBStoreLog(@"删除语句 prepare 失败 err=%s sql=%@", sqlite3_errmsg(db), sql);
+        return NULL;
+    }
     // 🔴 绑参顺序必须和上面 append 的顺序逐条对应（少绑一条不会报错，
     //    SQLite 把没绑的参数当 NULL ⇒ 条件恒不成立 ⇒ 静默删了个空）。
     int i = 1;
