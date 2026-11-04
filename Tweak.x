@@ -4392,6 +4392,84 @@ static int NBHarvestIvars(id obj, NSMutableDictionary *wrap, int maxDepth, NSUIn
     return a + b;
 }
 
+// ---------- v0.0.148：递归清洗（剔除坏值）而不是整块拒绝 ----------
+// 🔴🔴 真机现场（v0.0.147 结论行）把 499/500 失败的原因指得死死的：
+//     `[payload#5] 无 obj=BBBulletinRequest content=BBContent ui=dict
+//        keys=[launchImage,recordDate,shouldIgnoreDoNotDisturb,userInfo,notificationTriggerData]`
+//     `[payload统计] 累计尝试 500 ｜ 抓到 1 ｜ 无content 0 ｜ 无userInfo 0 ｜ JSON不合法 499`
+//   ⇒ `userInfo` **已经拿到了**，就在那个 dict 里（它本身就是 dict 的一个键）。
+//     我拿到的是**外层**，而外层里有 `recordDate`(NSDate)、`launchImage`(数据) ——
+//     这两个不是合法 JSON ⇒ `isValidJSONObject` 整体 false ⇒ **整块被我扔了**。
+//   ⇒ 这是「一个坏值毁掉一整包」的典型：正确做法是**剔掉坏值、留下好值**。
+static id NBSanitizeJSON(id v, int depth) {
+    if (!v || depth > 4) return nil;
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)v;
+        return (s.length > 512) ? [[s substringToIndex:512] stringByAppendingString:@"…"] : s;
+    }
+    if ([v isKindOfClass:[NSNumber class]]) return v;
+    if ([v isKindOfClass:[NSArray class]]) {
+        NSMutableArray *a = [NSMutableArray array];
+        for (id e in (NSArray *)v) {
+            if (a.count >= 32) break;
+            id s2 = NBSanitizeJSON(e, depth + 1);
+            if (s2) [a addObject:s2];
+        }
+        return a.count ? a : nil;
+    }
+    if ([v isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        for (id k in (NSDictionary *)v) {
+            if (d.count >= 32) break;
+            if (![k isKindOfClass:[NSString class]]) continue;
+            id s2 = NBSanitizeJSON(((NSDictionary *)v)[k], depth + 1);
+            if (s2) d[(NSString *)k] = s2;
+        }
+        return d.count ? d : nil;
+    }
+    return nil;      // NSDate / NSData / NSURL / 私有对象：**丢掉这一个值，不牵连整块**
+}
+
+// 从 action 容器里捞第一个可用 URL（数组/字典/单个 action 对象都认）。
+// 🔴 为什么要这条：现场显示 `objIvar` 里有 `_actions` 与 `_supplementaryActionsByLayout`，
+//    而 `dflt=BBAction url=(nil)` —— 默认动作没 URL，不代表**那些附加动作**里也没有。
+//    「点通知上的『查看』按钮直达内容页」就是靠 action 的 launchURL，这是第二个真实来源。
+// 有界：深度 ≤3、每层预算 8 个元素；`NBLaunchURLFrom` 内部全程 @try。
+static NSString *NBFirstURLInActions(id v, int depth, int budget) {
+    if (!v || depth < 0 || budget <= 0) return nil;
+    if ([v isKindOfClass:[NSArray class]]) {
+        int n = 0;
+        for (id e in (NSArray *)v) {
+            if (n++ >= budget) break;
+            NSString *u = NBFirstURLInActions(e, depth - 1, budget);
+            if (u.length) return u;
+        }
+        return nil;
+    }
+    if ([v isKindOfClass:[NSDictionary class]]) {
+        int n = 0;
+        for (id k in (NSDictionary *)v) {
+            if (n++ >= budget) break;
+            NSString *u = NBFirstURLInActions(((NSDictionary *)v)[k], depth - 1, budget);
+            if (u.length) return u;
+        }
+        return nil;
+    }
+    return NBLaunchURLFrom(v);      // 单个 action 对象
+}
+
+static NSString *NBFirstActionURL(id obj) {
+    if (!obj) return nil;
+    NSArray *keys = @[@"actions", @"supplementaryActionsByLayout"];
+    for (NSString *k in keys) {
+        id v = NBSafeValue(obj, k);
+        if (!v) v = NBFindIvarValue(obj, [k lowercaseString], nil, 4);
+        NSString *u = NBFirstURLInActions(v, 3, 8);
+        if (u.length) return u;
+    }
+    return nil;
+}
+
 static NSString *NBExtractPayload(id obj, NSString *tag) {
     if (!obj) return nil;
 
@@ -4457,10 +4535,33 @@ static NSString *NBExtractPayload(id obj, NSString *tag) {
     BOOL uiOK = (ui != nil);
 
     NSMutableDictionary *wrap = [NSMutableDictionary dictionary];
-    // 🔴 只有 userInfo 本身是合法 JSON 才放进去。放不进去也别整包丢掉 ——
-    //    target/thread 可能仍然有用（见下）。
-    if (uiOK && [NSJSONSerialization isValidJSONObject:ui]) {
-        wrap[@"userInfo"] = ui;
+    // 🔴🔴 v0.0.148：这里原来是「userInfo 整体是合法 JSON 才收，否则整块丢」——
+    //   真机上就是这一句把 499/500 条全扔了：外层 dict 里有 `recordDate`(NSDate)、
+    //   `launchImage`，两个坏值 ⇒ isValidJSONObject 整体 false ⇒ **连线都没存**。
+    //   现在改成：① **往下钻**（真身就在这个 dict 的 `userInfo` 键里）；
+    //            ② **递归清洗**后收（剔坏值，留好值）。
+    int drilled = 0;
+    if (uiOK) {
+        id u = ui;
+        // 最多钻两层：真机键表 `[…,userInfo,…]` ⇒ 下钻一层就是真身。
+        // 钻两层是为了容错（有的实现是 `{userInfo:{userInfo:{…}}}`），不会无限递归。
+        for (int n = 0; n < 2; n++) {
+            if (![u isKindOfClass:[NSDictionary class]]) break;
+            id in2 = ((NSDictionary *)u)[@"userInfo"];
+            if (!in2) break;
+            u = in2;
+            drilled++;
+        }
+        id clean = NBSanitizeJSON(u, 0);
+        if (clean) wrap[@"userInfo"] = clean;
+        // 外壳也洗一份留作线索（键名不能叫 userInfo，否则覆盖上面的真身）。
+        // 🔴 只在"钻过"时才单独存：没钻就等于外壳==真身，存两遍是纯冗余。
+        if (drilled > 0) {
+            id outer = NBSanitizeJSON(ui, 0);
+            if ([outer isKindOfClass:[NSDictionary class]] && [(NSDictionary *)outer count]) {
+                wrap[@"ctx"] = outer;
+            }
+        }
     }
     // `targetContentIdentifier`（iOS 13+）是系统给"这张通知该深链到哪儿"的官方字段，
     // 有些 App 会填。读不到就不放这个键（不写空串：空串会被解析端当"有值但没链接"）。
@@ -4485,6 +4586,10 @@ static NSString *NBExtractPayload(id obj, NSString *tag) {
             if (!lsa) lsa = NBFindIvarValue(obj, @"launchsessionaction", nil, 4);
             aURL = NBLaunchURLFrom(lsa);
         }
+        // v0.0.148：默认动作没 URL ≠ 没有 URL。现场显示 obj 上有
+        // `_actions` 与 `_supplementaryActionsByLayout`，而 `dflt=BBAction url=(nil)`
+        // ⇒ 再往这两个容器里捞一次（"点通知上的按钮直达内容页"就是这条）。
+        if (!aURL.length) aURL = NBFirstActionURL(obj);
         if (aURL.length) wrap[@"action"] = aURL;
     }
 
@@ -4510,11 +4615,11 @@ static NSString *NBExtractPayload(id obj, NSString *tag) {
                            ? [[wrap allKeys] componentsJoinedByString:@","]
                            : @"(空)";
             if (keys.length > 120) keys = [[keys substringToIndex:120] stringByAppendingString:@"…"];
-            NBLog(@"[payload泛扫#%d] obj[%@] 收 %d ｜ content[%@] 收 %d ｜ inner[%@] 收 %d ⇒ wrap 共 %lu 键 %@",
+            NBLog(@"[payload泛扫#%d] obj[%@] 收 %d ｜ content[%@] 收 %d ｜ inner[%@] 收 %d ｜ 钻 %d ⇒ wrap 共 %lu 键 %@",
                   gHvLog, obj ? NBClassName(obj) : @"(nil)", hvObj,
                   content ? NBClassName(content) : @"(nil)", hvContent,
                   innerContent ? NBClassName(innerContent) : @"(nil)", hvInner,
-                  (unsigned long)wrap.count, keys);
+                  drilled, (unsigned long)wrap.count, keys);
         }
     }
 
