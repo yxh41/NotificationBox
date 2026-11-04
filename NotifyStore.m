@@ -1749,6 +1749,10 @@ static NSString *NBAppendMarker(NSMutableString *s, NSString *label, NSString *p
 
     // dylib 装在哪：优先用 tweak 自己用 dladdr 报出来的路径（roothide 会重定向前缀，
     // App 侧猜路径基本猜不中），猜不到才退回逐个探测。
+    // 🔴 v0.0.137：`mtxt` 从三个标记里挑**任意一个有内容的**（优先级 SpringBoard → root → 旧位置）。
+    //    ⚠️ 这一行是编译期才发现的漏写：判据全绿、clang 报 `use of undeclared identifier 'mtxt'`
+    //    ——「文本全绿挡不住编译」，漏一个变量就是这么死的（§7 编译期才是硬闸门）。
+    NSString *mtxt = txtSB.length ? txtSB : (txtRt.length ? txtRt : txtOld);
     [s appendString:@"\n── dylib 安装位置 ──\n"];
     NSString *dylibPath = nil;
     NSRange dr = mtxt ? [mtxt rangeOfString:@"dylib="] : NSMakeRange(NSNotFound, 0);
