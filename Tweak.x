@@ -191,6 +191,8 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #include <pthread.h>          // v0.0.96：诊断文件追加要加锁（多线程写同一文件会互相盖掉行首）
+#include <unistd.h>           // v0.0.136：getuid()（区分 root 进程）+ chown()（修数据目录属主）
+#include <sys/stat.h>         // v0.0.136：stat() 读目录属主，诊断里要打出来
 #import "NotifyStore.h"
 #import "NotifyCommon.h"
 #import "NotifyFilter.h"
@@ -230,7 +232,7 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.135"
+#define NB_VER_STR @"0.0.136"
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -5260,13 +5262,49 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
 %ctor {
     gRecent = [NSMutableDictionary dictionary];   // 单线程时机初始化，之后只读引用
 
+    // 🔴🔴🔴 v0.0.136：数据目录的「属主自愈」—— 这是**治已经坏掉的现场**，不是预防。
+    //
+    // 坏现场长什么样（真机 2026-11-04）：
+    //     /var/mobile/Library/NotifyBox   存在=是  可写=否  写入测试 errno=1(EPERM)
+    //     DB / tweak.log / settings.plist / .tweak_ctor  全部「不存在」
+    //     而 tweak 侧看起来一切正常 ⇒ 极难联想到是权限
+    // 根因：本 tweak 同时注入 SpringBoard(mobile) 与 **backboardd(root)**，
+    //   凡是带 `createDirectoryAtPath:` 的地方（日志、.tweak_ctor）只要 root 先跑，
+    //   目录就归 root 所有 ⇒ App(mobile) 从此读不进也写不进。
+    //   老代码只给「设置」堵过这个坑，**日志和标记文件这两处漏了**。
+    // 修法两层：
+    //   ① 预防：NotifyStore.m 里 `NBCanWriteSharedFiles()` 让 root 进程彻底不碰这个目录；
+    //   ② 治疗：**只有 root 能 chown** ⇒ 就在 backboardd（唯一以 root 注入的进程）里把属主修回 mobile。
+    //      ⚠️ 只 chown 目录本身 + 目录里的直接子项，**不递归跟符号链接**（别改到别人家去）。
+    if (getuid() == 0) {
+        const char *legacy = [NOTIFYBOX_LEGACY_DIR fileSystemRepresentation];
+        // 501:501 = mobile:mobile（盒子 App 与 SpringBoard 的身份，iOS 上固定）
+        chown(legacy, 501, 501);
+        NSArray *kids = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:NOTIFYBOX_LEGACY_DIR
+                                                                           error:nil];
+        for (NSString *k in kids) {
+            NSString *p = [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:k];
+            chown([p fileSystemRepresentation], 501, 501);
+        }
+    }
+
     // 🔴 与 tweak.log 独立的「我跑过」证据：
     //    上一轮出现「日志文件不存在」，但 App 侧又疑似有记录 ⇒ 无法区分
     //    「tweak 没注入」与「日志写不进去」。这个标记文件把两者分开：
     //      .tweak_ctor 存在 + tweak.log 不存在 ⇒ 注入成功、但写日志失败
     //      两个都不存在                      ⇒ 真的没注入
-    {
-        NSString *mark = @"/var/mobile/Library/NotifyBox/.tweak_ctor";
+    // 🔴🔴 v0.0.136：这里**必须**排除 root 进程 —— 否则 backboardd 会把目录建成 root 所有，
+    //    正是这次「记录全没了」的根因（见上方 chown 那段）。root 进程改用 NSLog。
+    if (!NBCanWriteSharedFiles()) {
+        NSString *selfPath = @"?";
+        Dl_info dli;
+        if (dladdr((const void *)&NBProc, &dli) && dli.dli_fname) {
+            selfPath = [NSString stringWithUTF8String:dli.dli_fname];
+        }
+        NSLog(@"[NotifyBox/root] ctor 跑过 proc=%@ v=%@ dylib=%@（root 进程不写共享目录）",
+              NBProc(), NB_VER_STR, selfPath);
+    } else {
+        NSString *mark = [NBDataDir() stringByAppendingPathComponent:@".tweak_ctor"];
         // 🔴 用 dladdr 拿到 dylib 自己的真实路径：roothide 会把前缀重定向，
         //    App 侧探测那几个写死的候选路径通常都落空，只有 tweak 自己知道它被装在哪。
         NSString *selfPath = @"?";
@@ -5275,7 +5313,7 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
         NSString *body = [NSString stringWithFormat:@"%@ %@ %@ dylib=%@",
-                          [NSDate date], NBProc(), @"v0.0.25", selfPath];
+                          [NSDate date], NBProc(), NB_VER_STR, selfPath];
         NSData *md = [body dataUsingEncoding:NSUTF8StringEncoding];
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
@@ -5295,6 +5333,24 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
     //       而且现场看起来完全不像是权限问题。这种坑不能留。
     BOOL soundRecovered = NO;
     if ([NBProc() isEqualToString:@"SpringBoard"]) {
+        // 🔴🔴 v0.0.136：把「数据目录落在哪、谁的身份、能不能写」在**启动第一行**就留痕。
+        //   这次「记录全没了」查了一整天才定位到权限，就是因为日志里**没有一行**说清楚
+        //   库到底在哪个目录、那个目录 App 能不能写。判据要能直接答这个问题。
+        //   与 App 侧 didFinishLaunching 打的那行**同一格式**，两边一对就知道一不一致。
+        {
+            NSString *dir = NBDataDir();
+            NSString *src = [dir isEqualToString:NOTIFYBOX_LEGACY_DIR] ? @"老路径" : @"App容器";
+            struct stat st = {0};
+            BOOL hasStat = (stat([dir fileSystemRepresentation], &st) == 0);
+            NBLog(@"=== [路径] SpringBoard 数据目录=%@ 来源=%@ 属主=%d:%d 可写=%@ uid=%d",
+                  dir, src,
+                  hasStat ? (int)st.st_uid : -1, hasStat ? (int)st.st_gid : -1,
+                  (access([dir fileSystemRepresentation], W_OK) == 0) ? @"是" : @"否",
+                  (int)getuid());
+        }
+        // 老路径 → 容器的**一次性**迁移（幂等；目标已存在就跳过，只拷不删）
+        NBMigrateLegacyDataIfNeeded();
+
         // v0.0.52：注册 Darwin 通知观察者（盒子 App 删记录时唤醒我们清通知中心）。
         // 🔴 只在 SpringBoard 注册：tweak 主逻辑都在 SpringBoard；backboardd 不处理通知中心。
         CFNotificationCenterAddObserver(

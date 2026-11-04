@@ -2,10 +2,29 @@
 #import "ViewController.h"
 #import "NotifyFilter.h"
 #import "NotifyStore.h"
+// 🔴 v0.0.136：NBDataDir() / NBSharedLog() / NBMigrateLegacyDataIfNeeded() 都在这份头里。
+//    NotifyStore.h **不** import 它（tweak 与 App 的公共契约单独一份，避免头文件互相牵连），
+//    所以这里必须显式引 —— 少一行就是 "implicit declaration of function NBSharedLog"。
+#import "NotifyCommon.h"
 
 @implementation AppDelegate
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    // 🔴🔴 v0.0.136：**第一件事**就是定数据目录 + 迁移老数据。
+    //
+    // 为什么排在最前面、且必须在这里：
+    //   ① 后面每一步（读设置、runAutoClean、合并重复、读列表）都要先知道库在哪；
+    //      晚一步就是"用错的路径做了一次迁移"，比不做更糟（§1 顺序必须落成代码结构）。
+    //   ② 迁移是**幂等**的（目标已存在就跳过），每次启动都调没有代价。
+    //   ③ 这是**唯一**能拿到自己 Documents 的进程 —— tweak 那边是扫容器扫出来的，
+    //      只有 App 这边是系统亲口告诉的 ⇒ 必须在这里落一次日志，两边好对比。
+    NBMigrateLegacyDataIfNeeded();
+    NSString *dataDir = NBDataDir();
+    NSString *dataSrc = [dataDir isEqualToString:NOTIFYBOX_LEGACY_DIR] ? @"老路径兜底" : @"App容器";
+    NBSharedLog(@"[路径] 盒子App 数据目录=%@ 来源=%@ DB存在=%@",
+                dataDir, dataSrc,
+                [[NSFileManager defaultManager] fileExistsAtPath:NOTIFYBOX_DB_PATH] ? @"是" : @"否");
+
     // 🔴🔴 v0.0.28：旧格式（soundApps 名单 + 全局音）→ soundMap 的**唯一**迁移时机。
     //
     // 为什么放在这里、而且只放在这里：

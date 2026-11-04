@@ -3,6 +3,8 @@
 #import <sqlite3.h>
 #import <errno.h>
 #import <string.h>
+#import <unistd.h>     // v0.0.136：access()/W_OK/getuid() —— 判「以当前身份能不能写」
+#import <sys/stat.h>   // v0.0.136：stat() 读目录属主（诊断里要打 uid:gid）
 #import <CoreFoundation/CoreFoundation.h>   // v0.0.52：Darwin 通知（清系统通知中心用）
 
 // ---------- 列表一次最多取多少条 ----------
@@ -17,11 +19,136 @@
 //    界面上不许再写一个 2000。
 static const NSInteger kNBListLimit = 2000;
 
+// ---------- v0.0.136：数据目录的**单点出口**（App 容器优先，老路径兜底） ----------
+// 🔴 为什么必须是「一个函数」而不是「两个进程各写一份」：
+//    库/日志/设置分散在 40 处调用点，只要有一处解析结果不同，就会出现
+//    「tweak 记了、App 看不到」——这次真机买到的就是这一类（只是根因在沙箱，不在解析）。
+//    ⇒ 两个进程调**同一个实现**，只有"怎么拿到自己的容器"这一步分叉。
+//
+// 🔴 为什么扫 metadata 而不是用 LSApplicationWorkspace 的 dataContainerURL：
+//    ① 纯 Foundation，tweak 侧不多链一个私有框架（多链一个就多一份加载期风险）；
+//    ② SpringBoard 以 root 视角读 metadata 一定成功；
+//    ③ 代价是每次要读 N 个 plist ⇒ 结果必须缓存。
+// 🔴 为什么不能把容器 UUID 写死：App **每重装一次 UUID 就变**（每次装包都在变）。
+static NSString *NBFindAppDocsDir(void) {
+    NSString *base = @"/var/mobile/Containers/Data/Application";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *kids = [fm contentsOfDirectoryAtPath:base error:nil];
+    if (!kids.count) return nil;
+    for (NSString *u in kids) {
+        NSString *meta = [[base stringByAppendingPathComponent:u]
+                          stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:meta];
+        if (![d isKindOfClass:[NSDictionary class]]) continue;
+        id ident = d[@"MCMMetadataIdentifier"];
+        if (![ident isKindOfClass:[NSString class]]) continue;
+        if (![(NSString *)ident isEqualToString:NOTIFYBOX_APP_BUNDLE]) continue;
+        // 不判存在：App 第一次启动前 Documents 可能还没建，由调用方统一 createDirectory
+        return [[base stringByAppendingPathComponent:u] stringByAppendingPathComponent:@"Documents"];
+    }
+    return nil;
+}
+
+static NSString *gNBDataDir = nil;          // 进程内缓存（容器变了用 NBRefreshDataDir() 清）
+
+void NBRefreshDataDir(void) {
+    @synchronized ([NotifyStore class]) { gNBDataDir = nil; }
+}
+
+NSString *NBDataDir(void) {
+    @synchronized ([NotifyStore class]) {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        // 🔴 缓存必须**带存在性检查**：App 重装后 UUID 变了，旧路径还躺在缓存里 ⇒
+        //    写入会失败，而且失败得很安静（目录不存在 ⇒ sqlite3_open 报 unable to open）。
+        if (gNBDataDir.length && [fm fileExistsAtPath:gNBDataDir]) return gNBDataDir;
+
+        // App 自己的 Documents（两个进程都算得出来：App 直接问系统，SpringBoard 扫容器）
+        NSString *docs = nil;
+        if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:NOTIFYBOX_APP_BUNDLE]) {
+            NSArray *u = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask];
+            if (u.count) docs = [[u firstObject] path];
+        } else {
+            docs = NBFindAppDocsDir();
+        }
+
+        // 🔴🔴 **粘性降级**：路径只能被决定一次，之后不许随运行状态来回漂。
+        //   为什么必须这样：legacy 现在不可写（属主被 root 占了）⇒ 本次降级到容器；
+        //   而 backboardd 那边的 chown 修好之后，下一次 respring legacy 又变可写 ⇒
+        //   如果每次都按"当前可写"重新选，就会出现「这次写 A、下次写 B」，
+        //   两边的数据各自增长、互相看不见 —— 那正是这次事故的同型 bug，不能再造一次。
+        //   所以：一旦降级，就在容器里留一个 `.nb_dir_pinned` 标记，**永久**用容器。
+        //   （想回到老路径：删掉这个标记文件即可，见 README/设置页说明。）
+        NSString *pin = docs ? [docs stringByAppendingPathComponent:@".nb_dir_pinned"] : nil;
+        BOOL pinned = (pin.length && [fm fileExistsAtPath:pin]);
+
+        NSString *dir = nil;
+        if (pinned) {
+            dir = docs;                                     // 已固定：无条件用容器
+        } else if (access([NOTIFYBOX_LEGACY_DIR fileSystemRepresentation], W_OK) == 0) {
+            dir = NOTIFYBOX_LEGACY_DIR;                     // 正常情况：老路径可写 ⇒ 用它
+        } else if (docs.length) {
+            // 首次降级：写下标记（固定住），历史数据由 NBMigrateLegacyDataIfNeeded() 拷过来
+            [fm createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
+            [@"" writeToFile:pin atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            dir = docs;
+        } else {
+            dir = NOTIFYBOX_LEGACY_DIR;                     // 兜底（App 没装 / 扫不到容器）
+        }
+
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        gNBDataDir = dir;
+        return dir;
+    }
+}
+
+// 老路径 → 新位置的一次性迁移。
+// 🔴 三条规矩（少一条就会丢数据或反复覆盖）：
+//    ① **只拷不删**：老文件留着当备份。删掉就再也回不了头（这次用户已经手删过一次，血账）；
+//    ② 目标已存在就跳过：否则每次启动都拿老库盖新库 ⇒ 新记录全被冲掉；
+//    ③ 库和设置**各判各的**：少迁一个就会出现「库对了、设置全没了」的半废状态。
+void NBMigrateLegacyDataIfNeeded(void) {
+    NSString *dir = NBDataDir();
+    if (!dir.length || [dir isEqualToString:NOTIFYBOX_LEGACY_DIR]) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *name in @[NOTIFYBOX_DB_NAME, NOTIFYBOX_SETTINGS_NAME]) {
+        NSString *dst = [dir stringByAppendingPathComponent:name];
+        NSString *src = [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:name];
+        if ([fm fileExistsAtPath:dst]) continue;
+        if (![fm fileExistsAtPath:src]) continue;
+        [fm copyItemAtPath:src toPath:dst error:nil];
+    }
+}
+
+// 🔴🔴🔴 v0.0.136 的**根因刀**：哪些进程可以碰共享数据目录
+//
+// 事实链（真机买到的，不是推的）：
+//   ① 本 tweak 的过滤表是 `Bundles = (com.apple.springboard, com.apple.backboardd)`；
+//   ② **backboardd 以 root 运行**，而 SpringBoard 是 mobile；
+//   ③ 下面两个日志函数、以及 Tweak.x 的 `%ctor` 里那个 `.tweak_ctor` 标记，
+//      **全都有 `createDirectoryAtPath:`**，而且当时都**没有**进程保护；
+//   ④ ⇒ 只要 root 那个进程先跑一步，`/var/mobile/Library/NotifyBox` 就**归 root 所有**；
+//   ⑤ 之后 App（mobile）既读不进也写不进，现场长这样（真机环境自检）：
+//         目录 存在=是  可写=否
+//         写入测试=失败  errno=1(Operation not permitted)
+//         DB / tweak.log / settings.plist 全部「不存在」
+//      ——**长得完全不像权限问题**，所以能整整查一天。
+//   ⑥ Tweak.x 里早就为「**设置**」堵过这个坑（原话："backboardd 以 root 运行 ——
+//      它写出来的文件/目录会变成 root 所有，之后盒子 App（mobile）就写不动了……
+//      这种坑不能留"），**但日志和 .tweak_ctor 这两处漏了** ⇒ 这次就是在它们身上爆的。
+// ⇒ 规矩（从这版起当铁律）：**uid==0 的进程一律不碰共享数据目录**；
+//   它的日志退化成 NSLog（进系统日志），样本完全够用 —— backboardd 本来就不写库。
+BOOL NBCanWriteSharedFiles(void) {
+    static int cached = -1;
+    if (cached < 0) cached = (getuid() == 0) ? 0 : 1;
+    return cached == 1;
+}
+
 // 写库失败要留痕：区分「hook 没触发」与「触发了但写不进」
 static void NBStoreLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
+    if (!NBCanWriteSharedFiles()) { NSLog(@"[NotifyBox/root STORE] %@", msg); return; }
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:[NOTIFYBOX_LOG_PATH stringByDeletingLastPathComponent]
   withIntermediateDirectories:YES attributes:nil error:nil];
@@ -40,6 +167,9 @@ void NBSharedLog(NSString *fmt, ...) {
     va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
+
+    // 🔴 v0.0.136：root 进程（backboardd）不许建/写这个目录，见 NBCanWriteSharedFiles 上方的长注释。
+    if (!NBCanWriteSharedFiles()) { NSLog(@"[NotifyBox/root] %@", msg); return; }
 
     // 轮转检查（节流）
     {
@@ -1673,16 +1803,28 @@ static BOOL NBContainsText(NSString *hay, NSString *needle) {
 
 + (NSString *)debugSummary {
     NSFileManager *fm = [NSFileManager defaultManager];
+    // 🔴 v0.0.136：把「目录是谁的」直接摆到界面上。
+    //   旧的三行（存在/可读/可写）是**一个事实说三遍** —— 文件不在，后两个必然是否，
+    //   看着像三条证据，其实只有一条。真机排查时它没能回答"为什么 App 进不去"。
+    //   现在改成：目录来源 + 属主 uid:gid + 目录可写（当前身份）——这三项各自独立，
+    //   属主不是 501:501 就直接指向"被 root 进程占过"。
+    NSString *dir = NBDataDir();
+    NSString *src = [dir isEqualToString:NOTIFYBOX_LEGACY_DIR] ? @"老路径" : @"App容器";
+    struct stat st; memset(&st, 0, sizeof(st));
+    BOOL hasStat = (stat([dir fileSystemRepresentation], &st) == 0);
     BOOL exists = [fm fileExistsAtPath:NOTIFYBOX_DB_PATH];
     NSDictionary *attrs = [fm attributesOfItemAtPath:NOTIFYBOX_DB_PATH error:nil];
     unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
     NSInteger n = [self count];
     NSMutableString *s = [NSMutableString stringWithFormat:
-            @"DB 路径：%@\n存在：%@    大小：%llu B\n可读：%@    可写：%@\n记录数：%ld    上限：%ld",
+            @"数据目录：%@\n  来源：%@\n  属主：%d:%d（应为 501:501）  可写：%@\n"
+            @"DB 文件：%@\n  存在：%@  大小：%llu B  可读：%@\n记录数：%ld  上限：%ld",
+            dir, src,
+            hasStat ? (int)st.st_uid : -1, hasStat ? (int)st.st_gid : -1,
+            (access([dir fileSystemRepresentation], W_OK) == 0) ? @"是" : @"否",
             NOTIFYBOX_DB_PATH,
             exists ? @"是" : @"否", size,
             [fm isReadableFileAtPath:NOTIFYBOX_DB_PATH] ? @"是" : @"否",
-            [fm isWritableFileAtPath:NOTIFYBOX_DB_PATH] ? @"是" : @"否",
             (long)n, (long)[self maxRecords]];
 
     // 🔴 v0.0.10：把最近 3 条的**字段长度**打出来。

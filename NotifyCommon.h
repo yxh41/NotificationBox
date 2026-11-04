@@ -6,10 +6,45 @@
 // 🔴 共享常量：tweak 与盒子 App 必须一致（别各写一份）
 #define NOTIFYBOX_BUNDLE_ID   @"com.yxh41.notifybox"
 #define NOTIFYBOX_APP_BUNDLE  @"com.yxh41.notifybox.app"
-// 🔴 roothide 沙盒特殊：tweak(跑在 SpringBoard) 与 App 都要能读写的路径。
-//    真机已确认：盒子 App 能在 /var/mobile/Library/NotifyBox/ 建目录、写探针文件、读 sqlite。
-#define NOTIFYBOX_DB_PATH     @"/var/mobile/Library/NotifyBox/notifybox.sqlite"
-#define NOTIFYBOX_LOG_PATH    @"/var/mobile/Library/NotifyBox/tweak.log"
+
+// ---------- v0.0.136：数据目录改成**运行时解析**，不再写死 ----------
+// 🔴🔴 为什么推翻了原来那句「真机已确认 App 能访问 /var/mobile/Library/NotifyBox」：
+//   2026-11-04 真机环境自检（同一个 App、同一个包，什么都没改）：
+//       目录 /var/mobile/Library/NotifyBox
+//         存在=是  可写=否
+//         写入测试=失败  errno=1(Operation not permitted)
+//       DB / tweak.log / settings.plist 全部「不存在」
+//   而 **tweak 侧照记不误**（SpringBoard 是越狱进程，权限本来就不同）。
+//   ⇒ 关键判断：App 能 stat 到目录却进不去，报 **EPERM**（不是权限位不足的 EACCES）
+//     ⇒ 这是**沙箱/挂载**在拒，而 App 二进制里根本没有 entitlements（两版都验过：
+//       签名 blob 只有 [CodeDirectory, Requirements, CodeDirectory]，没有 Entitlements）
+//     ⇒ 也就是说：**App 访问 /var/mobile/Library 靠的是越狱环境给的放宽，不是它自己的权利。**
+//        那条放宽会随重装/重启/环境变化消失 ⇒ 「记录凭空读不到」这类幽灵 bug 的温床。
+//   ⇒ 正解：把库/日志/设置全部搬进**盒子 App 自己的 Documents**。
+//      ① App 对自己的数据容器**天然有权限**，与沙箱、越狱状态、roothide 怎么重定向都无关；
+//      ② tweak 有 root 权限，能写进去（路径靠扫容器 metadata 得到，不写死 UUID）；
+//      ③ 老路径只当**兜底**（App 没装 / 扫不到容器时），并做一次性迁移。
+// ⚠️ 下面三个宏**名字保持不变** —— 40 处调用点一个字都不用改；
+//    但它们是**表达式**不是字面量 ⇒ 绝对不许写成 `@NOTIFYBOX_DB_PATH`（那样编译不过）。
+#define NOTIFYBOX_LEGACY_DIR  @"/var/mobile/Library/NotifyBox"
+#define NOTIFYBOX_DB_NAME     @"notifybox.sqlite"
+#define NOTIFYBOX_LOG_NAME    @"tweak.log"
+#define NOTIFYBOX_SETTINGS_NAME @"settings.plist"
+
+// 单点出口：数据目录（两个进程共用同一份实现，见 NotifyStore.m）
+// 🟢 返回值在进程内缓存；容器 UUID 变了（重装 App）时用 NBRefreshDataDir() 强制重扫。
+NSString *NBDataDir(void);
+void     NBRefreshDataDir(void);
+// 🔴🔴 **uid==0 的进程一律不许碰共享数据目录**（本 tweak 同时注入 backboardd，它以 root 跑）。
+//    root 一旦执行 createDirectoryAtPath:，目录就归 root 所有 ⇒ 盒子 App(mobile) 从此
+//    读不进也写不进 —— 现场是「记录全没了 / 设置存不住」，而 errno 只给一个 EPERM。
+//    这里是那条规定**唯一的实现**，Tweak.x 的 ctor 与两个日志函数都调它。
+BOOL     NBCanWriteSharedFiles(void);
+// 老路径 → 新位置的**一次性**迁移（幂等，两个进程都可以调）
+void     NBMigrateLegacyDataIfNeeded(void);
+
+#define NOTIFYBOX_DB_PATH       [NBDataDir() stringByAppendingPathComponent:NOTIFYBOX_DB_NAME]
+#define NOTIFYBOX_LOG_PATH      [NBDataDir() stringByAppendingPathComponent:NOTIFYBOX_LOG_NAME]
 
 // ---------- 设置存储 ----------
 // 🔴🔴 v0.0.8 起：设置的**唯一权威位置**是下面这个文件，不再用 Preferences 域。
@@ -19,7 +54,10 @@
 //   ② /var/mobile/Library/Preferences/<id>.plist 归 cfprefsd 管：
 //      App 直接写文件，cfprefsd 可能拿自己的缓存盖回去，出现「改了没生效」的幽灵现象。
 //   新方案：盒子 App 写、tweak 读，**单一写入者、不经过 cfprefsd**。
-#define NOTIFYBOX_SETTINGS_PATH @"/var/mobile/Library/NotifyBox/settings.plist"
+// 🔴 v0.0.136：位置跟着数据目录一起搬进 App 容器（上面那套权限理由同样适用）——
+//   否则会出现「库能读了、设置却写不进去」的半废状态（真机已见：settings.plist 不存在、
+//   生效配置项数 0）。**"单一写入者"这条规则不变**，只是换个位置。
+#define NOTIFYBOX_SETTINGS_PATH [NBDataDir() stringByAppendingPathComponent:NOTIFYBOX_SETTINGS_NAME]
 
 // 旧路径：只为兼容 v0.0.7 及以前已经填过的值（只读兜底，不再写）
 #define NOTIFYBOX_PREFS_PATH  @"/var/mobile/Library/Preferences/com.yxh41.notifybox.plist"
