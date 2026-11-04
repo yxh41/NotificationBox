@@ -4330,6 +4330,20 @@ static BOOL NBIvarNameIsPriority(NSString *k) {
     return NO;
 }
 
+// 🔴 v0.0.147：这几个键**数据库里已经有列**（`bundle/title/message/subtitle` 是核心字段）。
+//   收进 payload 只是把同一段文字存两遍，有两个坏处：
+//     ① 库白白变大（500 条 × 一条通知的全部正文）；
+//     ② 🔴🔴 让「有 payload 的记录数」这个指标**彻底失真** —— 真机实测就是这样：
+//        `[payload泛扫#4] content[BBContent] 收 2 键 ⇒ wrap 共 2 键 title,message`，
+//        统计打出「累计尝试 500 ｜ 抓到 500 ｜ 无userInfo 0」，看起来 100% 命中，
+//        其实**一条新线索都没拿到**。这种"自证很漂亮、功能没进展"最难查。
+static BOOL NBIvarNameIsDenied(NSString *k) {
+    static NSArray *ws = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ws = @[@"title", @"message", @"subtitle", @"body"]; });
+    return [ws containsObject:[k lowercaseString]];
+}
+
 // priorityOnly = YES 只收优先名，NO 收其余。分两趟而不是缓存 Ivar 指针：
 // `class_copyIvarList` 的数组要 free，但 Ivar 本身归类所有 —— 分两趟重取一遍更省心。
 static int NBHarvestPass(id obj, NSMutableDictionary *wrap, int maxDepth,
@@ -4352,6 +4366,7 @@ static int NBHarvestPass(id obj, NSMutableDictionary *wrap, int maxDepth,
                 // 剥前导下划线：`_userInfo` 与 `userInfo` 是同一个语义。
                 NSString *k2 = [key hasPrefix:@"_"] ? [key substringFromIndex:1] : key;
                 if (!k2.length) continue;
+                if (NBIvarNameIsDenied(k2)) continue;              // 冗余列，见上面那条注释
                 if (NBIvarNameIsPriority(k2) != priorityOnly) continue;
                 if (wrap[k2]) continue;
                 id v = nil;
@@ -4477,9 +4492,15 @@ static NSString *NBExtractPayload(id obj, NSString *tag) {
     // 找到了的键不会被覆盖（`if (wrap[k2]) continue;`），只是在原来为空时才补上。
     // 有界日志（封顶 5 行）：这功能失败的样子是"长按只有『打开』"，和"没链接"同形，
     // 所以"泛扫收到了几个键"必须留痕，否则下一轮又只能猜。
-    int hvContent = 0, hvInner = 0;
+    int hvContent = 0, hvInner = 0, hvObj = 0;
     if (content) hvContent = NBHarvestIvars(content, wrap, 3, 20);
     if (innerContent && innerContent != content) hvInner = NBHarvestIvars(innerContent, wrap, 3, 20);
+    // v0.0.147：**obj 也要扫**。
+    // 🔴 真机证据（v0.0.146 结论行）：`content[BBContent] 收 2 键 ⇒ wrap 共 2 键 title,message`
+    //    —— `BBContent` 上**根本没有 userInfo**，只有 title/message（还没被泛扫扩到 obj）。
+    //    而唯一一直生效的线索 `defaultAction.launchURL` 就在 **obj** 上 ⇒ 线索在 obj，不在 content。
+    //    obj 有上百个 ivar，**只走"优先名"一趟**（绝不两趟），总键数封顶 26。
+    if (obj) hvObj = NBHarvestPass(obj, wrap, 4, YES, 26);
     {
         static int gHvLog = 0;
         if (gHvLog < 5) {
@@ -4489,8 +4510,9 @@ static NSString *NBExtractPayload(id obj, NSString *tag) {
                            ? [[wrap allKeys] componentsJoinedByString:@","]
                            : @"(空)";
             if (keys.length > 120) keys = [[keys substringToIndex:120] stringByAppendingString:@"…"];
-            NBLog(@"[payload泛扫#%d] content[%@] 收 %d 键 ｜ inner[%@] 收 %d 键 ⇒ wrap 共 %lu 键 %@",
-                  gHvLog, content ? NBClassName(content) : @"(nil)", hvContent,
+            NBLog(@"[payload泛扫#%d] obj[%@] 收 %d ｜ content[%@] 收 %d ｜ inner[%@] 收 %d ⇒ wrap 共 %lu 键 %@",
+                  gHvLog, obj ? NBClassName(obj) : @"(nil)", hvObj,
+                  content ? NBClassName(content) : @"(nil)", hvContent,
                   innerContent ? NBClassName(innerContent) : @"(nil)", hvInner,
                   (unsigned long)wrap.count, keys);
         }
@@ -4504,8 +4526,14 @@ static NSString *NBExtractPayload(id obj, NSString *tag) {
     }
     if (s.length > 2048) s = [s substringToIndex:2048];
 
-    // v0.0.135：抓不到时打一次「结构现场」（每个入口一行，自己限流，不占下面那 5 个名额）。
-    if (!s.length) NBDumpPayloadShape(obj, content, tag);
+    // v0.0.135：打一次「结构现场」（每个 tag 一行，自己限流，不占下面那 5 个名额）。
+    // 🔴🔴 v0.0.147：**去掉 `if (!s.length)` 这个前提**。
+    //   原来只在"抓不到"时打 —— 那是当时的前提（几乎全抓不到）。现在泛扫让提取
+    //   100% 成功（真机：`抓到 500 ｜ 无userInfo 0`），于是这行**再也没打过**，
+    //   而它恰恰是唯一能列出 `obj` / `content` 真实 ivar 名字的东西 ⇒ 证据自己消失了。
+    //   🔴 教训：**诊断件的触发条件不许建立在"它还失败"这个前提上**。
+    //   `NBDumpPayloadShape` 内部按 tag 去重，最多 3~4 行，不会刷屏。
+    NBDumpPayloadShape(obj, content, tag);
 
     // ---------- v0.0.134：诊断从「只有首 5 条」升级成「首 5 条细 + 累计统计」两级 ----------
     // 🔴 为什么 v0.0.133 那版不够用（真机实测买到的）：`[payload#N]` 只有 5 个名额、

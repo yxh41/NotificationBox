@@ -2159,7 +2159,7 @@ static NSString *NBEnvClock(double ts) {
     NSTimeInterval latest = 0;
     // v0.0.144：payload（长按直达）的三个量，跟着这一次 openDB **一起量**。
     //   `plCol` 三态：在 / 不在（带 SQLite 原话）/ 打不开库 —— 三者不许合并。
-    long plTotal = -1, plHave = -1, plRecent20 = -1;
+    long plTotal = -1, plHave = -1, plRecent20 = -1, plLink = -1;
     NSString *plCol = @"打不开库";
     NSString *plSample = nil;
     NSDictionary *plStats = nil;
@@ -2190,6 +2190,13 @@ static NSString *NBEnvClock(double ts) {
             // ④ v0.0.145：「5 / 500 到底是库存还是抓不到」—— 只能靠最近这批来分。
             plRecent20 = NBEnvPayloadRecent(ldb, 20);
             plStats    = NBEnvPayloadStats(ldb);
+            // ⑤ 🔴 v0.0.147：**这才是产品的真指标** —— payload 里真的含链接的条数。
+            //   v0.0.146 的真机账：泛扫让「有 payload 的记录」从 5/500 变成全表，
+            //   但收到的只有 `title,message`（数据库里本来就有的列）⇒ 指标好看、功能零进展。
+            //   `LIKE '%:\/%'` 那条是必需的：JSON 序列化会把 `/` 写成 `\/`。
+            //   SQLite 的 LIKE 默认没有转义符，反斜杠就是普通字符，不用 ESCAPE。
+            plLink = NBEnvCount(ldb, "SELECT COUNT(*) FROM notifications "
+                                     "WHERE payload LIKE '%://%' OR payload LIKE '%:\\/%';");
         } else {
             // 🔴 先把 errmsg 拷成 NSString 再看：下一次任何 sqlite 调用都会覆盖内部缓冲。
             const char *m = sqlite3_errmsg(ldb);
@@ -2209,10 +2216,12 @@ static NSString *NBEnvClock(double ts) {
 
     // ── payload：长按「直达内容页」的唯一线索 ──
     // 🔴 判定表（照这一屏就能定死病因，不用连电脑）：
-    //    列=不在                      ⇒ 走「补列」，功能与记录**都不该**受影响
-    //    列=在，最近 20 条里 0 条     ⇒ tweak 侧现在也抓不到 ⇒ 看 `[payload现场]` 的结构 dump
-    //    列=在，最近 20 条里大半有    ⇒ 抓取正常，那批 0 的只是**加列之前的库存**
-    //    列=在，有数，样本「含链接」  ⇒ 平台就该显示「直达」；若仍显示「打开」= App 侧解析问题
+    //    列=不在                        ⇒ 走「补列」，功能与记录**都不该**受影响
+    //    列=在，最近 20 条里 0 条       ⇒ tweak 侧现在也抓不到 ⇒ 看 `[payload现场]` 的结构 dump
+    //    列=在，最近 20 条里大半有      ⇒ 抓取正常，那批 0 的只是**加列之前的库存**
+    //    🔴 **「有 payload」多而「含链接」少** ⇒ 收到的都是 title/message 这种冗余列，
+    //       指标好看但功能零进展（v0.0.146 真机就是这个形态）⇒ 看「含链接」那一行才有意义
+    //    含链接 > 0                     ⇒ 平台该显示「直达」；若仍显示「打开」= App 侧解析问题
     [s appendString:@"\n── payload（长按直达）──\n"];
     [s appendFormat:@"  列=%@   有 payload 的记录=%ld / %ld\n", plCol, plHave, plTotal];
     if (plTotal < 0) {
@@ -2220,6 +2229,7 @@ static NSString *NBEnvClock(double ts) {
     }
     // 🔴 这一行是本版的核心判据：「5/500」分不开库存与故障，最近 20 条能。
     [s appendFormat:@"  最近 20 条里有 payload 的 = %ld 条\n", plRecent20];
+    [s appendFormat:@"  其中**含链接**的 = %ld 条（这才是「直达」用得上的）\n", plLink];
     if (plStats) {
         NSNumber *cnt = plStats[@"count"];
         NSNumber *mn  = plStats[@"minTs"];
