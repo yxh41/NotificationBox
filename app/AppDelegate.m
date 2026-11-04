@@ -28,6 +28,16 @@
                 dataDir, healed ? @"是" : @"否",
                 [[NSFileManager defaultManager] fileExistsAtPath:NOTIFYBOX_DB_PATH] ? @"是" : @"否");
 
+    // 🔴🔴 v0.0.138：App 侧也跑一遍启动探针，结果落到 /private/var/tmp/nb_boot_NotifyBoxApp.txt。
+    //
+    // 为什么 App 也要跑：**App 的沙箱和 SpringBoard 的沙箱不是同一个**。
+    //   同一批候选路径两边各试一次、并排看，才能判断"是谁被拒"：
+    //     · 只有 App 写不进  ⇒ App 的 entitlement 问题（要加 no-container）
+    //     · 两边都写不进      ⇒ 路径本身有问题，得换地方
+    //     · 两边都写进        ⇒ 那个目录没问题，问题在别处（比如 tweak 压根没跑）
+    //   摆在 didFinishLaunching 最前面，理由同下：后面每一步都要先能写盘。
+    NBWriteBootProbe();
+
     // 🔴🔴 v0.0.28：旧格式（soundApps 名单 + 全局音）→ soundMap 的**唯一**迁移时机。
     //
     // 为什么放在这里、而且只放在这里：

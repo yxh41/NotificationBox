@@ -5,6 +5,8 @@
 #import <string.h>
 #import <unistd.h>     // v0.0.136：access()/W_OK/getuid() —— 判「以当前身份能不能写」
 #import <sys/stat.h>   // v0.0.136：stat() 读目录属主（诊断里要打 uid:gid）
+#import <fcntl.h>      // v0.0.138：open()/O_WRONLY/O_CREAT/O_TRUNC（探针的第二种写法）
+#import <dlfcn.h>      // v0.0.138：dladdr() —— 探针要报 dylib 自己的真实路径
 #import <CoreFoundation/CoreFoundation.h>   // v0.0.52：Darwin 通知（清系统通知中心用）
 
 // ---------- 列表一次最多取多少条 ----------
@@ -77,21 +79,180 @@ NSString *NBDataDir(void) {
 //   ② root 进程不许调：它会把自己刚建的那个目录再建一次，等于原地复活这个 bug；
 //   ③ 只在「存在但当前身份写不进」时动手 —— 可写时零动作（不碰就不会出事）。
 // 返回 YES = 这次真的动手且成功了（调用方要把这个事实打进日志）。
+// 🔴🔴 v0.0.138：**删掉 `removeItemAtPath` 那一步**。不是"怕删数据"，是更硬的三条：
+//   ① **不可逆动作不许落在"读数不可信"的轮次**。这个函数的入口条件就是 `access(W_OK) != 0`
+//      —— 而那正是我们无法解释的那个 EPERM。在"不知道谁在拒"的状态下去删目录，是拿现场赌博。
+//   ② **先删后建，建失败就永久失去现场**：删成功了、`createDirectory` 失败（沙箱/空间/任何原因），
+//      目录就没了；返回值还是 NO ⇒ 调用方看不出发生了不可逆的事。
+//   ③ 2026-11-04 真机就出现过「11:38 还有 6 个文件、11:52 路径整个不存在」这一段，
+//      而**没有任何一行代码承认过自己删了东西**。这种形状不能再留。
+// ⇒ 现在只做一件事：**写不进就如实报出来**（`NBWriteBootProbe` 会把 errno 记全），目录留着。
 BOOL NBHealDataDirOwnership(void) {
     if (!NBCanWriteSharedFiles()) return NO;
     const char *p = [NOTIFYBOX_LEGACY_DIR fileSystemRepresentation];
     struct stat hst; memset(&hst, 0, sizeof(hst));
     if (stat(p, &hst) != 0) return NO;              // 不存在：让 NBDataDir 正常建（归本进程所有）
     if (access(p, W_OK) == 0) return NO;            // 可写：零动作
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *kids = [fm contentsOfDirectoryAtPath:NOTIFYBOX_LEGACY_DIR error:nil];
-    // 🔴 `kids == nil` 与 `count == 0` 必须分开判：读不出来（权限/异常）不等于"空"，
-    //    把 nil 当 0 会在读失败时删掉一个**可能有记录**的目录。
-    if (kids == nil || kids.count > 0) return NO;
-    if (![fm removeItemAtPath:NOTIFYBOX_LEGACY_DIR error:nil]) return NO;
-    return [fm createDirectoryAtPath:NOTIFYBOX_LEGACY_DIR
-             withIntermediateDirectories:YES attributes:nil error:nil];
+    NSLog(@"[NotifyBox] ⚠️ 数据目录存在但当前身份写不进 dir=%@ 属主=%d:%d uid=%d errno=%d(%s)"
+          @"（v0.0.138 起**不再删目录重建**，只报告。诊断见 /private/var/tmp/nb_boot_*.txt）",
+          NOTIFYBOX_LEGACY_DIR, (int)hst.st_uid, (int)hst.st_gid, (int)getuid(),
+          errno, strerror(errno));
+    return NO;
 }
+
+// ───────────────────────────── v0.0.138 启动探针 ─────────────────────────────
+// 设计要点（每一条都是被真机打过的地方，别删）：
+//   ① **它自己不能是静默的**：连"写 /tmp 这一步"的结果都要检查并 NSLog。
+//      否则又是一个"探针失败 ⇒ 看起来像没跑"的闭环。
+//   ② **同一目录试两种写法**：`NSData writeToFile:atomically:YES`（`.tweak_ctor` 就是这种）
+//      与 `open+write`（绕开 atomic 的"临时文件 + rename"）。结果若不同，
+//      直接指向"是 atomic 那条路被拒"，而不是笼统的"写不进"。
+//   ③ **errno 每个动作分别清零再取**，绝不复用上一句的残留（否则会报出误导性的 errno）。
+//   ④ 候选目录**不只试第一个能写的就收工**：全部试完再汇总，才知道"应该搬到哪去"。
+
+static NSString *NBProbeProcName(void) {
+    NSString *n = [[NSProcessInfo processInfo] processName];
+    if (!n.length) n = @"?";
+    // 进程名里可能有路径/空格，当文件名用之前先洗一遍
+    NSCharacterSet *bad = [[NSCharacterSet alphanumericCharacterSet] invertedSet];
+    NSString *s = [[n componentsSeparatedByCharactersInSet:bad] componentsJoinedByString:@"_"];
+    return s.length ? s : @"?";
+}
+
+// 探一个目录：建目录 → 写法① → 写法② → 读回。返回该目录（能写）或 nil。
+static NSString *NBProbeOneDir(NSString *dir, NSMutableString *out) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    const char *cp = [dir fileSystemRepresentation];
+
+    struct stat st; memset(&st, 0, sizeof(st));
+    errno = 0;
+    BOOL hasSt = (stat(cp, &st) == 0);
+    int stErr = errno;
+
+    [out appendFormat:@"  ── %@\n", dir];
+    if (hasSt) {
+        [out appendFormat:@"     stat=OK 属主=%d:%d mode=%o\n",
+                           (int)st.st_uid, (int)st.st_gid, (unsigned)(st.st_mode & 07777)];
+    } else {
+        [out appendFormat:@"     stat=FAIL errno=%d(%s)\n", stErr, strerror(stErr)];
+    }
+
+    errno = 0;
+    BOOL mk = [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    int mkErr = errno;
+    if (mk) {
+        [out appendString:@"     createDirectory=OK\n"];
+    } else {
+        [out appendFormat:@"     createDirectory=FAIL errno=%d(%s)%@\n", mkErr, strerror(mkErr),
+                           hasSt ? @"（目录已存在，FAIL 属正常）" : @"（目录不存在且建不出来）"];
+    }
+    if (!mk && !hasSt) {
+        [out appendString:@"     ⇒ 目录不存在也建不出来，写入测试跳过\n"];
+        return nil;
+    }
+
+    NSString *f1 = [dir stringByAppendingPathComponent:@".nb_probe_atomic"];
+    NSString *f2 = [dir stringByAppendingPathComponent:@".nb_probe_open"];
+    NSData *payload = [@"NotifyBox probe\n" dataUsingEncoding:NSUTF8StringEncoding];
+
+    // 写法①：和 `.tweak_ctor` / `.tweak_ctor_root` 完全同一种写法
+    errno = 0;
+    BOOL w1 = [payload writeToFile:f1 atomically:YES];
+    int e1 = errno;
+    if (w1) {
+        [out appendString:@"     NSData(atomically:YES)=OK\n"];
+    } else {
+        [out appendFormat:@"     NSData(atomically:YES)=FAIL errno=%d(%s)\n", e1, strerror(e1)];
+    }
+
+    // 写法②：直接 open+write，绕开 atomic 的临时文件 + rename
+    errno = 0;
+    int fd = open([f2 fileSystemRepresentation], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int eOpen = errno;
+    BOOL w2 = NO;
+    int e2 = 0;
+    if (fd >= 0) {
+        errno = 0;
+        ssize_t n = write(fd, payload.bytes, payload.length);
+        e2 = errno;
+        w2 = (n == (ssize_t)payload.length);
+        close(fd);
+    }
+    if (w2) {
+        [out appendString:@"     open+write=OK\n"];
+    } else if (fd < 0) {
+        [out appendFormat:@"     open+write=FAIL（open 就失败）errno=%d(%s)\n", eOpen, strerror(eOpen)];
+    } else {
+        [out appendFormat:@"     open+write=FAIL（open 成功、write 失败）errno=%d(%s)\n", e2, strerror(e2)];
+    }
+
+    // 读回：证明"写得进"与"读得回"是两件事，两个都要有
+    NSString *probeKept = w1 ? f1 : (w2 ? f2 : nil);
+    if (probeKept) {
+        NSString *rb = [NSString stringWithContentsOfFile:probeKept
+                                                 encoding:NSUTF8StringEncoding error:nil];
+        [out appendFormat:@"     读回=%@\n", rb.length ? @"OK" : @"FAIL"];
+        [fm removeItemAtPath:probeKept error:nil];    // 探针自己收拾干净，不污染数据目录
+        return dir;
+    }
+    [out appendString:@"     读回=（没写成，跳过）\n"];
+    return nil;
+}
+
+int NBWriteBootProbe(void) {
+    NSMutableString *out = [NSMutableString string];
+    NSString *proc = NBProbeProcName();
+
+    [out appendFormat:@"NotifyBox 启动探针 v%@\n", NOTIFYBOX_VER_STR];
+    [out appendFormat:@"进程=%@ pid=%d uid=%d euid=%d\n",
+                      proc, (int)getpid(), (int)getuid(), (int)geteuid()];
+    [out appendFormat:@"时间=%@\n", [NSDate date]];
+    Dl_info dli;
+    if (dladdr((const void *)&NBWriteBootProbe, &dli) && dli.dli_fname) {
+        [out appendFormat:@"dylib=%s\n", dli.dli_fname];
+    }
+    [out appendFormat:@"数据目录(常量)=%@\n\n", NOTIFYBOX_LEGACY_DIR];
+
+    // 4 个候选，全部试完再汇总 —— 只试到第一个能写的就收工，等于放弃了"搬到哪"的答案
+    NSArray *cands = @[
+        NOTIFYBOX_LEGACY_DIR,
+        @"/var/mobile/Documents/NotifyBox",
+        @"/private/var/tmp/NotifyBox",
+        @"/var/mobile/Library/Preferences/NotifyBox",
+    ];
+    NSMutableArray *writable = [NSMutableArray array];
+    for (NSString *c in cands) {
+        NSString *ok = NBProbeOneDir(c, out);
+        if (ok) [writable addObject:ok];
+    }
+    [out appendFormat:@"\n== 写成功的目录: %@\n",
+                      writable.count ? [writable componentsJoinedByString:@"  "] : @"（一个都没有）"];
+
+    // 🔴 落盘这一步自身也要检查：写不进 /tmp ⇒ 至少 NSLog 里要有，不能让探针自己静默消失
+    NSString *dst = [NSString stringWithFormat:@"/private/var/tmp/nb_boot_%@.txt", proc];
+    NSString *dstAll = @"/private/var/tmp/nb_boot_all.txt";
+    NSData *od = [out dataUsingEncoding:NSUTF8StringEncoding];
+    errno = 0;
+    BOOL w = [od writeToFile:dst atomically:YES];
+    int ew = errno;
+    if (w) {
+        NSLog(@"[NotifyBox/probe] %@ 探针已写入 %@（可写目录 %lu 个）",
+              proc, dst, (unsigned long)writable.count);
+    } else {
+        NSLog(@"[NotifyBox/probe] ⚠️ %@ 探针写 /tmp 失败 errno=%d(%s) path=%@",
+              proc, ew, strerror(ew), dst);
+    }
+    // 汇总文件：把两个进程的结果并排放，一次 cat 就能对比（末次写赢的问题由"文件名带进程名"避免）
+    errno = 0;
+    BOOL wa = [od writeToFile:dstAll atomically:NO];   // 非 atomic 追加语义更接近"就地覆盖"，不会互相删临时文件
+    if (!wa) {
+        NSLog(@"[NotifyBox/probe] ⚠️ %@ 汇总文件写失败 errno=%d(%s) path=%@",
+              proc, errno, strerror(errno), dstAll);
+    }
+    NSLog(@"[NotifyBox/probe] ===== 探针结果（%@）=====\n%@", proc, out);
+    return (int)writable.count;
+}
+
 
 // 诊断专用：盒子 App 的容器 Documents。**永远不许拿它当写入路径。**
 //   App 进程：直接问系统要自己那份（准确、零扫描）；
@@ -1733,6 +1894,53 @@ static NSString *NBAppendMarker(NSMutableString *s, NSString *label, NSString *p
         [s appendString:@"  ⇒ ⚠️ 只有旧位置的标记：tweak 在跑，但**记到别处去了**（split-brain）\n"];
     } else {
         [s appendString:@"  ⇒ 三处都没有：tweak 没注入（或装了没 respring、或过滤器未命中）\n"];
+    }
+
+    // ── v0.0.138 启动探针 ──
+    // 🔴 这一段存在的唯一理由：上面那三个标记**全都押在"能往共享目录写文件"这一个前提上**，
+    //    一旦写不进就同时消失 ⇒「没注入」和「写不进」在证据上同形。探针走 /private/var/tmp，
+    //    是完全独立的第二条通道。App 自己也会写一份 `nb_boot_NotifyBoxApp.txt`。
+    // ⚠️ App 受容器沙箱约束，**可能读不到 /tmp**（读不到就如实说"读不到"，不许当成"没有"）。
+    [s appendString:@"\n── v0.0.138 启动探针（/private/var/tmp）──\n"];
+    {
+        NSArray *names = @[@"nb_boot_SpringBoard.txt",
+                           @"nb_boot_backboardd.txt",
+                           @"nb_boot_NotifyBoxApp.txt",
+                           @"nb_boot_all.txt"];
+        NSFileManager *pfm = [NSFileManager defaultManager];
+        BOOL anyRead = NO;
+        for (NSString *n in names) {
+            NSString *fp = [@"/private/var/tmp" stringByAppendingPathComponent:n];
+            NSDictionary *pa = [pfm attributesOfItemAtPath:fp error:nil];
+            if (!pa && ![pfm fileExistsAtPath:@"/private/var/tmp"]) {
+                [s appendString:@"  ❔ 本进程看不到 /private/var/tmp（沙箱）⇒ 下面几行无意义\n"];
+                break;
+            }
+            if (!pa) {
+                [s appendFormat:@"  ❌ %@ 不存在\n", n];
+                continue;
+            }
+            anyRead = YES;
+            NSString *txt = [NSString stringWithContentsOfFile:fp
+                                                      encoding:NSUTF8StringEncoding error:nil];
+            [s appendFormat:@"  ✅ %@  %llu B  改于 %@\n", n,
+                [pa[NSFileSize] unsignedLongLongValue], pa[NSFileModificationDate]];
+            if (txt.length) {
+                // 只摘关键几行（整篇太长，屏幕上滚不完）：进程 / dylib / 每个候选的结论行
+                for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
+                    BOOL keep = ([line hasPrefix:@"进程="] || [line hasPrefix:@"dylib="] ||
+                                 [line containsString:@"=FAIL"] || [line hasPrefix:@"  ── "] ||
+                                 [line hasPrefix:@"== 写成功的目录"] || [line hasPrefix:@"     读回="]);
+                    if (keep) [s appendFormat:@"     %@\n", line];
+                }
+            }
+        }
+        if (!anyRead) {
+            [s appendString:@"\n  🔴 一个探针文件都没有 ⇒ 两个可能，靠"App 能否看到 /tmp"区分：\n"
+                          @"     · 上一行说了"看不到 /private/var/tmp" ⇒ 是沙箱，本条不作证据；\n"
+                          @"     · 能看到 /tmp 却一个文件都没有 ⇒ tweak 与 App 都没跑起来/没写成功，\n"
+                          @"       去终端用 root 跑：cat /private/var/tmp/nb_boot_*.txt\n"];
+        }
     }
 
     // ── 旧位置（App 容器，只读参考）──

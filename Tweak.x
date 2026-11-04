@@ -233,7 +233,11 @@ static NSString *NBProc(void) {
 //   全是**文本层**判据，没有一条能发现"符号可达性"问题 ⇒ 新增一条自检：
 //   **改「字面量 → 宏」之前，先比一行号：`#define` 在哪、第一个引用在哪。**
 //   顺便加一条：`#define` 别埋在几百行之后的常量堆里，宏一律放这个区域。
-#define NB_VER_STR @"0.0.137"
+// 🔴🔴 v0.0.138：版本号**不再在这里写字面量**，改成 NotifyCommon.h 里 `NOTIFYBOX_VER_STR` 的别名。
+//   以前这里是第三份来源（另两份是 control 与 Info.plist），只能靠"三处相等"保证一致 ——
+//   而 NotifyStore.m 是 tweak 与 App **共用**的，探针文件里要报版本号，它拿不到 Tweak.x 的宏。
+//   ⇒ 唯一来源放头文件，这里只留别名，所有既有 `NB_VER_STR` 用法一字不动。
+#define NB_VER_STR NOTIFYBOX_VER_STR
 
 // ---------- 延迟推送的残留清理（v0.0.19） ----------
 //
@@ -5261,6 +5265,19 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
 %end
 
 %ctor {
+    // 🔴🔴🔴 v0.0.138：**整个 ctor 的第一件事**就是把启动探针写出去，而且它自己不许静默失败。
+    //
+    // 为什么必须是第一件、不能排在日志初始化之后：
+    //   2026-11-04 查了两天没分开「没注入」和「注入了但写不进」，根因是**所有判据都押在
+    //   同一个前提上** —— `.tweak_ctor` / `tweak.log` / DB 全都要先能往共享目录写文件。
+    //   那一步一失败，它们同时消失，两个完全不同的世界在证据上同形。
+    //   ⇒ 探针走 /private/var/tmp（1777，几乎对所有进程可写），并且**连写 /tmp 自身的
+    //    结果都检查**。它在最前面，就不会被后面任何一步的失败掩盖。
+    //   ⇒ 用户侧判据只有一条：注销后 `cat /private/var/tmp/nb_boot_*.txt`
+    //      有文件 ⇒ dylib 加载了、ctor 跑了，里面的 errno 就是"为什么写不进"的答案
+    //      没文件 ⇒ dylib 压根没被加载，问题在 ellekit/注入层，与本插件代码无关
+    NBWriteBootProbe();
+
     gRecent = [NSMutableDictionary dictionary];   // 单线程时机初始化，之后只读引用
 
     // 🔴🔴🔴 v0.0.136：数据目录的「属主自愈」—— 这是**治已经坏掉的现场**，不是预防。
@@ -5302,7 +5319,12 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
             NSString *m = [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:@".tweak_ctor_root"];
             NSString *body = [NSString stringWithFormat:@"%@ %@ %@ chown=OK uid=%d",
                               [NSDate date], NBProc(), NB_VER_STR, (int)rst.st_uid];
-            [body writeToFile:m atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            // 🔴 v0.0.138：写失败必须留痕（见下方 `.tweak_ctor` 那段同样的理由）
+            NSError *rerr = nil;
+            if (![body writeToFile:m atomically:YES encoding:NSUTF8StringEncoding error:&rerr]) {
+                NSLog(@"[NotifyBox/root] ⚠️ 写 .tweak_ctor_root 失败 errno=%d(%s) err=%@ path=%@",
+                      errno, strerror(errno), rerr, m);
+            }
         }
     }
 
@@ -5336,7 +5358,17 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
         [[NSFileManager defaultManager] createDirectoryAtPath:
             [mark stringByDeletingLastPathComponent]
                                  withIntermediateDirectories:YES attributes:nil error:nil];
-        [md writeToFile:mark atomically:YES];
+        // 🔴🔴 v0.0.138：**这里原来是 `[md writeToFile:mark atomically:YES];` —— 返回值丢弃、失败无声。**
+        //   代价：`.tweak_ctor` 不在这个事实，同时兼容「没注入」和「注入了写不进」两种完全
+        //   不同的世界，而它们要查的方向正好相反。查了两天就是因为这两件事在证据上同形。
+        //   ⇒ 现在失败必须喊出来；成功也不再多说（探针文件才是主证据）。
+        errno = 0;
+        BOOL mw = [md writeToFile:mark atomically:YES];
+        if (!mw) {
+            NSLog(@"[NotifyBox] ⚠️ 写 .tweak_ctor 失败 errno=%d(%s) path=%@ "
+                  @"（写不进共享目录；诊断见 /private/var/tmp/nb_boot_*.txt）",
+                  errno, strerror(errno), mark);
+        }
     }
 
     // 🔴🔴 v0.0.13：朗读自毁保护，必须排在任何 hook 之前。

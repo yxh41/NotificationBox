@@ -7,6 +7,13 @@
 #define NOTIFYBOX_BUNDLE_ID   @"com.yxh41.notifybox"
 #define NOTIFYBOX_APP_BUNDLE  @"com.yxh41.notifybox.app"
 
+// ---------- v0.0.138：版本号的**唯一来源** ----------
+// 🔴 以前 Tweak.x 里有一份 `#define NB_VER_STR`，control / Info.plist 又各有一份 ⇒ 三处来源，
+//    只能靠"三处相等"来保证一致，改版时漏一处就分不清"装的哪一版"（v0.0.56 已经踩过）。
+//    现在这里是**唯一**来源：Tweak.x 的 `NB_VER_STR` 只是它的别名，NotifyStore.m（tweak 与 App
+//    共用）也直接用它 —— 探针文件里报的版本号因此不可能和控件里的不一致。
+#define NOTIFYBOX_VER_STR @"0.0.138"
+
 // ---------- v0.0.137：数据目录回到**编译期常量**，不再运行时解析 ----------
 // 三版三次反复，把结论钉在这里：
 //   v0.0.135 及以前：写死 `/var/mobile/Library/NotifyBox`，能跑，但属主偶尔被 root 占掉。
@@ -47,7 +54,32 @@ BOOL     NBCanWriteSharedFiles(void);
 // 属主自愈的**非 root 那条腿**：目录存在但当前身份写不进、且目录**为空**时，删掉重建。
 //   能改属主的只有 root（Tweak.x 的 ctor），这条是不依赖 root 注入的兜底。
 //   返回 YES = 真的动手且成功了。**非空目录绝不动**（里面有记录就是用户的全部历史）。
+// 🔴🔴 v0.0.138：**撤掉 `removeItemAtPath` 那一步**。理由不是"可能删数据"，而是更硬的一条：
+//   一个"自愈"函数里放不可逆动作，**失败一次就永久失去现场**。而且它是"先删后建"——
+//   建失败（沙箱/空间/任何原因）目录就没了，返回值还是 NO，一声不响。
+//   现在改成**只报不删**：写不进去就如实报，目录留着，人来看。
 BOOL     NBHealDataDirOwnership(void);
+
+// 🔴🔴🔴 v0.0.138 启动探针 —— **只为一件事：把"我跑没跑 / 能不能写 / 为什么写不进"
+//   变成一条不依赖"写进共享目录"这个前提的证据。**
+//
+// 2026-11-04 真机教训（查了两天、换了五个版本都没分开的那件事）：
+//   手上所有判据 —— `.tweak_ctor` / `tweak.log` / DB / 环境自检里的三个装载标记 ——
+//   **全部**建立在"能往 /var/mobile/Library/NotifyBox 写文件"这一个前提上。
+//   这一步一失败，它们会**同时**变成"不存在" ⇒
+//   「压根没注入」与「注入了但写不进」在证据上完全同形，无法区分。
+//   ⇒ 判据不许全押在同一个前提上。必须有第二条独立通道。
+//
+// 通道选 /private/var/tmp（1777，几乎对所有进程可写；用户在终端里是 root，一定读得到），
+// 并且**逐个候选路径 × 两种写法**都试一遍、每个都记 errno：
+//   ① NSData writeToFile:atomically:YES   —— 和 `.tweak_ctor` 用的是同一种写法
+//   ② open + write                        —— 绕开 atomic 的"临时文件 + rename"
+// 两者结果不同就直接指出问题在"哪个写法"，而不是笼统的"写不进"。
+//
+// 汇总落到 `/private/var/tmp/nb_boot_<进程名>.txt`；**连"写 /tmp 这一步自身"的结果**
+// 也会体现在返回值与 NSLog 里（否则又是同一个坑：探针自己静默失败）。
+// 返回可写目录个数（0 = 一个都写不进）。
+int      NBWriteBootProbe(void);
 
 #define NOTIFYBOX_DB_PATH       [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:NOTIFYBOX_DB_NAME]
 #define NOTIFYBOX_LOG_PATH      [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:NOTIFYBOX_LOG_NAME]
