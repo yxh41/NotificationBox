@@ -984,7 +984,7 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // 正是「长按到底认了哪条链接」的唯一证据，而表里没有任何词能匹配它（`直开` 那条从 v0.0.118
 // 起也一直被筛掉）。若不加，验证长按时会看到"一条都没有"，误判成"压根没走直达"。**第四次。**
 static NSString * const kNBKeyLineTable =
-    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级|直达|直开";
+    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级|直达|直开|打开";
 
 static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [kNBKeyLineTable componentsSeparatedByString:@"|"];

@@ -569,6 +569,17 @@ static NSString *NBLinkForLog(NSString *s) {
             (unsigned long)s.length];
 }
 
+// v0.0.153：候选**名单**里一条只留 40 字。
+// 🔴 名单是 3 条挤在同一行里的，用 72 字那份会把一行撑成三行，而日志窗口只有 ~50 行。
+//    40 字足够认出"这是哪家域名、哪条路径"，又不会把预算吃光。
+static NSString *NBLinkForList(id s) {
+    if (![s isKindOfClass:[NSString class]]) return @"(非字符串)";
+    if (![s length]) return @"(空)";
+    return ([(NSString *)s length] <= 40) ? (NSString *)s
+        : [NSString stringWithFormat:@"%@…(%lu)",
+           [(NSString *)s substringToIndex:40], (unsigned long)[(NSString *)s length]];
+}
+
 + (nullable NSString *)deeplinkFromPayload:(nullable NSString *)payload {
     if (![payload isKindOfClass:[NSString class]] || !payload.length) return nil;
     NSData *d = [payload dataUsingEncoding:NSUTF8StringEncoding];
@@ -628,13 +639,41 @@ static NSString *NBLinkForLog(NSString *s) {
     NSArray *best = (NSArray *)cands.firstObject;
     id v = (best.count > 1) ? best[1] : nil;
     NSString *key = (best.count > 2 && [best[2] isKindOfClass:[NSString class]]) ? best[2] : @"";
-    // 🔴 只打"选中了哪条 + 打分 + 从哪个键认出来的"，不打全部候选：
-    //    候选数已经给了，需要看细节时再放开。日志行数是预算。
+    // 🔴🔴 v0.0.153：候选**条数** ≠ **不同目标数**。同一个 URL 可能从根上的 `userInfo`
+    //    和 `ctx.userInfo` 各挂一份（v0.0.152 真机形状实测就是这样两条 path 都有），
+    //    两次都进 cands ⇒ 计数虚高，用户会以为"有 3 个能跳的地方"。
+    //    两个数一起给，账才对得上。（同 §4「一个 0/一个 N 必须能解释是哪种」）
+    NSMutableSet *uniq = [NSMutableSet set];
+    for (NSArray *c in cands) {
+        if (c.count > 1 && [c[1] isKindOfClass:[NSString class]]) [uniq addObject:c[1]];
+    }
     if (wantLog) {
-        NBSharedLog(@"[直达] 候选 %lu 条 ｜ 拆 %d 次 ｜ 见过 :// %d 个 ｜ %@ ｜ 选中(%ld,%@)=%@%@",
-                    (unsigned long)cands.count, diag.decodes, diag.sawScheme, loss,
+        NBSharedLog(@"[直达] 候选 %lu 条(不同 %lu) ｜ 拆 %d 次 ｜ 见过 :// %d 个 ｜ %@ ｜ 选中(%ld,%@)=%@%@",
+                    (unsigned long)cands.count, (unsigned long)uniq.count, diag.decodes,
+                    diag.sawScheme, loss,
                     (long)[best[0] integerValue], key.length ? key : @"?",
                     NBLinkForLog((NSString *)v), tail);
+        // 🔴🔴 v0.0.153：只打"选中哪条"是**不够的**，而且正是这个缺口让 151 的洞活了下来：
+        //    151 那屏候选 2 条，选中了上报 URL；可如果那天恰好还有一条真链接分更高，
+        //    日志只会说"选中了真链接"，那条上报 URL 就永远藏在名单里看不见，
+        //    等换一条"没有真链接"的通知，它就会被选中。
+        //    ⇒ 名单里前 3 条（分数 + 键名 + 40 字 URL）必须打出来。
+        //    只有 1 条时不打：没被选中的什么都没有，`选中(…)` 那行已经说全了。
+        if (cands.count > 1) {
+            NSMutableArray *parts = [NSMutableArray array];
+            for (NSUInteger i = 0; i < cands.count && i < 3; i++) {
+                NSArray *c = (NSArray *)cands[i];
+                NSString *k2 = (c.count > 2 && [c[2] isKindOfClass:[NSString class]]
+                                && [(NSString *)c[2] length]) ? (NSString *)c[2] : @"?";
+                [parts addObject:[NSString stringWithFormat:@"%ld:%@=%@",
+                                  (long)[c[0] integerValue], k2,
+                                  NBLinkForList(c.count > 1 ? c[1] : nil)]];
+            }
+            NBSharedLog(@"[直达] 候选名单 %@%@", [parts componentsJoinedByString:@" ｜ "],
+                        (cands.count > 3)
+                        ? [NSString stringWithFormat:@" ｜ …另 %lu 条",
+                           (unsigned long)(cands.count - 3)] : @"");
+        }
     }
     return [v isKindOfClass:[NSString class]] ? (NSString *)v : nil;
 }
