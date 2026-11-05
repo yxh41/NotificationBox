@@ -31,7 +31,8 @@ static const NSInteger kNBListLimit = 2000;
 //    ⇒ 两条铁律：
 //      ① **路径只能是常量**（NOTIFYBOX_LEGACY_DIR）。常量算不出两个答案。
 //      ② 老路径的真问题只有**属主**，而属主只有 root 能改 ⇒ 由 backboardd 的 ctor chown。
-// 🔴 下面这个 `NBFindAppDocsDir()` 现在**只服务诊断**（NBAltDataDir），
+// 🔴 下面这个 `NBFindAppDocsDir()` 现在**只服务诊断**（v0.0.156 起唯一的调用者是
+//    NBWriteOldLocationProbe —— root 进程代读旧位置标记），
 //    **绝不**参与写入路径决策 —— 它拿到的路径在 SpringBoard 里恒为 nil，
 //    在 App 里恒为自己的容器，两边不一致本身就是这个 bug 的源头。
 static NSString *NBFindAppDocsDir(void) {
@@ -227,6 +228,68 @@ NSString *NBLastProbeReport(void) {
     return gNBProbeReport;
 }
 
+// ───────── v0.0.156：旧位置（App 容器）装载标记的**代读** ─────────
+//
+// 🔴 为什么需要别人代读（这是「死探针」的正解，不是排版问题）：
+//    盒子 App 带 `com.apple.private.security.no-container`（见 Resources/NotifyBoxApp.entitlements）
+//    ⇒ 它**没有自己的容器** ⇒ `URLsForDirectory:NSDocumentDirectory` 返 nil
+//    ⇒ 旧位置那条路径在 App 进程里永远算不出来。
+//    而 envCheck **只在 App 里跑**，所以「旧位置 .tweak_ctor」那一行过去一直是**死探针**：
+//    恒打「本进程算不出这个路径」，一条信息都不含 —— 与 v0.0.144 删掉那一节**同一个死因**。
+//    更糟的是它上方的注释还写着「那条留着，因为它读的是**文件**、不是进程能力」——
+//    那句话在 App 进程里根本不成立：path 为 nil 时 NBAppendMarker 第一句就 return，从不读文件。
+//    ⇒ split-brain（tweak 记到别处去了）这条判据，实际上**已经失效了整整十二版**。
+//
+// 🔴 正解（铁律：读不到某个值，先问**这进程有没有权限**，不是换字段）：
+//    换有权限的进程代做、结果落共享介质。
+//    `NBFindAppDocsDir()` 扫的是 `/var/mobile/Containers/Data/Application/*/…metadata.plist`，
+//    SpringBoard 受沙箱限制扫不到，**backboardd(root) 扫得到** ⇒ 由 root 进程写一份记录，
+//    App 只读文件（共享数据目录 0777，App 有 entitlement 读得进）。
+//
+// 🔴 三条纪律（每条对应一种会被误读的失败）：
+//    ① **算不出就不写** —— 绝不用空值覆盖别人已经写好的答案（否则轮次一换，答案自己消失）；
+//    ② 写失败要 NSLog 喊出来，不许静默（静默失败与"没跑"在证据上同形）；
+//    ③ 记录必须带 `proc=`，否则读的人不知道这份答案是**哪个进程**给的。
+static void NBWriteOldLocationProbe(void) {
+    NSString *p = NBFindAppDocsDir();
+    if (!p.length) return;                  // ① 算不出就沉默（SpringBoard / App 都走这条）
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL dirExists = [fm fileExistsAtPath:p];
+    NSString *mk = [p stringByAppendingPathComponent:@".tweak_ctor"];
+    NSDictionary *ma = [fm attributesOfItemAtPath:mk error:nil];
+    NSString *txt = [NSString stringWithContentsOfFile:mk
+                                             encoding:NSUTF8StringEncoding error:nil];
+    // 🔴 三态不许合并：「目录在不在」「标记在不在」「标记读不读得出」是三件事。
+    NSMutableString *o = [NSMutableString string];
+    [o appendFormat:@"proc=%@\n", NBProbeProcName()];
+    [o appendFormat:@"path=%@\n", p];
+    [o appendFormat:@"dirExists=%d\n", dirExists ? 1 : 0];
+    [o appendFormat:@"markerExists=%d\n", ma ? 1 : 0];
+    if (txt.length) {
+        NSString *t = [txt stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (t.length > 200) t = [t substringToIndex:200];
+        // 记录格式是「一行一个键」⇒ 内容里的换行必须压掉，否则 key=value 解析会串行
+        t = [t stringByReplacingOccurrencesOfString:@"\n" withString:@" ⏎ "];
+        [o appendFormat:@"marker=%@\n", t];
+    }
+    if (ma && !txt.length) [o appendFormat:@"markerUnreadable=%llu\n",
+                                   [ma[NSFileSize] unsignedLongLongValue]];
+    [o appendFormat:@"ts=%.0f\n", [[NSDate date] timeIntervalSince1970]];
+
+    NSString *dst = [NBDataDir() stringByAppendingPathComponent:@".old_location"];
+    errno = 0;
+    BOOL w = [[o dataUsingEncoding:NSUTF8StringEncoding] writeToFile:dst atomically:YES];
+    if (!w) {
+        // ② 写不进要喊：这条记录缺失会让 App 侧说「没有代读记录」，别让它无声无息
+        NSLog(@"[NotifyBox/probe] ⚠️ 旧位置代读记录写失败 errno=%d(%s) path=%@",
+              errno, strerror(errno), dst);
+    } else {
+        chmod([dst fileSystemRepresentation], 0666);   // 与日志/设置同一条规矩：共享文件人人可读
+    }
+}
+
 int NBWriteBootProbe(void) {
     NSMutableString *out = [NSMutableString string];
     NSString *proc = NBProbeProcName();
@@ -279,23 +342,22 @@ int NBWriteBootProbe(void) {
     }
     NSLog(@"[NotifyBox/probe] ===== 探针结果（%@）=====\n%@", proc, out);
     gNBProbeReport = [out copy];
+
+    // v0.0.156：顺手把「旧位置（App 容器）的装载标记」记一份，供 App 侧 envCheck 读。
+    //   🔴 必须排在 /tmp 探针**之后**：那一条是本函数的主产出，不能被这里任何异常拖住。
+    //   算不出容器路径的进程（SpringBoard / App）会自己沉默，见函数上方纪律 ①。
+    NBWriteOldLocationProbe();
+
     return (int)writable.count;
 }
 
 
-// 诊断专用：盒子 App 的容器 Documents。**永远不许拿它当写入路径。**
-//   App 进程：直接问系统要自己那份（准确、零扫描）；
-//   其它进程：扫 metadata（SpringBoard 受沙箱限制基本扫不到 ⇒ 返回 nil 是正常现象，
-//            这恰恰是 v0.0.136 split-brain 的直接原因，诊断里要把这个 nil 显示出来）。
-NSString *NBAltDataDir(void) {
-    NSString *own = [[NSBundle mainBundle] bundleIdentifier];
-    if ([own isEqualToString:NOTIFYBOX_APP_BUNDLE]) {
-        NSArray *u = [[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
-                                                            inDomains:NSUserDomainMask];
-        return u.count ? [[u firstObject] path] : nil;
-    }
-    return NBFindAppDocsDir();
-}
+// 🔴 v0.0.156：**删掉 `NBAltDataDir()`**（连声明一起删，见 NotifyCommon.h）。
+//   它曾经的唯一调用点是 envCheck 里那条「旧位置 .tweak_ctor」，而那条在 App 进程里
+//   恒走 nil 分支（App 带 no-container ⇒ 没有容器 ⇒ NSDocumentDirectory 返 nil）⇒ 死探针。
+//   现在改由 root 进程代读（NBWriteOldLocationProbe），这个函数就再没有调用者了。
+//   留着它的坏处不是占几行，而是**下次还会有人拿它写一个新的死探针**
+//   —— 一个在 App 里恒为 nil 的 API，名字看起来却像"能拿到路径"。
 
 // 🔴🔴🔴 v0.0.142：**撤销** v0.0.136「uid==0 一律不许碰共享目录」那一刀。
 //
@@ -2109,6 +2171,72 @@ static NSString *NBEnvClock(double ts) {
     return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:ts]];
 }
 
+// ───── v0.0.156：旧位置（App 容器）装载标记 —— App 侧只读「代读记录」 ─────
+// 🔴 为什么不再自己算路径：App 带 no-container ⇒ 无容器 ⇒ 路径恒算不出 ⇒ 死探针。
+//    真相由 root 进程写进 `数据目录/.old_location`（见 NBWriteOldLocationProbe）。
+// 🔴 四态，一个都不许合并（合并的代价就是上一版那种「一条信息都不含」的行）：
+//    ① 有记录 + 标记在   ⇒ 返回标记正文（调用方据此判 split-brain）
+//    ② 有记录 + 标记不在 ⇒ 正常（没有残留）
+//    ③ 有记录但解析不出路径 ⇒ 记录坏了，如实说「坏了」，不许退化成 ②
+//    ④ 没记录 ⇒ **「读不到」而不是「不存在」**（tweak 侧可能也扫不到，或还没重启过）
+static NSString *NBAppendOldLocation(NSMutableString *s, BOOL *seenOut) {
+    if (seenOut) *seenOut = NO;
+    NSString *fp = [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:@".old_location"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *a = [fm attributesOfItemAtPath:fp error:nil];
+    NSString *txt = [NSString stringWithContentsOfFile:fp
+                                             encoding:NSUTF8StringEncoding error:nil];
+    if (!txt.length) {
+        if (a) {
+            [s appendFormat:@"  ⚠️ 旧位置（App 容器）：代读记录在但读不出（%llu B）\n",
+                [a[NSFileSize] unsignedLongLongValue]];
+        } else {
+            [s appendString:@"  ❔ 旧位置（App 容器）：没有代读记录 ⇒ **读不到，不是不存在**\n"
+                          @"     （App 自己没有容器、算不出这个路径；记录由 root 进程在 ctor 写）\n"];
+        }
+        return nil;
+    }
+    // 记录格式固定「一行一个键」，逐行取第一个 `=` 切开（值里可能还有 `=`，只切第一处）
+    NSMutableDictionary *kv = [NSMutableDictionary dictionary];
+    for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
+        NSRange r = [line rangeOfString:@"="];
+        if (r.location == NSNotFound || r.location == 0) continue;
+        NSString *k = [line substringToIndex:r.location];
+        NSString *v = [line substringFromIndex:r.location + 1];
+        if (k.length && v.length) kv[k] = v;
+    }
+    NSString *proc = kv[@"proc"] ?: @"?";
+    NSString *path = kv[@"path"];
+    if (!path.length) {
+        [s appendFormat:@"  ⚠️ 旧位置（App 容器）：代读记录在但没解析出路径（proc=%@）\n", proc];
+        return nil;
+    }
+    if (seenOut) *seenOut = YES;
+    BOOL marker = [kv[@"markerExists"] isEqualToString:@"1"];
+    BOOL dirOK  = [kv[@"dirExists"] isEqualToString:@"1"];
+    [s appendFormat:@"  %@ 旧位置（由 %@ 代读于 %@）\n     %@\n",
+        marker ? @"⚠️" : @"✅", proc,
+        NBEnvClock([(NSString *)kv[@"ts"] doubleValue]), path];
+    if (!dirOK) {
+        [s appendString:@"     目录不在（App 从没在该容器里跑过 ⇒ 无残留）\n"];
+        return nil;
+    }
+    if (!marker) {
+        [s appendString:@"     .tweak_ctor 不在（没有 split-brain 残留）\n"];
+        return nil;
+    }
+    NSString *t = kv[@"marker"];
+    if (t.length) {
+        [s appendFormat:@"     .tweak_ctor 在：%@\n", t];
+        return t;
+    }
+    // 标记文件在、但内容读不出（0 字节 / 权限）—— 又说了一遍「三态不许合并」
+    [s appendFormat:@"     .tweak_ctor 在但内容读不出（%@）\n",
+        kv[@"markerUnreadable"] ? [NSString stringWithFormat:@"%@ B", kv[@"markerUnreadable"]]
+                                : @"原因未知"];
+    return @"(标记在、内容读不出)";
+}
+
 + (NSString *)envCheck {
     NSMutableString *s = [NSMutableString string];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -2274,19 +2402,27 @@ static NSString *NBEnvClock(double ts) {
     //    上一版只查了「当前数据目录」这一处 ⇒「tweak 记到别处去了」被误报成
     //    「tweak 从未注入任何进程」。判据说得比证据宽，方向就错。
     [s appendString:@"\n── tweak 装载标记 ──\n"];
-    NSString *altDir = NBAltDataDir();
     NSString *txtSB  = NBAppendMarker(s, @"SpringBoard（mobile）",
                                       [dir stringByAppendingPathComponent:@".tweak_ctor"]);
     NSString *txtRt  = NBAppendMarker(s, @"backboardd（root，chown 成功才写）",
                                       [dir stringByAppendingPathComponent:@".tweak_ctor_root"]);
-    NSString *txtOld = NBAppendMarker(s, @"旧位置（App 容器，v0.0.136 残留）",
-                                      altDir ? [altDir stringByAppendingPathComponent:@".tweak_ctor"] : nil);
+    // 🔴🔴 v0.0.156：旧位置这一条改成**由 root 进程代读**，不再由 App 自己算路径。
+    //   以前这里是 `altDir ? … : nil`，而 App 带 no-container ⇒ altDir 恒 nil
+    //   ⇒ NBAppendMarker 第一句 `if (!path.length)` 就 return，**从不读文件**
+    //   ⇒ 恒打一行「本进程算不出这个路径」= 死探针，split-brain 判据实际已失效十二版。
+    //   注意 txtOld 现在的含义变了：它是**代读回来的标记正文**，不是 App 读到的文件内容。
+    BOOL oldSeen = NO;
+    NSString *txtOld = NBAppendOldLocation(s, &oldSeen);
     if (txtSB.length && txtRt.length) {
         [s appendString:@"  ⇒ 两个进程都注入过，属主自愈也跑过了\n"];
     } else if (txtSB.length) {
         [s appendString:@"  ⇒ SpringBoard 注入过；缺 root 标记 = backboardd 没跑到或 chown 没过\n"];
     } else if (txtOld.length) {
         [s appendString:@"  ⇒ ⚠️ 只有旧位置的标记：tweak 在跑，但**记到别处去了**（split-brain）\n"];
+    } else if (!oldSeen) {
+        // 🔴 铁律：读不到 ≠ 不存在。这一支不许并进下面那句「三处都没有」。
+        [s appendString:@"  ⇒ 可见的两处都没有标记；旧位置**读不到**（无代读记录）\n"
+                      @"     ⇒ 因此**不能**断言「tweak 从未注入」，先看下面的 /tmp 探针\n"];
     } else {
         [s appendString:@"  ⇒ 三处都没有：tweak 没注入（或装了没 respring、或过滤器未命中）\n"];
     }
@@ -2296,6 +2432,17 @@ static NSString *NBEnvClock(double ts) {
     //    一旦写不进就同时消失 ⇒「没注入」和「写不进」在证据上同形。探针走 /private/var/tmp，
     //    是完全独立的第二条通道。App 自己也会写一份 `nb_boot_NotifyBoxApp.txt`。
     // ⚠️ App 受容器沙箱约束，**可能读不到 /tmp**（读不到就如实说"读不到"，不许当成"没有"）。
+    //
+    // 🔴🔴 v0.0.156：**这一节的篇幅瘦身**（原来 4 个文件 ≈49 行，占整屏一半）。
+    //    冗余不在"打了几行"，而在"同一件事说了好几遍"：
+    //      ① 每个文件对 4 个候选目录各打一行 `读回=OK`，而同文件末尾的
+    //         `== 写成功的目录` 一行已经给出了答案 ⇒ 同一件事说五遍；
+    //      ② 逐目录明细（`  ── 目录` / `=FAIL`）**只有失败时**才需要看；
+    //      ③ `nb_boot_all.txt` 是 `writeToFile:atomically:NO` 的**末次写赢副本**
+    //         （见 NBWriteBootProbe 末尾），内容与某个 per-process 文件完全重复
+    //         ⇒ 它唯一独有的信息是「最后是谁写的」。
+    //    ⇒ 健康时每文件 4 行（文件/进程/读回汇总/写成功目录），**出现 =FAIL 才展开明细**，
+    //       异常时的输出与旧版**逐字一致**（信息一条不丢），健康时 49 → 15 行。
     [s appendString:@"\n── v0.0.138 启动探针（/private/var/tmp）──\n"];
     {
         NSArray *names = @[@"nb_boot_SpringBoard.txt",
@@ -2318,15 +2465,54 @@ static NSString *NBEnvClock(double ts) {
             anyRead = YES;
             NSString *txt = [NSString stringWithContentsOfFile:fp
                                                       encoding:NSUTF8StringEncoding error:nil];
-            [s appendFormat:@"  ✅ %@  %llu B  改于 %@\n", n,
-                [pa[NSFileSize] unsignedLongLongValue], pa[NSFileModificationDate]];
-            if (txt.length) {
-                // 只摘关键几行（整篇太长，屏幕上滚不完）：进程 / dylib / 每个候选的结论行
-                for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
-                    BOOL keep = ([line hasPrefix:@"进程="] || [line hasPrefix:@"dylib="] ||
-                                 [line containsString:@"=FAIL"] || [line hasPrefix:@"  ── "] ||
-                                 [line hasPrefix:@"== 写成功的目录"] || [line hasPrefix:@"     读回="]);
-                    if (keep) [s appendFormat:@"     %@\n", line];
+            NSArray *lines = txt.length ? [txt componentsSeparatedByString:@"\n"] : @[];
+            NSString *procLine = nil, *dylibLine = nil, *writable = nil;
+            int rbOK = 0, rbFail = 0, rbSkip = 0;
+            BOOL anyFail = NO;
+            for (NSString *line in lines) {
+                if ([line hasPrefix:@"进程="]) { procLine = line; continue; }
+                if ([line hasPrefix:@"dylib="]) { dylibLine = line; continue; }
+                if ([line hasPrefix:@"== 写成功的目录"]) { writable = line; continue; }
+                if ([line hasPrefix:@"     读回="]) {
+                    if ([line containsString:@"OK"]) rbOK++;
+                    else if ([line containsString:@"FAIL"]) rbFail++;
+                    else rbSkip++;                 // 「（没写成，跳过）」
+                    continue;
+                }
+                if (!anyFail && [line containsString:@"=FAIL"]) anyFail = YES;
+            }
+            // 🔴 `     读回=FAIL` 会在上面被 `读回=` 那一支先吃掉（continue 掉了），
+            //    所以这里必须再补一次判定 —— 否则「读到失败 1」却不展开明细，
+            //    汇总说有问题、下面却什么都没有（读者会以为明细被截断了）。
+            if (rbFail > 0) anyFail = YES;
+            if ([n isEqualToString:@"nb_boot_all.txt"]) {
+                // ③ 末次写赢的副本 ⇒ 只报"最后是谁写的"，不再 dump 内部
+                [s appendFormat:@"  ✅ %@  %llu B  改于 %@（末次写赢副本，内容同上某份）\n     %@\n",
+                    n, [pa[NSFileSize] unsignedLongLongValue], pa[NSFileModificationDate],
+                    procLine ?: @"进程=(空)"];
+                continue;
+            }
+            [s appendFormat:@"  ✅ %@  %llu B  改于 %@\n",
+                n, [pa[NSFileSize] unsignedLongLongValue], pa[NSFileModificationDate]];
+            [s appendFormat:@"     %@\n", procLine ?: @"进程=(空)"];
+            if (dylibLine) [s appendFormat:@"     %@\n", dylibLine];
+            // ① `读回` 与 `写成功的目录` 合成一行：两个量本来就是同一件事的两种说法
+            NSMutableString *rb = [NSMutableString string];
+            [rb appendFormat:@"读回 OK %d", rbOK];
+            if (rbFail) [rb appendFormat:@" / **失败 %d**", rbFail];
+            if (rbSkip) [rb appendFormat:@" / 跳过 %d", rbSkip];
+            [s appendFormat:@"     %@ ｜ %@\n", rb, writable ?: @"== 写成功的目录:(空)"];
+            // ② 明细只在真出错时展开（与旧版输出逐字一致）
+            if (anyFail) {
+                [s appendString:@"     ⚠️ 失败明细：\n"];
+                int shown = 0;
+                for (NSString *line in lines) {
+                    if (shown >= 14) { [s appendString:@"       …（还有更多，去终端 cat）\n"]; break; }
+                    BOOL keep = ([line containsString:@"=FAIL"] || [line hasPrefix:@"  ── "] ||
+                                 [line hasPrefix:@"     读回="] || [line hasPrefix:@"== 写成功的目录"]);
+                    if (!keep) continue;
+                    [s appendFormat:@"       %@\n", line];
+                    shown++;
                 }
             }
         }
@@ -2340,10 +2526,13 @@ static NSString *NBEnvClock(double ts) {
 
     // ── 旧位置（App 容器）那一节已删 ──
     // 🔴 v0.0.144 删掉的理由：v0.0.143 之后盒子 App 带 `no-container` entitlement，
-    //    `NBAltDataDir()` 在 App 进程里**恒为 nil** ⇒ 这一节恒显示「（本进程算不出来）」，
+    //    容器路径在 App 进程里**恒为 nil** ⇒ 这一节恒显示「（本进程算不出来）」，
     //    是一条**恒为定值的死探针**：看起来总在报警，实际一条信息都不含。
-    //    它原来要证的事（split-brain：tweak 记到别处去了）已经由上面
-    //    「旧位置装载标记」那条覆盖 —— 那条留着，因为它读的是**文件**、不是进程能力。
+    // 🔴🔴 v0.0.156 更正上一版的自我安慰：这里原本写着「它要证的事已由上面
+    //    『旧位置装载标记』那条覆盖 —— 那条留着，因为它读的是**文件**、不是进程能力」。
+    //    **那句话是错的**：那条走的也是同一个 nil 路径，NBAppendMarker 第一句就 return，
+    //    从不读文件 ⇒ 十二个版本里 split-brain 判据一直是空的（一个恒定的 ❔）。
+    //    现在改由 root 进程代读、结果落 `.old_location`，App 只读文件（见 NBAppendOldLocation）。
 
     // dylib 装在哪：优先用 tweak 自己用 dladdr 报出来的路径（roothide 会重定向前缀，
     // App 侧猜路径基本猜不中），猜不到才退回逐个探测。
@@ -2428,11 +2617,32 @@ static NSString *NBEnvClock(double ts) {
     NSDictionary *cfg = NBLoadSettings();
     [s appendFormat:@"  生效配置项数：%lu\n", (unsigned long)cfg.count];
     if (cfg.count) {
+        // 🔴🔴 v0.0.156：**空值键折叠成一行**。
+        //    逐键打一行时，一个「装过但都清空了」的配置能让这一段吃掉十几行；
+        //    而那些行对判据零贡献 —— 判据是上面那个「生效配置项数」。
+        // 🔴 折叠 ≠ 隐藏：键名一个不少地列在那一行里，只是不再各占一行。
+        //    （「文件存在但为空 = 全部清空，是合法状态」这条语义必须保留，见下面那行提示。）
+        // 🔴 「空」的判定要把 `()`、`{}`、空白、逗号分号都当噪声去掉再判 ——
+        //    否则空数组的 description 是 `(\n)`，会被当成"有值"照打一行。
         NSArray *keys = [[cfg allKeys] sortedArrayUsingSelector:@selector(compare:)];
+        NSMutableArray *empties = [NSMutableArray array];
         for (NSString *k in keys) {
             NSString *v = [cfg[k] description] ?: @"";
+            NSString *probe = [v stringByReplacingOccurrencesOfString:@"(" withString:@""];
+            probe = [probe stringByReplacingOccurrencesOfString:@")" withString:@""];
+            probe = [probe stringByReplacingOccurrencesOfString:@"{" withString:@""];
+            probe = [probe stringByReplacingOccurrencesOfString:@"}" withString:@""];
+            probe = [probe stringByReplacingOccurrencesOfString:@"," withString:@""];
+            probe = [probe stringByReplacingOccurrencesOfString:@";" withString:@""];
+            probe = [probe stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (!probe.length) { [empties addObject:k]; continue; }
             if (v.length > 60) v = [[v substringToIndex:60] stringByAppendingString:@"..."];
             [s appendFormat:@"    %@ = %@\n", k, v];
+        }
+        if (empties.count) {
+            [s appendFormat:@"    空值 %lu 项（未清空前不显示，键名照列）：%@\n",
+                (unsigned long)empties.count, [empties componentsJoinedByString:@","]];
         }
     } else {
         [s appendString:@"    （无设置 ⇒ 不过滤、不替换，行为与不装插件一致）\n"];

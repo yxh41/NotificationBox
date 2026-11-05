@@ -12,7 +12,7 @@
 //    只能靠"三处相等"来保证一致，改版时漏一处就分不清"装的哪一版"（v0.0.56 已经踩过）。
 //    现在这里是**唯一**来源：Tweak.x 的 `NB_VER_STR` 只是它的别名，NotifyStore.m（tweak 与 App
 //    共用）也直接用它 —— 探针文件里报的版本号因此不可能和控件里的不一致。
-#define NOTIFYBOX_VER_STR @"0.0.155"
+#define NOTIFYBOX_VER_STR @"0.0.156"
 
 // ---------- v0.0.141：把「记录全没了」的真正根因修掉（附加字段连累了核心功能） ----------
 //
@@ -72,9 +72,10 @@
 // 数据目录 = 常量。保留这个函数只为一个用途：**打日志/诊断时打印它**，
 // 以及让"目录只有一个"这件事在代码里有名字。它不许参与任何决策。
 NSString *NBDataDir(void);
-// 盒子 App 的容器 Documents —— **只给诊断看，绝不当写入路径**（理由见上方长注释）。
-// App 进程里是直接问系统拿到的自己的容器；其它进程扫容器 metadata 得到（扫不到返回 nil）。
-NSString *NBAltDataDir(void);
+// 🔴 v0.0.156：`NBAltDataDir()` 已**删除**（函数+声明一起）。
+//    它唯一调用点是 envCheck 里「旧位置 .tweak_ctor」那一行，而那一行在 App 进程里
+//    恒走 nil 分支（App 带 no-container ⇒ 没有容器 ⇒ NSDocumentDirectory 返 nil）
+//    ⇒ 恒打「本进程算不出这个路径」的死探针。现改由 root 进程代读，结果落共享数据目录。
 // 🔴🔴 **uid==0 的进程一律不许碰共享数据目录**（本 tweak 同时注入 backboardd，它以 root 跑）。
 //    root 一旦执行 createDirectoryAtPath:，目录就归 root 所有 ⇒ 盒子 App(mobile) 从此
 //    读不进也写不进 —— 现场是「记录全没了 / 设置存不住」，而 errno 只给一个 EPERM。
