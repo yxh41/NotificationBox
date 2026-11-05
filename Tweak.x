@@ -2572,10 +2572,16 @@ static void NBDumpNCSnapshot(NSString *seq) {
             //    否则读的人分不清"它变了"和"它只是到点了"。
             NSString *whyLog = !ok ? @"异常(必打)"
                                    : (dueByChange ? @"内容变了" : @"保底(内容没变)");
-            NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld｜严格 %ld / 可读uuid %ld（可量=%d）seq=%@ 写入=%@ ｜ 距上条 %.0f 秒（-1=首条）｜ 期间省略 %lu 条 ｜ 本条因为：%@ ｜ 自动清 开=%ld 小时 超时=%lu 条%@",
+            // 🔴🔴 v0.0.155：`（可量=%d）` 原来印的是 `(csDest ? 1 : 0)` —— 一个 0/1 **开关**，
+            //    却紧挨着「可读 uuid 689」印成一个孤零零的数字。真机截图里
+            //      `可读 uuid 689（可量=1）`
+            //    所有人都会读成「689 条里有 1 条可量」，而它想说的是「这一轮能拿到落点句柄」。
+            //    这正是本项目反复付学费的「标签与它量的那件事不同源」——
+            //    数字没错，但它**看上去在说另一件事**。⇒ 改成自解释的状态词，不给人误读的余地。
+            NBLog(@"=== [扫] NC 现状 %lu 条（有键 %lu）｜界面认 %ld / 探测 %ld｜严格 %ld / 可读uuid %ld（落点 %@）seq=%@ 写入=%@ ｜ 距上条 %.0f 秒（-1=首条）｜ 期间省略 %lu 条 ｜ 本条因为：%@ ｜ 自动清 开=%ld 小时 超时=%lu 条%@",
                   (unsigned long)all.count, (unsigned long)withKeys,
                   (long)csYes, (long)csMeasured, (long)cseYes, (long)cseMeasured,
-                  (csDest ? 1 : 0), seq ?: @"", writeState,
+                  (csDest ? @"拿到" : @"拿不到"), seq ?: @"", writeState,
                   scanSpan, (unsigned long)sScanLogSkip, whyLog,
                   (long)autoHours, (unsigned long)oldReqs.count, acState);
             sScanLogTs = scanNow;
