@@ -35,6 +35,7 @@
 @property (nonatomic) int sawScheme;    // 含 :// 的字符串总数（不管能不能解析）
 @property (nonatomic) int parsedOK;     // NBLinkURL 解析通过的
 @property (nonatomic) int dropParse;    // 含 :// 却解析不出来
+@property (nonatomic) int trimmed;      // 靠「跳过垃圾前缀」才解析出来的（v0.0.154）
 @property (nonatomic) int dropAsset;    // 图片/头像
 @property (nonatomic) int dropReport;   // 上报/统计（键名或路径自证）
 @property (nonatomic) int dropHTTP;     // http(s) 且键名不认识
@@ -226,10 +227,46 @@ static NSString *NBOneLine(NSString *s, NSUInteger cap) {
 
 
 // 只认 `scheme://` 这种。`NSURL` 对 "abc:def" 也会给一个 scheme，太宽。
+// v0.0.154：把「前缀垃圾 + 一条合法 URL」的串截回到第一个合法 scheme。
+// 🔴 真机样本（2026-11-05 00:20:18，键名 `_acts`）：
+//      4,sinaweibo://gotovideo?selected_containerid=231557_2024_1&is_url_deco…
+//    前面挂着 `4,`，于是 scheme 变成非法（scheme 必须字母开头）⇒ `URLWithString:` 返回 nil。
+//    这条**是真的跳转目标**（微博视频），却因为一个前缀被判成"解析失败"。
+//    正解不是放宽 `URLWithString:`（它已经极宽松），而是**跳过垃圾前缀再解析一次**。
+// 🔴 只在**解析失败**之后才用它 ⇒ 正常串一次都不会被改动，已有结果零变化。
+//    判据：`https://a.com/?next=sms://b` 的第一个 `://` 往回退到 `https` 起点 0 ⇒ 原样返回。
+static NSString *NBLinkTrimToScheme(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length < 5) return s;
+    NSUInteger n = s.length;
+    for (NSUInteger i = 0; i + 2 < n; i++) {
+        if ([s characterAtIndex:i] != ':') continue;
+        if ([s characterAtIndex:i + 1] != '/' || [s characterAtIndex:i + 2] != '/') continue;
+        // 从 `:` 往回退，凑出 scheme 主体；遇到非 scheme 字符就停
+        NSUInteger j = i;
+        while (j > 0) {
+            unichar c = [s characterAtIndex:j - 1];
+            BOOL ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') || c == '+' || c == '.' || c == '-';
+            if (!ok) break;
+            j--;
+        }
+        if (j == i) continue;                       // 冒号前面一个字符都没有 ⇒ 不是 scheme
+        unichar c0 = [s characterAtIndex:j];
+        BOOL alpha = (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z');
+        if (!alpha) continue;                       // `4,sinaweibo://` 里若退到 `4` 开头就不算（继续找下一个 ://）
+        return (j == 0) ? s : [s substringFromIndex:j];
+    }
+    return s;
+}
+
 static NSURL *NBLinkURL(NSString *s) {
     if (![s isKindOfClass:[NSString class]] || s.length < 5) return nil;
     if ([s rangeOfString:@"://"].location == NSNotFound) return nil;
     NSURL *u = [NSURL URLWithString:s];
+    if (u && u.scheme.length) return u;
+    NSString *t = NBLinkTrimToScheme(s);            // 兜底：跳过垃圾前缀再试一次
+    if (!t || [t isEqualToString:s]) return nil;
+    u = [NSURL URLWithString:t];
     if (!u || !u.scheme.length) return nil;
     return u;
 }
@@ -434,6 +471,15 @@ static void NBCollectLinks(id node, NSString *key, NSInteger depth,
             return;
         }
         diag.parsedOK++;
+        // 🔴 v0.0.154：这条是**靠截断垃圾前缀**才活下来的（真机样本 `4,sinaweibo://…`）。
+        //    必须**当场把 str 归一**，不能等打开时再截：否则"判的串"（资产/上报路径/打分）
+        //    和"开的串"不是同一个 —— 那条纪律（同一对象吗）本项目付过学费。
+        NSString *trimmedStr = NBLinkTrimToScheme(str);
+        if (![trimmedStr isEqualToString:str]) {
+            diag.trimmed++;
+            [diag note:[NSString stringWithFormat:@"%@(截断前缀)", key.length ? key : @"?"]];
+            str = trimmedStr;
+        }
         if (NBURLIsAsset(str, key)) {
             diag.dropAsset++;
             [diag note:[NSString stringWithFormat:@"%@(图片)", key.length ? key : @"?"]];
@@ -603,6 +649,9 @@ static NSString *NBLinkForList(id s) {
     NSMutableString *tail = [NSMutableString string];
     if (quiet > 0) [tail appendFormat:@" ｜ 静默重复 %d", quiet];
     if (diag.budgetHit) [tail appendString:@" ｜ 预算用尽"];
+    // 🔴 v0.0.154：有几条是靠「跳过垃圾前缀」才认出来的。
+    //    不给这个数，"截断"就是一条看不见的暗改（本项目的旧病）。
+    if (diag.trimmed > 0) [tail appendFormat:@" ｜ 截断前缀 %d", diag.trimmed];
 
     // 丢弃明细：四个数字 + 涉及的键名。键名才是"下次该改哪条规则"的唯一依据。
     NSString *loss = [NSString stringWithFormat:@"丢 %d(图片)/%d(上报)/%d(http无名)/%d(解析失败)",
@@ -660,19 +709,41 @@ static NSString *NBLinkForList(id s) {
         //    ⇒ 名单里前 3 条（分数 + 键名 + 40 字 URL）必须打出来。
         //    只有 1 条时不打：没被选中的什么都没有，`选中(…)` 那行已经说全了。
         if (cands.count > 1) {
+            // 🔴 v0.0.154：名单按 **URL 去重**后再打。
+            //    真机（2026-11-05 00:20:38）出现过 `候选 3 条(不同 1)` 却打了 3 行一模一样的
+            //    名单：同一个 bilibili 链接从 `link` 和两个 `url` 各命中一次。
+            //    那样既浪费预算，又和「不同 1」当着读者的面打架。
+            //    去重后一条就够，并且把「从哪些键命中、命中几次」压进同一条。
             NSMutableArray *parts = [NSMutableArray array];
-            for (NSUInteger i = 0; i < cands.count && i < 3; i++) {
-                NSArray *c = (NSArray *)cands[i];
-                NSString *k2 = (c.count > 2 && [c[2] isKindOfClass:[NSString class]]
-                                && [(NSString *)c[2] length]) ? (NSString *)c[2] : @"?";
-                [parts addObject:[NSString stringWithFormat:@"%ld:%@=%@",
-                                  (long)[c[0] integerValue], k2,
-                                  NBLinkForList(c.count > 1 ? c[1] : nil)]];
+            NSMutableSet *done = [NSMutableSet set];
+            for (NSArray *c in cands) {
+                if (parts.count >= 3) break;
+                if (c.count < 2 || ![c[1] isKindOfClass:[NSString class]] || ![(NSString *)c[1] length]) continue;
+                NSString *one = (NSString *)c[1];
+                if ([done containsObject:one]) continue;
+                [done addObject:one];
+                NSInteger times = 0;
+                NSMutableArray *ks = [NSMutableArray array];
+                for (NSArray *c2 in cands) {   // 同一 URL 出现几次、用过哪些键名
+                    if (c2.count > 1 && [c2[1] isKindOfClass:[NSString class]]
+                        && [(NSString *)c2[1] isEqualToString:one]) {
+                        times++;
+                        NSString *k2 = (c2.count > 2 && [c2[2] isKindOfClass:[NSString class]]
+                                        && [(NSString *)c2[2] length]) ? (NSString *)c2[2] : @"?";
+                        if (![ks containsObject:k2] && ks.count < 3) [ks addObject:k2];
+                    }
+                }
+                [parts addObject:[NSString stringWithFormat:@"%ld:%@%@=%@",
+                                  (long)[c[0] integerValue],
+                                  [ks componentsJoinedByString:@","],
+                                  (times > 1) ? [NSString stringWithFormat:@"(×%ld)", (long)times] : @"",
+                                  NBLinkForList(one)]];
             }
+            // 🔴 「另 N 条」按**不同目标**算（和 `不同 M` 同口径），不是按候选条数算
             NBSharedLog(@"[直达] 候选名单 %@%@", [parts componentsJoinedByString:@" ｜ "],
-                        (cands.count > 3)
-                        ? [NSString stringWithFormat:@" ｜ …另 %lu 条",
-                           (unsigned long)(cands.count - 3)] : @"");
+                        (uniq.count > parts.count)
+                        ? [NSString stringWithFormat:@" ｜ …另 %lu 个不同目标",
+                           (unsigned long)(uniq.count - parts.count)] : @"");
         }
     }
     return [v isKindOfClass:[NSString class]] ? (NSString *)v : nil;
