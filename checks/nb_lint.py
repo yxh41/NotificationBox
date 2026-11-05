@@ -156,33 +156,65 @@ def rd(p):
 
 SRC_EXT = (".m", ".x", ".h")
 
+# 除源码外还要读的文件（版本号判据要它们）
+EXTRA_FILES = ("control", "Resources/Info.plist")
+
+
+def wanted(rel):
+    return rel.endswith(SRC_EXT) or rel in EXTRA_FILES
+
+
+def tracked(root):
+    """仓库里**已被 git 跟踪**的文件列表 —— 这是唯一的白名单来源。
+
+    🔴🔴 v0.0.157 第一次 CI 就栽在这里，必须记下来：
+       CI 把 Theos 和 iOS SDK clone 到**仓库根目录**（`$THEOS = $GITHUB_WORKSPACE/theos`），
+       于是 `os.walk(root)` 把几万个苹果头文件一起扫进来 ⇒ G1 在
+       `theos/vendor/include/BaseBoard/BSAction.h` 上判 CRLF、H1 在 CoreData 的头文件上判
+       花括号不平衡 —— **判据在别人的代码上判红**。副作用还包括 lint 白跑 4.5 分钟。
+       修法**不是补排除名单**：名单永远漏（今天漏 theos，明天漏别的），
+       而 `git ls-files` 是**事实**，不是我的记忆。判据只该量我们自己的代码。
+       ⇒ 这是「判据域必须是被测上下文」的第三次变形
+         （前两次：量了磁盘上的当前仓库、注释里写的函数名把自己算进去）。
+
+    ⚠️ 副作用（必须知道）：白名单来自 git ⇒ **新建但没 `git add` 的文件不会被判**。
+       所以本地流程是「先 add，再跑 lint」，而不是反过来。
+    """
+    r = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True)
+    if r.returncode == 0 and r.stdout.strip():
+        names = [p for p in r.stdout.decode("utf-8", "replace").split("\0") if p]
+        return [p for p in names if wanted(p)]
+    # 没有 git（比如从 tarball 跑）：回退到目录遍历，但**把这件事喊出来**，
+    # 否则又是一条"看着一样、其实量的是别的东西"的静默降级。
+    print("⚠️  git ls-files 不可用，回退到目录遍历（可能扫进第三方 SDK）")
+    out = []
+    for dirpath, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs
+                   if d not in (".git", ".workbuddy", "packages", "dist", "obj", "theos")]
+        for n in names:
+            rel = os.path.relpath(os.path.join(dirpath, n), root).replace("\\", "/")
+            if wanted(rel):
+                out.append(rel)
+    return out
+
 
 def load(root):
-    """把仓库里所有源码读进两个 dict：str（判据用）与 bytes（行尾/编码判据用）。
+    """把仓库里**我们自己的**源码读进两个 dict：str（判据用）与 bytes（行尾判据用）。
 
     🔴 为什么必须同时留 bytes：G1 判的是行尾，而 `text=True` 的通用换行会把 CRLF
        悄悄翻译成 LF ⇒ 判据恒绿。这是「读不到 ≠ 不存在」的变种：
        **被读取层改写过的内容，不能用来判断它原本是什么。**
     """
     files, raw = {}, {}
-    for dirpath, dirs, names in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in (".git", ".workbuddy", "packages", "dist", "obj")]
-        for n in names:
-            if not n.endswith(SRC_EXT):
-                continue
-            full = os.path.join(dirpath, n)
-            rel = os.path.relpath(full, root).replace("\\", "/")
-            with open(full, "rb") as f:
-                b = f.read()
-            raw[rel] = b
-            files[rel] = b.decode("utf-8", "replace")
-    for extra in ("control", "Resources/Info.plist"):
-        p = os.path.join(root, *extra.split("/"))
-        if os.path.exists(p):
-            with open(p, "rb") as f:
-                b = f.read()
-            raw[extra] = b
-            files[extra] = b.decode("utf-8", "replace")
+    for rel in tracked(root):
+        p = os.path.join(root, *rel.split("/"))
+        if not os.path.isfile(p):
+            print("⚠️  git 里记着但磁盘上没有（已删除未提交？）：%s" % rel)
+            continue
+        with open(p, "rb") as f:
+            b = f.read()
+        raw[rel] = b
+        files[rel] = b.decode("utf-8", "replace")
     return files, raw
 
 
