@@ -390,7 +390,13 @@ static void NBStoreLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    if (!NBCanWriteSharedFiles()) { NSLog(@"[NotifyBox/root STORE] %@", msg); return; }
+    // 🔴🔴 v0.0.157：这里原本是
+    //     `if (!NBCanWriteSharedFiles()) { NSLog(@"[NotifyBox/root STORE] %@", msg); return; }`
+    //   —— 那个闸门恒返 YES（见 NotifyCommon.h 该函数的注释）⇒ 这一支**永不执行**。
+    //   死代码里的话最贵：它唯一的作用是让人以为「root 的 STORE 日志走 NSLog」，
+    //   而事实相反 —— root 和别的进程一样写共享日志。
+    //   纯结构改动（闸门恒 YES 时分支本来就不进），行为一字未变。
+    //   同一份副本 `NBSharedLog` 里那处**必须同时删**，否则两处不同源、以后又会被抄来抄去。
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:[NOTIFYBOX_LOG_PATH stringByDeletingLastPathComponent]
   withIntermediateDirectories:YES attributes:nil error:nil];
@@ -418,8 +424,12 @@ void NBSharedLog(NSString *fmt, ...) {
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
 
-    // 🔴 v0.0.136：root 进程（backboardd）不许建/写这个目录，见 NBCanWriteSharedFiles 上方的长注释。
-    if (!NBCanWriteSharedFiles()) { NSLog(@"[NotifyBox/root] %@", msg); return; }
+    // 🔴🔴 v0.0.157：这里原本是 `if (!NBCanWriteSharedFiles()) { NSLog(@"[NotifyBox/root] %@", msg); return; }`
+    //   加上面那句「root 进程不许建/写这个目录」的注释 —— 两者都过期了。
+    //   闸门恒返 YES ⇒ 这支永不执行；而「root 不许写」这条规矩 v0.0.142 就撤销了
+    //   （它把唯一在干活的 backboardd 关在门外，记录整体消失 8 小时）。
+    //   ⚠️ 写失败仍然会 NSLog 兜底（见下面的 `if (!wok)`），那一条是**真的会执行**的通道 ——
+    //   删掉的是假分支，不是独立通道。
 
     // 轮转检查（节流）
     {

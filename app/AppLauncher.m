@@ -542,7 +542,17 @@ static void NBCollectLinks(id node, NSString *key, NSInteger depth,
 //    没有它，我只能一直猜"是不是埋太深"。
 //    `j88` = 88 字的 JSON 字符串（我拆过）；`s12://` = 12 字且含 `://`；`n` = 数字。
 static void NBShapeAppend(NSMutableString *out, id node, int depth) {
-    if (out.length > 220) return;                 // 硬上限：一行最多 ~240 字
+    // 🔴🔴 v0.0.157：原来是 `if (out.length > 220) return;` —— **静默截断**。
+    //   读者看到 `{key:j88,sub:{…` 会以为「形状就长这样」，而不是「后面还有东西我没画」。
+    //   这和本项目反复栽的那个坑同型：**"没画出来"与"没有"在证据上同形**。
+    //   注意本函数是递归的（同一个 out 会被层层进入），所以标记只能打一次：
+    //   用「整串里已经有这个标记」当哨兵，而不是 hasSuffix ——
+    //   因为内层打完标记后，外层还会再补自己的 `}`，末字符就不再是标记了，
+    //   用 hasSuffix 会打出 `…(截断)}…(截断)` 这种二次标记。
+    if (out.length > 220) {
+        if (![out containsString:@"…(截断)"]) [out appendString:@"…(截断)"];
+        return;
+    }
     if (!node) { [out appendString:@"nil"]; return; }
     if ([node isKindOfClass:[NSString class]]) {
         NSString *s = (NSString *)node;

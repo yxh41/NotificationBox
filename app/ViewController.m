@@ -983,8 +983,15 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // v0.0.149：补 `直达` / `直开` —— AppLauncher 新打的 `[直达] 候选 N 条 ｜ 拆 JSON M 次 ｜ 选中(…)`
 // 正是「长按到底认了哪条链接」的唯一证据，而表里没有任何词能匹配它（`直开` 那条从 v0.0.118
 // 起也一直被筛掉）。若不加，验证长按时会看到"一条都没有"，误判成"压根没走直达"。**第四次。**
+// 🔴🔴 v0.0.157：补 `路径` —— **第六次**（第五次是 `[打开]`，见 v0.0.154）。
+//   `app/AppDelegate.m:27` 打的 `[路径] 盒子App 数据目录=… 自愈=… DB存在=…` 是
+//   「App 到底把数据放哪、DB 在不在」的唯一一行历史，而表里没有任何词能匹配 `[路径]`
+//   ⇒ 这一行从写下来那天起就一直被筛掉，等于没打。
+//   ⚠️ **这次不是靠人眼发现的**：把「发出侧所有 NBSharedLog 标签 ↔ 这张表」做成机械对拍
+//   （`checks/nb_lint.py` 的 E1）之后它当场变红。⇒ 人眼扫表已经失败六次，
+//   这类病只能靠机械对拍守，所以那张判据现在**入库并挂在 CI 上**，每次编译都会跑。
 static NSString * const kNBKeyLineTable =
-    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级|直达|直开|打开";
+    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级|直达|直开|打开|路径";
 
 static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [kNBKeyLineTable componentsSeparatedByString:@"|"];

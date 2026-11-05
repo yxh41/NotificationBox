@@ -38,6 +38,15 @@ jobs:
           echo "SDK 就位："
           ls "$THEOS/sdks"
 
+      # 🔴🔴 v0.0.157：结构判据入库并挂到 CI。
+      #   在此之前每版的判据都写在临时目录里，清一次就全丢 —— 而里面那些判据是
+      #   用真机代价换来的（权限事故、静默截断、日志被自己的筛选表吃掉…）。
+      #   `--selftest` 会把每条判据对应的代码改坏、断言它变红：
+      #   只在新代码上是绿的判据等于没有判据，所以这一步必须连着变异一起跑。
+      #   放在编译**之前**：判据红了就别浪费时间编译。
+      - name: Structural lint (checks/nb_lint.py --selftest)
+        run: python3 checks/nb_lint.py --selftest
+
       - name: Build package (roothide, arm64e)
         run: make package FINALPACKAGE=1
 

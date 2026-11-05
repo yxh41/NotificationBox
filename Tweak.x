@@ -5592,6 +5592,13 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
         const char *legacy = [NOTIFYBOX_LEGACY_DIR fileSystemRepresentation];
         // 501:501 = mobile:mobile（盒子 App 与 SpringBoard 的身份，iOS 上固定）
         chown(legacy, 501, 501);
+        // 🔴🔴 v0.0.157：**属主和权限必须一起修，只修一半等于没修。**
+        //   ① 的 0777 此前只写在 `NBDataDir()` 里，而 backboardd 这一侧**从不调 `NBDataDir()`**
+        //      （root 那条分支只写 NSLog）⇒ 它只 chown、不 chmod。真机实测目录是 **755**，
+        //      即「设计意图 0777、实际没生效」—— 预防措施在唯一以 root 注入的进程里是空的。
+        //   chmod 幂等、可逆、不创建任何东西（目录不存在时返 ENOENT，无害）；
+        //      它也不会把 root 刚建好的目录变成没人写得了 —— 只放宽，不收紧。
+        chmod(legacy, 0777);
         NSArray *kids = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:NOTIFYBOX_LEGACY_DIR
                                                                            error:nil];
         for (NSString *k in kids) {
@@ -5618,6 +5625,12 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
             if (![body writeToFile:m atomically:YES encoding:NSUTF8StringEncoding error:&rerr]) {
                 NSLog(@"[NotifyBox/root] ⚠️ 写 .tweak_ctor_root 失败 errno=%d(%s) err=%@ path=%@",
                       errno, strerror(errno), rerr, m);
+            } else {
+                // 🔴 v0.0.157：**写成功也得管权限。** 这个文件是 root 建的，而读它的是
+                //   mobile 身份的盒子 App。`writeToFile:atomically:YES` 是「临时文件 + rename」，
+                //   新文件的 mode 由 umask 决定，我们从来没设过 ⇒ 「标记在不在」这个判定
+                //   被交给了 umask。修法和日志/DB/`.old_location` 一致：0666，人人可读。
+                chmod([m fileSystemRepresentation], 0666);
             }
         }
     }
@@ -5627,17 +5640,32 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
     //    「tweak 没注入」与「日志写不进去」。这个标记文件把两者分开：
     //      .tweak_ctor 存在 + tweak.log 不存在 ⇒ 注入成功、但写日志失败
     //      两个都不存在                      ⇒ 真的没注入
-    // 🔴🔴 v0.0.136：这里**必须**排除 root 进程 —— 否则 backboardd 会把目录建成 root 所有，
-    //    正是这次「记录全没了」的根因（见上方 chown 那段）。root 进程改用 NSLog。
-    if (!NBCanWriteSharedFiles()) {
+    // 🔴🔴 v0.0.157：这里原本是
+    //     `if (!NBCanWriteSharedFiles()) { NSLog(@"…（root 进程不写共享目录）"); } else { …写标记… }`
+    //   而 `NBCanWriteSharedFiles()` 自 v0.0.142 起**恒返 YES**（那个「禁止 root 写」的闸门
+    //   已被证明是错的：它把唯一在干活的进程关在门外，真机记录整体消失 8 小时）。
+    //   ⇒ 上面那一支是**恒不可达的死代码**，而它还会打出一句「root 进程不写共享目录」——
+    //   一句在主张"有条规则"，而那条规则早就不存在了。
+    //   **这是死探针的第二种长相**：v0.0.156 删掉的那条是"读不到"（入参恒 nil）；
+    //   这一条是"永不执行"，但两者干的是同一件事 —— 在文档和日志上维持一个假事实。
+    //   现在把分支摊平：所有进程都写 `.tweak_ctor`。这和本版给两个标记补 `chmod 0666`
+    //   是同一件事的两面 —— **既然 root 也会写它，就必须让 mobile 读得到它。**
+    //   （纯结构改动：闸门恒 YES 时 else 分支本来就会执行，行为一字未变。）
+    //
+    // 🔴 v0.0.157：但 root 侧必须留一条**不依赖"能写共享目录"**的证据通道 ——
+    //   v0.0.138 的教训是「判据不许全押在同一个前提上」，NSLog→syslog 就是那条独立通道。
+    //   原来那句挂在死分支里、还夹带一句假规则；现在改成只按身份判断，内容只说事实。
+    //   一次开机只打一行，且不进 tweak.log ⇒ 不占界面上那 ~50 行的窗口。
+    if (getuid() == 0) {
         NSString *selfPath = @"?";
         Dl_info dli;
         if (dladdr((const void *)&NBProc, &dli) && dli.dli_fname) {
             selfPath = [NSString stringWithUTF8String:dli.dli_fname];
         }
-        NSLog(@"[NotifyBox/root] ctor 跑过 proc=%@ v=%@ dylib=%@（root 进程不写共享目录）",
+        NSLog(@"[NotifyBox/root] ctor 跑过 proc=%@ v=%@ dylib=%@",
               NBProc(), NB_VER_STR, selfPath);
-    } else {
+    }
+    {
         NSString *mark = [NBDataDir() stringByAppendingPathComponent:@".tweak_ctor"];
         // 🔴 用 dladdr 拿到 dylib 自己的真实路径：roothide 会把前缀重定向，
         //    App 侧探测那几个写死的候选路径通常都落空，只有 tweak 自己知道它被装在哪。
@@ -5662,6 +5690,11 @@ static void NBPickUpAfterPublish(id obj, NSString *hint, NSString *tag, int slot
             NSLog(@"[NotifyBox] ⚠️ 写 .tweak_ctor 失败 errno=%d(%s) path=%@ "
                   @"（写不进共享目录；诊断见 /private/var/tmp/nb_boot_*.txt）",
                   errno, strerror(errno), mark);
+        } else {
+            // 🔴 v0.0.157：与 `.tweak_ctor_root` 同一条规矩 —— 写完立刻把 mode 定成 0666。
+            //   不设的话，「标记存在」这件事只有同一个身份读得出来；跨身份（root 写、mobile 读）
+            //   就会读不到，而读不到在证据上和「没写」一模一样 —— 正是我们要消灭的那种同形。
+            chmod([mark fileSystemRepresentation], 0666);
         }
     }
 
