@@ -501,6 +501,54 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)nbToast:(NSString *)text;
 @end
 
+// 🔴 v0.0.161：诊断长文本页用的独立 VC（**文件级**，不能嵌进 @implementation ViewController 里，
+//    Objective-C 不允许在 @implementation 内再写 @interface/@implementation）。
+//    关掉系统长按选择（避免越狱环境闪退），复制走 nav「复制全文」按钮（直接写 UIPasteboard）。
+@interface NBTextViewController : UIViewController
+@property (nonatomic, copy) NSString *fullText;
+@property (nonatomic, strong) UITextView *textView;
+- (void)nbCopyFull:(UIButton *)sender;
+@end
+
+@implementation NBTextViewController
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = NBPageBG();   // v0.0.71 与全站统一
+
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectZero];
+    tv.editable = NO;
+    tv.selectable = NO;                 // v0.0.161：关掉系统长按选择，避免越狱环境闪退
+    tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    tv.text = self.fullText ?: @"(空)";
+    tv.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:tv];
+    self.textView = tv;
+    [NSLayoutConstraint activateConstraints:@[
+        [tv.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [tv.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [tv.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [tv.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor],
+    ]];
+
+    UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [copyBtn setTitle:@"复制全文" forState:UIControlStateNormal];
+    copyBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    [copyBtn addTarget:self action:@selector(nbCopyFull:) forControlEvents:UIControlEventTouchUpInside];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:copyBtn];
+}
+
+// 直接写剪贴板，不触发 UIMenuController ⇒ 不闪退
+- (void)nbCopyFull:(UIButton *)sender {
+    UIPasteboard.generalPasteboard.string = self.fullText ?: @"";
+    NSString *old = [sender titleForState:UIControlStateNormal];
+    [sender setTitle:@"已复制 ✓" forState:UIControlStateNormal];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [sender setTitle:old forState:UIControlStateNormal];
+    });
+}
+@end
+
 @implementation ViewController
 
 - (void)dealloc {
@@ -1099,56 +1147,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [head stringByAppendingFormat:@"\n\n%@", [keep componentsJoinedByString:@"\n"]];
 }
 
-// 🔴 v0.0.161：诊断长文本页。
-//   原实现用 `UITextView(selectable=YES)`，长按选择会触发系统选择菜单 / 放大镜
-//   （`UIMenuController` / `UITextSelectionView`），在越狱环境下偶发闪退。
-//   改为「不可选择 + 复制全文按钮」：复制直接走 `UIPasteboard`，不碰系统选择 UI，
-//   闪退消失，复制照样能把整段日志发回给我。
-@interface NBTextViewController : UIViewController
-@property (nonatomic, copy) NSString *fullText;
-@property (nonatomic, strong) UITextView *textView;
-@end
-
-@implementation NBTextViewController
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = NBPageBG();   // v0.0.71 与全站统一
-
-    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectZero];
-    tv.editable = NO;
-    tv.selectable = NO;                 // v0.0.161：关掉系统长按选择，避免越狱环境闪退
-    tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
-    tv.text = self.fullText ?: @"(空)";
-    tv.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:tv];
-    self.textView = tv;
-    [NSLayoutConstraint activateConstraints:@[
-        [tv.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
-        [tv.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [tv.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [tv.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor],
-    ]];
-
-    UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [copyBtn setTitle:@"复制全文" forState:UIControlStateNormal];
-    copyBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-    [copyBtn addTarget:self action:@selector(nbCopyFull:) forControlEvents:UIControlEventTouchUpInside];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:copyBtn];
-}
-
-// 直接写剪贴板，不触发 UIMenuController ⇒ 不闪退
-- (void)nbCopyFull:(UIButton *)sender {
-    UIPasteboard.generalPasteboard.string = self.fullText ?: @"";
-    NSString *old = [sender titleForState:UIControlStateNormal];
-    [sender setTitle:@"已复制 ✓" forState:UIControlStateNormal];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [sender setTitle:old forState:UIControlStateNormal];
-    });
-}
-@end
-
-// 长文本用可滚动 VC 展示：UIAlertController 的 message 太长会被截断，且不能复制
+// 长文本用可滚动 VC 展示：UIAlertController 的 message 太长会被截断，且不能复制。
+// 🔴 v0.0.161：改用文件级 `NBTextViewController`（见文件顶部），关掉系统长按选择避免越狱环境闪退，
+//    复制走 nav「复制全文」按钮（直接写 UIPasteboard，不碰系统选择 UI）。
 - (void)showText:(NSString *)text title:(NSString *)title {
     NBTextViewController *vc = [[NBTextViewController alloc] init];
     vc.title = title;
