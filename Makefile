@@ -2,7 +2,15 @@
 # 🔴 TARGET 必须是 16.5：theos/sdks 仓库最高只有 iPhoneOS16.5.sdk，
 #    写 16.0 会在 GitHub Actions / 干净 Theos 里「找不到 SDK」。
 #    16.5 SDK 编出来、最低部署 16.0，在 iOS 16.0–16.7 都能跑。
-ARCHS = arm64e
+# 🔴🔴🔴 v0.0.158：`ARCHS = arm64e` 改回 `arm64 arm64e`（fat）。
+#   原值编出来是 **thin arm64e**（包内实测：cputype=0x100000C cpusubtype=0x2，单切片），
+#   而 **App Store 下载的 App 全是 arm64 进程** —— 瘦 arm64e 的 dylib 进不去 arm64 进程，
+#   dyld 按架构直接拒，**不崩溃、不报错、日志里什么都没有**。
+#   表现就是「设置 App / Filza 正常（arm64e），用户 App 里插件不生效」——
+#   而设置 App 与 SpringBoard 恰好都是 arm64e，所以这个 bug 在自家产品线上永远看不见。
+#   ⚠️ NotifyBox 本身只注入 SpringBoard/backboardd（都是 arm64e），fat 对它无害；
+#      但新增的 NBProbe 必须能进用户 App，否则它测不到任何东西。
+ARCHS = arm64 arm64e
 TARGET = iphone:clang:16.5:16.0
 THEOS_PACKAGE_SCHEME = roothide
 FINALPACKAGE = 1
@@ -41,6 +49,20 @@ NotifyBox_FRAMEWORKS = Foundation CoreFoundation AVFoundation AVFAudio AudioTool
 NotifyBox_CFLAGS = -fobjc-arc -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations
 NotifyBox_LIBRARIES = sqlite3
 
+include $(THEOS_MAKE_PATH)/tweak.mk
+
+# ---------- 注入诊断（临时件 v0.0.158，解决问题后连 target 一起删） ----------
+# 为什么要独立一个 dylib：NotifyBox 的 Filter 只匹配 SpringBoard + backboardd，
+#   而"插件在用户 App 里拿得到什么权限"必须在**用户 App 进程里**量。
+#   塞进 NotifyBox 就要把它的 Filter 扩到所有 App ⇒ 等于给产品加一堆不该有的行为。
+# ⚠️ Theos 支持一个 Makefile 里多个 TWEAK：换 TWEAK_NAME 再 include 一次 tweak.mk。
+#   漏了第二次 include ⇒ 编译期过、**包里没有这个 dylib**，而且不报错。
+# ⚠️ plist 走 theos 约定：仓库根的 NBProbe.plist 会自动装成同名 .plist。
+TWEAK_NAME = NBProbe
+NBProbe_FILES = NBProbe.m
+# 只用 Foundation/CoreFoundation：这份代码要进**所有 App**，依赖越少越不可能炸
+NBProbe_FRAMEWORKS = Foundation CoreFoundation
+NBProbe_CFLAGS = -fobjc-arc -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations
 include $(THEOS_MAKE_PATH)/tweak.mk
 
 # ---------- 独立盒子 App（读库展示） ----------

@@ -550,9 +550,14 @@ MUTATIONS = [
      "|打开|路径\";", "|打开\";", "E1"),
     ("M9 !oldSeen 分支写死成 NO", "NotifyStore.m",
      "} else if (!oldSeen) {", "} else if (NO) {", "F1"),
+    # 🔴 v0.0.158：锚点里**不许写死版本号**。
+    #   原来是 `@"0.0.157"`，一发版就变成"锚点出现 0 次"⇒ 变异自证自己先红。
+    #   这类判据的失效方式是"每次发版都要人肉改一次"，而漏改的表现是
+    #   「变异没跑起来」被写成 FAIL —— 看着像判据有问题，其实是锚点过期。
+    #   改成占位符，运行时从 NotifyCommon.h 现读当前版本。
     ("M10 版本号只改一处", "NotifyCommon.h",
-     "#define NOTIFYBOX_VER_STR @\"0.0.157\"",
-     "#define NOTIFYBOX_VER_STR @\"0.0.156\"", "A2"),
+     '#define NOTIFYBOX_VER_STR @"@VER@"',
+     '#define NOTIFYBOX_VER_STR @"9.9.9"', "A2"),
     ("M11 把恒不成立的死分支加回去", "Tweak.x",
      '    if (getuid() == 0) {\n        NSString *selfPath = @"?";',
      '    if (!NBCanWriteSharedFiles()) {\n        NSString *selfPath = @"?";', "D2"),
@@ -577,6 +582,17 @@ def selftest(files, base_ctx):
             bad[name] = "文件缺失"
             continue
         src = files[key]
+        # 占位符 @VER@ ⇒ 现读当前版本号（见 MUTATIONS 里 M10 的注释）
+        if "@VER@" in old or "@VER@" in new:
+            m = re.search(r'NOTIFYBOX_VER_STR @"([^"]+)"',
+                          files.get("NotifyCommon.h", ""))
+            cur = m.group(1) if m else ""
+            if not cur:
+                print("  ✗ %s —— 读不到当前版本号，占位符 @VER@ 无法展开" % name)
+                bad[name] = "版本号读不到"
+                continue
+            old = old.replace("@VER@", cur)
+            new = new.replace("@VER@", cur)
         if src.count(old) != 1:
             print("  ✗ %s —— 锚点出现 %d 次（必须唯一）：%r" % (name, src.count(old), old))
             bad[name] = "锚点不唯一"
