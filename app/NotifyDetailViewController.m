@@ -106,7 +106,7 @@
 
     self.bodyView = [[UITextView alloc] init];
     self.bodyView.editable = NO;
-    self.bodyView.selectable = YES;              // ← 见文件头 ①
+    self.bodyView.selectable = NO;               // v0.0.161：关掉长按选择，避免越狱环境闪退（复制走 nav「复制」按钮，见 onCopy:）
     self.bodyView.scrollEnabled = YES;
     self.bodyView.alwaysBounceVertical = YES;
     self.bodyView.font = [UIFont systemFontOfSize:15];

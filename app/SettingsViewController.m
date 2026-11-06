@@ -63,6 +63,7 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
 //    分不开 ⇒ 任何"数字输入"字段都不能只用 integerValue 判对错。
 
 @interface SettingsViewController () <UITextFieldDelegate>
+- (void)nbCopyUsage:(UIButton *)sender;   // v0.0.161：使用说明页复制按钮
 @property (nonatomic, strong) UIScrollView *scroll;
 // 🔴 v0.0.71：结构从「一串平铺的行」改成「分组 → 组卡片 → 行」。
 //    原来 20 多行一个接一个排下来、中间一个标题都没有，用户只能靠"上下滑到第几行"
@@ -974,7 +975,7 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
 
     UITextView *tv = [[UITextView alloc] initWithFrame:CGRectZero];
     tv.editable = NO;
-    tv.selectable = YES;                  // 可复制，方便贴回来问
+    tv.selectable = NO;                   // v0.0.161：关掉长按选择，避免越狱环境闪退（复制走 nav「复制」按钮）
     tv.font = [UIFont systemFontOfSize:13];
     tv.textColor = [UIColor labelColor];
     tv.backgroundColor = NBPageBG();
@@ -982,6 +983,13 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     tv.text = [self usageText];
     tv.translatesAutoresizingMaskIntoConstraints = NO;
     [vc.view addSubview:tv];
+
+    // v0.0.161：复制改为按钮（直接写 UIPasteboard，不触发系统选择菜单）
+    UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [copyBtn setTitle:@"复制" forState:UIControlStateNormal];
+    copyBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    [copyBtn addTarget:self action:@selector(nbCopyUsage:) forControlEvents:UIControlEventTouchUpInside];
+    vc.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:copyBtn];
     [NSLayoutConstraint activateConstraints:@[
         [tv.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor],
         [tv.leadingAnchor constraintEqualToAnchor:vc.view.leadingAnchor],
@@ -989,6 +997,17 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
         [tv.bottomAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.bottomAnchor],
     ]];
     [self.navigationController pushViewController:vc animated:YES];
+}
+
+// v0.0.161：直接写剪贴板，不触发 UIMenuController ⇒ 不闪退
+- (void)nbCopyUsage:(UIButton *)sender {
+    UIPasteboard.generalPasteboard.string = [self usageText] ?: @"";
+    NSString *old = [sender titleForState:UIControlStateNormal];
+    [sender setTitle:@"已复制 ✓" forState:UIControlStateNormal];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [sender setTitle:old forState:UIControlStateNormal];
+    });
 }
 
 
