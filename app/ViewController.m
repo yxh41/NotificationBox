@@ -13,6 +13,8 @@
 #import "NBTheme.h"
 // v0.0.118：长按菜单里的「打开」⇒ 按 bundleId 打开对应 App（两条路 + 失败留痕都在那个模块里）
 #import "AppLauncher.h"
+// v0.0.164：列表顶部的双列总览网格（只负责画，聚合与取值都在本文件里算）
+#import "OverviewGridView.h"
 
 // v0.0.38 的 `kNBMarkAllWidth`（「全标已读」按钮固定宽度）在 v0.0.131 删掉了：
 // 那个按钮已经搬进筛选菜单，布局里不再需要算它的宽度 —— 连声明一起去掉，
@@ -154,6 +156,14 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    两个数组一旦长度不同（改一处漏一处），屏幕就会"标题说 11月5日、内容是 11月4日"，
 //    而且这种错**不会报错**，只能靠肉眼发现。
 @property (nonatomic, strong) NSArray<NSDictionary *> *sectionModels;
+// v0.0.164：列表顶部的双列总览网格（挂在 `table.tableHeaderView` 上）。
+// 🔴 为什么挂 tableHeaderView 而不是做成第 0 段的一行/一张卡：
+//    ① 它是"总览"，滚下去就该消失，不能永久占着屏幕（挂在 topCard 里会挤掉列表一屏的 1/4）；
+//    ② 做成第 0 段会**改所有行号**，而 `sectionModels` / `nbIndexPathForRowId:` /
+//       左滑删除 / 批量已读全都按行号定位 —— 加一段假 section 等于给每一个按行号取值的地方
+//       埋一颗定时炸弹（v0.0.33 删除错位就是这么来的）。
+//    挂 header 则**完全不动行号**，列表的数据源一个字都不用改。
+@property (nonatomic, strong) NBOverviewGridView *overviewGrid;
 @property (nonatomic, strong) NSArray<NSString *> *bundles;
 @property (nonatomic, copy)   NSString *filterBundle;   // nil = 全部
 @property (nonatomic, copy)   NSString *searchText;
@@ -385,6 +395,11 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    不许再写 `self.items[...row]` —— 那会把"第几行"当成"全表第几条"，分组一开就错位。
 - (void)nbRebuildDaySections;
 - (nullable NSDictionary *)nbItemAtIndexPath:(nullable NSIndexPath *)ip;
+// v0.0.164：总览网格 —— 从 `self.items` 聚合出「每个 App 几条 + 最新那条是什么」，
+// 再交给 `OverviewGridView` 画。**只在「全部 App」这一层显示**（筛到单个 App 时撤掉）。
+- (void)nbRebuildOverview;
+// 点总览里的某张卡片 ⇒ 和点顶部图标**走同一条路**（设 `filterBundle` + 重查）。
+- (void)nbOverviewSelectBundle:(nullable NSString *)bid;
 // v0.0.37：全部 / 只看未读（自己的分段控件，替掉没渲染出来的系统 scope bar）
 - (void)onUnread:(UISegmentedControl *)seg;
 // v0.0.49：★ 只看标星开关；以及"有没有任何规则带 ★ 动作"（★ 视图为空时区分
@@ -1831,6 +1846,20 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     y = cy + 4;
 
     self.table.frame = CGRectMake(0, y, w, h - y - safeBottom);
+
+    // v0.0.164：总览网格的**宽度只在这里跟随**（高度由卡片数决定，见 `nbRebuildOverview`）。
+    // 🔴 为什么需要单独这一处：`nbRebuildOverview` 可能早于本次布局就跑完了 ——
+    //    首屏 `loadData` 在 `viewDidLoad` 里，那时 table 宽度还是 0，走的是"屏幕宽"兜底值。
+    //    宽度真变了（旋转 / 分屏）必须让表格重新量一次 header 尺寸，否则网格里两列卡片
+    //    会按旧宽度排（右列被切掉一半）。判据用 0.5pt 容差，避免亚像素抖动引起每帧重赋。
+    if (self.overviewGrid &&
+        (self.overviewGrid.bounds.size.width < w - 0.5 ||
+         self.overviewGrid.bounds.size.width > w + 0.5)) {
+        CGRect f = self.overviewGrid.frame;
+        f.size.width = w;
+        self.overviewGrid.frame = f;
+        self.table.tableHeaderView = self.overviewGrid;
+    }
 }
 
 - (void)reloadIconBar {
@@ -2122,6 +2151,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self nbRebuildDaySections];
     // v0.0.72：未读书签的计数必须紧跟 `self.items` 重建（见方法注释里的顺序要求）。
     [self rebuildBundleUnread];
+    // v0.0.164：总览网格。
+    // 🔴 位置要求：必须排在 `self.items` 赋值之后（它是唯一的数据来源），
+    //    并且排在 `reloadData` **之前** —— 换 `tableHeaderView` 会改列表的 contentSize，
+    //    和 reloadData 抢同一帧时，滚动位置会被夹一次（症状是"刷新后列表自己跳了一下"）。
+    [self nbRebuildOverview];
     [self.table reloadData];
     [self updateEmptyView];
     // v0.0.98：残留提示条。放在这里是因为它依赖 `applyAliveFilter` 刚算出来的
@@ -3179,6 +3213,185 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     if (ip.row < 0 || ip.row >= (NSInteger)rows.count) return nil;
     id d = rows[ip.row];
     return [d isKindOfClass:[NSDictionary class]] ? (NSDictionary *)d : nil;
+}
+
+#pragma mark - v0.0.164 双列总览网格
+
+// 从 `self.items` 聚合出「每个 App 几条 + 最新那条是什么」，交给网格去画。
+//
+// 🔴 聚合**只在这里做一次**，网格那边不许再算（`OverviewGridView.h` 顶部写了理由）。
+//
+// 🔴🔴 条数必须是 `nbGroupCount` 之和，**不是行数**：
+//    v0.0.95 起同内容同日的行会归并成一条（列表上显示 ×N）。若按行数数，
+//    一个发了 8 条同款营销的 App 在网格上会显示「1 条」—— 而列表里那一行明明写着 ×8。
+//    两个数摆在同一个屏幕上互相解释，差一条用户就会开始怀疑整个界面。
+//
+// 🔴 为什么**不**在卡片上显示未读数：见方法体里那一段（口径会打架）。
+- (void)nbRebuildOverview {
+    if (!self.table) return;
+
+    NSArray<NSDictionary *> *items = self.items;
+    if (![items isKindOfClass:[NSArray class]]) items = @[];
+
+    // 已经筛到某个 App ⇒ 撤掉总览。
+    // 🔴 理由不是"不好看"，而是它此刻**没有信息量**：只剩那一个 App 的一张卡，
+    //    却要占掉列表上方近 200pt。回到「全部」时它自己会回来。
+    if (self.filterBundle.length || items.count == 0) {
+        if (self.table.tableHeaderView) self.table.tableHeaderView = nil;
+        return;
+    }
+
+    // ---- 按 App 聚合。`self.items` 是 ts DESC ⇒ 首次出现的那个 App 天然排在最前 ----
+    NSMutableArray<NSString *> *order = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *agg = [NSMutableDictionary dictionary];
+    NSInteger totalCount = 0;
+
+    for (NSDictionary *d in items) {
+        if (![d isKindOfClass:[NSDictionary class]]) continue;
+        NSString *bid = d[@"bundle"];
+        if (![bid isKindOfClass:[NSString class]] || !bid.length) continue;
+
+        // 归并一定会补这个键（`applyGroupCollapse` 两条分支都写了）；真缺了按 1 算 ——
+        // 🔴 绝不按 0 算：一个 App 明明有一条通知，网格上写「0 条」比不显示更糟。
+        NSInteger n = [d[@"nbGroupCount"] integerValue];
+        if (n <= 0) n = 1;
+        totalCount += n;
+
+        NSMutableDictionary *a = agg[bid];
+        if (!a) {
+            a = [NSMutableDictionary dictionary];
+            a[@"total"] = @0;
+            a[@"head"] = d;          // 该 App 最新的一条（用来取摘要和时间）
+            agg[bid] = a;
+            [order addObject:bid];   // 顺序 = 首次出现顺序 = 最新在前
+        }
+        a[@"total"] = @([a[@"total"] integerValue] + n);
+    }
+
+    // 只有一个 App 时不画网格：一张卡片的"网格"没有意义，而列表第一行已经把它说完了。
+    if (order.count < 2) {
+        if (self.table.tableHeaderView) self.table.tableHeaderView = nil;
+        return;
+    }
+
+    // ---- 时间文案。🔴 口径和列表 cell 那一套**故意保持不同**，但必须能对得上：
+    //      网格只给"什么时候"，所以今天给 HH:mm、昨天给"昨天"、更早给 M/d。
+    //      卡片只有 36pt 宽放时间，写完整的 "MM-dd HH:mm" 会被截成 "11-0…"（等于没写）。
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDate *today = [cal startOfDayForDate:[NSDate date]];
+    NSDate *yest = [cal dateByAddingUnit:NSCalendarUnitDay value:-1 toDate:today options:0];
+
+    static NSDateFormatter *fmtHM = nil;
+    static NSDateFormatter *fmtMD = nil;
+    static dispatch_once_t onceOv;
+    dispatch_once(&onceOv, ^{
+        fmtHM = [[NSDateFormatter alloc] init];
+        fmtHM.locale = [NSLocale localeWithLocaleIdentifier:@"zh_Hans_CN"];
+        fmtHM.dateFormat = @"HH:mm";
+        fmtMD = [[NSDateFormatter alloc] init];
+        fmtMD.locale = [NSLocale localeWithLocaleIdentifier:@"zh_Hans_CN"];
+        fmtMD.dateFormat = @"M/d";
+    });
+
+    NSInteger maxCards = [NBOverviewGridView maxCards];
+    NSInteger want = (NSInteger)order.count;
+    if (want > maxCards) want = maxCards;
+
+    NSMutableArray<NBOverviewCard *> *cards = [NSMutableArray arrayWithCapacity:(NSUInteger)want];
+    for (NSInteger i = 0; i < want; i++) {
+        NSString *bid = order[(NSUInteger)i];
+        NSDictionary *a = agg[bid];
+        NSDictionary *head = a[@"head"];
+        if (![head isKindOfClass:[NSDictionary class]]) continue;
+
+        NBOverviewCard *c = [[NBOverviewCard alloc] init];
+        c.bundleId = bid;
+        c.name = [self appNameForBundle:bid];
+        c.total = [a[@"total"] integerValue];
+
+        // 摘要优先级：正文 → 副标题 → 标题。
+        // 🔴 为什么最后才用 `title`：很多 App 的 title 就是它自己的名字（"微信"），
+        //    拿来当摘要等于把一个字都没多说。
+        NSString *line = head[@"message"];
+        if (![line isKindOfClass:[NSString class]] || !line.length) line = head[@"subtitle"];
+        if (![line isKindOfClass:[NSString class]] || !line.length) line = head[@"title"];
+        c.line = [line isKindOfClass:[NSString class]] ? line : @"";
+
+        NSDate *dt = [NSDate dateWithTimeIntervalSince1970:[head[@"ts"] doubleValue]];
+        if (!dt) {
+            c.timeText = @"";
+        } else if ([cal isDate:dt inSameDayAsDate:today]) {
+            c.timeText = [fmtHM stringFromDate:dt];
+        } else if ([cal isDate:dt inSameDayAsDate:yest]) {
+            c.timeText = @"昨天";
+        } else {
+            c.timeText = [fmtMD stringFromDate:dt];
+        }
+
+        // 🔴 未读**故意不放进来**：本类的 `hasUnread` 那种东西一旦加上，就会出现
+        //    "网格说 1 条未读、书签说 3 条"——因为网格按 `nbGroupCount` 数条数，
+        //    而 `nbUnreadByBundle` 是按**行**数的（折叠组只算 1）。两个数写的不是一回事。
+        //    未读本来已经有更合适的出口：紧挨在网格上方的图标栏红点。这里不重复，也不打架。
+        [cards addObject:c];
+    }
+
+    if (cards.count < 2) {
+        if (self.table.tableHeaderView) self.table.tableHeaderView = nil;
+        return;
+    }
+
+    // ---- 组装视图 ----
+    // 🔴 宽度兜底：首屏时 `loadData` 可能早于 `viewDidLayoutSubviews`，此时 table 的宽度是 0。
+    //    传 0 进去的话网格会按 0 宽排版（卡片压成一条线）。三级兜底和 `updateMoreFooter` 同款。
+    CGFloat w = self.table.bounds.size.width;
+    if (w <= 0) w = self.view.bounds.size.width;
+    if (w <= 0) w = [UIScreen mainScreen].bounds.size.width;
+
+    CGFloat h = [NBOverviewGridView heightForCardCount:cards.count];
+
+    if (!self.overviewGrid) {
+        self.overviewGrid = [[NBOverviewGridView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+        // 🔴 weak：网格被 `tableHeaderView` 强持有（table 又被 self.view 持有），
+        //    这里再强捕 self 就是一条 self → table → header → block → self 的环，
+        //    整个 ViewController 永远不会释放。
+        __weak typeof(self) wself = self;
+        self.overviewGrid.onSelectBundle = ^(NSString *bid) {
+            [wself nbOverviewSelectBundle:bid];
+        };
+    }
+    self.overviewGrid.frame = CGRectMake(0, 0, w, h);
+    self.overviewGrid.totalApps = (NSInteger)order.count;
+    self.overviewGrid.totalCount = totalCount;
+    [self.overviewGrid setCards:cards];
+
+    // 🔴 **高度变了才重新赋值**。每次刷新都赋一遍的话，UITableView 会重算
+    //    contentSize 并夹一次 contentOffset —— 症状是"列表每 15 秒自己往上跳一下"。
+    //    高度只由卡片数决定（`heightForCardCount:`），卡片数只随 App 数变化，
+    //    所以"没变就不赋"是安全的。宽度变化走 `viewDidLayoutSubviews` 里的那一处。
+    CGFloat oldH = self.table.tableHeaderView ? self.table.tableHeaderView.frame.size.height : -1;
+    if (!self.table.tableHeaderView || oldH < h - 0.5 || oldH > h + 0.5) {
+        self.table.tableHeaderView = self.overviewGrid;
+    }
+}
+
+// 点总览里的某张卡片。
+// 🔴 它和 `onIcon:` 是**同一件事**（设 `filterBundle` + `loadData`），
+//    不是另一条过滤路径。两条路各写一份过滤逻辑，迟早有一处漏掉 `searchBundles` 之类。
+- (void)nbOverviewSelectBundle:(NSString *)bid {
+    if (!bid.length) return;
+    if (self.filterBundle.length && [self.filterBundle isEqualToString:bid]) return;
+
+    self.filterBundle = bid;
+    [self loadData];
+
+    // 换筛选后列表要回到顶部 —— 否则用户点的是"抖音 11 条"，
+    // 却停在原来滚到一半的位置，看到的可能是空列表（他会以为没记录）。
+    if ([self.table numberOfSections] > 0 &&
+        [self.table numberOfRowsInSection:0] > 0) {
+        [self.table scrollToRowAtIndexPath:[NSIndexPath indexPathForRow:0 inSection:0]
+                          atScrollPosition:UITableViewScrollPositionTop
+                                  animated:NO];
+    }
 }
 
 #pragma mark - UITableView
