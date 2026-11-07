@@ -18,7 +18,11 @@ static const NSInteger kNBOverviewMaxCards = 8;   // 4 行 × 2 列
 static const CGFloat   kNBOverviewTop      = 10;  // 顶部内边距
 static const CGFloat   kNBOverviewHeadH    = 18;  // 抬头行（"总览" + 范围计数）
 static const CGFloat   kNBOverviewHeadGap  = 6;   // 抬头 → 第一行卡片
-static const CGFloat   kNBOverviewCardH    = 46;  // 单卡高度
+// 🔴 v0.0.165：46 → 52。真机截图（2026-11-08）显示**摘要行压到了图标上**：
+//    旧几何是 图标 y=6 高 20（占到 26），而摘要行 y=24 ⇒ 两者**重叠 2pt**。
+//    这不是"离得近"，是"盖在一起"—— 图上 "EXC_BAD_ACCESS (SI…" 的顶边正好切进图标下沿。
+//    现在 图标 6..26、摘要行 32..47，净空 6pt；卡片 52 高，底部留 5pt。
+static const CGFloat   kNBOverviewCardH    = 52;  // 单卡高度
 static const CGFloat   kNBOverviewGapX     = 8;
 static const CGFloat   kNBOverviewGapY     = 8;
 static const CGFloat   kNBOverviewInsetX   = 12;
@@ -160,23 +164,23 @@ static const CGFloat   kNBOverviewBottom   = 8;
     if (w <= 0 || h <= 0) return;
 
     CGFloat iconS = 20;
-    _iconBox.frame = CGRectMake(6, 6, iconS, iconS);
+    _iconBox.frame = CGRectMake(6, 6, iconS, iconS);      // 占到 y=26
     _iconImage.frame = _iconBox.bounds;
     _iconLetter.frame = _iconBox.bounds;
 
-    // 右上角条数：先定它的宽度，名字的可用宽度才能算 ——
-    // 🔴 顺序反了（先排名字再排条数）就会出现长 App 名把条数挤出去。
+    // 第一行：名字与条数，纵向**对齐图标中心**（图标中心 16 ⇒ 16pt 高的标签放在 y=7）。
+    // 🔴 旧值 y=5 是照着 15pt 高算的，改高度时必须一起改，否则名字会往上飘。
     CGFloat countW = 38;
-    _countLabel.frame = CGRectMake(w - 6 - countW, 5, countW, 15);
+    _countLabel.frame = CGRectMake(w - 6 - countW, 7, countW, 16);
 
     CGFloat nameX = CGRectGetMaxX(_iconBox.frame) + 5;
-    _nameLabel.frame = CGRectMake(nameX, 5,
-                                  MAX(20, w - 6 - countW - nameX), 15);
+    _nameLabel.frame = CGRectMake(nameX, 7, MAX(20, w - 6 - countW - nameX), 16);
 
-    // 第二行：左边摘要、右边时间。同样先定时间宽度。
+    // 第二行：左边摘要、右边时间。**y=32 起点是关键**（见文件头 kNBOverviewCardH 的注释）：
+    // 它必须排在图标底边 26 之下、并且留出看得见的净空，否则摘要顶边会切进图标。
     CGFloat timeW = 36;
-    _timeLabel.frame = CGRectMake(w - 6 - timeW, 24, timeW, 14);
-    _lineLabel.frame = CGRectMake(6, 24, MAX(20, w - 12 - timeW - 4), 14);
+    _timeLabel.frame = CGRectMake(w - 6 - timeW, 32, timeW, 15);
+    _lineLabel.frame = CGRectMake(6, 32, MAX(20, w - 12 - timeW - 4), 15);
 }
 
 - (void)setHighlighted:(BOOL)highlighted {
