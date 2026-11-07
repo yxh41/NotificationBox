@@ -169,9 +169,57 @@ def find_str(b, s):
     return s.encode("utf-16-le") in b
 
 
+FAT_MAGIC_32 = 0xcafebabe
+FAT_MAGIC_64 = 0xcafebabf
+
+
+def fat_slices(b):
+    """fat（通用）二进制 ⇒ [(cputype, 切片起始, 切片长度)]；thin 二进制 ⇒ []。
+
+    🔴 v0.0.164 新增。本仓库从 0.0.160 起 `ARCHS = arm64 arm64e` ⇒ App 与 dylib
+       **都是 fat**。旧 `regions()` 直接把文件开头当 Mach-O 头读，而 fat 头里
+       偏移 16 处根本不是 `ncmds`（是切片表的内容），解析出的段偏移全是垃圾，
+       最后在 `struct.unpack_from` 越界处抛 `struct.error`。
+       「崩比恒绿好」，但这一条必须修 —— 否则「代码真的改了」这一整节在 fat 包上
+       从来没有真正跑过（每次都在它之前就崩了）。
+    """
+    if len(b) < 8:
+        return []
+    magic = struct.unpack_from(">I", b, 0)[0]
+    if magic not in (FAT_MAGIC_32, FAT_MAGIC_64):
+        return []
+    n = struct.unpack_from(">I", b, 4)[0]
+    if n <= 0 or n > 16:
+        return []                      # 明显不是 fat（防垃圾头）
+    out = []
+    if magic == FAT_MAGIC_32:
+        for i in range(n):
+            o = 8 + i * 20
+            if o + 20 > len(b):
+                return []
+            cputype, _sub, off, size, _align = struct.unpack_from(">IIIII", b, o)
+            out.append((cputype, off, size))
+    else:
+        for i in range(n):
+            o = 8 + i * 32
+            if o + 32 > len(b):
+                return []
+            cputype, _sub, off, size, _align, _res = struct.unpack_from(">IIQQII", b, o)
+            out.append((cputype, off, size))
+    return out
+
+
 def regions(b):
-    ncmds = struct.unpack_from("<I", b, 16)[0]
-    off, uuid, sig = 32, None, None
+    """返回 (uuid 区间, 签名区间, [(段名, 起始, 长度)])，**全部是文件内绝对偏移**。
+
+    🔴 fat 二进制只在**第一个切片**里找（本包的切片顺序是 arm64 在前）。
+       切片的 `fileoff` 都是"相对切片起点"的，所以统统要加 `base` —— 漏加的表现是
+       所有 diff 都被归到"头部/其它"，于是 `code` 恒 0（假的"代码没改"）。
+    """
+    sl = fat_slices(b)
+    base = sl[0][1] if sl else 0
+    ncmds = struct.unpack_from("<I", b, base + 16)[0]
+    off, uuid, sig = base + 32, None, None
     segs = []
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", b, off)
@@ -179,20 +227,42 @@ def regions(b):
             uuid = (off + 8, off + 24)
         elif cmd == 0x1d:
             dataoff, datasize = struct.unpack_from("<II", b, off + 8)
-            sig = (dataoff, dataoff + datasize)
+            sig = (base + dataoff, base + dataoff + datasize)
         elif cmd == 0x19:
             name = b[off + 8:off + 24].rstrip(b"\0").decode("ascii", "replace")
             foff, fsize = struct.unpack_from("<QQ", b, off + 40)
-            segs.append((name, foff, fsize))
+            segs.append((name, base + foff, fsize))
         if cmdsize == 0:
             break
         off += cmdsize
+    # 🔴 算不出来就明说：宁可红，也不要拿一个错的分类去比。
+    for nm, fo, fs in segs:
+        if fs and fo + fs > len(b):
+            raise SystemExit("regions(): 段 %s 越界（%d+%d > 文件 %d）—— 头解析错了"
+                             % (nm, fo, fs, len(b)))
     return uuid, sig, segs
+
+
+def same_arch_bytes(x, y):
+    """两版都是 fat ⇒ 各取**第一个切片**（同一架构）。否则原样返回。
+
+    🔴 v0.0.164 为什么要切：fat 包里两版切片的长度几乎必然不同（代码长了），
+       整文件逐字节比会在**切片边界之后**全面错位 —— 从那里往后每一个字节都对不上，
+       差异数会变成几万，而它说明的不是"代码改了多少"，只是"长度不同"。
+       切开之后两边的偏移从各自切片起点算，段分类才落在真正的位置上。
+    """
+    sx, sy = fat_slices(x), fat_slices(y)
+    if sx and sy:
+        ox, lx = sx[0][1], sx[0][2]
+        oy, ly = sy[0][1], sy[0][2]
+        return x[ox:ox + lx], y[oy:oy + ly]
+    return x, y
 
 
 def code_diff(x, y):
     """逐字节比两版二进制，按段分类。**不看文件大小** —— 大小相等也要比（见文件头 B）。"""
-    u, s, segs = regions(y)
+    xs, ys = same_arch_bytes(x, y)
+    u, s, segs = regions(ys)
 
     def cls(i):
         if u and u[0] <= i < u[1]:
@@ -204,11 +274,14 @@ def code_diff(x, y):
                 return nm
         return "头部/其它"
 
-    diffs = [i for i in range(min(len(x), len(y))) if x[i] != y[i]]
+    n = min(len(xs), len(ys))
+    diffs = [i for i in range(n) if xs[i] != ys[i]]
     cnt = Counter(cls(i) for i in diffs)
     code = sum(v for k, v in cnt.items()
                if k in ("__TEXT", "__TEXT_EXEC", "__DATA", "__DATA_CONST"))
-    return cnt, code
+    # 比了多少也要报出来 —— 「两版长度不同 ⇒ 尾部没比」这件事必须写在屏幕上，
+    # 否则读者会把它当成"尾部完全相同"。
+    return cnt, code, (len(xs), len(ys), n)
 
 
 # ───────────────────────────── 常驻回归串 ─────────────────────────────
@@ -303,10 +376,14 @@ def main(argv):
 
     print("\n===== 1 🔴 真的改了代码？（大小相等也要逐字节比）=====")
     for nm, x, y in (("App", a0, ab), ("dylib", d0, db)):
-        cnt, code = code_diff(x, y)
-        print("  %s: %d → %d B（差 %+d）" % (nm, len(x), len(y), len(y) - len(x)))
-        print("     差异 %d 字节 = %s"
-              % (sum(cnt.values()), " + ".join("%s %d" % (k, v) for k, v in cnt.most_common())))
+        cnt, code, cmp_info = code_diff(x, y)
+        lx, ly, n = cmp_info
+        fat = "fat" if fat_slices(y) else "thin"
+        print("  %s: 整文件 %d → %d B（差 %+d），%s 同架构切片 %d vs %d B"
+              % (nm, len(x), len(y), len(y) - len(x), fat, lx, ly))
+        print("     逐字节比了前 %d 字节；差异 %d 字节 = %s"
+              % (n, sum(cnt.values()),
+                 " + ".join("%s %d" % (k, v) for k, v in cnt.most_common())))
         chk("%s 的代码/数据段有差异（%d 字节）" % (nm, code), code > 0)
         u, s, _ = regions(y)
         chk("%s 有 LC_UUID" % nm, u is not None)
@@ -328,6 +405,12 @@ def main(argv):
         print("\n===== 4 版本特有判据（含反向对照）=====")
         for s in news:
             chk("新版里有：%s" % s, find_str(ab, s) or find_str(db, s))
+            # 🔴🔴 v0.0.164 补：文件头第 2 条写的是「新版有 **+ 旧版没有** 才证明本版新增」，
+            #    而这里以前只判了前半句 —— 一个**旧版早就存在**的串照样 PASS。
+            #    症状：这一节看起来在验"本版新增了什么"，实际只验了"这个名字此刻在包里"，
+            #    拿它当"新增证据"就是假绿（REF §Z4 的第①种）。
+            chk("旧版里没有（反向对照）：%s" % s,
+                not (find_str(a0, s) or find_str(d0, s)))
         for s in gones:
             chk("新版里已清零：%s" % s, not find_str(ab, s) and not find_str(db, s))
         for s in prevhads:
