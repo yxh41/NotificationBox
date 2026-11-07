@@ -25,6 +25,17 @@ NS_ASSUME_NONNULL_BEGIN
                  message:(nullable NSString *)message
                 subtitle:(nullable NSString *)subtitle;
 
+// ---------- v0.0.162：把「为什么拦」暴露出来（App 侧「规则测试器」用） ----------
+// 🔴🔴 这是 `shouldDropBundle:` 的**唯一实现**，那个 BOOL 接口只是它的一层包装
+//      （`reason != nil`）。这样 App 里显示的拦截原因与引擎真正的判定是同一份代码 ——
+//      项目铁律：两份判定必走岔，而走岔的试运行结果比没有结果更坏。
+// 返回 nil = 放行；非 nil = 拦，且返回的这句话就是原因（形如「命中黑名单」）。
+// 任何异常一律返回 nil（= 放行）：宁可多推一条，不可把通知吞了。
++ (nullable NSString *)dropReasonForBundle:(nullable NSString *)bundle
+                                     title:(nullable NSString *)title
+                                   message:(nullable NSString *)message
+                                  subtitle:(nullable NSString *)subtitle;
+
 // v0.0.51：连记录都不要（per-App 名单 NB_KEY_NO_RECORD_APPS）。
 // 判定口径：命中的 App **不落库**（闸门在 Tweak.x 的 recordWithBundle: 之前），
 //   但**不碰呈现**——通知照弹、过滤/替换/换声/朗读照跑。

@@ -138,23 +138,30 @@ typedef NS_ENUM(NSInteger, NBSoundVerdict) {
     return out;
 }
 
-+ (BOOL)shouldDropBundle:(NSString *)bundle
-                   title:(NSString *)title
-                 message:(NSString *)message
-                subtitle:(NSString *)subtitle {
+// 🔴 v0.0.162：判定搬到这里，成为**唯一实现**；`shouldDropBundle:` 退化成一层包装。
+//    这样 App 侧「规则测试器」显示的原因，和引擎真正用的是同一份代码。
++ (NSString *)dropReasonForBundle:(NSString *)bundle
+                            title:(NSString *)title
+                          message:(NSString *)message
+                         subtitle:(NSString *)subtitle {
     @try {
         NSDictionary *p = [self prefs];
-        if (!p.count) return NO;                 // 没有任何设置 ⇒ 绝不改变任何行为
+        if (!p.count) return nil;                // 没有任何设置 ⇒ 绝不改变任何行为
 
         NSString *bid = bundle.length ? bundle : @"";
 
         // 黑名单：直接拦
-        if ([[self arrayFromPref:p[@"blacklist"]] containsObject:bid]) return YES;
+        if ([[self arrayFromPref:p[@"blacklist"]] containsObject:bid]) {
+            return @"命中黑名单";
+        }
 
         // 白名单：只有**填了**才生效；不在名单里的都拦
         // 🔴 这是有杀伤力的语义（等于「只留这几个 App」），所以只在 white.count>0 时动手
         NSArray *white = [self arrayFromPref:p[@"whitelist"]];
-        if (white.count && ![white containsObject:bid]) return YES;
+        if (white.count && ![white containsObject:bid]) {
+            return [NSString stringWithFormat:@"白名单不含此 App（名单 %lu 个）",
+                    (unsigned long)white.count];
+        }
 
         // 关键词过滤：标题+正文+副标题 里出现就拦（记录已在此之前完成，盒子里仍能看到）
         NSArray *kw = [self arrayFromPref:p[@"blockKeywords"]];
@@ -162,13 +169,24 @@ typedef NS_ENUM(NSInteger, NBSoundVerdict) {
             NSString *text = [NSString stringWithFormat:@"%@ %@ %@",
                               title ?: @"", message ?: @"", subtitle ?: @""];
             for (NSString *k in kw) {
-                if ([text rangeOfString:k].location != NSNotFound) return YES;
+                if ([text rangeOfString:k].location != NSNotFound) {
+                    return [NSString stringWithFormat:@"命中过滤关键词「%@」", k];
+                }
             }
         }
     } @catch (__unused NSException *e) {
-        return NO;      // 判错就放行：宁可多推一条，也不要把通知吞掉
+        return nil;     // 判错就放行：宁可多推一条，也不要把通知吞掉
     }
-    return NO;
+    return nil;
+}
+
++ (BOOL)shouldDropBundle:(NSString *)bundle
+                   title:(NSString *)title
+                 message:(NSString *)message
+                subtitle:(NSString *)subtitle {
+    // 🔴 只做一层包装，**不许**在这里再写一份判定（理由见头文件）。
+    return [self dropReasonForBundle:bundle title:title
+                             message:message subtitle:subtitle] != nil;
 }
 
 // v0.0.51：连记录都不要（per-App）。判定只认 NB_KEY_NO_RECORD_APPS 一个键，

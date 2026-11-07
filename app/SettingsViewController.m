@@ -14,6 +14,7 @@
 #import "SoundAppsViewController.h"
 #import "InstalledApps.h"
 #import "NotifyStatsViewController.h"
+#import "RuleTesterViewController.h"
 #import "KeywordRulesViewController.h"
 // v0.0.71：统一视觉层（颜色 / 圆角 / 图标 / 分组卡片的唯一来源）
 #import "NBTheme.h"
@@ -131,6 +132,7 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
 // 而后者定义在它**之后** —— 项目开 -Werror，靠定义顺序解析选择器会直接编不过。
 - (void)onBatchClean:(id)sender;
 - (void)onStats:(id)sender;
+- (void)onRuleTester:(id)sender;   // v0.0.162
 - (void)confirmDeleteTitle:(NSString *)title
                     bundle:(NSString *)bundle
                   beforeTs:(NSTimeInterval)beforeTs
@@ -385,6 +387,10 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     // v0.0.48：关键词规则（标星 / 自动折叠）
     [self addActionRow:@"关键词规则" sub:@"标星 / 自动折叠" icon:@"tag.fill" tint:gray
                    key:@"kwrule" destructive:NO action:@selector(onKeywordRules:)];
+    // v0.0.162：规则测试器 —— 上面这些规则配错是**静默**的（某类通知悄悄不记 / 悄悄不弹），
+    // 这里可以把一条样例通知喂给引擎同一套判定函数，先看清结果再发真通知。
+    [self addActionRow:@"规则测试器" sub:@"发通知前先试一条" icon:@"doc.text.magnifyingglass"
+                  tint:gray key:@"ruletest" destructive:NO action:@selector(onRuleTester:)];
     // v0.0.46：统计，排在"诊断"之前 —— 诊断是排查用的，统计是天天想看的。
     [self addActionRow:@"统计" sub:@"哪个 App 最烦人" icon:@"chart.bar.fill" tint:gray
                    key:@"stats" destructive:NO action:@selector(onStats:)];
@@ -1348,6 +1354,13 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
 - (void)onKeywordRules:(id)sender {
     [self.view endEditing:YES];
     KeywordRulesViewController *v = [[KeywordRulesViewController alloc] init];
+    [self.navigationController pushViewController:v animated:YES];
+}
+
+// v0.0.162：规则测试器
+- (void)onRuleTester:(id)sender {
+    [self.view endEditing:YES];
+    RuleTesterViewController *v = [[RuleTesterViewController alloc] init];
     [self.navigationController pushViewController:v animated:YES];
 }
 
