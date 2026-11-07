@@ -149,6 +149,11 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 @property (nonatomic, strong) UIView *topCard;
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSArray<NSDictionary *> *items;
+// 🔴 v0.0.163：按天分组的**唯一**数据源 —— 每项 `@{@"title": 日期标题, @"items": 这一天的行}`。
+//    标题与行**一对一捆在同一个字典里**，不另存一份平行的 titles 数组：
+//    两个数组一旦长度不同（改一处漏一处），屏幕就会"标题说 11月5日、内容是 11月4日"，
+//    而且这种错**不会报错**，只能靠肉眼发现。
+@property (nonatomic, strong) NSArray<NSDictionary *> *sectionModels;
 @property (nonatomic, strong) NSArray<NSString *> *bundles;
 @property (nonatomic, copy)   NSString *filterBundle;   // nil = 全部
 @property (nonatomic, copy)   NSString *searchText;
@@ -375,6 +380,11 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)nbSetRead:(BOOL)read forRowIds:(NSArray<NSNumber *> *)ids;
 // 按 rowId 现查它在当前 items 里的行号（找不到返回 nil）。
 - (NSIndexPath *)nbIndexPathForRowId:(NSInteger)rowId;
+// v0.0.163：按天分组 —— 从 `self.items` 重建 `sectionModels`；以及按 indexPath 取行。
+// 🔴 分组**只在这一处**产生，任何读行的地方都必须走 `nbItemAtIndexPath:`，
+//    不许再写 `self.items[...row]` —— 那会把"第几行"当成"全表第几条"，分组一开就错位。
+- (void)nbRebuildDaySections;
+- (nullable NSDictionary *)nbItemAtIndexPath:(nullable NSIndexPath *)ip;
 // v0.0.37：全部 / 只看未读（自己的分段控件，替掉没渲染出来的系统 scope bar）
 - (void)onUnread:(UISegmentedControl *)seg;
 // v0.0.49：★ 只看标星开关；以及"有没有任何规则带 ★ 动作"（★ 视图为空时区分
@@ -2107,6 +2117,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     NSArray<NSDictionary *> *base = self.itemsBeforeAlive;
     if (!base) base = @[];
     self.items = [self applyAliveFilter:base];
+    // 🔴 v0.0.163：分组必须紧跟 `self.items` 重建、且**排在 reloadData 之前** ——
+    //    数据源读的是 `sectionModels`，晚一步就是"新数据配旧分组"。
+    [self nbRebuildDaySections];
     // v0.0.72：未读书签的计数必须紧跟 `self.items` 重建（见方法注释里的顺序要求）。
     [self rebuildBundleUnread];
     [self.table reloadData];
@@ -3094,14 +3107,105 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return NO;
 }
 
+#pragma mark - v0.0.163 按天分组
+
+// 把 `self.items`（已按 ts DESC 排好）切成「一天一段」。
+// 🔴 只做一件事：分组。**不排序、不改行、不过滤** —— 那些都在更上游，
+//    这里再动一次就变成"界面上看到的顺序 ≠ 库里的顺序"，而导出/批量操作全都按 items 走。
+- (void)nbRebuildDaySections {
+    NSArray<NSDictionary *> *items = self.items;
+    if (![items isKindOfClass:[NSArray class]] || !items.count) {
+        self.sectionModels = @[];
+        return;
+    }
+
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSLocale *cn = [NSLocale localeWithLocaleIdentifier:@"zh_Hans_CN"];
+    NSDateFormatter *fmtMD = [[NSDateFormatter alloc] init];
+    fmtMD.locale = cn;
+    fmtMD.dateFormat = @"M月d日";
+    NSDateFormatter *fmtYMD = [[NSDateFormatter alloc] init];
+    fmtYMD.locale = cn;
+    fmtYMD.dateFormat = @"yyyy年M月d日";
+
+    NSDate *today = [cal startOfDayForDate:[NSDate date]];
+    NSDate *yesterday = [cal dateByAddingUnit:NSCalendarUnitDay value:-1
+                                       toDate:today options:0];
+
+    NSMutableArray<NSDictionary *> *models = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *buf = [NSMutableArray array];
+    __block NSDate *curDay = nil;
+
+    void (^flush)(void) = ^{
+        if (!buf.count || !curDay) return;
+        NSString *title;
+        if ([cal isDate:curDay inSameDayAsDate:today]) {
+            title = @"今天";
+        } else if ([cal isDate:curDay inSameDayAsDate:yesterday]) {
+            title = @"昨天";
+        } else if ([cal component:NSCalendarUnitYear fromDate:curDay] ==
+                   [cal component:NSCalendarUnitYear fromDate:today]) {
+            title = [fmtMD stringFromDate:curDay];
+        } else {
+            title = [fmtYMD stringFromDate:curDay];   // 跨年必须带年份，否则"1月3日"分不清哪年
+        }
+        // 🔴 `[buf copy]` 是必须的：不 copy 的话下一次 removeAllObjects 会把已经存进
+        //    models 的那一份也清空 ⇒ 所有分组都变成空数组（而 numberOfSections 仍然 > 0）。
+        [models addObject:@{@"title": title, @"items": [buf copy]}];
+        [buf removeAllObjects];
+    };
+
+    for (NSDictionary *d in items) {
+        if (![d isKindOfClass:[NSDictionary class]]) continue;
+        NSDate *dt = [NSDate dateWithTimeIntervalSince1970:[d[@"ts"] doubleValue]];
+        NSDate *day = [cal startOfDayForDate:dt];
+        if (!curDay || ![cal isDate:day inSameDayAsDate:curDay]) {
+            flush();
+            curDay = day;
+        }
+        [buf addObject:d];
+    }
+    flush();
+
+    self.sectionModels = models;
+}
+
+// 唯一的「按 indexPath 取行」入口。任何地方都不许再写 `self.items[...row]`。
+- (NSDictionary *)nbItemAtIndexPath:(NSIndexPath *)ip {
+    if (!ip) return nil;
+    if (ip.section < 0 || ip.section >= (NSInteger)self.sectionModels.count) return nil;
+    NSArray *rows = self.sectionModels[ip.section][@"items"];
+    if (![rows isKindOfClass:[NSArray class]]) return nil;
+    if (ip.row < 0 || ip.row >= (NSInteger)rows.count) return nil;
+    id d = rows[ip.row];
+    return [d isKindOfClass:[NSDictionary class]] ? (NSDictionary *)d : nil;
+}
+
 #pragma mark - UITableView
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return self.sectionModels.count;
+}
+
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.items.count;
+    if (section < 0 || section >= (NSInteger)self.sectionModels.count) return 0;
+    NSArray *rows = self.sectionModels[section][@"items"];
+    return [rows isKindOfClass:[NSArray class]] ? rows.count : 0;
+}
+
+// 日期标题。plain 样式下 section header **天然吸顶**，滚动时当前日期一直挂在顶上。
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (section < 0 || section >= (NSInteger)self.sectionModels.count) return nil;
+    id t = self.sectionModels[section][@"title"];
+    return [t isKindOfClass:[NSString class]] ? (NSString *)t : nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     NotifyCell *c = [tableView dequeueReusableCellWithIdentifier:@"c" forIndexPath:indexPath];
-    NSDictionary *d = self.items[indexPath.row];
+    NSDictionary *d = [self nbItemAtIndexPath:indexPath];
+    if (!d) {
+        // 行数与分组同源，正常到不了这里。真到了就交一张空卡，绝不让后面的取值链炸掉。
+        return c;
+    }
     NSString *bid = d[@"bundle"];
     NSString *title = d[@"title"];
     NSString *msg = d[@"message"];
@@ -3237,7 +3341,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         [self loadData];
         return;
     }
-    NSDictionary *row = self.items[ip.row];
+    NSDictionary *row = [self nbItemAtIndexPath:ip];
     if (![row isKindOfClass:[NSMutableDictionary class]]) {
         [self loadData];          // 兜底：万一哪天 query 改成返回不可变字典
         return;
@@ -3252,9 +3356,14 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     NSString *bid = row[@"bundle"];
     NSMutableArray<NSIndexPath *> *paths = [NSMutableArray arrayWithObject:ip];
     for (NSIndexPath *other in [self.table indexPathsForVisibleRows]) {
-        if (other.section != ip.section || other.row == ip.row) continue;
-        if (other.row >= (NSInteger)self.items.count) continue;   // 越界就当没有这一行
-        NSString *o = self.items[other.row][@"bundle"];
+        // 🔴 v0.0.163：原来是 `other.section != ip.section` —— 分组之前只有一个 section，
+        //    这句恒假等于没写；分组之后它会**把其它天的同 App 行全部跳过**，
+        //    结果就是"改了已读，隔壁那天同 App 的卡片还写着旧未读数"。
+        //    正确判据只有一条：跳过自己。
+        if (other.section == ip.section && other.row == ip.row) continue;
+        NSDictionary *od = [self nbItemAtIndexPath:other];
+        if (!od) continue;
+        NSString *o = od[@"bundle"];
         if (bid.length && [o isEqualToString:bid]) [paths addObject:other];
     }
     [self.table reloadRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationNone];
@@ -3269,10 +3378,19 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 //    需要的判据更多、也更容易漏（本项目删错行那几版全是这个形态）。
 - (NSIndexPath *)nbIndexPathForRowId:(NSInteger)rowId {
     if (rowId <= 0) return nil;
-    for (NSInteger i = 0; i < (NSInteger)self.items.count; i++) {
-        NSDictionary *r = self.items[i];
-        if (![r isKindOfClass:[NSDictionary class]]) continue;
-        if ([r[@"id"] integerValue] == rowId) return [NSIndexPath indexPathForRow:i inSection:0];
+    // 🔴 v0.0.163：分组之后"第几行"不再等于"全表第几条" ⇒ 必须**逐段**扫，
+    //    返回的 indexPath 要带上真正的 section。仍返回 `inSection:0` 的话，
+    //    点一天里靠后的那条会去改**另一天**的同一行号（改错行、且界面上看不出来）。
+    for (NSInteger s = 0; s < (NSInteger)self.sectionModels.count; s++) {
+        NSArray *rows = self.sectionModels[s][@"items"];
+        if (![rows isKindOfClass:[NSArray class]]) continue;
+        for (NSInteger i = 0; i < (NSInteger)rows.count; i++) {
+            NSDictionary *r = rows[i];
+            if (![r isKindOfClass:[NSDictionary class]]) continue;
+            if ([r[@"id"] integerValue] == rowId) {
+                return [NSIndexPath indexPathForRow:i inSection:s];
+            }
+        }
     }
     return nil;
 }
@@ -3290,7 +3408,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         return;
     }
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    NSDictionary *d = self.items[indexPath.row];
+    NSDictionary *d = [self nbItemAtIndexPath:indexPath];
     // v0.0.95：这一行可能是 ×N 的组 ⇒ 点开就等于"整组都看过了"，
     // 否则会出现"点开过、卡片还是未读"（组内其它几条的 read 全是 0）。
     NSArray<NSNumber *> *gids = [d[@"nbGroupIds"] isKindOfClass:[NSArray class]]
