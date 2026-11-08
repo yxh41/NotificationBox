@@ -385,6 +385,184 @@ static NSString *NBClockText(NSInteger minutes) {
     }
 }
 
+// ---------- v0.0.168：临时静音 ----------
+//
+// 语义与免打扰一致（不弹、仍记进盒子），只是"什么时候结束"由**绝对时间戳**决定。
+//
+// 🔴 这个功能最坏的失效方式不是崩溃，是**通知全都不弹了**。
+//    所以下面三道防呆一个都不能省，而且每道都选择"照常弹"这个方向：
+//      ① 表不是字典 / 到期值读不出 ⇒ 整表不生效；
+//      ② 到期时间超过 7 天上限 ⇒ 该条不生效（防单位搞错写进天文数字）；
+//      ③ 已过期 ⇒ 不生效（这是正常状态，不报）。
+//    三道的共同点：**出错一律放行**。反过来写（出错一律拦下）会得到一个
+//    "莫名其妙全哑、日志里什么都没有"的现场 —— 本项目的「延迟推送」就是这么死的。
+//
+// 🔴 「配了但没生效」必须能单独报出来（problem 那条输出）：
+//    静音表存在、返回的却是 NO，这在现场与"压根没配"长得一模一样。
+//    不把它说成一句话，用户看到的就是"我明明静音了还在响"，而我手上没有任何读数。
+
+// 到期值可能是 NSNumber，也可能是手改 plist 写成的字符串。
+// 🔴 字符串必须**整串**都是数字才认：`[v doubleValue]` 对 "abc" 返回 0，
+//    而 0 是"1970 年到期"= 已过期 = 不生效 —— 这看着安全，其实把"配置写错了"
+//    伪装成"过期了"，两者在日志里完全不同。用扫描器 + isAtEnd 严格判。
+static BOOL NBMuteUntilValue(id v, NSTimeInterval *out) {
+    if (!v) return NO;
+    if ([v isKindOfClass:[NSNumber class]]) { *out = [(NSNumber *)v doubleValue]; return YES; }
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!s.length) return NO;
+        NSScanner *sc = [NSScanner scannerWithString:s];
+        double d = 0;
+        if ([sc scanDouble:&d] && sc.isAtEnd) { *out = d; return YES; }
+        return NO;
+    }
+    return NO;
+}
+
++ (NSDate *)nextMorningNineFrom:(NSDate *)now {
+    NSDate *base = now ?: [NSDate date];
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDate *nine = [cal dateBySettingHour:9 minute:0 second:0 ofDate:base options:0];
+    // 日历推算失败时退回"24 小时后"，绝不返回 nil（调用方拿 nil 去算时间就是另一场事故）
+    if (!nine) return [base dateByAddingTimeInterval:24 * 60 * 60];
+    if ([nine timeIntervalSinceDate:base] < 30 * 60) {
+        NSDate *tomorrow = [cal dateByAddingUnit:NSCalendarUnitDay value:1 toDate:nine options:0];
+        nine = [cal dateBySettingHour:9 minute:0 second:0 ofDate:(tomorrow ?: nine) options:0];
+    }
+    return nine ?: [base dateByAddingTimeInterval:24 * 60 * 60];
+}
+
++ (NSString *)menuTitleForMuteKind:(NBMuteKind)kind {
+    switch (kind) {
+        case NBMuteKind1Hour:     return @"静音 1 小时";
+        case NBMuteKind8Hours:    return @"静音 8 小时";
+        case NBMuteKindTomorrow9: return @"静音到明早 9:00";
+    }
+    return @"临时静音";
+}
+
++ (NSDate *)endDateForMuteKind:(NBMuteKind)kind now:(NSDate *)now {
+    NSDate *base = now ?: [NSDate date];
+    if (kind == NBMuteKind1Hour)  return [base dateByAddingTimeInterval:60 * 60];
+    if (kind == NBMuteKind8Hours) return [base dateByAddingTimeInterval:8 * 60 * 60];
+    return [self nextMorningNineFrom:base];
+}
+
++ (NSString *)describeMuteEnd:(NSTimeInterval)until now:(NSDate *)now {
+    NSTimeInterval nowTs = [(now ?: [NSDate date]) timeIntervalSince1970];
+    NSTimeInterval left = until - nowTs;
+    if (left <= 0) return @"已过期";
+
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"zh_Hans_CN"];
+        fmt.dateFormat = @"M月d日 HH:mm";
+    });
+    NSString *when = [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:until]];
+
+    NSString *rest;
+    // 🔴 单位写进字面量（"剩 47 分" 而不是 "47"）：这个串会被打进日志，
+    //    而日志里一个裸数字没有单位时，读的人只能靠猜（曾经把秒读成分）。
+    if (left < 60)         rest = [NSString stringWithFormat:@"剩 %.0f 秒", left];
+    else if (left < 3600)  rest = [NSString stringWithFormat:@"剩 %.0f 分", left / 60.0];
+    else if (left < 86400) rest = [NSString stringWithFormat:@"剩 %.1f 小时", left / 3600.0];
+    else                   rest = [NSString stringWithFormat:@"剩 %.1f 天", left / 86400.0];
+    return [NSString stringWithFormat:@"%@（%@）", when, rest];
+}
+
++ (BOOL)shouldDropForMute:(NSString *)bundle
+                      now:(NSDate *)now
+                   reason:(NSString **)reason
+                  problem:(NSString **)problem {
+    if (reason) *reason = nil;
+    if (problem) *problem = nil;
+    @try {
+        NSDictionary *p = [self prefs];
+        id raw = p[NB_KEY_MUTE_UNTIL];
+        if (!raw) return NO;
+
+        if (![raw isKindOfClass:[NSDictionary class]]) {
+            if (problem) {
+                *problem = [NSString stringWithFormat:@"%@ 不是字典而是 %@ ⇒ 整表不生效",
+                            NB_KEY_MUTE_UNTIL, NSStringFromClass([raw class])];
+            }
+            return NO;
+        }
+        NSDictionary *tbl = (NSDictionary *)raw;
+        if (!tbl.count) return NO;
+
+        NSTimeInterval nowTs = [(now ?: [NSDate date]) timeIntervalSince1970];
+        NSString *bi = [bundle isKindOfClass:[NSString class]] ? bundle : @"";
+
+        // 精确匹配优先，其次通配 "*"。两个都读：精确那条过期了，通配那条仍可能有效。
+        NSMutableArray<NSString *> *keys = [NSMutableArray array];
+        if (bi.length) [keys addObject:bi];
+        if (![keys containsObject:@"*"]) [keys addObject:@"*"];
+
+        NSString *bad = nil;      // 只有"一条都没静音"时才把这个报出去
+        for (NSString *k in keys) {
+            id v = tbl[k];
+            if (!v) continue;
+
+            NSTimeInterval until = 0;
+            if (!NBMuteUntilValue(v, &until)) {
+                bad = [NSString stringWithFormat:@"“%@”的到期值读不出（是 %@）",
+                       k, NSStringFromClass([v class])];
+                continue;
+            }
+            if (until <= nowTs) continue;                      // ③ 已过期：正常，不报
+
+            NSTimeInterval left = until - nowTs;
+            if (left > NB_MUTE_MAX_SECONDS) {                   // ② 超上限：防单位搞错
+                bad = [NSString stringWithFormat:@"“%@”还剩 %.0f 秒 > 上限 %.0f 秒",
+                       k, left, NB_MUTE_MAX_SECONDS];
+                continue;
+            }
+            if (reason) *reason = [self describeMuteEnd:until now:now];
+            return YES;
+        }
+
+        if (bad && problem) *problem = bad;
+        return NO;
+    } @catch (__unused NSException *e) {
+        return NO;      // 判错就不拦：宁可吵一下，绝不能莫名其妙全都不弹
+    }
+}
+
++ (NSArray<NSDictionary *> *)activeMutesAt:(NSDate *)now {
+    NSTimeInterval nowTs = [(now ?: [NSDate date]) timeIntervalSince1970];
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    @try {
+        id raw = [self prefs][NB_KEY_MUTE_UNTIL];
+        if (![raw isKindOfClass:[NSDictionary class]]) return @[];
+        NSDictionary *tbl = (NSDictionary *)raw;
+        for (NSString *k in tbl) {
+            if (![k isKindOfClass:[NSString class]]) continue;
+            NSTimeInterval until = 0;
+            if (!NBMuteUntilValue(tbl[k], &until)) continue;
+            if (until <= nowTs) continue;
+            if (until - nowTs > NB_MUTE_MAX_SECONDS) continue;   // 与判定同口径：不算生效
+            [out addObject:@{ @"bundle": k,
+                              @"until":  @(until),
+                              @"text":   [self describeMuteEnd:until now:now] }];
+        }
+    } @catch (__unused NSException *e) { return @[]; }
+
+    // 排序：通配 "*" 最前（它影响所有 App），其余按到期时间升序、同刻按 bundle。
+    // 🔴 排序必须在**这里**收口：判据和界面都读这个函数，两处各排一次必走岔。
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        BOOL aw = [a[@"bundle"] isEqualToString:@"*"], bw = [b[@"bundle"] isEqualToString:@"*"];
+        if (aw != bw) return aw ? NSOrderedAscending : NSOrderedDescending;
+        NSTimeInterval au = [a[@"until"] doubleValue], bu = [b[@"until"] doubleValue];
+        if (au != bu) return au < bu ? NSOrderedAscending : NSOrderedDescending;
+        return [a[@"bundle"] compare:b[@"bundle"]];
+    }];
+    return out;
+}
+
 // ---------- 按 App 换提示音（实验） ----------
 //
 // 真机 PROBE 数据（2026-10-23，v0.0.20）决定了这里的写法，一条都不能凭猜：

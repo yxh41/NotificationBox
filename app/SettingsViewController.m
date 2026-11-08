@@ -144,6 +144,13 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
 - (void)onNoRecordApps:(id)sender;
 - (void)onSpeakApps:(id)sender;
 - (void)onDndApps:(id)sender;
+// v0.0.168：临时静音的总览 + 一键解除。
+// 🔴 这个入口不是"可有可无的便利"：临时静音是从**长按某条记录**设的，
+//    设完之后那条记录可能被删掉、App 可能被卸载 ⇒ 用户再也找不到那个长按菜单，
+//    静音表却还在生效。没有一个固定的解除入口，功能就是不可逆的。
+- (void)onMutes:(id)sender;
+// v0.0.168：本页统一的状态行提示（写 statusLabel + 立刻重排）。
+- (void)nbSay:(NSString *)msg bad:(BOOL)bad;
 - (void)onSoundApps:(id)sender;
 - (void)onSoundFile:(id)sender;
 - (void)onSoundPreview:(id)sender;
@@ -256,6 +263,13 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
              keyboard:UIKeyboardTypeNumbersAndPunctuation key:NB_KEY_DND_END];
     [self addActionRow:@"免打扰生效的 App" sub:nil icon:@"bell.slash.fill" tint:indigo
                    key:@"dndapps" destructive:NO action:@selector(onDndApps:)];
+
+    // v0.0.168：临时静音的总览入口。
+    // 🔴 为什么必须有：静音是从「长按某条记录」设的，而那条记录可能被删、App 可能被卸载，
+    //    设完就再也找不到那个菜单了 —— 静音表却还在生效（到期前一直不弹）。
+    //    没有固定入口的"临时"功能，实际上就是不可逆的。
+    [self addActionRow:@"临时静音的 App" sub:nil icon:@"bell.fill" tint:indigo
+                   key:@"mutes" destructive:NO action:@selector(onMutes:)];
 
     // ---------- 3. 提示音 ----------
     // 🔴 真机 PROBE 数据说明这是"造系统对象"：默认提示音**不带 BBSound**（sound=nil），
@@ -676,6 +690,15 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     [self setActionValue:(dn ? [NSString stringWithFormat:@"已选 %lu 个 ›", (unsigned long)dn]
                              : @"全部 App ›")
                   forKey:@"dndapps"];
+
+    // v0.0.168：临时静音。读的是 `activeMutesAt:` —— **和判定侧同一个函数**，
+    // 所以"这里显示 2 个"和"实际会拦住 2 个 App"不会出现分歧。
+    // 🔴 空表要显示「没有生效中的」而不是「未设置」：它的零值含义是"现在什么都没静音"，
+    //    这是一个**正常且确定**的状态，不是"没配"。
+    NSUInteger mn = [[NotifyFilter activeMutesAt:nil] count];
+    [self setActionValue:(mn ? [NSString stringWithFormat:@"%lu 个生效中 ›", (unsigned long)mn]
+                             : @"没有生效中的 ›")
+                  forKey:@"mutes"];
 
     // v0.0.51：不记录的 App。空 = 全部记录（与 speak/dnd 的"全部 App"同族语义）。
     // 🔴 文案不能说成"未设置"就完事 —— 空名单是**功能关闭**的正常状态，
@@ -1227,6 +1250,75 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
 - (void)onDndApps:(id)sender {
     [self.view endEditing:YES];
     [self push:[[AppPickerViewController alloc] initWithMode:NBAppPickModeDnd]];
+}
+
+// v0.0.168：列出当前生效的临时静音，可一键全部解除。
+// 🔴 列表必须带**到期时刻 + 还剩多久**：只写 App 名的话，用户看到"抖音 静音中"
+//    无法判断它是刚设的 8 小时、还是十分钟后就自己好了 —— 而这两种情况该不该手动解除完全不同。
+- (void)onMutes:(id)sender {
+    [self.view endEditing:YES];
+
+    NSArray<NSDictionary *> *list = [NotifyFilter activeMutesAt:nil];
+    if (!list.count) {
+        [self nbSay:@"当前没有生效中的临时静音" bad:NO];
+        return;
+    }
+
+    // 🔴 本页没有 `appNameForBundle:`（那是列表页的助手）⇒ 这里现查一次 InstalledApps。
+    //    不用"取不到就显示 bundle"了事：bundle 名对用户毫无意义，而**名字查不到**本身
+    //    是需要区分的信息（App 已卸载 vs 枚举失败），所以取不到时显示 bundle 并在末尾标注。
+    NSMutableDictionary<NSString *, NSString *> *nameMap = [NSMutableDictionary dictionary];
+    for (InstalledApp *app in [InstalledApps all]) {
+        if (app.bundleId.length && app.name.length) nameMap[app.bundleId] = app.name;
+    }
+
+    NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithCapacity:list.count];
+    for (NSDictionary *e in list) {
+        NSString *b = e[@"bundle"];
+        NSString *name = nil;
+        if ([b isEqualToString:@"*"]) {
+            name = @"所有 App（通配）";
+        } else {
+            NSString *n = nameMap[b];
+            name = n.length ? n : [NSString stringWithFormat:@"%@（没查到名字）", b];
+        }
+        [lines addObject:[NSString stringWithFormat:@"· %@ — %@", name, e[@"text"] ?: @"?"]];
+    }
+
+    UIAlertController *a = [UIAlertController
+                            alertControllerWithTitle:[NSString stringWithFormat:
+                                                      @"临时静音 %lu 个", (unsigned long)list.count]
+                                             message:[lines componentsJoinedByString:@"\n"]
+                                      preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"全部解除"
+                                         style:UIAlertActionStyleDestructive
+                                       handler:^(UIAlertAction *act) {
+        NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[NotifyStore settings]];
+        [d removeObjectForKey:NB_KEY_MUTE_UNTIL];
+        BOOL ok = [NotifyStore saveSettings:d];
+        // 回读：整表必须真的空了。`saveSettings:` 返回 YES 只说明"文件写了"，
+        // 而这里要证的是"之后没有任何一条还在生效"—— 两件事，中间隔着读回。
+        NSUInteger keep = [[NotifyFilter activeMutesAt:nil] count];
+        if (!ok || keep) {
+            [self nbSay:[NSString stringWithFormat:@"解除没生效（%@，还剩 %lu 个）",
+                         ok ? @"写盘后仍读到" : @"写盘失败", (unsigned long)keep] bad:YES];
+        } else {
+            [self nbSay:@"已全部解除" bad:NO];
+        }
+        [self refreshActionValues];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+// 本页统一的"说一句话"：写状态行（`statusLabel`）并立刻重排。
+// 🔴 不用 UIAlertController 弹成功/失败：这里是在**另一个 alert 的 action 回调里**，
+//    在 alert 收起的瞬间再 present 一个 alert，系统会静默丢掉（本项目在长按菜单上栽过同一形态）。
+- (void)nbSay:(NSString *)msg bad:(BOOL)bad {
+    self.statusLabel.textColor = bad ? [UIColor systemRedColor] : [UIColor labelColor];
+    self.statusLabel.text = msg ?: @"";
+    [self.view setNeedsLayout];
+    [self.view layoutIfNeeded];
 }
 
 - (void)onSoundApps:(id)sender {

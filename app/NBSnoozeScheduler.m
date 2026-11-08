@@ -6,6 +6,7 @@
 //
 
 #import "NBSnoozeScheduler.h"
+#import "NotifyFilter.h"
 #import <UserNotifications/UserNotifications.h>
 
 @implementation NBSnoozeScheduler
@@ -26,17 +27,11 @@
     if (kind == NBSnoozeKind1Hour) return [base dateByAddingTimeInterval:60 * 60];
 
     // ---- 明早 9:00 ----
-    NSCalendar *cal = [NSCalendar currentCalendar];
-    NSDate *nine = [cal dateBySettingHour:9 minute:0 second:0 ofDate:base options:0];
-    // `dateBySettingHour:` 极端情况下可能返回 nil（日历推算失败）⇒ 退回"24 小时后"，别返回 nil
-    if (!nine) return [base dateByAddingTimeInterval:24 * 60 * 60];
-
-    // 🔴 只剩不到 30 分钟就不算"稍后"了（用户还在 App 里，一转眼就响，等于现在响）
-    if ([nine timeIntervalSinceDate:base] < 30 * 60) {
-        NSDate *tomorrow = [cal dateByAddingUnit:NSCalendarUnitDay value:1 toDate:nine options:0];
-        nine = [cal dateBySettingHour:9 minute:0 second:0 ofDate:(tomorrow ?: nine) options:0];
-    }
-    return nine ?: [base dateByAddingTimeInterval:24 * 60 * 60];
+    // 🔴 v0.0.168：这里原来有一份自己的「今天 9:00 / 不足 30 分钟顺延到明天」推算。
+    //    同一版加的「临时静音」菜单里也有「明早 9:00」—— 两处各算一份必然走岔，
+    //    而它们摆在**同一个长按菜单**里，用户看到两个都写着「明早 9:00」却行为不同，
+    //    那种 bug 连解释都没法解释。⇒ 推算收口到 NotifyFilter 一处（tweak 与 App 都编它）。
+    return [NotifyFilter nextMorningNineFrom:base];
 }
 
 + (NSString *)describeFireDate:(NSDate *)date {

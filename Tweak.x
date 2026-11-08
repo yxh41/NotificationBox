@@ -209,6 +209,13 @@ static int gHit3 = 0;   // _publishBulletinRequest:forSectionID:forDestinations:
 static int gDropped = 0;    // 被过滤掉（没有交给原方法）的条数
 static int gReplaced = 0;   // 内容替换真正改过字段的次数
 static int gDndDropped = 0; // v0.0.21：免打扰时段拦下的条数
+// v0.0.168：临时静音拦下的条数。🔴 必须与 gDndDropped **分开计数** ——
+// 两个功能都会让"通知不弹"，合成一个数之后，看到 30 条被拦根本分不清是时段还是静音，
+// 而这两件事的排查方向完全不同（一个是配置时间、一个是过期时间）。
+static int gMuteDropped = 0;
+// v0.0.168：静音表存在却没能生效的次数（到期值读不出 / 超上限）。
+// 单独计数是因为它对应的是「我配了静音却还在响」，与"真的拦了 N 条"是相反的证据。
+static int gMuteBad = 0;
 static int gSoundApplied = 0; // v0.0.21：尝试过换提示音的条数（成没成看 SOUND# 那行）
 // 去重表：key -> 最后一次记录的时间戳
 static NSMutableDictionary *gRecent = nil;
@@ -4912,6 +4919,36 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
                       gDndDropped, bid, tag, dndWhy ?: @"?");
             }
             return NBDeny();
+        }
+
+        // ②.6 临时静音（v0.0.168）
+        //
+        // 与免打扰同一个语义（不弹、仍记录），区别只是结束时刻由**绝对时间戳**决定，
+        // 到点自己失效 —— 不需要任何"到点请把我关掉"的定时器（定时器是最容易永久失效的东西：
+        // 一次偶发失败就把功能永久关掉，而用户看到的是"静音了一天还没恢复"）。
+        //
+        // 🔴 为什么判定必须在 DND 之后、内容替换之前：
+        //    `applyReplaceRulesTo:` 会改标题，而静音只管"弹不弹"、不该改内容；
+        //    若排在替换之后，被静音的通知连`替换`都做了，日志里就会同时出现
+        //    REPL 和 MUTE 两行 —— 而用户看到的是"没弹"，归因时那行 REPL 是纯噪音。
+        //    （顺序必须落成代码结构：注释守不住顺序，行序才守得住。）
+        NSString *muteWhy = nil;
+        NSString *muteBad = nil;
+        if ([NotifyFilter shouldDropForMute:bid now:nil reason:&muteWhy problem:&muteBad]) {
+            gMuteDropped++;
+            if (gMuteDropped <= 8 || (gMuteDropped % 50) == 0) {
+                NBLog(@"MUTE#%d bundle=%@ tag=%@ %@ ⇒ 不弹（仍记进盒子）",
+                      gMuteDropped, bid, tag, muteWhy ?: @"?");
+            }
+            return NBDeny();
+        }
+        // 🔴 「配了但没能生效」必须单独报：这个状态在现场与"压根没配"长得一模一样
+        //    （都表现为通知照常弹），不报就只剩盲猜。只报前 3 次 —— 它每条通知都会成立，
+        //    不限量就是刷屏，而刷屏会把 DROP#/MUTE# 这些真证据挤出日志窗口。
+        if (muteBad.length && gMuteBad < 3) {
+            gMuteBad++;
+            NBLog(@"MUTE-BAD#%d bundle=%@ 静音配置没生效：%@ ⇒ 本次照常弹",
+                  gMuteBad, bid, muteBad);
         }
 
         // ③ 内容替换（只改呈现，库里留着原文）

@@ -421,16 +421,74 @@ def _(c):
 # 发出侧打了、筛选表里没有词能匹配 ⇒ 等于没打。人眼扫表已连续失败六次
 # （DELAY# / PROBEDATE / payload / 降级 / 直达+直开 / 打开 / 路径），只能靠这条。
 
-@chk("E1", "每个 NBSharedLog 标签都能过关键词筛选表", baseline="red")
+# 「结论行」这一屏读的是 `[NotifyStore logText:]` ⇒ `NOTIFYBOX_LOG_PATH`（tweak.log）。
+# 所以判据域 = **所有写这个文件的入口**。写别的文件的通道不是不管，而是**显式列出原因**，
+# 并且一旦出现第 4 个新名字就当场 FAIL（见下面的 unknown 守卫）。
+#   🔴 直接把闸门关成"只认 NBSharedLog"就是本判据六个月来的原状 —— 代价是 11 行日志
+#      从来没被看过。宁可多列两行注释，也不许再出现"不在域里却在绿着"。
+LOG_CHANNEL_SEEDS = ("NBSharedLog", "NBStoreLog")
+
+OTHER_LOG_CHANNELS = {
+    "NBDiagStep":  "Tweak.x:2946 → NBDiagAppend，写 pre-log 文件，不写 tweak.log",
+    "NBDiagLogF":  "NotifySoundDiag.m:136，只写 sound diag 文件（App 有单独的查看页）",
+    "NSLog":       "走 oslog / 控制台，不进 tweak.log",
+}
+
+
+def log_aliases(src):
+    """写 tweak.log 的那几个函数的**全部名字**，含宏别名（`Tweak.x:225` 的 `#define NBLog NBSharedLog`）。
+
+    🔴🔴 不认别名 = 别名发出的日志整批不在判据域里。实测（v0.0.167）：
+       Tweak.x 有 11 行 `NBLog(@"[…` 带标签，而 E1 的锚点只认字面 `NBSharedLog(@"[`
+       ⇒ 这 11 行从写下那天起**一次也没被这条判据看过**。判据一直是绿的，
+       但它绿的理由是"没看见"，不是"没问题"——正是 REF §Z4 的第①类假绿。
+       「人眼扫表失败六次」的教训，被"锚点只覆盖一半"原封不动地复制了一遍。
+
+    这里**动态解析宏**而不是把 `NBLog|NBSharedLog` 写死：以后再有人加一个别名，
+    同一条判据自动覆盖，不用回来改脚本（写死的话，下个别名又是一个盲区）。
+    """
+    names = set(LOG_CHANNEL_SEEDS)
+    for seed in LOG_CHANNEL_SEEDS:
+        for m in re.finditer(r'#\s*define\s+([A-Za-z_]\w*)\s+%s\b' % seed, src):
+            names.add(m.group(1))
+    return names
+
+
+# 标签只有两种长相：`[中文/英文…]` 或 `大写字母开头的词#`（`DND#` `DROP#` `MUTE#` `DELAY-SKIP#`）。
+# 🔴 `#` 前面**允许小写**（`{0,20}` 里放开 a-z）：只认全大写的话，`MUTE-bad#` 这种
+#    「前缀大写、中间小写」的标签会**既进不了 emitted、也进不了 used** ——
+#    于是它连"锚点不认识我"都不会喊，属于最安静的那种漏。放开字符集把这个类直接堵掉。
+#    （这也是为什么下面的 used 守卫不是万能的：它只能喊出"名字不认识"，
+#      喊不出"这行的长相不在我的模式里"。模式本身的收口只能靠写宽一点。）
+# 🔴 **方括号要留住**，不能只取里面的字：App 侧是 `[line containsString:k]` 整行子串比，
+#    判据把括号剥掉之后 `[源]` 就只剩一个 `源` 字 —— 而关键词表里写 `[源]` 才是精确的。
+#    剥掉括号 ⇒ 要么判据判不过（口径不一致的假红），要么逼我在表里放一个单字 `源`
+#    （把一堆无关行也捞进来）。两把尺子必须先对齐刻度。
+TAG_RE = r'(?:\[[^\]"]{1,40}\]|[A-Z][A-Za-z0-9_\-]{0,20}#)'
+
+
+@chk("E1", "每个日志标签都能过关键词筛选表", baseline="red")
 def _(c):
+    src = strip_comments(allsrc(c["files"]))
     vc = strip_comments(find1(c["files"], "ViewController.m") or "")
     m = re.search(r'kNBKeyLineTable\s*=\s*\n?\s*@"([^"]+)"', vc)
     if not m:
         return (False, "找不到 kNBKeyLineTable")
     kws = m.group(1).split("|")
-    emitted = set(re.findall(r'NBSharedLog\(@"\[([^\]"]+)\]', strip_comments(allsrc(c["files"]))))
+    alts = log_aliases(src)
+    # 🔴 先无条件自曝"锚点不认识的名字"：凡是**以标签开头**的日志调用，名字必须落在
+    #    「写 tweak.log 的函数」或「显式登记过的其他通道」里。都不在 ⇒ FAIL。
+    #    不这么做的话，将来再来一个别名，那批行又是不在域里地绿着，谁也发现不了。
+    used = set(re.findall(r'\b([A-Za-z_]\w*)\(@\s*"%s' % TAG_RE, src))
+    unknown = sorted(used - alts - set(OTHER_LOG_CHANNELS))
+    if unknown:
+        return (False, "有标签的调用来自没登记过的名字 %s ⇒ 这些行不被检查"
+                       "（要么加进 LOG_CHANNEL_SEEDS/OTHER_LOG_CHANNELS，要么把标签去掉）" % unknown)
+    emitted = set(re.findall(r'(?:%s)\(@\s*"(%s)'
+                             % ("|".join(re.escape(a) for a in sorted(alts, key=len, reverse=True)),
+                                TAG_RE), src))
     if not emitted:
-        return (False, "一个带标签的 NBSharedLog 都没扫到（判据锚点失效）")
+        return (False, "一个带标签的日志行都没扫到（判据锚点失效）")
     bad = sorted(t for t in emitted if not any(k and k in t for k in kws))
     return (not bad, "过不了筛的标签：%s" % bad if bad else "%d 个标签全过" % len(emitted))
 
@@ -547,7 +605,17 @@ MUTATIONS = [
      "static void NBWriteOldLocationProbe(void)",
      "static void NBAltDataDir(void)", "D1"),
     ("M8 关键词表删掉「路径」", "app/ViewController.m",
-     "|打开|路径\";", "|打开\";", "E1"),
+     "|打开|路径|[源]", "|打开|[源]", "E1"),
+    # 🔴 v0.0.168 新增两条：E1 在这一版把锚点扩成"动态解析宏别名 + 留住方括号"，
+    #   等于换了把尺子 ⇒ 新加的两个分支必须各自能被单独证伪，否则又是"换了个说法还是绿的"。
+    #   M13 打的是**方括号标签分支**：表里没了 `[源]`，`[源]` 这行就必须红。
+    ("M13 关键词表删掉 [源]（方括号标签分支）", "app/ViewController.m",
+     "|[源]|[自动清]|", "|[自动清]|", "E1"),
+    #   M14 打的是**别名自曝守卫**（unknown 那条）：把 NBLog 宏改成指向别的名字后，
+    #   它发出的 11 行标签就重新落回"不在域里"的状态。这时判据必须喊"这个名字我没登记"，
+    #   而不是像改锚点之前那样悄悄看不见 ⇒ 这才是真正修掉了那个六个月的盲区。
+    ("M14 NBLog 宏指向别的名字（别名自曝守卫）", "Tweak.x",
+     "#define NBLog NBSharedLog", "#define NBLog NBLogOther", "E1"),
     ("M9 !oldSeen 分支写死成 NO", "NotifyStore.m",
      "} else if (!oldSeen) {", "} else if (NO) {", "F1"),
     # 🔴 v0.0.158：锚点里**不许写死版本号**。
@@ -615,6 +683,17 @@ def baseline_check(root, rev, base_ctx):
 
     baseline="red" 的判据必须红（证明它是本版新增、且真有分辨力），
     baseline="green" 的必须绿（证明既有性质没被误判）。
+
+    🔴🔴 **`baseline="red"` 是"引入那一版的前一版"，**不是"任意旧版"**。
+       这条标注是**累积**的：B2/B3/B4/C1/C2/D2/G1 都标在 v0.0.157 引入时，
+       而 E1 在 v0.0.168 改过口径也标了 red。一次只能传一个 REV，
+       所以除了"最新那条 red"以外，其余必然以「该红没红」的形式出现在列表里 ——
+       **那是标注机制的算术结果，不是判据失效。**
+       实测（v0.0.168，`--baseline HEAD`）：wrong_green = 7 条历史判据，
+       E1 已从列表里消失（= 旧表确实过不了新尺子，分辨力成立）。
+       ⇒ 看这一屏的正确姿势：**只盯你这一版动过的那几条**在不在列表里。
+       别去"修"那 7 条 —— 修法只能是给每条 red 标注再记一个引入版号，
+       那是又一份会漂移的手工台账，比噪声更贵。
     """
     print("\n===== 反向对照（%s 的源码）=====" % rev)
     old_files, old_raw = load_baseline(root, rev)
@@ -633,6 +712,8 @@ def baseline_check(root, rev, base_ctx):
     print("  应为红却仍绿：%s" % (wrong_green or "无"))
     print("  应为绿却变红：%s" % (wrong_red or "无"))
     if wrong_green:
+        print("  ⚠️ 上面这些里，只有**本版改过的那几条**算真问题；"
+              "其余是 red 标注按引入版累积、而一次只传了一个 REV 的算术结果。")
         bad["baseline/该红没红"] = str(wrong_green)
     if wrong_red:
         bad["baseline/该绿却红"] = str(wrong_red)

@@ -19,6 +19,9 @@
 #import "NBTextExtract.h"
 // v0.0.167：稍后提醒（本地通知，App 侧自足）
 #import "NBSnoozeScheduler.h"
+// v0.0.168：临时静音。判定逻辑在 NotifyFilter 里 —— **tweak 与 App 编的是同一份**，
+// 不能在 App 里再写一份"这个 App 现在静音了没"，否则两边口径会各走一路。
+#import "NotifyFilter.h"
 
 // v0.0.38 的 `kNBMarkAllWidth`（「全标已读」按钮固定宽度）在 v0.0.131 删掉了：
 // 那个按钮已经搬进筛选菜单，布局里不再需要算它的宽度 —— 连声明一起去掉，
@@ -527,6 +530,11 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)nbOpenExternalLink:(NSString *)link;
 // v0.0.167：稍后提醒（App 侧本地通知，不经过 tweak）。
 - (void)nbSnoozeRow:(NSDictionary *)row kind:(NBSnoozeKind)kind;
+// v0.0.168：把这个 App 的临时静音写到到期时刻 / 取消它。
+// 🔴 写完之后**必须回读一次**（`shouldDropForMute:`），不许拿"我写了"当"它生效了"：
+//    写盘失败、条目超上限、值超上限——三条路都返回 YES 给保存函数但在判定侧是"不生效"。
+- (void)nbMuteRow:(NSDictionary *)row kind:(NBMuteKind)kind;
+- (void)nbUnmuteRow:(NSDictionary *)row;
 // 「打开」的落点。🔴 只发请求 + toast，**绝不 present** ——
 //    这个动作是在菜单正在收起的瞬间执行的，此时 present 会被系统静默丢掉。
 - (void)nbOpenAppWithBundle:(NSString *)bundleId;
@@ -1076,8 +1084,24 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //   ⚠️ **这次不是靠人眼发现的**：把「发出侧所有 NBSharedLog 标签 ↔ 这张表」做成机械对拍
 //   （`checks/nb_lint.py` 的 E1）之后它当场变红。⇒ 人眼扫表已经失败六次，
 //   这类病只能靠机械对拍守，所以那张判据现在**入库并挂在 CI 上**，每次编译都会跑。
+//
+// 🔴🔴 v0.0.168：补 `[源]` `[自动清]` `NC-ID` `补ID` —— **第七次**，而且是四次一块。
+//   这次的原因不是我又忘了加，而是**E1 自己只覆盖了一半**：
+//   `Tweak.x:225` 有 `#define NBLog NBSharedLog`，而 E1 的锚点写的是字面
+//   `NBSharedLog(@"\[` ⇒ Tweak.x 里那 11 行 `NBLog(@"[…` 从写下那天起
+//   一次也没被这条判据看过。判据一直绿，绿的理由是"没看见"。
+//   ⇒ 把锚点改成动态解析宏别名、并把方括号留住（App 是整行 `containsString:` 比，
+//     判据剥掉括号就与 App 不同口径）之后，这 4 条当场变红，一个不多一个不少。
+//   🔴 这四条里最贵的是 `[源]`：`nc=… 有ts=…` 是「盒子到底从通知中心读到了几条」
+//     的唯一一线证据，一直静默消失在筛子里 —— 查「记录变少」时看不见它，
+//     就会去怀疑别的地方（已经怀疑过两次）。
+//     教训升级：**判据「绿」要先问它到底看见了几条**。看不见的绿比红更贵。
+//
+// 🔴 v0.0.168 同轮还补了 `[残]`（`NotifyStore.m:2977` 起的 5 行去重/残留诊断）。
+//   它只在手动触发那一趟打，不会淹屏幕；而它承载的「段= / 精确= / 忽略大小写=」
+//   正是判断「这条记录到底是不是同一条」的唯一读数。
 static NSString * const kNBKeyLineTable =
-    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级|直达|直开|打开|路径";
+    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级|直达|直开|打开|路径|[源]|[自动清]|NC-ID|补ID|[残]|MUTE";
 
 static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [kNBKeyLineTable componentsSeparatedByString:@"|"];
@@ -3791,6 +3815,54 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                                   options:0
                                  children:snoozeActs]];
 
+    // ================= v0.0.168：临时静音 =================
+    // 与「稍后提醒」是两件事，别混：
+    //   稍后提醒 = 过 N 分钟**再响一次**（要本地通知权限）；
+    //   临时静音 = 从现在起 N 小时**不弹这个 App**（记录照旧，不需要任何权限）。
+    // 🔴 当前已静音时，**第一项不是"再静音一次"而是"现在到什么时候"** ——
+    //    不然用户点开菜单看不出自己之前静过、还剩多久，只能靠回忆。
+    //    那一项设成 disabled：它是状态显示，不是动作（摆一个点了没反应的动作更糟）。
+    NSString *muteBid = [row[@"bundle"] isKindOfClass:[NSString class]]
+                      ? (NSString *)row[@"bundle"] : @"";
+    NSString *curMute = nil;
+    BOOL muted = [NotifyFilter shouldDropForMute:muteBid now:nil reason:&curMute problem:NULL];
+
+    NSMutableArray<UIMenuElement *> *muteActs = [NSMutableArray arrayWithCapacity:5];
+    if (muted) {
+        UIAction *info = [UIAction actionWithTitle:[NSString stringWithFormat:@"当前：%@",
+                                                    curMute ?: @"静音中"]
+                                             image:[UIImage systemImageNamed:@"info.circle"]
+                                        identifier:nil
+                                           handler:^(__kindof UIAction *a) { }];
+        info.attributes = UIMenuElementAttributesDisabled;
+        [muteActs addObject:info];
+    }
+    for (NSInteger k = NBMuteKind1Hour; k <= NBMuteKindTomorrow9; k++) {
+        NBMuteKind kind = (NBMuteKind)k;
+        UIAction *a = [UIAction actionWithTitle:[NotifyFilter menuTitleForMuteKind:kind]
+                                         image:nil
+                                    identifier:nil
+                                       handler:^(__kindof UIAction *act) {
+            [weakSelf nbMuteRow:row kind:kind];
+        }];
+        [muteActs addObject:a];
+    }
+    if (muted) {
+        UIAction *off = [UIAction actionWithTitle:@"取消静音"
+                                            image:[UIImage systemImageNamed:@"bell"]
+                                       identifier:nil
+                                          handler:^(__kindof UIAction *act) {
+            [weakSelf nbUnmuteRow:row];
+        }];
+        off.attributes = UIMenuElementAttributesDestructive;
+        [muteActs addObject:off];
+    }
+    [acts addObject:[UIMenu menuWithTitle:@"临时静音"
+                                    image:[UIImage systemImageNamed:@"bell.slash"]
+                               identifier:nil
+                                  options:0
+                                 children:muteActs]];
+
     return [UIMenu menuWithTitle:@"" children:acts];
 }
 
@@ -3824,6 +3896,114 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         // 成功和失败都要说话：失败是"权限没给/排不上"，用户必须知道为什么没响。
         if (message.length) [weakSelf nbToast:message];
     }];
+}
+
+// ================= v0.0.168：临时静音的写入 =================
+//
+// 🔴 这个函数做三件事，顺序不能换：
+//   ① 用 `activeMutesAt:` **重建**整张表（它顺手把过期项、坏值清掉）；
+//   ② 加/删本 App 那一条并落盘；
+//   ③ **回读校验**：再问一次"这个 App 现在真的静音了吗"。
+//   ③ 不能省。`writeToFile:` 返回 YES 只证明"文件写进去了"，
+//   不证明"判定侧认这一条"（超上限那条路就是写成功但判定不生效）。
+//   本项目在「保存成功但功能没生效」上已经付过学费（v0.0.32 开关白名单）。
+//
+// 🔴 重建表而不是在旧字典上改：旧字典里可能有 `"abc"` 这种读不出的到期值。
+//   在旧值上改会把它原样带进新表，而 `activeMutesAt:` 会把它剔掉 —— 顺手修好。
+//   代价是：坏条目会被**静默丢弃**。可以接受，因为坏条目本来就是"没生效"的状态。
+- (void)nbMuteRow:(NSDictionary *)row kind:(NBMuteKind)kind {
+    if (![row isKindOfClass:[NSDictionary class]]) return;
+
+    id bv = row[@"bundle"];
+    NSString *bid = [bv isKindOfClass:[NSString class]] ? (NSString *)bv : nil;
+    if (!bid.length) {
+        [self nbToast:@"这条没有 bundle id，没法按 App 静音"];
+        return;
+    }
+
+    NSMutableDictionary *tbl = [NSMutableDictionary dictionary];
+    for (NSDictionary *e in [NotifyFilter activeMutesAt:nil]) {
+        NSString *b = e[@"bundle"];
+        if ([b isKindOfClass:[NSString class]]) tbl[b] = e[@"until"];
+    }
+    // 🔴 到顶就拒绝新的（不淘汰旧的）：静音是个位数级的手动操作，到顶说明写坏了；
+    //    此时"少静音一个、并说出来"比"悄悄挤掉一个你不知道的"安全。
+    if (!tbl[bid] && tbl.count >= NB_MUTE_MAX_ENTRIES) {
+        [self nbToast:[NSString stringWithFormat:
+                       @"静音条目已经 %d 条，先取消几个再试", NB_MUTE_MAX_ENTRIES]];
+        return;
+    }
+
+    NSTimeInterval until = [[NotifyFilter endDateForMuteKind:kind now:nil] timeIntervalSince1970];
+    tbl[bid] = @(until);
+
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[NotifyStore settings]];
+    d[NB_KEY_MUTE_UNTIL] = tbl;
+    BOOL saved = [NotifyStore saveSettings:d];
+
+    // ③ 回读：问的是"判定侧认不认"，不是"我写没写"。
+    // 🔴 必须查**精确那一条**在不在，不能只用 `shouldDropForMute:bid` ——
+    //    那个函数找不到精确条目时会退到通配 "*"，如果恰好有全局静音，
+    //    一次**失败的写入**也会被判成成功（"命中率 100% 但收到的全是自己已有的字段"那种假绿）。
+    BOOL exact = NO;
+    for (NSDictionary *e in [NotifyFilter activeMutesAt:nil]) {
+        if ([e[@"bundle"] isEqualToString:bid]) { exact = YES; break; }
+    }
+    NSString *why = nil;
+    BOOL ok = saved && exact
+           && [NotifyFilter shouldDropForMute:bid now:nil reason:&why problem:NULL];
+    if (!ok) {
+        [self nbToast:[NSString stringWithFormat:@"静音没有生效（%@）",
+                       saved ? @"写进去了但判定侧不认，看日志 MUTE-BAD#" : @"写盘失败"]];
+        return;
+    }
+
+    NSString *name = [self appNameForBundle:bid];
+    [self nbToast:[NSString stringWithFormat:@"%@ 已静音 · %@", name.length ? name : bid, why ?: @""]];
+}
+
+// 取消静音。只删本 App 那一条 —— 但 `"*"`（全部 App）若还在生效，它照旧静音，
+// 所以这里**必须把话说清**，否则用户会以为"点了取消却还在静音 = 功能坏了"。
+- (void)nbUnmuteRow:(NSDictionary *)row {
+    if (![row isKindOfClass:[NSDictionary class]]) return;
+
+    id bv = row[@"bundle"];
+    NSString *bid = [bv isKindOfClass:[NSString class]] ? (NSString *)bv : nil;
+    if (!bid.length) { [self nbToast:@"这条没有 bundle id"]; return; }
+
+    NSMutableDictionary *tbl = [NSMutableDictionary dictionary];
+    for (NSDictionary *e in [NotifyFilter activeMutesAt:nil]) {
+        NSString *b = e[@"bundle"];
+        if ([b isKindOfClass:[NSString class]] && ![b isEqualToString:bid]) {
+            tbl[b] = e[@"until"];
+        }
+    }
+
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[NotifyStore settings]];
+    if (tbl.count) d[NB_KEY_MUTE_UNTIL] = tbl;
+    else [d removeObjectForKey:NB_KEY_MUTE_UNTIL];
+    BOOL saved = [NotifyStore saveSettings:d];
+
+    // 回读：本 App **那一条**必须真的没了。
+    // 🔴 判据必须是"精确条目在不在"，不能用 `shouldDropForMute:bid` ——
+    //    那个函数查不到精确条目会退到通配 "*"，于是"精确条目已删、全局静音还在"这个
+    //    **成功**状态会被判成失败，弹出"取消没生效"。（我第一版就是这么写的。）
+    BOOL exactStill = NO;
+    for (NSDictionary *e in [NotifyFilter activeMutesAt:nil]) {
+        if ([e[@"bundle"] isEqualToString:bid]) { exactStill = YES; break; }
+    }
+    if (!saved || exactStill) {
+        [self nbToast:saved ? @"取消没生效：条目还在，看日志 MUTE-BAD#"
+                            : @"取消没生效：写盘失败"];
+        return;
+    }
+    // 本 App 的没了、但全局静音还在 —— 这是最容易误判成"取消失败"的状态，必须点名。
+    NSString *why = nil;
+    if ([NotifyFilter shouldDropForMute:@"*" now:nil reason:&why problem:NULL]) {
+        [self nbToast:[NSString stringWithFormat:@"已取消本 App · 但全局静音仍在（%@）", why ?: @""]];
+        return;
+    }
+    [self nbToast:@"已取消静音"];
 }
 
 // 标题 / 正文 / 副标题按顺序拼，空的跳过。

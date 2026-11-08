@@ -12,6 +12,17 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, retain, nullable) id sound;       // 换提示音用（见 applyReplaceRulesTo）
 @end
 
+// 形如 "1 小时" / "8 小时" / "到明早 9:00"。菜单标题与真正算出来的时间**同源**，
+// 避免"菜单说 8 小时、实际存了 8 分钟"这种只有到点才发现的分歧。
+// 🔴 枚举必须声明在 `@interface` **外面**（我第一版把它写在方法声明中间，
+//    `@interface` 体内只接受方法/属性声明，clang 会在这里直接报错）。
+//    放在这里的另一个原因是调用方（App 的菜单）只用 kind 这个数，不需要类本身。
+typedef NS_ENUM(NSInteger, NBMuteKind) {
+    NBMuteKind1Hour = 0,
+    NBMuteKind8Hours,
+    NBMuteKindTomorrow9,
+};
+
 @interface NotifyFilter : NSObject
 
 // 🔴 v0.0.8：改成**纯字符串**接口。
@@ -97,6 +108,43 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)shouldDropForDND:(nullable NSString *)bundle
                      now:(nullable NSDate *)now
                   reason:(NSString * _Nullable * _Nullable)reason;
+
+// ---------- v0.0.168：临时静音 ----------
+// 语义与免打扰**完全一致**（不弹、但照常记进盒子），区别只是"什么时候结束"：
+// 免打扰是每天固定时段，临时静音是"从现在起 N 小时"、单次、自己过期。
+// 之所以不塞进 shouldDropForDND：那个函数里有一条防呆「开始==结束 ⇒ 关闭」，
+// 而绝对时间戳进来之后这条防呆的语境就错了。两个语义混进一个函数，最后一个也说不清。
+//
+// 返回 YES = 这个 App 此刻被临时静音，调用方应当不弹（并 return NBDeny()）。
+// reason（可为 NULL）= 人话，形如 "到 11-09 09:00（剩 47 分）"。
+// problem（可为 NULL）= **配了但没能生效**的原因。这是本函数刻意留的第二条输出：
+//   静音表存在却读不出/超上限时，返回 NO（照常弹）——那是一个"什么都没发生"的状态，
+//   如果不单独报一句，现场就只有"我明明静音了却还在响"，无从下手。
+//   🔴 两条输出必须分开：把它们合成一个 reason，就等于把"生效了"和"没生效"写成同一句话。
++ (BOOL)shouldDropForMute:(nullable NSString *)bundle
+                      now:(nullable NSDate *)now
+                   reason:(NSString * _Nullable * _Nullable)reason
+                  problem:(NSString * _Nullable * _Nullable)problem;
+
+// 菜单标题与真正算出来的时间**同源**，避免"菜单说 8 小时、实际存了 8 分钟"
+// 这种只有到点才发现的分歧。枚举本身声明在 `@interface` 外面（见文件上方）。
++ (NSString *)menuTitleForMuteKind:(NBMuteKind)kind;
++ (NSDate *)endDateForMuteKind:(NBMuteKind)kind now:(nullable NSDate *)now;
+// 到期时刻的人话（"11-09 09:00 · 剩 47 分"）。now 由调用方传，便于判据用固定时刻复算。
++ (NSString *)describeMuteEnd:(NSTimeInterval)until now:(nullable NSDate *)now;
+
+// ---------- 「明早 9:00」的唯一口径（v0.0.168）----------
+// 「稍后提醒」(v0.0.167) 和「临时静音」(v0.0.168) 的菜单里都有这一档，两处必须算出**同一个时刻**：
+// 同一个长按菜单里两个都写着「明早 9:00」、行为却不同，是没法向用户解释的。
+// 规则：先取「今天的 9:00」；若距那一刻已不足 30 分钟（或已过去），顺延到「明天 9:00」。
+//   🔴 为什么不一律明天 9:00：凌晨 3 点说「明早」指的是**今天早上**，一律明天 = 静音/提醒 30 小时。
+//   🔴 为什么不一律今天 9:00：晚上 23 点选「明早」只能是明天；而 `dateBySettingHour:` 在
+//      已过时刻上会给出**今天早上那个过去时间** ⇒ 静音立刻到期，看起来像「点了没反应」。
++ (NSDate *)nextMorningNineFrom:(nullable NSDate *)now;
+
+// 当前生效的静音条目（已过期的不算）。每项：@{@"bundle":…, @"until":@(epoch), @"text":…}。
+// 排序 = 先按到期时间升序、再按 bundle。"*" 单列在最前（它影响所有 App，最该先看到）。
++ (NSArray<NSDictionary *> *)activeMutesAt:(nullable NSDate *)now;
 
 // ---------- v0.0.25：按 App 换提示音（实验）—— **换挂点重写** ----------
 //
