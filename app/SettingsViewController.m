@@ -14,6 +14,9 @@
 #import "SoundAppsViewController.h"
 #import "InstalledApps.h"
 #import "NotifyStatsViewController.h"
+// v0.0.169：通知权限自检（「稍后提醒」走本地通知；拿不到权限时必须有地方看真实原因）。
+// 这个头里已经 import 了 UserNotifications，所以 UNAuthorizationStatus 在这里也能用。
+#import "NBSnoozeScheduler.h"
 #import "RuleTesterViewController.h"
 #import "KeywordRulesViewController.h"
 // v0.0.71：统一视觉层（颜色 / 圆角 / 图标 / 分组卡片的唯一来源）
@@ -149,6 +152,8 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
 //    设完之后那条记录可能被删掉、App 可能被卸载 ⇒ 用户再也找不到那个长按菜单，
 //    静音表却还在生效。没有一个固定的解除入口，功能就是不可逆的。
 - (void)onMutes:(id)sender;
+// v0.0.169：通知权限自检（「稍后提醒」用本地通知，拿不到权限时必须有地方看原因）。
+- (void)onNotifAuth:(id)sender;
 // v0.0.168：本页统一的状态行提示（写 statusLabel + 立刻重排）。
 - (void)nbSay:(NSString *)msg bad:(BOOL)bad;
 - (void)onSoundApps:(id)sender;
@@ -270,6 +275,13 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     //    没有固定入口的"临时"功能，实际上就是不可逆的。
     [self addActionRow:@"临时静音的 App" sub:nil icon:@"bell.fill" tint:indigo
                    key:@"mutes" destructive:NO action:@selector(onMutes:)];
+
+    // v0.0.169：通知权限自检。
+    // 🔴 为什么放在「免打扰」这一节的末尾：它属于同一类东西（"弹不弹"），
+    //    而用户遇到「稍后提醒说没有通知权限」时，第一反应就是来这里找。
+    //    单独开一节会让设置页再长一块，而这一项本来就是低频排障。
+    [self addActionRow:@"通知权限（稍后提醒用）" sub:@"点开看状态与原因 ›" icon:@"questionmark.circle" tint:indigo
+                   key:@"notifauth" destructive:NO action:@selector(onNotifAuth:)];
 
     // ---------- 3. 提示音 ----------
     // 🔴 真机 PROBE 数据说明这是"造系统对象"：默认提示音**不带 BBSound**（sound=nil），
@@ -1309,6 +1321,48 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
         [self refreshActionValues];
     }]];
     [self presentViewController:a animated:YES completion:nil];
+}
+
+// v0.0.169：通知权限自检。
+// 🔴 这一项存在的唯一目的 = **让用户把"为什么没权限"原样念给我听**。
+//    以前只有一句"没有通知权限"，而它背后至少三种病（用户拒绝 / 系统报错 / 授权框没弹），
+//    修法完全不同，靠猜就是一轮 CI 换一个错误答案。
+- (void)onNotifAuth:(id)sender {
+    [self.view endEditing:YES];
+    __weak typeof(self) weakSelf = self;
+
+    [NBSnoozeScheduler fetchAuthorizationReport:^(NSString *report, UNAuthorizationStatus status) {
+        // fetch 保证回调已在主线程（getNotificationSettings 的后台队列已 hop 回来）
+        UIAlertController *a = [UIAlertController
+                                alertControllerWithTitle:@"通知权限自检"
+                                                 message:report
+                                          preferredStyle:UIAlertControllerStyleAlert];
+
+        [a addAction:[UIAlertAction actionWithTitle:@"关闭"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+
+        [a addAction:[UIAlertAction actionWithTitle:@"重新申请"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *act) {
+            // 🔴 结果写状态行，不再叠一个 alert：这是在 alert 的 action 里，
+            //    在收起的瞬间再 present 会被系统静默丢掉（本项目在长按菜单上栽过同形态）。
+            [NBSnoozeScheduler requestAuthorization:^(BOOL granted, NSString *detail) {
+                [weakSelf nbSay:(detail ?: (granted ? @"已授权" : @"没拿到权限")) bad:!granted];
+            }];
+        }]];
+
+        [a addAction:[UIAlertAction actionWithTitle:@"去系统设置"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *act) {
+            BOOL ok = [NBSnoozeScheduler openSystemNotificationSettings];
+            [weakSelf nbSay:(ok ? @"已跳转系统设置，回来后再点开这里复查状态"
+                                : @"跳不过去：拿不到设置页 URL")
+                        bad:!ok];
+        }]];
+
+        [weakSelf presentViewController:a animated:YES completion:nil];
+    }];
 }
 
 // 本页统一的"说一句话"：写状态行（`statusLabel`）并立刻重排。

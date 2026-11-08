@@ -14,6 +14,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <UserNotifications/UserNotifications.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -46,6 +47,31 @@ typedef NS_ENUM(NSInteger, NBSnoozeKind) {
             subtitle:(nullable NSString *)subtitle
                 body:(nullable NSString *)body
           completion:(nullable void (^)(BOOL ok, NSString *_Nullable message))completion;
+
+// ---------- v0.0.169：通知权限自检 ----------
+//
+// 🔴 为什么非要这个（真机报「没有通知权限」才加的）：
+//    v0.0.167 失败时只有一句话「没有通知权限：设置 → 通知 → 消息盒子 里打开」，
+//    而 `granted == NO` **至少对应三种完全不同的病因**，修法各不相同：
+//      ① 用户点过"不允许"        ⇒ 去系统设置打开就行；
+//      ② 系统层面报错（error 非空）⇒ 这个 App 可能**根本没被系统登记**，
+//         去设置里翻不到它，点多少次都没用（本 App 带 `no-container`，嫌疑最大）；
+//      ③ 授权框压根没弹（状态仍是"未决"）⇒ 同上，是登记问题，不是用户拒绝。
+//    把它们写成同一句话 = 把三个病因伪装成一个，用户只能反复点、我只能盲猜。
+//    ⇒ 判据：**先报状态，再报原因**。状态是 `authorizationStatus`，它不会说谎。
+//
+// `status` 原样回传，调用方可以据此决定要不要给"去设置"按钮。
+// completion **一定在主线程**（`getNotificationSettings` 的回调在后台队列）。
++ (void)fetchAuthorizationReport:(nullable void (^)(NSString *report,
+                                                    UNAuthorizationStatus status))completion;
+
+// 再申请一次授权（设置页手动触发）。completion 在主线程，detail 是人话。
++ (void)requestAuthorization:(nullable void (^)(BOOL granted,
+                                                NSString *_Nullable detail))completion;
+
+// 打开本 App 在「设置 → 通知」里的那一页。
+// 返回 NO = 连 URL 都拿不到；真正的"跳不过去"只能靠调用方在回来时复查状态。
++ (BOOL)openSystemNotificationSettings;
 
 @end
 

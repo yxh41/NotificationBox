@@ -8,8 +8,125 @@
 #import "NBSnoozeScheduler.h"
 #import "NotifyFilter.h"
 #import <UserNotifications/UserNotifications.h>
+#import <UIKit/UIKit.h>
+
+// 状态/开关 ⇒ 人话。**每个值都要有名字**，包括"我不认识这个值"——
+// 只印数字的话，用户报上来一个 "3"，我仍要回来查表（"只给数字的留痕改不了规则"）。
+static NSString *NBStatusText(UNAuthorizationStatus s) {
+    switch ((NSInteger)s) {
+        case 0: return @"未决（0 notDetermined —— 系统还没问过 / 授权框没弹出来）";
+        case 1: return @"已拒绝（1 denied —— 用户或系统关掉了）";
+        case 2: return @"已授权（2 authorized）";
+        case 3: return @"临时授权（3 provisional，静默投递）";
+        case 4: return @"短暂授权（4 ephemeral）";
+    }
+    return [NSString stringWithFormat:@"未知状态（%ld）", (long)s];
+}
+
+static NSString *NBSettingText(UNNotificationSetting v) {
+    switch ((NSInteger)v) {
+        case 0: return @"不支持";
+        case 1: return @"关";
+        case 2: return @"开";
+    }
+    return [NSString stringWithFormat:@"未知（%ld）", (long)v];
+}
 
 @implementation NBSnoozeScheduler
+
++ (void)fetchAuthorizationReport:(void (^)(NSString *, UNAuthorizationStatus))completion {
+    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+    if (!center) {
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(@"拿不到 UNUserNotificationCenter（系统没有这个服务）", 0);
+            });
+        }
+        return;
+    }
+
+    [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *s) {
+        // 🔴 这个回调**在后台队列**：拼字符串无所谓，但绝不能在这里碰 UI。
+        NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
+        NSString *path = [[NSBundle mainBundle] bundlePath] ?: @"(nil)";
+
+        NSString *report = [NSString stringWithFormat:
+            @"授权状态：%@\n"
+            @"弹窗 %@ ｜ 声音 %@ ｜ 通知中心 %@\n"
+            @"Bundle：%@\n"
+            @"App 路径：%@",
+            NBStatusText(s.authorizationStatus),
+            NBSettingText(s.alertSetting),
+            NBSettingText(s.soundSetting),
+            NBSettingText(s.notificationCenterSetting),
+            bundle, path];
+
+        // 再补一条"系统到底认不认这个 App"的旁证：能查待发请求 = 服务是通的；
+        // 查不出来也只是异常，不影响上面的状态读数，所以单独 try 一下。
+        [center getPendingNotificationRequestsWithCompletionHandler:^(NSArray *reqs) {
+            NSString *full = [report stringByAppendingFormat:@"\n待发提醒：%lu 条",
+                              (unsigned long)reqs.count];
+            if (completion) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completion(full, s.authorizationStatus);
+                });
+            }
+        }];
+    }];
+}
+
++ (void)requestAuthorization:(void (^)(BOOL, NSString *))completion {
+    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+    if (!center) {
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(NO, @"这台设备没有通知服务（UNUserNotificationCenter 为 nil）");
+            });
+        }
+        return;
+    }
+
+    [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
+                          completionHandler:^(BOOL granted, NSError *error) {
+        // 无论成败都**复查状态**：granted 只是"这次请求的结果"，
+        // 而我们要报给用户的是"现在到底能不能发"。
+        [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *s) {
+            NSString *detail = nil;
+            if (granted) {
+                detail = [NSString stringWithFormat:@"已授权（%@）", NBStatusText(s.authorizationStatus)];
+            } else if (s.authorizationStatus == UNAuthorizationStatusDenied) {
+                // ① 用户拒绝：这句话必须指向"去哪儿打开"，因为 App 自己改不了
+                detail = @"你之前拒绝过通知权限 ⇒ 设置 → 通知 → 消息盒子 → 允许通知";
+            } else if (error) {
+                // ② 系统报错。**必须带上 domain/code**：这就是判断"有没有被系统登记"的唯一线索
+                detail = [NSString stringWithFormat:
+                          @"系统拒绝了（%@ %ld：%@）⇒ 这个 App 可能没被系统登记",
+                          error.domain, (long)error.code,
+                          error.localizedDescription ?: @"无描述"];
+            } else {
+                // ③ granted=NO 但既没拒绝也没报错 ⇒ 授权框没弹出来。这一支以前和①混在一起。
+                detail = [NSString stringWithFormat:
+                          @"系统没有弹出授权框（状态仍为 %@）⇒ 多半是这个 App 没被系统登记",
+                          NBStatusText(s.authorizationStatus)];
+            }
+            if (completion) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completion(granted, detail);
+                });
+            }
+        }];
+    }];
+}
+
++ (BOOL)openSystemNotificationSettings {
+    NSString *s = UIApplicationOpenSettingsURLString;
+    if (!s.length) return NO;
+    NSURL *u = [NSURL URLWithString:s];
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!u || !app) return NO;
+    [app openURL:u options:@{} completionHandler:nil];
+    return YES;
+}
 
 + (NSString *)menuTitleForKind:(NBSnoozeKind)kind {
     switch (kind) {
@@ -88,12 +205,14 @@
         return;
     }
 
-    [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
-                          completionHandler:^(BOOL granted, NSError *error) {
+    // 🔴 v0.0.169：授权失败**不再笼统说"没有通知权限"**。
+    //    v0.0.167 那一句话把三种病因（用户拒绝 / 系统报错 / 授权框没弹）说成同一件事，
+    //    结果用户只能反复点、我只能盲猜 —— 也正是这次「稍后提醒显示没有通知权限」的由来。
+    //    现在把 `requestAuthorization:` 报出来的状态与原因原样转给用户。
+    [self requestAuthorization:^(BOOL granted, NSString *detail) {
         if (!granted) {
-            // 🔴 不 granted 有两种：用户拒绝、以及系统层面失败（error 非 nil）。
-            //    两种都要说清"去哪儿能打开"，否则用户只会觉得这个功能是坏的。
-            finish(NO, @"没有通知权限：设置 → 通知 → 消息盒子 里打开");
+            finish(NO, [NSString stringWithFormat:@"稍后提醒没排上：%@",
+                        detail ?: @"没有通知权限"]);
             return;
         }
 
@@ -127,7 +246,11 @@
                                                                          trigger:trigger];
         [center addNotificationRequest:req withCompletionHandler:^(NSError *addError) {
             if (addError) {
-                finish(NO, [NSString stringWithFormat:@"排不上：%@", addError.localizedDescription]);
+                // 🔴 同样带上 domain/code：`localizedDescription` 是本地化文案，
+                //    同一个 code 在不同系统语言下长得完全不同，事后对不上账。
+                finish(NO, [NSString stringWithFormat:@"排不上（%@ %ld：%@）",
+                            addError.domain, (long)addError.code,
+                            addError.localizedDescription ?: @"无描述"]);
             } else {
                 finish(YES, [NSString stringWithFormat:@"%@ 提醒你", when]);
             }

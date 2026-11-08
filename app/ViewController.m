@@ -3893,8 +3893,31 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                            subtitle:subtitle
                                body:body
                          completion:^(BOOL ok, NSString *message) {
-        // 成功和失败都要说话：失败是"权限没给/排不上"，用户必须知道为什么没响。
-        if (message.length) [weakSelf nbToast:message];
+        if (!message.length) return;
+
+        if (ok) {
+            [weakSelf nbToast:message];
+            return;
+        }
+
+        // 🔴 v0.0.169：**失败不再走 toast**。
+        //    失败文案现在带着 error domain / code 和授权状态（那是判断根因的唯一线索），
+        //    长度和重要性都不是一个 2 秒 toast 能承载的 —— 用户还没来得及读就没了，
+        //    于是只能报"它说没有通知权限"，而那正是把三种病因混成一句话的旧版本。
+        // ⚠️ 延后 0.35 秒：这段回调虽然是异步的（UN 的回调 + 已 hop 主线程），
+        //    但仍可能赶在长按菜单收起动画的窗口里；在这个窗口 present 会被系统静默丢掉。
+        //    （本项目在「打开 App」上栽过同形态，那次是同步 present，这里多一道保险。）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIAlertController *a = [UIAlertController
+                                    alertControllerWithTitle:@"稍后提醒没排上"
+                                                     message:message
+                                              preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"好"
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+            [weakSelf presentViewController:a animated:YES completion:nil];
+        });
     }];
 }
 
