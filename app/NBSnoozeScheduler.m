@@ -178,6 +178,74 @@ static NSString *NBSandboxReport(void) {
     return s;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.0.172：「装到磁盘的版本」 vs 「SpringBoard 里正在跑的版本」。
+//
+// 🔴🔴 为什么这条必须存在：这一版对静音**一行逻辑都没改**（dylib 的 __TEXT 只差 1 字节，
+//    就是版本号里那个数字）。用户「静音设了还是弹」的唯一解释是 **SpringBoard 里跑的
+//    还是旧 dylib** —— tweak 只在 SpringBoard 重启时重新加载。
+//    而这件事在此之前**从来没被量过**，全是我的推断。
+//    postinst 现在会自动 respring，但"postinst 到底跑没跑"在这里也是不可见的：
+//    dpkg 脚本失败、chroot、killall 不存在……每一种都表现为「和没改一样」。
+//    ⇒ 唯一能分辨的办法 = 让 dylib 自己报版本，App 读回来和磁盘上的比。
+//
+// 数据来源：`Tweak.x` 的 %ctor 每次都把
+//      `<日期> <进程名> <版本号> dylib=<真实路径>`
+//   写进 `.tweak_ctor`（0666，root/mobile 都读得到）。所以这个文件的版本号 = 
+//   **最近一次 SpringBoard 启动时加载的那个 dylib 的版本**，正是要的那一个。
+static NSString *NBVersionFromMark(NSString *path) {
+    NSString *txt = [NSString stringWithContentsOfFile:path
+                                              encoding:NSUTF8StringEncoding error:NULL];
+    if (!txt.length) return nil;
+    // 🔴 不按"第 5 段"取：`[NSDate date]` 的段数会随格式变（还有本地化）。
+    //    改成"扫所有词，找第一个形如 数字.数字.数字 的"，写死的只有版本号自身的形状。
+    for (NSString *tok in [txt componentsSeparatedByCharactersInSet:
+                           [NSCharacterSet whitespaceAndNewlineCharacterSet]]) {
+        NSArray *parts = [tok componentsSeparatedByString:@"."];
+        if (parts.count != 3) continue;
+        BOOL digits = YES;
+        for (NSString *p in parts) {
+            if (!p.length) { digits = NO; break; }
+            for (NSUInteger i = 0; i < p.length; i++) {
+                unichar c = [p characterAtIndex:i];
+                if (c < '0' || c > '9') { digits = NO; break; }
+            }
+            if (!digits) break;
+        }
+        if (digits) return tok;
+    }
+    return nil;
+}
+
+static NSString *NBTweakVersionReport(void) {
+    NSString *mine = NOTIFYBOX_VER_STR;
+    // 🔴 两个标记都读：
+    //    `.tweak_ctor`      = 非 root 进程（SpringBoard）写的 —— 这才是**执行过滤的那一个**
+    //    `.tweak_ctor_root` = root 进程（backboardd）写的 —— 只作旁证
+    //    只读 root 那个会把"backboardd 新版、SpringBoard 旧版"这种半边更新的现场看反。
+    NSString *sbMark = [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:@".tweak_ctor"];
+    NSString *rtMark = [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:@".tweak_ctor_root"];
+    NSString *sbVer = NBVersionFromMark(sbMark);
+    NSString *rtVer = NBVersionFromMark(rtMark);
+
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"盒子 App：%@\n", mine];
+    if (!sbVer.length) {
+        // 🔴 三态里的"读不到"必须单独说，不能和"版本不一致"共用一句话 ——
+        //    读不到的病因是没注入/写不进共享目录，方向完全不同。
+        [s appendFormat:@"SpringBoard 里的 dylib：**读不到**（%@ 不在或读不出）\n"
+                        @"   ⇒ 要么没注入，要么写不进共享目录", sbMark.lastPathComponent];
+    } else if ([sbVer isEqualToString:mine]) {
+        [s appendFormat:@"SpringBoard 里的 dylib：%@（一致 ✅）", sbVer];
+    } else {
+        [s appendFormat:@"SpringBoard 里的 dylib：%@ ❗️ **不是同一个版本**\n"
+                        @"   ⇒ 正在跑的是旧的，装完要重启一次手机（或注销）才生效",
+         sbVer];
+    }
+    [s appendFormat:@"\nbackboardd 里的 dylib：%@", rtVer.length ? rtVer : @"读不到"];
+    return s;
+}
+
 @implementation NBSnoozeScheduler
 
 + (void)fetchAuthorizationReport:(void (^)(NSString *, UNAuthorizationStatus))completion {
@@ -207,6 +275,8 @@ static NSString *NBSandboxReport(void) {
             @"no-container：%@\n"
             @"路径白名单：%@\n"
             @"— 沙箱与数据（v0.0.172 验收） —\n"
+            @"%@\n"
+            @"— 装到磁盘 vs 正在跑 —\n"
             @"%@",
             NBStatusText(s.authorizationStatus),
             NBSettingText(s.alertSetting),
@@ -220,7 +290,8 @@ static NSString *NBSandboxReport(void) {
             // 数组型 entitlement 会印成「(非标量 type=…)」——那正是"它在"的旁证，
             // 别把它改成"读不到"。真要看内容得解包，不是这一页的事。
             NBEntitlementValue(@"com.apple.security.exception.files.absolute-path.read-write"),
-            NBSandboxReport()];
+            NBSandboxReport(),
+            NBTweakVersionReport()];
 
         // 再补一条"系统到底认不认这个 App"的旁证：能查待发请求 = 服务是通的；
         // 查不出来也只是异常，不影响上面的状态读数，所以单独 try 一下。
