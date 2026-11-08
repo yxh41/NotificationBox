@@ -3783,8 +3783,12 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         }];
         [snoozeActs addObject:a];
     }
+    // 🔴 用的是**带 identifier:options:** 的那个重载。短版本 `menuWithTitle:image:children:`
+    //    并不存在 —— CI 在 `no known class method for selector` 上直接报错。
     [acts addObject:[UIMenu menuWithTitle:@"稍后提醒"
                                     image:[UIImage systemImageNamed:@"clock"]
+                               identifier:nil
+                                  options:0
                                  children:snoozeActs]];
 
     return [UIMenu menuWithTitle:@"" children:acts];
