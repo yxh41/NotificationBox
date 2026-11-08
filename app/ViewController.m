@@ -17,6 +17,8 @@
 #import "OverviewGridView.h"
 // v0.0.166：长按菜单里的「打开链接 / 复制验证码」（纯本地正则，抽不到就不显示）
 #import "NBTextExtract.h"
+// v0.0.167：稍后提醒（本地通知，App 侧自足）
+#import "NBSnoozeScheduler.h"
 
 // v0.0.38 的 `kNBMarkAllWidth`（「全标已读」按钮固定宽度）在 v0.0.131 删掉了：
 // 那个按钮已经搬进筛选菜单，布局里不再需要算它的宽度 —— 连声明一起去掉，
@@ -523,6 +525,8 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // v0.0.166：打开外部链接（正文里抽到的 http/https）。
 // 和 `nbOpenAppWithBundle:` 分开：那个是"切到某个 App"，这个是"交给系统打开"。
 - (void)nbOpenExternalLink:(NSString *)link;
+// v0.0.167：稍后提醒（App 侧本地通知，不经过 tweak）。
+- (void)nbSnoozeRow:(NSDictionary *)row kind:(NBSnoozeKind)kind;
 // 「打开」的落点。🔴 只发请求 + toast，**绝不 present** ——
 //    这个动作是在菜单正在收起的瞬间执行的，此时 present 会被系统静默丢掉。
 - (void)nbOpenAppWithBundle:(NSString *)bundleId;
@@ -3765,7 +3769,57 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         [acts addObject:codeAct];
     }
 
+    // ================= v0.0.167：稍后提醒 =================
+    // 🔴 做成子菜单（而不是 3 个平铺项）：菜单里已经有「打开 / 复制 / 打开链接 / 复制验证码」，
+    //    再平铺 3 个时间选项会让长按菜单变成一张列表，最常用的「打开」被顶到看不见的地方。
+    NSMutableArray<UIMenuElement *> *snoozeActs = [NSMutableArray arrayWithCapacity:3];
+    for (NSInteger k = NBSnoozeKind15Min; k <= NBSnoozeKindNextMorning; k++) {
+        NBSnoozeKind kind = (NBSnoozeKind)k;
+        UIAction *a = [UIAction actionWithTitle:[NBSnoozeScheduler menuTitleForKind:kind]
+                                         image:nil
+                                    identifier:nil
+                                       handler:^(__kindof UIAction *act) {
+            [weakSelf nbSnoozeRow:row kind:kind];
+        }];
+        [snoozeActs addObject:a];
+    }
+    [acts addObject:[UIMenu menuWithTitle:@"稍后提醒"
+                                    image:[UIImage systemImageNamed:@"clock"]
+                                 children:snoozeActs]];
+
     return [UIMenu menuWithTitle:@"" children:acts];
+}
+
+// 排一条"稍后提醒"。
+- (void)nbSnoozeRow:(NSDictionary *)row kind:(NBSnoozeKind)kind {
+    if (![row isKindOfClass:[NSDictionary class]]) return;
+
+    id tv = row[@"title"];
+    NSString *title = [tv isKindOfClass:[NSString class]] ? (NSString *)tv : nil;
+
+    NSString *name = [self appNameForBundle:row[@"bundle"]];
+    NSString *subtitle = name.length
+                       ? [NSString stringWithFormat:@"稍后提醒 · %@", name]
+                       : @"稍后提醒";
+
+    // 正文可能很长（营销短信、群公告）⇒ 截到 140 个**完整字符**。
+    // 🔴 用 `rangeOfComposedCharacterSequencesForRange:` 而不是裸 `substringToIndex:`：
+    //    裸截会把 emoji / 组合字符劈成半个码点，通知里出现"口"字方块。
+    NSString *body = [self nbBodyTextForRow:row];
+    if (body.length > 140) {
+        NSRange r = [body rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, 140)];
+        body = [[body substringWithRange:r] stringByAppendingString:@"…"];
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [NBSnoozeScheduler scheduleKind:kind
+                         alertTitle:title
+                           subtitle:subtitle
+                               body:body
+                         completion:^(BOOL ok, NSString *message) {
+        // 成功和失败都要说话：失败是"权限没给/排不上"，用户必须知道为什么没响。
+        if (message.length) [weakSelf nbToast:message];
+    }];
 }
 
 // 标题 / 正文 / 副标题按顺序拼，空的跳过。
