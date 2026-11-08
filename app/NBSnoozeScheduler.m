@@ -10,6 +10,7 @@
 #import <UserNotifications/UserNotifications.h>
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
+#import <dlfcn.h>
 
 // 从**当前进程的代码签名**里读一个 entitlement。
 //
@@ -17,23 +18,52 @@
 //    `usernotificationsd` 按**签名身份**认 App，Info.plist 里的 CFBundleIdentifier
 //    对它没有约束力。v0.0.170 的真机现象是 status 永远停在 notDetermined ——
 //    也就是"系统不认识这个进程"，而唯一的身份凭据就是这一串 entitlement。
+//
+// 🔴🔴 v0.0.171：`SecTask` 这一族 API **不在公共 Security 头里**（那个头里只有 `SecTrust`），
+//    直接写 `SecTaskRef` 会编译期 `unknown type name 'SecTaskRef'`（CI run #302 报的就是这个）。
+//    ⇒ 改用 **dlsym 运行期取符号**，自己声明类型。三个好处：
+//      ① 编译期不依赖任何私有头；
+//      ② 符号不存在时只是"读不到"，不会在**链接期**变成 undefined symbol
+//         （链接失败的报错看着像代码问题，其实只是这台系统没这个 API）；
+//      ③ 拿不到就明说"读不到"，而不是编一个值出来 —— 这正是本项目反复栽的那类假读数。
+typedef struct __SecTask *NBSecTaskRef;
+
+static CFTypeRef NBCopyEntitlement(NSString *key) {
+    static NBSecTaskRef (*createSelf)(CFAllocatorRef) = NULL;
+    static CFTypeRef (*copyValue)(NBSecTaskRef, CFStringRef, CFErrorRef *) = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // dlopen 只是兜底：UIKit 已经把 Security 装进进程了，RTLD_DEFAULT 通常直接能找到。
+        // 打不开也继续往下走（不 return），否则一次 dlopen 失败就永久拿不到读数。
+        dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
+        void *s1 = dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+        void *s2 = dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+        if (s1) createSelf = (NBSecTaskRef (*)(CFAllocatorRef))s1;
+        if (s2) copyValue = (CFTypeRef (*)(NBSecTaskRef, CFStringRef, CFErrorRef *))s2;
+    });
+    if (!createSelf || !copyValue) return NULL;
+
+    NBSecTaskRef t = createSelf(kCFAllocatorDefault);
+    if (!t) return NULL;
+    CFTypeRef v = copyValue(t, (__bridge CFStringRef)key, NULL);
+    CFRelease(t);
+    return v;
+}
+
 // 🔴 只认标量（字符串/布尔/数字）。数组/字典一律回"非标量"：**绝不 description 未知对象**，
 //    这条纪律在通知回调里尤其硬（曾经因为打印未知对象直接卡死）。
 static NSString *NBEntitlementValue(NSString *key) {
-    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
-    if (!task) return @"(拿不到 SecTask)";
-    CFTypeRef v = SecTaskCopyValueForEntitlement(task, (__bridge CFStringRef)key, NULL);
-    CFRelease(task);
-    if (!v) return @"(无)";          // 注意：这是"签名里没有这个键"，不是"值为假"
+    CFTypeRef v = NBCopyEntitlement(key);
+    if (!v) return @"(读不到：SecTask 符号不在，或签名里没有这个键)";
 
     NSString *out = nil;
     CFTypeID t = CFGetTypeID(v);
-    if (t == CFBooleanGetTypeID())      out = CFBooleanGetValue(v) ? @"true" : @"false";
+    if (t == CFBooleanGetTypeID())      out = CFBooleanGetValue((CFBooleanRef)v) ? @"true" : @"false";
     else if (t == CFStringGetTypeID())  out = [NSString stringWithString:(__bridge NSString *)v];
     else if (t == CFNumberGetTypeID())  out = [(__bridge NSNumber *)v stringValue];
     else                                out = [NSString stringWithFormat:@"(非标量 type=%lu)", (unsigned long)t];
     CFRelease(v);
-    return out ?: @"(无)";
+    return out ?: @"(空)";
 }
 
 // 状态/开关 ⇒ 人话。**每个值都要有名字**，包括"我不认识这个值"——
