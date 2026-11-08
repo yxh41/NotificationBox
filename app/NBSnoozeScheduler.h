@@ -55,10 +55,14 @@ typedef NS_ENUM(NSInteger, NBSnoozeKind) {
 //    而 `granted == NO` **至少对应三种完全不同的病因**，修法各不相同：
 //      ① 用户点过"不允许"        ⇒ 去系统设置打开就行；
 //      ② 系统层面报错（error 非空）⇒ 这个 App 可能**根本没被系统登记**，
-//         去设置里翻不到它，点多少次都没用（本 App 带 `no-container`，嫌疑最大）；
+//         去设置里翻不到它，点多少次都没用；
 //      ③ 授权框压根没弹（状态仍是"未决"）⇒ 同上，是登记问题，不是用户拒绝。
 //    把它们写成同一句话 = 把三个病因伪装成一个，用户只能反复点、我只能盲猜。
 //    ⇒ 判据：**先报状态，再报原因**。状态是 `authorizationStatus`，它不会说谎。
+//    ⚠️ v0.0.172 更正：②③ 当时怀疑的元凶是 `com.apple.private.security.no-container`
+//       （App 没有数据容器 ⇒ 通知服务按 bundle 落盘时无处可落）。那条 entitlement
+//       已经删掉、换成路径白名单，所以②③ 的病因描述不再是"no-container"，而是
+//       "系统没为这个 App 建过记录"。
 //
 // `status` 原样回传，调用方可以据此决定要不要给"去设置"按钮。
 // completion **一定在主线程**（`getNotificationSettings` 的回调在后台队列）。
@@ -72,6 +76,23 @@ typedef NS_ENUM(NSInteger, NBSnoozeKind) {
 // 打开本 App 在「设置 → 通知」里的那一页。
 // 返回 NO = 连 URL 都拿不到；真正的"跳不过去"只能靠调用方在回来时复查状态。
 + (BOOL)openSystemNotificationSettings;
+
+// ---------- v0.0.173：tweak dylib 版本对齐 ----------
+//
+// 🔴🔴 为什么这条必须有：tweak 的 dylib **只在 SpringBoard 重启时重新加载**。
+//    v0.0.173 起 postinst 不再自动重启（用户要求"我自己手动操作"），
+//    于是「装完没重启」变成了一个**必然会发生**的中间状态：
+//        盒子 App = 新版（有静音菜单、能写静音表）
+//        SpringBoard 里跑的 dylib = 旧版（根本没有 shouldDropForMute 那段）
+//    ⇒ 用户看到「静音设好了，通知照样弹」，与"代码写错了"完全同形。
+//    不能指望用户记得重启，也不能指望他会去翻自检页 ⇒ 进 App 就提示一次。
+//
+// 🔴 实现放在 `NBSnoozeScheduler.m` 里（同一个文件的 `NBTweakVersionReport` 已经在读这些标记），
+//    语义上它其实不属于"稍后提醒"。真要分家就新建 `NBVersionCheck.m` 并加进 Makefile
+//    的 `NotifyBoxApp_FILES`（漏了会在**链接期**报 undefined symbol，不是静默）。
+//
+// 返回 nil = 版本一致（不需要打扰用户）；非 nil = 要显示的那段话。
++ (nullable NSString *)tweakVersionMismatchNotice;
 
 @end
 

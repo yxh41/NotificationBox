@@ -498,6 +498,10 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // v0.0.33：轻量一行提示（左滑删除失败时用）。
 // 不走 showText: —— 那个是"长文本可滚动页"，弹一句"这条已经没了"太重。
 - (void)alertTitle:(NSString *)title text:(NSString *)text;
+// v0.0.173：tweak dylib 版本不一致时提醒"还差一次重启"。
+// 🔴 只在**读出来的版本和本 App 不同**（或读不到）时弹，一致时什么都不做 ——
+//    这个提示的目的是把「装了没重启」和「代码写错了」分开，不是每次打开都报一次平安。
+- (void)nbWarnIfTweakOutdated;
 - (NSString *)keyLinesFrom:(NSString *)text;
 - (NSString *)selLinesFrom:(NSString *)text;
 - (NSString *)probeLinesFrom:(NSString *)text;
@@ -683,6 +687,50 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
     // v0.0.121：改走 `IfDue` —— 从详情页返回也会走这里，而 `DidBecomeActive` 那条路
     //    常常紧跟其后，两条叠在几百毫秒内发两次请求没有任何意义。
     [self requestNCSnapshotIfDue];
+    // v0.0.173：进来先看"跑的是不是新版"。
+    [self nbWarnIfTweakOutdated];
+}
+
+// v0.0.173：dylib 版本不一致 ⇒ 告诉用户"还差一次重启"。
+//
+// 🔴🔴 为什么这个提示必须存在（它是"不自动重启"的对价）：
+//    v0.0.173 起 postinst 不再 kill SpringBoard（用户要求手动操作），
+//    于是「装了新版但没重启」变成**必然经过的一个状态**：
+//        盒子 App = 新版（有静音菜单、能写静音表）
+//        SpringBoard 里跑的 dylib = 旧版（没有 shouldDropForMute 那段）
+//    用户看到「静音设好了，通知照样弹」—— 和"代码写错了"一模一样。
+//    这一条把那个状态变成**屏幕上的一句话**，而不是让他去自检页里翻。
+//
+// 🔴 进程内只弹一次：`warned` 是 static，杀进程才会重置。
+//    用户点「知道了」但不重启、又切回前台 —— 不该再弹一遍烦他；
+//    而他下次冷启动 App 时会再看到（那时候他多半还没重启）。
+- (void)nbWarnIfTweakOutdated {
+    static BOOL warned = NO;
+    if (warned) return;
+
+    NSString *notice = [NBSnoozeScheduler tweakVersionMismatchNotice];
+    if (!notice.length) return;      // 一致 ⇒ 不打扰
+
+    // 🔴 已经有弹窗在上面（长按菜单/设置页）就先不动：在别人 present 的瞬间再 present
+    //    会被系统静默丢掉，而"丢了"和"不需要提示"在证据上同形。留到下次启动再说。
+    if (self.presentedViewController) return;
+
+    warned = YES;
+    __weak typeof(self) weakSelf = self;
+    // 延迟一点：`viewWillAppear:` 时视图还没上屏，直接 present 会失败（日志里报
+    // "whose view is not in the window hierarchy"），而这个失败不会体现在界面上。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (weakSelf.presentedViewController) return;   // 这 0.45 秒里又有人弹了
+        UIAlertController *a = [UIAlertController
+                                alertControllerWithTitle:@"还差一次重启"
+                                                 message:notice
+                                          preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+        [weakSelf presentViewController:a animated:YES completion:nil];
+    });
 }
 
 - (void)onForeground:(NSNotification *)note {

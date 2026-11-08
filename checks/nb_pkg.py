@@ -424,6 +424,10 @@ MUST_PRESENT_APP = [
     "SpringBoard 里的 dylib：",
     "不是同一个版本",
     "backboardd 里的 dylib：",
+    # 🔴 v0.0.173：不再自动 respring ⇒ 「装了没重启」是必经状态，
+    #    必须有一条**用户看得见的**提示把「没重启」和「代码写错了」分开。
+    "还差一次重启",
+    "重启一次手机（或注销）",
 ]
 
 
@@ -500,6 +504,19 @@ def main(argv):
         pm = cur_m[pi_key]
         print("    postinst 权限：0%o" % pm)
         chk("postinst 带可执行位（否则 dpkg 静默不跑它）", bool(pm & 0o111))
+
+        # 🔴🔴 v0.0.173：**不许再自动重启 SpringBoard**（用户明确要求自己手动）。
+        #    ⚠️ 判据必须只看**可执行行**：注释里写着"不 killall"完全正常，
+        #    拿整份文本去查 `in` 会对自己写的解释假红 —— 「判据域必须是被测上下文」。
+        #    （v0.0.172 这一版真的杀过 SpringBoard，所以这条不是假想的风险。）
+        pi_text = (cur_c.get(pi_key) or b"").decode("utf-8", "replace")
+        pi_code = "\n".join(l for l in pi_text.splitlines()
+                            if not l.strip().startswith("#"))
+        chk("postinst 不再自动重启（可执行行里没有 killall）",
+            "killall" not in pi_code)
+        # 反过来：它现在唯一该做的事不能一起被删掉
+        chk("postinst 仍然在修数据目录权限（chmod 0777）",
+            "chmod 0777" in pi_code)
 
     print("\n===== 0.5 🔴 App 的 entitlements（v0.0.172 的核心改动）=====")
     # 这一节比的是**签名里的那一条 blob**，不是代码里的字符串 —— 理由见 entitlements_xml()。

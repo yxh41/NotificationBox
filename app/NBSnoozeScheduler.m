@@ -248,6 +248,36 @@ static NSString *NBTweakVersionReport(void) {
 
 @implementation NBSnoozeScheduler
 
++ (NSString *)tweakVersionMismatchNotice {
+    // 🔴 判据和自检页那一节**用同一个函数读同一个文件**（`NBVersionFromMark`），
+    //    不另写一份解析：两处代码一旦走岔，"进 App 没提示但自检页说不一致"
+    //    就成了一个新的、只能靠猜的现场。
+    NSString *sbMark = [NOTIFYBOX_LEGACY_DIR stringByAppendingPathComponent:@".tweak_ctor"];
+    NSString *sbVer = NBVersionFromMark(sbMark);
+    NSString *mine = NOTIFYBOX_VER_STR;
+
+    if (!sbVer.length) {
+        // 读不到有两种：从没装过 tweak，或者装过但写不进共享目录。
+        // 两种都归到"还没重启过"这句话里能落地 —— 因为重启是用户唯一能做的动作，
+        // 而它同时也是这两种情况的正确答案。
+        return [NSString stringWithFormat:
+                @"没读到 SpringBoard 里的 tweak 版本。\n\n"
+                @"一般是还差一次重启：装完之后 SpringBoard 仍在跑旧的 dylib，"
+                @"启动时没写过标记。\n"
+                @"重启一次手机（或注销）后就对上了。\n\n"
+                @"这个 App 是 %@。", mine];
+    }
+    if ([sbVer isEqualToString:mine]) {
+        return nil;      // 一致 ⇒ 不打扰用户
+    }
+    return [NSString stringWithFormat:
+            @"SpringBoard 里跑的是 %@，这个 App 是 %@。\n\n"
+            @"新装的代码还没生效 —— tweak 的 dylib 只在 SpringBoard 重启时重新加载。\n"
+            @"在那之前，临时静音、拦截规则这些都由**旧版逻辑**执行，"
+            @"看起来就像「改了没用」。\n\n"
+            @"重启一次手机（或注销）即可对上。", sbVer, mine];
+}
+
 + (void)fetchAuthorizationReport:(void (^)(NSString *, UNAuthorizationStatus))completion {
     UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
     if (!center) {
