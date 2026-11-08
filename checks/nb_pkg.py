@@ -162,11 +162,20 @@ def unpack_all(data):
 # ───────────────────────────── 二进制检查 ─────────────────────────────
 
 def find_str(b, s):
-    """含中文的 @"" 落 __ustring（UTF-16LE），纯 ASCII 的落 __cstring。
-    判断自动做，不要手选 —— 用 ASCII 提取器查中文恒为 0，那是假红。"""
-    if s.isascii():
-        return s.encode("ascii") in b
-    return s.encode("utf-16-le") in b
+    """在二进制里找一个字符串字面量。
+
+    🔴🔴 v0.0.168 修一个把"在"读成"不在"的尺子错（**假红**，与"恒绿"同族、方向相反）：
+       编码不是按**针**决定的，是按**目标字面量**决定的。clang 把含任何非 ASCII 字符的
+       `@""` 整串放进 `__ustring`（UTF-16LE），于是 `@"DND#%d bundle=%@ … ⇒ 不弹"` 里的
+       `DND#` 在文件里是 `D\0N\0D\0#\0` —— 拿 ASCII 去查**恒为 False**。
+       实测代价：v0.0.168 验包把「新版里有 MUTE#」判成 FAIL，差点让我去改一段没坏的代码；
+       而同一批里 `DROP#`/`REPL#` 是"有"，只是因为它们的格式串恰好全 ASCII。
+       ⇒ 判据：**纯 ASCII 的针必须两种编码都查**。
+       （反过来的方向原本就是对的：中文针只查 UTF-16LE，因为中文不可能出现在 ASCII 串里。）
+    """
+    if not s.isascii():
+        return s.encode("utf-16-le") in b
+    return (s.encode("ascii") in b) or (s.encode("utf-16-le") in b)
 
 
 FAT_MAGIC_32 = 0xcafebabe
