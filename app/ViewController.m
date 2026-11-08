@@ -15,6 +15,8 @@
 #import "AppLauncher.h"
 // v0.0.164：列表顶部的双列总览网格（只负责画，聚合与取值都在本文件里算）
 #import "OverviewGridView.h"
+// v0.0.166：长按菜单里的「打开链接 / 复制验证码」（纯本地正则，抽不到就不显示）
+#import "NBTextExtract.h"
 
 // v0.0.38 的 `kNBMarkAllWidth`（「全标已读」按钮固定宽度）在 v0.0.131 删掉了：
 // 那个按钮已经搬进筛选菜单，布局里不再需要算它的宽度 —— 连声明一起去掉，
@@ -514,6 +516,13 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // 🔴 菜单内容**只在这里定义**：cell 只负责"长按了 ⇒ 问你"，不知道菜单里有什么。
 //    这样加/减动作只有一处要改，cell 复用也不会带着上一行的动作跑。
 - (UIMenu *)nbMenuForRow:(NSDictionary *)row;
+// v0.0.166：这一条通知的「可读正文」—— 标题 / 正文 / 副标题按顺序拼，空的跳过。
+// 🔴 抽出来是因为现在有**两个**消费者：菜单里的「复制内容」，以及链接/验证码提取。
+//    各拼一份的话，某天改了顺序就会出现"复制出来的内容和识别用的内容不是同一串"。
+- (NSString *)nbBodyTextForRow:(NSDictionary *)row;
+// v0.0.166：打开外部链接（正文里抽到的 http/https）。
+// 和 `nbOpenAppWithBundle:` 分开：那个是"切到某个 App"，这个是"交给系统打开"。
+- (void)nbOpenExternalLink:(NSString *)link;
 // 「打开」的落点。🔴 只发请求 + toast，**绝不 present** ——
 //    这个动作是在菜单正在收起的瞬间执行的，此时 present 会被系统静默丢掉。
 - (void)nbOpenAppWithBundle:(NSString *)bundleId;
@@ -3698,7 +3707,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     }
 
     __weak typeof(self) weakSelf = self;
-    NSMutableArray<UIMenuElement *> *acts = [NSMutableArray arrayWithCapacity:2];
+    NSMutableArray<UIMenuElement *> *acts = [NSMutableArray arrayWithCapacity:4];
 
     UIAction *openAct = [UIAction actionWithTitle:openTitle
                                             image:[UIImage systemImageNamed:(link.length ? @"link" : @"arrow.up.forward.app")]
@@ -3712,22 +3721,81 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                                             image:[UIImage systemImageNamed:@"doc.on.doc"]
                                        identifier:nil
                                           handler:^(__kindof UIAction *a) {
-        // 拼法和详情页 `plainText` 一致（标题 / 正文 / 副标题，缺哪个跳哪个）。
-        NSMutableArray<NSString *> *parts = [NSMutableArray array];
-        id tv = row[@"title"];
-        id mv = row[@"message"];
-        id sv = row[@"subtitle"];
-        if ([tv isKindOfClass:[NSString class]] && [(NSString *)tv length]) [parts addObject:(NSString *)tv];
-        if ([mv isKindOfClass:[NSString class]] && [(NSString *)mv length]) [parts addObject:(NSString *)mv];
-        if ([sv isKindOfClass:[NSString class]] && [(NSString *)sv length]) [parts addObject:(NSString *)sv];
-        if (!parts.count) [parts addObject:@"（这条通知没有内容）"];
+        NSString *body = [weakSelf nbBodyTextForRow:row];
         UIPasteboard *pb = [UIPasteboard generalPasteboard];
-        pb.string = [parts componentsJoinedByString:@"\n"];
+        pb.string = body.length ? body : @"（这条通知没有内容）";
         [weakSelf nbToast:@"已复制"];
     }];
     [acts addObject:copyAct];
 
+    // ================= v0.0.166：正文提取 =================
+    // 🔴 只有**真的抽到东西**才加这两项。抽不到还摆一个点了没反应的动作，
+    //    用户会以为功能坏了（"永远不触发的功能比没做更糟"）。
+    NSString *body = [self nbBodyTextForRow:row];
+
+    NSString *linkStr = [NBTextExtract firstLinkInText:body];
+    if (linkStr.length) {
+        // 标题里带域名：用户点之前就知道会被带到哪儿去。
+        // 🔴 域名过长时退回裸标题 —— 菜单标题被截成"打开链接 · mp.weixi…"反而更难读。
+        NSURL *lu = [NSURL URLWithString:linkStr];
+        NSString *host = lu.host;
+        NSString *title = (host.length && host.length <= 22)
+                        ? [NSString stringWithFormat:@"打开链接 · %@", host]
+                        : @"打开链接";
+        UIAction *linkAct = [UIAction actionWithTitle:title
+                                                image:[UIImage systemImageNamed:@"link"]
+                                           identifier:nil
+                                              handler:^(__kindof UIAction *a) {
+            [weakSelf nbOpenExternalLink:linkStr];
+        }];
+        [acts addObject:linkAct];
+    }
+
+    NSString *code = [NBTextExtract verificationCodeInText:body];
+    if (code.length) {
+        // 🔴 把码**印在标题里**：这样点之前就能确认抽对了没有。
+        //    只写「复制验证码」的话，抽错的代价是用户粘贴时才发现。
+        UIAction *codeAct = [UIAction actionWithTitle:[NSString stringWithFormat:@"复制验证码 %@", code]
+                                                image:[UIImage systemImageNamed:@"number.square"]
+                                           identifier:nil
+                                              handler:^(__kindof UIAction *a) {
+            UIPasteboard.generalPasteboard.string = code;
+            [weakSelf nbToast:[NSString stringWithFormat:@"已复制 %@", code]];
+        }];
+        [acts addObject:codeAct];
+    }
+
     return [UIMenu menuWithTitle:@"" children:acts];
+}
+
+// 标题 / 正文 / 副标题按顺序拼，空的跳过。
+- (NSString *)nbBodyTextForRow:(NSDictionary *)row {
+    if (![row isKindOfClass:[NSDictionary class]]) return nil;
+    NSMutableArray<NSString *> *parts = [NSMutableArray arrayWithCapacity:3];
+    for (NSString *key in @[@"title", @"message", @"subtitle"]) {
+        id v = row[key];
+        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) {
+            [parts addObject:(NSString *)v];
+        }
+    }
+    return parts.count ? [parts componentsJoinedByString:@"\n"] : nil;
+}
+
+- (void)nbOpenExternalLink:(NSString *)link {
+    NSURL *u = [NSURL URLWithString:link];
+    if (!u || !u.scheme.length) {
+        [self nbToast:@"这个链接打不开"];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    [[UIApplication sharedApplication] openURL:u options:@{}
+                             completionHandler:^(BOOL ok) {
+        if (ok) return;
+        // 失败要在主线程说话（回调不保证在主线程）。
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf nbToast:@"这个链接打不开"];
+        });
+    }];
 }
 
 - (void)nbOpenAppWithBundle:(NSString *)bundleId {

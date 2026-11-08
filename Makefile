@@ -102,7 +102,7 @@ APPLICATION_NAME = NotifyBoxApp
 #    这是**同一个坑的第八次**（v0.0.28 / v0.0.33 / v0.0.44 / v0.0.46 / v0.0.48 / v0.0.71 …）：
 #    漏了这一行 = 编译期过、链接期 undefined symbol（`_OBJC_CLASS_$_AppLauncher`），
 #    报错看着像代码问题，其实是构建配置。
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/KeywordRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m app/NotifyExport.m app/NotifyStatsViewController.m app/RuleTesterViewController.m app/OverviewGridView.m app/NBTheme.m app/AppLauncher.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m NBAppName.m
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/KeywordRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m app/NotifyExport.m app/NotifyStatsViewController.m app/RuleTesterViewController.m app/OverviewGridView.m app/NBTextExtract.m app/NBTheme.m app/AppLauncher.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m NBAppName.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
 # 🔴🔴 v0.0.50：桌面图标资源。**必须显式声明** —— theos 的 application.mk 只打包
 #      FILES 里列的 .m 和 INFOPLIST，Resources/ 目录下的其他文件**不会自动进包**：
