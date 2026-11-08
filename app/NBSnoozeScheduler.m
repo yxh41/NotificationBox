@@ -7,6 +7,9 @@
 
 #import "NBSnoozeScheduler.h"
 #import "NotifyFilter.h"
+#import "NotifyCommon.h"
+#import <sqlite3.h>
+#import <errno.h>
 #import <UserNotifications/UserNotifications.h>
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
@@ -88,6 +91,93 @@ static NSString *NBSettingText(UNNotificationSetting v) {
     return [NSString stringWithFormat:@"未知（%ld）", (long)v];
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.0.172：沙箱与数据实测。
+//
+// 🔴 这一段存在的唯一目的 = 给「删掉 no-container」这刀**配一把能读的尺子**。
+//    v0.0.172 把 `com.apple.private.security.no-container` 换成了路径白名单，
+//    改对了：App 有了容器，通知权限能落库；
+//    改错了：App 又被关回容器，读不到 /var/mobile/Library/NotifyBox
+//            ⇒ 盒子列表空（而这不是"记录丢了"，是"App 看不见"）。
+//    两种结果的**唯一可分辨之处**就在下面这四行，所以必须摊在自检页上，
+//    不能靠用户描述"好像没记录"。
+//
+// 🔴 为什么用 `NSHomeDirectory()` 判容器，而不是去读 entitlement：
+//    entitlement **声明了什么** ≠ 系统**给了什么**。白名单写了但没被沙箱采用（拼错、
+//    或键名在这个 iOS 版本上不认）时，读 entitlement 依然显示"有这条"
+//    —— 那是拿声明当事实，本项目栽过多次（"改了 ≠ 在跑"）。
+//    `NSHomeDirectory()` 是内核/沙箱给的**结果**，它落在 Containers/Data/Application/<UUID>
+//    才说明 App 真的有数据容器。宁可用结果，不用声明。
+//
+// 🔴 读目录/开库都是**只读**（sqlite3_open_v2 + SQLITE_OPEN_READONLY）：
+//    诊断绝不能顺手建库改数据 —— 那会让"打不开"变成"打得开但空"，
+//    两种病混成一种，比不诊断更糟。
+static NSString *NBSandboxReport(void) {
+    NSMutableString *s = [NSMutableString string];
+
+    NSString *home = NSHomeDirectory() ?: @"(nil)";
+    BOOL hasContainer = ([home rangeOfString:@"/Containers/Data/Application/"].location != NSNotFound);
+    [s appendFormat:@"我的容器：%@\n   %@\n", hasContainer ? @"有" : @"没有", home];
+
+    // 文档目录在"没有容器"时会**恒为 nil**——它是最灵敏的那一根探针，
+    // 而且它 nil 的时候屏幕上会显示一个空白，所以必须显式写出人话。
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = docs.count ? docs.firstObject : nil;
+    [s appendFormat:@"文档目录：%@\n", doc.length ? doc : @"拿不到（nil ⇒ 系统没给数据容器）"];
+
+    // 数据目录：能不能列。列不出来要把 errno 带出来——
+    // errno=1(EPERM) = 沙箱拒绝（白名单没生效）；errno=2(ENOENT) = 目录真不在。
+    NSString *dir = NOTIFYBOX_LEGACY_DIR;
+    NSError *e = nil;
+    NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:&e];
+    if (items) {
+        [s appendFormat:@"数据目录：可读，%lu 项\n", (unsigned long)items.count];
+    } else {
+        [s appendFormat:@"数据目录：不可读（errno=%d %@）\n",
+            (int)e.code, e.localizedDescription ?: @"?"];
+    }
+
+    // 🔴🔴 写测试：**能读 ≠ 能写**，而这一版最怕的恰恰是"能读不能写"。
+    //    两种病在同一屏上长得几乎一样（列表有记录=读通了），但静音要生效必须**能写**：
+    //    静音表就在这个目录里（settings.plist）。只测读 ⇒ 用户设了静音、表没落盘、
+    //    通知照弹，而自检页全绿 —— 又是一次"判据绿的理由不是它要证的事"。
+    //    测试文件写到数据目录、写完立刻删；不碰任何既有文件。
+    NSError *we = nil;
+    NSString *probe = [dir stringByAppendingPathComponent:@".nb_write_probe"];
+    BOOL canWrite = [@"ok" writeToFile:probe atomically:YES
+                              encoding:NSUTF8StringEncoding error:&we];
+    if (canWrite) {
+        [[NSFileManager defaultManager] removeItemAtPath:probe error:NULL];
+        [s appendFormat:@"写测试：能写（静音表能落盘）\n"];
+    } else {
+        [s appendFormat:@"写测试：**不能写**（errno=%d %@）⇒ 静音设了也存不进去\n",
+            (int)we.code, we.localizedDescription ?: @"?"];
+    }
+
+    // 数据库：真开一次、真数一次。
+    // 🔴 只报"记录数"是不够的：0 条和"根本没打开"长得一样。三种结局分开写：
+    //    打不开（rc/errno）、打得开但查不出（表不对）、查出来 N 条。
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2([NOTIFYBOX_DB_PATH UTF8String], &db, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        [s appendFormat:@"数据库：打不开（rc=%d，sqlite 说：%s）",
+            rc, db ? sqlite3_errmsg(db) : "句柄都没建出来"];
+    } else {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM notifications", -1, &st, NULL) == SQLITE_OK
+            && sqlite3_step(st) == SQLITE_ROW) {
+            [s appendFormat:@"数据库：能打开，记录 %lld 条",
+                (long long)sqlite3_column_int64(st, 0)];
+        } else {
+            [s appendFormat:@"数据库：能打开，但数不出来（%s）", sqlite3_errmsg(db)];
+        }
+        sqlite3_finalize(st);
+    }
+    if (db) sqlite3_close(db);
+
+    return s;
+}
+
 @implementation NBSnoozeScheduler
 
 + (void)fetchAuthorizationReport:(void (^)(NSString *, UNAuthorizationStatus))completion {
@@ -114,7 +204,10 @@ static NSString *NBSettingText(UNNotificationSetting v) {
             @"— 系统看到的身份 —\n"
             @"application-identifier：%@\n"
             @"platform-application：%@\n"
-            @"no-container：%@",
+            @"no-container：%@\n"
+            @"路径白名单：%@\n"
+            @"— 沙箱与数据（v0.0.172 验收） —\n"
+            @"%@",
             NBStatusText(s.authorizationStatus),
             NBSettingText(s.alertSetting),
             NBSettingText(s.soundSetting),
@@ -122,7 +215,12 @@ static NSString *NBSettingText(UNNotificationSetting v) {
             bundle, path,
             NBEntitlementValue(@"application-identifier"),
             NBEntitlementValue(@"platform-application"),
-            NBEntitlementValue(@"com.apple.private.security.no-container")];
+            // 🔴 v0.0.172：这一行现在**应该**显示「没有」。它显示「有」= 装的是旧包。
+            NBEntitlementValue(@"com.apple.private.security.no-container"),
+            // 数组型 entitlement 会印成「(非标量 type=…)」——那正是"它在"的旁证，
+            // 别把它改成"读不到"。真要看内容得解包，不是这一页的事。
+            NBEntitlementValue(@"com.apple.security.exception.files.absolute-path.read-write"),
+            NBSandboxReport()];
 
         // 再补一条"系统到底认不认这个 App"的旁证：能查待发请求 = 服务是通的；
         // 查不出来也只是异常，不影响上面的状态读数，所以单独 try 一下。

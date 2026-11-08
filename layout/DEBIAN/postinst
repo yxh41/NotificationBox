@@ -1,0 +1,40 @@
+#!/bin/sh
+# NotifyBox · v0.0.172
+#
+# 🔴🔴 为什么安装后必须 respring（这不是"贴心"，是功能能不能用的问题）：
+#     tweak 的 dylib 只在 **SpringBoard 重启**时才重新加载。
+#     用户从 v0.0.168 起连着装了几版都没有 respring，结果是：
+#         盒子 App = 新版（有静音菜单、能写静音表）
+#         SpringBoard 里跑的 dylib = **旧版**（根本没有 shouldDropForMute 那段）
+#     ⇒ 用户看到的就是「临时静音设好了，通知照样弹」。
+#     这不是静音写错了，是**刀没上机**。
+#     （同族教训：判据里那条"改了 ≠ 在跑"。装完不重启，一切新代码都只是躺在磁盘上。）
+#
+# 🔴 只 kill SpringBoard，不动 backboardd：
+#     dylib 注入两个进程，但 SpringBoard 重启时 backboardd 侧不重载也没关系
+#     （通知过滤真正跑在 SpringBoard 这条路），而 kill backboardd 会顺带黑屏/掉声音，
+#     代价比收益大。
+
+DATADIR=/var/mobile/Library/NotifyBox
+
+# 🔴🔴 v0.0.172：属主和权限必须一起修，只修一半等于没修。
+#    v0.0.157 那次教训：0777 只写在 NBDataDir() 里，而 backboardd **从不调它**
+#    ⇒ 真机目录一直是 755，「预防」在唯一那个 root 进程里是空的。
+#    这里以 root 跑，正好补上：目录 0777 + 属主 mobile:mobile，
+#    数据库文件 0666（写成功也要设 mode —— 落盘 mode 由 umask 决定）。
+#    ⚠️ 这些都**不能替代** entitlement 白名单：白名单没生效时沙箱直接 EPERM，
+#    权限再宽也白搭。这条只是把"Unix 那一层"先摆正，免得它伪装成白名单的错。
+if [ -d "$DATADIR" ]; then
+    chown mobile:mobile "$DATADIR" 2>/dev/null || true
+    chmod 0777 "$DATADIR" 2>/dev/null || true
+    chmod 0666 "$DATADIR"/*.sqlite 2>/dev/null || true
+    chmod 0666 "$DATADIR"/*.plist 2>/dev/null || true
+fi
+
+if [ -x /usr/bin/killall ]; then
+    /usr/bin/killall -9 SpringBoard 2>/dev/null || true
+else
+    killall -9 SpringBoard 2>/dev/null || true
+fi
+
+exit 0

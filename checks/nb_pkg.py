@@ -159,6 +159,28 @@ def unpack_all(data):
     return data_files, ctl_files
 
 
+def ctl_modes(data):
+    """control.tar 成员的 {名字: 权限位}。
+
+    🔴🔴 v0.0.172 新增。存在的理由是**一场已经差点发生的静默失败**：
+       `layout/DEBIAN/postinst` 不以 `.sh` 结尾，而推送脚本的 mode 规则写的是
+       `p.endswith('.sh')` ⇒ 它会被推成 100644 ⇒ dpkg exec 失败 ⇒ **postinst 不跑，
+       而 deb 照样装上了**。用户在设备上看到的现象是「装了新版，但行为还是旧的」，
+       与「代码没改」完全同形。
+       ⚠️ 而 `unpack_all()` 只返回**内容**、把 mode 丢了 —— 于是「全量 blob sha 对拍」
+       对这件事是瞎的（sha 与 mode 无关）。判据必须显式把 mode 读出来。
+    """
+    out = {}
+    for n, d in ar_members(data):
+        if not n.startswith("control.tar"):
+            continue
+        tf = open_tar(n, d)
+        for m in tf.getmembers():
+            if m.isfile():
+                out[m.name] = m.mode
+    return out
+
+
 # ───────────────────────────── 二进制检查 ─────────────────────────────
 
 def find_str(b, s):
@@ -252,6 +274,56 @@ def regions(b):
     return uuid, sig, segs
 
 
+CSMAGIC_EMBEDDED_SIGNATURE = 0xfade0cc0
+CSMAGIC_EMBEDDED_ENTITLEMENTS = 0xfade7171
+
+
+def entitlements_xml(b):
+    """从二进制的 code signature 里取出 entitlements 的 XML 原文；取不到返回 None。
+
+    🔴🔴 v0.0.172 新增，起因是一把**已经不能用了的尺子**：
+       验 entitlements 的老办法是「在二进制里搜键名字符串」（v0.0.171 的 nb_ent171.py
+       就是这么验的，当时有效）。但这一版的自检页要**把键名念给用户看**，
+       于是 `@"com.apple.private.security.no-container"` 这个字面量被编进了 __cstring
+       ⇒ 「搜得到」从此恒为真 ⇒ **判据被自己的诊断代码污染，变成恒绿**。
+       （同族：v0.0.161 那次"锚点只覆盖一半"，结论都是"绿的理由不是它要证的事"。）
+       ⇒ 正解不是换一个更冷门的针，而是**去读签名本身**：
+          LC_CODE_SIGNATURE 指向一个 SuperBlob，里面 type=5 的那一条就是 entitlements 原文。
+          它和代码里的字符串**物理上不是同一份东西**，污染不了。
+
+    结构（全部大端）：
+        SuperBlob   magic(0xfade0cc0) length count 然后 count 个 {type, offset}
+                    offset 是相对 SuperBlob 起点的
+        Blob(type=5) magic(0xfade7171) length payload=XML
+    """
+    _u, sig, _segs = regions(b)          # regions 已把 fat 的 base 加好，给的是绝对偏移
+    if not sig:
+        return None
+    off, _end = sig
+    if off + 12 > len(b):
+        return None
+    magic, _length, count = struct.unpack_from(">III", b, off)
+    if magic != CSMAGIC_EMBEDDED_SIGNATURE:
+        return None
+    if count <= 0 or count > 64:
+        return None                      # 防垃圾计数
+    for i in range(count):
+        eo = off + 12 + i * 8
+        if eo + 8 > len(b):
+            return None
+        btype, boff = struct.unpack_from(">II", b, eo)
+        if btype != 5:                   # CSSLOT_ENTITLEMENTS
+            continue
+        p = off + boff
+        if p + 8 > len(b):
+            return None
+        bmagic, blen = struct.unpack_from(">II", b, p)
+        if bmagic != CSMAGIC_EMBEDDED_ENTITLEMENTS or blen < 8 or p + blen > len(b):
+            return None
+        return b[p + 8:p + blen].rstrip(b"\0")
+    return None
+
+
 def same_arch_bytes(x, y):
     """两版都是 fat ⇒ 各取**第一个切片**（同一架构）。否则原样返回。
 
@@ -324,6 +396,28 @@ MUST_PRESENT_DYLIB = [
     "空值 %lu 项",
     # v0.0.157：root 侧唯一不依赖"能写共享目录"的证据通道
     "ctor 跑过 proc=%@ v=%@ dylib=%@",
+    # 🔴 v0.0.172：临时静音从"版本特有"升格为常驻。
+    #    升格的理由：用户在 v0.0.168~171 连着四版反馈「静音设了还是弹」，
+    #    而其中至少一轮的真因是 **dylib 没重载**（装了新包、跑的还是旧 dylib）。
+    #    这两条串是"静音这把刀确实在跑着的那个二进制里"的**唯一机械凭据**：
+    #    光看源码有、装上没有，用户看到的现象和不写这段代码完全一样。
+    #    刀在（MUTE#）+ 刀坏了会说（MUTE-BAD#），缺一条就剩盲猜。
+    "MUTE#",
+    "MUTE-BAD#",
+]
+
+# App 侧的常驻回归串。和 MUST_PRESENT_DYLIB 分开：两个二进制混在一个表里，
+# 「dylib 里必须有」被写成「哪里有一个就行」是迟早的事。
+MUST_PRESENT_APP = [
+    # 🔴 v0.0.172：沙箱自检四行。它们是删掉 no-container 之后**唯一的验收读数**，
+    #    少任何一行，用户报上来"记录没了"时我都无法区分
+    #    「白名单没生效」/「目录真不在」/「能读不能写」/「库打不开」这四种病。
+    "我的容器：",
+    "文档目录：",
+    "数据目录：",
+    "写测试：",
+    # 空值那一支也要在：三态里的"没算出来"不能和"0 条"共用一句话
+    "拿不到（nil ⇒ 系统没给数据容器）",
 ]
 
 
@@ -360,8 +454,11 @@ def main(argv):
         print(__doc__)
         return 2
 
-    cur_d, cur_c = unpack_all(fetch_deb(ver))
-    prev_d, prev_c = unpack_all(fetch_deb(prev))
+    cur_raw = fetch_deb(ver)
+    prev_raw = fetch_deb(prev)
+    cur_d, cur_c = unpack_all(cur_raw)
+    prev_d, prev_c = unpack_all(prev_raw)
+    cur_m = ctl_modes(cur_raw)
 
     def pick(files, suffix):
         hit = [k for k in files if k.endswith(suffix)]
@@ -387,6 +484,34 @@ def main(argv):
             print("    " + line)
     chk("control 里 Version: %s" % ver, "Version: %s" % ver in ctl)
     chk("control 里 Architecture: iphoneos-arm64e", "iphoneos-arm64e" in ctl)
+
+    # 🔴🔴 v0.0.172：maintainer script 必须真的在包里、而且**带 x 位**。
+    #    「内容对」和「会被执行」是两件事：dpkg 靠 exec 跑 postinst，没有 x 位就失败。
+    #    这也是"sha 对拍看不见 mode"留下的那个洞，只能在包这一层量。
+    pi_key = next((k for k in cur_m if k.endswith("postinst")), None)
+    chk("control.tar 里有 postinst", pi_key is not None)
+    if pi_key is not None:
+        pm = cur_m[pi_key]
+        print("    postinst 权限：0%o" % pm)
+        chk("postinst 带可执行位（否则 dpkg 静默不跑它）", bool(pm & 0o111))
+
+    print("\n===== 0.5 🔴 App 的 entitlements（v0.0.172 的核心改动）=====")
+    # 这一节比的是**签名里的那一条 blob**，不是代码里的字符串 —— 理由见 entitlements_xml()。
+    ex = entitlements_xml(ab)
+    chk("App 二进制里有 entitlements blob（ldid 真的用了 -S 那份）", ex is not None)
+    if ex is not None:
+        ent = ex.decode("utf-8", "replace")
+        print("    entitlements 原文 %d 字节" % len(ex))
+        chk("有 application-identifier",
+            "<key>application-identifier</key>" in ent)
+        chk("🔴 no-container 已删除（否则通知权限落不了库）",
+            "com.apple.private.security.no-container" not in ent)
+        chk("🔴 路径白名单 read-write 已加入",
+            "com.apple.security.exception.files.absolute-path.read-write" in ent)
+        chk("白名单里写的是数据目录",
+            "/var/mobile/Library/NotifyBox" in ent)
+        chk("platform-application 还在",
+            "<key>platform-application</key>" in ent)
 
     print("\n===== 1 🔴 真的改了代码？（大小相等也要逐字节比）=====")
     for nm, x, y in (("App", a0, ab), ("dylib", d0, db)):
@@ -414,6 +539,8 @@ def main(argv):
             not find_str(ab, s) and not find_str(db, s))
     for s in MUST_PRESENT_DYLIB:
         chk("dylib 里必须有：%s" % s, find_str(db, s))
+    for s in MUST_PRESENT_APP:
+        chk("App 里必须有：%s" % s, find_str(ab, s))
 
     if news or gones or prevhads:
         print("\n===== 4 版本特有判据（含反向对照）=====")

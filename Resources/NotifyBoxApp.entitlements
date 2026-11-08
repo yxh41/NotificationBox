@@ -37,31 +37,45 @@
     -->
     <key>platform-application</key>
     <true/>
-    <key>com.apple.private.security.no-container</key>
-    <true/>
 
     <!--
       v0.0.170：给系统一个"我是谁"的答案。
-
-      🔴 真机现象（2026-11-08）：点「稍后提醒」→ 提示没有通知权限；
-         自检页读出 `authorizationStatus = 0 notDetermined` —— 也就是**授权框压根没弹**。
-         "未决"这一条把病因锁死在"系统没认出这个 App"，不是用户关了权限
-         （关了会是 1 denied）。
-
-      🔴 `usernotificationsd` 认 App 靠的是**代码签名里的身份**，而不是 Info.plist 里那个
-         CFBundleIdentifier。越狱环境下 ldid 的 ad-hoc 签名如果不带 application-identifier，
-         这个 App 在它眼里就是"没有身份的进程" ⇒ 不建记录、不弹框、状态永远停在未决，
-         而且**不报错**（requestAuthorization 返回 granted=NO、error=nil）。
-
-      ⚠️ 这条是**实验**：值写成裸 bundle id（不带 TEAMID. 前缀），因为越狱 SideStore/ldid
-         这一类签名没有真 team。若系统不认，自检页会显示 `(无)` 或原样回显，
-         到时候再决定是换写法还是换架构（见下）。
-      ⚠️ 若补了仍然未决，剩下的两条路是：
-         ① 放弃 UN 本地通知，改由 tweak 在 SpringBoard 里落地提醒；
-         ② 去掉 no-container、改用 App Group 容器共享数据（App 与 tweak 都能读），
-            代价是数据目录要迁移。
+      🔴 `usernotificationsd` 认 App 靠代码签名里的身份，不是 Info.plist 的 CFBundleIdentifier。
     -->
     <key>application-identifier</key>
     <string>com.yxh41.notifybox.app</string>
+
+    <!--
+      🔴🔴🔴 v0.0.172：`com.apple.private.security.no-container` 已删除，换成下面这条**路径白名单**。
+
+      为什么删（真机 2026-11-08 三条现象拼起来的）：
+        ① 点「稍后提醒」→ 授权框**弹出来了**，点了「允许」；
+        ② 授权状态**仍然是 notDetermined**（未决）；
+        ③ 系统「设置 → 通知」里**根本没有「消息盒子」这一项**。
+      三条连起来只有一种解释：弹框是 SpringBoard 弹的，但**这个允许没能被写进系统库**
+      ⇒ usernotificationsd 没为这个 App 建过任何记录 ⇒ 状态停在进行中、设置里查无此项。
+      而本 App 唯一"不寻常"的地方就是 no-container —— 它连自己的数据容器都没有，
+      通知服务按 bundle 落盘时无处可落。**"没有容器"的代价一直没被付过账，
+      直到有功能需要系统按 bundle 记住它。**
+
+      🔴 为什么不直接"去掉就完"：去掉之后 App 会被关回自己的容器，
+         而盒子数据在 `/var/mobile/Library/NotifyBox`（沙箱外）⇒ 又回到 v0.0.143
+         之前那个「记录全没了（其实是 App 看不见）」的现场。
+      ⇒ 正解 = **不靠 no-container 逃沙箱，而是把唯一需要的那条路径白名单写出来**：
+         `com.apple.security.exception.files.absolute-path.*` 是沙箱在**生成 profile 时**
+         读取的 entitlement（系统 App 普遍这么用），配 platform-application 生效。
+
+      ⚠️ 这条如果没生效，症状会立刻可见：盒子列表空、自检页「记录数=-1 / DB 可读=否」。
+         那时回滚只需把 no-container 加回来（并接受"稍后提醒用不了"）。
+    -->
+    <key>com.apple.security.exception.files.absolute-path.read-write</key>
+    <array>
+      <!-- 带斜杠与不带斜杠都写上：沙箱比对是字符串前缀匹配，两种写法在不同系统版本上行为不一致，
+           少写一个就可能是"目录能读、文件打不开"这种最难查的半通状态。 -->
+      <string>/var/mobile/Library/NotifyBox/</string>
+      <string>/var/mobile/Library/NotifyBox</string>
+      <string>/private/var/mobile/Library/NotifyBox/</string>
+      <string>/private/var/mobile/Library/NotifyBox</string>
+    </array>
 </dict>
 </plist>
