@@ -31,7 +31,23 @@
 //      ③ 拿不到就明说"读不到"，而不是编一个值出来 —— 这正是本项目反复栽的那类假读数。
 typedef struct __SecTask *NBSecTaskRef;
 
-static CFTypeRef NBCopyEntitlement(NSString *key) {
+// 🔴🔴 v0.0.173：把"读不到"拆成三种病因。
+//    上一版这里只有一句 `(读不到：SecTask 符号不在，或签名里没有这个键)` ——
+//    一句话盖住三种完全不同的世界：
+//      ① 这台系统上根本没有 SecTask 这两个符号（dlsym 拿不到）⇒ 是我的探测方法不可用；
+//      ② 符号在、任务建不出来                          ⇒ 是运行环境的问题；
+//      ③ 符号和任务都正常，但签名里**确实没这个键**      ⇒ 这才是"没配"。
+//    而 v0.0.172 真机截图里 `no-container` 显示的就是那句合并话 —— 我盯着它
+//    无法判断"删掉生效了"还是"探测本身坏了"。这正是本项目反复栽的那类假读数：
+//    **一个 0 必须说清是几种病因里的哪一种。**
+typedef NS_ENUM(NSInteger, NBEntLookup) {
+    NBEntLookupNoAPI = 0,   // dlsym 找不到 SecTask 符号
+    NBEntLookupNoTask,      // 有符号，但 SecTaskCreateFromSelf 返回 NULL
+    NBEntLookupMissing,     // 符号/任务都正常，这个键不在签名里
+    NBEntLookupOK,          // 读到了（*outValue 是 +1 的引用，调用方负责 CFRelease）
+};
+
+static NBEntLookup NBCopyEntitlement(NSString *key, CFTypeRef *outValue) {
     static NBSecTaskRef (*createSelf)(CFAllocatorRef) = NULL;
     static CFTypeRef (*copyValue)(NBSecTaskRef, CFStringRef, CFErrorRef *) = NULL;
     static dispatch_once_t once;
@@ -44,20 +60,31 @@ static CFTypeRef NBCopyEntitlement(NSString *key) {
         if (s1) createSelf = (NBSecTaskRef (*)(CFAllocatorRef))s1;
         if (s2) copyValue = (CFTypeRef (*)(NBSecTaskRef, CFStringRef, CFErrorRef *))s2;
     });
-    if (!createSelf || !copyValue) return NULL;
+    if (!createSelf || !copyValue) return NBEntLookupNoAPI;
 
     NBSecTaskRef t = createSelf(kCFAllocatorDefault);
-    if (!t) return NULL;
+    if (!t) return NBEntLookupNoTask;
     CFTypeRef v = copyValue(t, (__bridge CFStringRef)key, NULL);
     CFRelease(t);
-    return v;
+    if (!v) return NBEntLookupMissing;
+    if (outValue) *outValue = v;
+    return NBEntLookupOK;
 }
 
 // 🔴 只认标量（字符串/布尔/数字）。数组/字典一律回"非标量"：**绝不 description 未知对象**，
 //    这条纪律在通知回调里尤其硬（曾经因为打印未知对象直接卡死）。
 static NSString *NBEntitlementValue(NSString *key) {
-    CFTypeRef v = NBCopyEntitlement(key);
-    if (!v) return @"(读不到：SecTask 符号不在，或签名里没有这个键)";
+    CFTypeRef v = NULL;
+    NBEntLookup st = NBCopyEntitlement(key, &v);
+    switch (st) {
+        // 🔴 三种病因三种话，绝不合并 —— 合并了就等于把"没配"和"我量不到"混成一条。
+        case NBEntLookupNoAPI:   return @"量不到（这台系统没有 SecTask 符号）";
+        case NBEntLookupNoTask:  return @"量不到（SecTaskCreateFromSelf 失败）";
+        // ⚠️ "没有这个键"是**结论**，不是"读不到"。v0.0.172 删掉 no-container 之后
+        //    这一行就应该显示这句 —— 它显示这句才说明删干净了。
+        case NBEntLookupMissing: return @"没有这个键（签名里确实没配）";
+        case NBEntLookupOK:      break;
+    }
 
     NSString *out = nil;
     CFTypeID t = CFGetTypeID(v);
@@ -304,7 +331,7 @@ static NSString *NBTweakVersionReport(void) {
             @"platform-application：%@\n"
             @"no-container：%@\n"
             @"路径白名单：%@\n"
-            @"— 沙箱与数据（v0.0.172 验收） —\n"
+            @"— 沙箱与数据（白名单验收） —\n"
             @"%@\n"
             @"— 装到磁盘 vs 正在跑 —\n"
             @"%@",
