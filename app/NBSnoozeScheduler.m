@@ -9,6 +9,32 @@
 #import "NotifyFilter.h"
 #import <UserNotifications/UserNotifications.h>
 #import <UIKit/UIKit.h>
+#import <Security/Security.h>
+
+// 从**当前进程的代码签名**里读一个 entitlement。
+//
+// 🔴 为什么必须读这个而不是读 Info.plist：`requestAuthorization` 背后是
+//    `usernotificationsd` 按**签名身份**认 App，Info.plist 里的 CFBundleIdentifier
+//    对它没有约束力。v0.0.170 的真机现象是 status 永远停在 notDetermined ——
+//    也就是"系统不认识这个进程"，而唯一的身份凭据就是这一串 entitlement。
+// 🔴 只认标量（字符串/布尔/数字）。数组/字典一律回"非标量"：**绝不 description 未知对象**，
+//    这条纪律在通知回调里尤其硬（曾经因为打印未知对象直接卡死）。
+static NSString *NBEntitlementValue(NSString *key) {
+    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
+    if (!task) return @"(拿不到 SecTask)";
+    CFTypeRef v = SecTaskCopyValueForEntitlement(task, (__bridge CFStringRef)key, NULL);
+    CFRelease(task);
+    if (!v) return @"(无)";          // 注意：这是"签名里没有这个键"，不是"值为假"
+
+    NSString *out = nil;
+    CFTypeID t = CFGetTypeID(v);
+    if (t == CFBooleanGetTypeID())      out = CFBooleanGetValue(v) ? @"true" : @"false";
+    else if (t == CFStringGetTypeID())  out = [NSString stringWithString:(__bridge NSString *)v];
+    else if (t == CFNumberGetTypeID())  out = [(__bridge NSNumber *)v stringValue];
+    else                                out = [NSString stringWithFormat:@"(非标量 type=%lu)", (unsigned long)t];
+    CFRelease(v);
+    return out ?: @"(无)";
+}
 
 // 状态/开关 ⇒ 人话。**每个值都要有名字**，包括"我不认识这个值"——
 // 只印数字的话，用户报上来一个 "3"，我仍要回来查表（"只给数字的留痕改不了规则"）。
@@ -54,12 +80,19 @@ static NSString *NBSettingText(UNNotificationSetting v) {
             @"授权状态：%@\n"
             @"弹窗 %@ ｜ 声音 %@ ｜ 通知中心 %@\n"
             @"Bundle：%@\n"
-            @"App 路径：%@",
+            @"App 路径：%@\n"
+            @"— 系统看到的身份 —\n"
+            @"application-identifier：%@\n"
+            @"platform-application：%@\n"
+            @"no-container：%@",
             NBStatusText(s.authorizationStatus),
             NBSettingText(s.alertSetting),
             NBSettingText(s.soundSetting),
             NBSettingText(s.notificationCenterSetting),
-            bundle, path];
+            bundle, path,
+            NBEntitlementValue(@"application-identifier"),
+            NBEntitlementValue(@"platform-application"),
+            NBEntitlementValue(@"com.apple.private.security.no-container")];
 
         // 再补一条"系统到底认不认这个 App"的旁证：能查待发请求 = 服务是通的；
         // 查不出来也只是异常，不影响上面的状态读数，所以单独 try 一下。

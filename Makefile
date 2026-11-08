@@ -112,7 +112,7 @@ NotifyBoxApp_INFOPLIST = Resources/Info.plist
 NotifyBoxApp_RESOURCES = Resources/AppIcon.png
 # 🔴 App 侧也要 AVFoundation/AVFAudio：声音选择页要**试听**，那是在 App 里跑的 TTS。
 #    不链的话编译期就找不到 AVSpeechSynthesizer，而 tweak 侧那份救不了 App。
-NotifyBoxApp_FRAMEWORKS = UIKit Foundation MobileCoreServices AVFoundation AVFAudio AudioToolbox UserNotifications
+NotifyBoxApp_FRAMEWORKS = UIKit Foundation MobileCoreServices AVFoundation AVFAudio AudioToolbox UserNotifications Security
 NotifyBoxApp_CFLAGS = -fobjc-arc -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations
 NotifyBoxApp_LIBRARIES = sqlite3
 NotifyBoxApp_INSTALL_PATH = /Applications

@@ -39,5 +39,29 @@
     <true/>
     <key>com.apple.private.security.no-container</key>
     <true/>
+
+    <!--
+      v0.0.170：给系统一个"我是谁"的答案。
+
+      🔴 真机现象（2026-11-08）：点「稍后提醒」→ 提示没有通知权限；
+         自检页读出 `authorizationStatus = 0 notDetermined` —— 也就是**授权框压根没弹**。
+         "未决"这一条把病因锁死在"系统没认出这个 App"，不是用户关了权限
+         （关了会是 1 denied）。
+
+      🔴 `usernotificationsd` 认 App 靠的是**代码签名里的身份**，而不是 Info.plist 里那个
+         CFBundleIdentifier。越狱环境下 ldid 的 ad-hoc 签名如果不带 application-identifier，
+         这个 App 在它眼里就是"没有身份的进程" ⇒ 不建记录、不弹框、状态永远停在未决，
+         而且**不报错**（requestAuthorization 返回 granted=NO、error=nil）。
+
+      ⚠️ 这条是**实验**：值写成裸 bundle id（不带 TEAMID. 前缀），因为越狱 SideStore/ldid
+         这一类签名没有真 team。若系统不认，自检页会显示 `(无)` 或原样回显，
+         到时候再决定是换写法还是换架构（见下）。
+      ⚠️ 若补了仍然未决，剩下的两条路是：
+         ① 放弃 UN 本地通知，改由 tweak 在 SpringBoard 里落地提醒；
+         ② 去掉 no-container、改用 App Group 容器共享数据（App 与 tweak 都能读），
+            代价是数据目录要迁移。
+    -->
+    <key>application-identifier</key>
+    <string>com.yxh41.notifybox.app</string>
 </dict>
 </plist>
