@@ -14,9 +14,9 @@
 #import "SoundAppsViewController.h"
 #import "InstalledApps.h"
 #import "NotifyStatsViewController.h"
-// v0.0.169：通知权限自检（「稍后提醒」走本地通知；拿不到权限时必须有地方看真实原因）。
-// 这个头里已经 import 了 UserNotifications，所以 UNAuthorizationStatus 在这里也能用。
-#import "NBSnoozeScheduler.h"
+// v0.0.175：「稍后提醒」已删（越狱 App 拿不到通知授权，真机实测），
+// 这个头现在只提供**只读诊断**（容器 / 写权限 / 记录数 / dylib 版本）。
+#import "NBDiagnostics.h"
 #import "RuleTesterViewController.h"
 #import "KeywordRulesViewController.h"
 // v0.0.71：统一视觉层（颜色 / 圆角 / 图标 / 分组卡片的唯一来源）
@@ -152,8 +152,8 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
 //    设完之后那条记录可能被删掉、App 可能被卸载 ⇒ 用户再也找不到那个长按菜单，
 //    静音表却还在生效。没有一个固定的解除入口，功能就是不可逆的。
 - (void)onMutes:(id)sender;
-// v0.0.169：通知权限自检（「稍后提醒」用本地通知，拿不到权限时必须有地方看原因）。
-- (void)onNotifAuth:(id)sender;
+// v0.0.175：自检入口（只读诊断；「稍后提醒」已删，不再有"申请权限"这回事）。
+- (void)onDiagnostics:(id)sender;
 // v0.0.168：本页统一的状态行提示（写 statusLabel + 立刻重排）。
 - (void)nbSay:(NSString *)msg bad:(BOOL)bad;
 - (void)onSoundApps:(id)sender;
@@ -276,12 +276,13 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     [self addActionRow:@"临时静音的 App" sub:nil icon:@"bell.fill" tint:indigo
                    key:@"mutes" destructive:NO action:@selector(onMutes:)];
 
-    // v0.0.169：通知权限自检。
-    // 🔴 为什么放在「免打扰」这一节的末尾：它属于同一类东西（"弹不弹"），
-    //    而用户遇到「稍后提醒说没有通知权限」时，第一反应就是来这里找。
-    //    单独开一节会让设置页再长一块，而这一项本来就是低频排障。
-    [self addActionRow:@"通知权限（稍后提醒用）" sub:@"点开看状态与原因 ›" icon:@"questionmark.circle" tint:indigo
-                   key:@"notifauth" destructive:NO action:@selector(onNotifAuth:)];
+    // v0.0.175：自检入口。原来是「通知权限（稍后提醒用）」，随功能一起改造：
+    // 它不再问"有没有通知权限"（那条路在越狱 App 上不通），只报**盒子的现场**：
+    // 容器在不在 / 数据目录能不能读能不能写 / 库里几条 / SpringBoard 里跑的是哪个 dylib。
+    // 🔴 留在这里而不是塞进「关于」：用户报"记录没了""静音设了没用"时，
+    //    这三件事正好是能区分病因的那三行，而「免打扰」这一节是他第一反应会来的地方。
+    [self addActionRow:@"运行诊断" sub:@"容器 / 读写 / 记录数 / dylib 版本 ›" icon:@"questionmark.circle" tint:indigo
+                   key:@"diagnostics" destructive:NO action:@selector(onDiagnostics:)];
 
     // ---------- 3. 提示音 ----------
     // 🔴 真机 PROBE 数据说明这是"造系统对象"：默认提示音**不带 BBSound**（sound=nil），
@@ -1323,44 +1324,39 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     [self presentViewController:a animated:YES completion:nil];
 }
 
-// v0.0.169：通知权限自检。
-// 🔴 这一项存在的唯一目的 = **让用户把"为什么没权限"原样念给我听**。
-//    以前只有一句"没有通知权限"，而它背后至少三种病（用户拒绝 / 系统报错 / 授权框没弹），
-//    修法完全不同，靠猜就是一轮 CI 换一个错误答案。
-- (void)onNotifAuth:(id)sender {
+// v0.0.175：自检（纯只读）。
+// 🔴 这一项服务的是「盒子本身」的排障，跟通知权限无关：
+//    用户报"记录没了" —— 是数据库真的空了，还是 App 又被关回容器看不见目录？
+//    用户报"静音设了没用" —— 是静音表没落盘（能读不能写），还是跑的是旧 dylib？
+//    **这两组病因在屏幕上长得一模一样**，而它们各自的答案就在下面这份报告里。
+//    ⇒ 所以它必须是"一次给全"，不能拆成几个按钮让用户挑 —— 他会挑错。
+- (void)onDiagnostics:(id)sender {
     [self.view endEditing:YES];
     __weak typeof(self) weakSelf = self;
 
-    [NBSnoozeScheduler fetchAuthorizationReport:^(NSString *report, UNAuthorizationStatus status) {
-        // fetch 保证回调已在主线程（getNotificationSettings 的后台队列已 hop 回来）
-        UIAlertController *a = [UIAlertController
-                                alertControllerWithTitle:@"通知权限自检"
-                                                 message:report
-                                          preferredStyle:UIAlertControllerStyleAlert];
+    // 🔴 先把"正在算"写进状态行：拼报告要读目录、开一次 sqlite（只读），
+    //    虽然很快，但没有这句的话，点下去到弹窗之间是一片静默，
+    //    而"静默"和"点了没反应"在体验上同形。
+    [self nbSay:@"正在读取…" bad:NO];
 
+    [NBDiagnostics fetchDiagnosticsReport:^(NSString *report) {
+        // 契约是"回调一定在主线程"（见 NBDiagnostics.h），所以这里直接动 UI。
+        [weakSelf nbSay:@"自检完成" bad:NO];
+
+        UIAlertController *a = [UIAlertController
+                                alertControllerWithTitle:@"运行诊断"
+                                                 message:report ?: @"(没有读数)"
+                                          preferredStyle:UIAlertControllerStyleAlert];
+        // 报告很长（十几行），放一个「复制」：用户贴给我比手抄屏幕可靠得多。
+        [a addAction:[UIAlertAction actionWithTitle:@"复制全部"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *act) {
+            UIPasteboard.generalPasteboard.string = report ?: @"";
+            [weakSelf nbSay:@"已复制，可以直接粘给我" bad:NO];
+        }]];
         [a addAction:[UIAlertAction actionWithTitle:@"关闭"
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
-
-        [a addAction:[UIAlertAction actionWithTitle:@"重新申请"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *act) {
-            // 🔴 结果写状态行，不再叠一个 alert：这是在 alert 的 action 里，
-            //    在收起的瞬间再 present 会被系统静默丢掉（本项目在长按菜单上栽过同形态）。
-            [NBSnoozeScheduler requestAuthorization:^(BOOL granted, NSString *detail) {
-                [weakSelf nbSay:(detail ?: (granted ? @"已授权" : @"没拿到权限")) bad:!granted];
-            }];
-        }]];
-
-        [a addAction:[UIAlertAction actionWithTitle:@"去系统设置"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *act) {
-            BOOL ok = [NBSnoozeScheduler openSystemNotificationSettings];
-            [weakSelf nbSay:(ok ? @"已跳转系统设置，回来后再点开这里复查状态"
-                                : @"跳不过去：拿不到设置页 URL")
-                        bad:!ok];
-        }]];
-
         [weakSelf presentViewController:a animated:YES completion:nil];
     }];
 }

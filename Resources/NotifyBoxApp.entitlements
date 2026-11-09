@@ -79,38 +79,20 @@
     </array>
 
     <!--
-      🔴🔴🔴 v0.0.174：**只读**放开系统通知库的两个目录，用来回答一个我至今只能猜的问题：
-      「usernotificationsd 到底有没有为这个 App 建过记录？」
+      🔴🔴🔴 v0.0.175：v0.0.174 在这里加过的 `com.apple.security.exception.files.absolute-path.read-only`
+      （放开 /var/mobile/Library/UserNotifications 与 BulletinBoard 两个目录）**已删除**。
 
-      为什么必须能自己量：
-        真机 v0.0.172 / v0.0.173 两版的自检页都是
-            授权状态：未决（0 notDetermined）
-            弹窗 不支持 ｜ 声音 不支持 ｜ 通知中心 不支持
-        用户点过「允许」，状态不动，系统「设置 → 通知」里也翻不到。
-        这要么是"决定没写进系统库"，要么是"根本没建立过记录"——**两种病，修法相反**，
-        而我拿不到任何能区分的读数，只能反复请用户点按钮、再请他把屏幕上的话念给我。
-        这已经消耗了三轮。
+      删的理由：那一整条权限只服务一个探针 ——「usernotificationsd 到底有没有为这个 App
+      建过记录」。探针（`NBRecordLookup` / `NBSystemNotificationStoreReport`）随
+      「稍后提醒」一起下线了，**留着权限就是一条没有消费者的声明**。
+      本项目记过同族的账：「恒为定值的字段 = 死探针 ⇒ 连声明一起删」。
+      ⇒ 留这段注释而不是留权限：让下一个我看明白**它是被主动删的，不是漏配**。
 
-      为什么是这两个路径：
-        · `/var/mobile/Library/UserNotifications/`   —— 通知服务的 per-app 记录（多用这个）
-        · `/var/mobile/Library/BulletinBoard/`       —— 老一代 BB 账本
-      列表里出现 `com.yxh41.notifybox.app` 就说明"系统认我"，
-      没有就说明"从来没建成" —— 一句话把病因钉死。
-
-      ⚠️ **只读**（read-only），不是 read-write：诊断只需要列目录，绝不给写权限。
-      ⚠️ 列不出来时 App 必须报「读不到」，**不许把它当成"没有"**（读不到 ≠ 不存在，
-         这条本项目栽过多次）。三态各一句话。
+      那个探针的结论已经拿到了，写在这里免得以后有人重走一遍（真机实测）：
+        `/var/mobile/Library/UserNotifications/` 有 375 个 App 记录，**没有我们这一条**；
+        `uicache` 注册过、`uicache -r` 也试过，均无效。
+        ⇒ 越狱（Cydia/Sileo）安装的 App，`installd` 完全不参与，系统不会为它建通知记录。
+          加多少权限都改不了这件事 —— 所以「稍后提醒」这条路在越狱 App 上**本身不通**。
     -->
-    <key>com.apple.security.exception.files.absolute-path.read-only</key>
-    <array>
-      <string>/var/mobile/Library/UserNotifications/</string>
-      <string>/var/mobile/Library/UserNotifications</string>
-      <string>/private/var/mobile/Library/UserNotifications/</string>
-      <string>/private/var/mobile/Library/UserNotifications</string>
-      <string>/var/mobile/Library/BulletinBoard/</string>
-      <string>/var/mobile/Library/BulletinBoard</string>
-      <string>/private/var/mobile/Library/BulletinBoard/</string>
-      <string>/private/var/mobile/Library/BulletinBoard</string>
-    </array>
 </dict>
 </plist>

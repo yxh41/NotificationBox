@@ -49,6 +49,7 @@ import io
 import json
 import lzma
 import os
+import plistlib
 import struct
 import sys
 import tarfile
@@ -428,12 +429,15 @@ MUST_PRESENT_APP = [
     #    必须有一条**用户看得见的**提示把「没重启」和「代码写错了」分开。
     "还差一次重启",
     "重启一次手机（或注销）",
-    # 🔴 v0.0.174：判断"系统认不认我"那一节的三条。缺一条，那节就等于没做 ——
-    #    「有我的记录」和「无一提及 notifybox」必须各有一个串，
-    #    否则"读到了但没我的记录"和"压根读不到"在屏幕上又会混成一种。
-    "系统通知库里有没有我",
-    "有我的记录",
-    "无一提及 notifybox",
+    # 🔴 v0.0.175：「稍后提醒」整个删除（越狱 App 拿不到通知授权）。
+    #    ⚠️ v0.0.174 这里还挂着「系统通知库里有没有我 / 有我的记录 / 无一提及 notifybox」
+    #    三条 —— 那一节随功能一起删了，判据**必须跟着删**，否则验包会 FAIL 在
+    #    "一个已经主动删掉的串不存在"上，而那种 FAIL 只会教人把判据注释掉。
+    #    ⇒ 反向也要判：见命令行 `--gone` + `--prev-had`。
+    #    这一类"功能下线"的验收，正确的两个方向是：
+    #      ① 旧版的入口串在新版里清零（`--gone`），**且**旧版里真有它（`--prev-had`）
+    #         —— 少了后半句，"清零"对一个从来没存在过的串也恒绿
+    #      ② 留下来的诊断串一个不少（就是上面这些）
 ]
 
 
@@ -548,12 +552,30 @@ def main(argv):
             "/var/mobile/Library/NotifyBox" in ent)
         chk("platform-application 还在",
             "<key>platform-application</key>" in ent)
-        # 🔴 v0.0.174：只读白名单是「系统通知库里有没有我」那一节的唯一依据，
-        #    少了它自检页只会显示"读不到"，而读不到和"没有"是两件事。
-        chk("有 absolute-path.read-only（用于读系统通知库）",
-            "absolute-path.read-only" in ent)
-        chk("只读白名单里写了 UserNotifications",
-            "/var/mobile/Library/UserNotifications" in ent)
+        # 🔴🔴 v0.0.175：这两条原判「有 read-only 白名单、里面有 UserNotifications」。
+        #    「稍后提醒」下线后那条权限**没有消费者了**（探针随功能一起删），正解是反过来判**必须没有**。
+        #    而"判没有"这里有个坑：判据域是签名里那份 XML 原文，而我在 entitlements 里
+        #    留了一段解释「删掉了什么」的注释 —— **判据会被自己的注释污染**（本项目栽过：
+        #    自检页把键名念给用户看，那个字面量就进了二进制 ⇒「搜得到」恒为真）。
+        #    ⇒ 改成**解析成 plist 按 key 判**：注释在解析时天然消失，两个方向都干净。
+        #    ⚠️ 解析失败时 ep 置空但下面那条无条件 FAIL，不让后面的检查"被 if 跳过"
+        #       （判据被 if 跳过 = 判据消失，只会留下满屏 PASS）。
+        okparse = False
+        ep = {}
+        try:
+            ep = plistlib.loads(ex)
+            okparse = isinstance(ep, dict)
+        except Exception:
+            okparse = False
+        if not okparse:
+            ep = {}
+        chk("entitlements 能解析成 plist（否则下面按键判的全是瞎猜）", okparse)
+        chk("v0.0.175 已删掉只读白名单（功能下线，权限留着没有消费者）",
+            "com.apple.security.exception.files.absolute-path.read-only" not in ep)
+        chk("🔴 read-write 白名单还在（盒子数据全靠它）",
+            "com.apple.security.exception.files.absolute-path.read-write" in ep)
+        chk("🔴 no-container 不在（v0.0.172 删的，不许偷偷回来）",
+            "com.apple.private.security.no-container" not in ep)
 
     print("\n===== 1 🔴 真的改了代码？（大小相等也要逐字节比）=====")
     for nm, x, y in (("App", a0, ab), ("dylib", d0, db)):

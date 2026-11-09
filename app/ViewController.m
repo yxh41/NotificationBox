@@ -17,8 +17,9 @@
 #import "OverviewGridView.h"
 // v0.0.166：长按菜单里的「打开链接 / 复制验证码」（纯本地正则，抽不到就不显示）
 #import "NBTextExtract.h"
-// v0.0.167：稍后提醒（本地通知，App 侧自足）
-#import "NBSnoozeScheduler.h"
+// v0.0.175：「稍后提醒」已整个删除（越狱 App 拿不到通知授权，真机实测见
+// NBDiagnostics.h 文件头），这个头文件现在只剩**只读诊断** + dylib 版本对齐。
+#import "NBDiagnostics.h"
 // v0.0.168：临时静音。判定逻辑在 NotifyFilter 里 —— **tweak 与 App 编的是同一份**，
 // 不能在 App 里再写一份"这个 App 现在静音了没"，否则两边口径会各走一路。
 #import "NotifyFilter.h"
@@ -532,8 +533,6 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // v0.0.166：打开外部链接（正文里抽到的 http/https）。
 // 和 `nbOpenAppWithBundle:` 分开：那个是"切到某个 App"，这个是"交给系统打开"。
 - (void)nbOpenExternalLink:(NSString *)link;
-// v0.0.167：稍后提醒（App 侧本地通知，不经过 tweak）。
-- (void)nbSnoozeRow:(NSDictionary *)row kind:(NBSnoozeKind)kind;
 // v0.0.168：把这个 App 的临时静音写到到期时刻 / 取消它。
 // 🔴 写完之后**必须回读一次**（`shouldDropForMute:`），不许拿"我写了"当"它生效了"：
 //    写盘失败、条目超上限、值超上限——三条路都返回 YES 给保存函数但在判定侧是"不生效"。
@@ -708,7 +707,7 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
     static BOOL warned = NO;
     if (warned) return;
 
-    NSString *notice = [NBSnoozeScheduler tweakVersionMismatchNotice];
+    NSString *notice = [NBDiagnostics tweakVersionMismatchNotice];
     if (!notice.length) return;      // 一致 ⇒ 不打扰
 
     // 🔴 已经有弹窗在上面（长按菜单/设置页）就先不动：在别人 present 的瞬间再 present
@@ -3841,32 +3840,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         [acts addObject:codeAct];
     }
 
-    // ================= v0.0.167：稍后提醒 =================
-    // 🔴 做成子菜单（而不是 3 个平铺项）：菜单里已经有「打开 / 复制 / 打开链接 / 复制验证码」，
-    //    再平铺 3 个时间选项会让长按菜单变成一张列表，最常用的「打开」被顶到看不见的地方。
-    NSMutableArray<UIMenuElement *> *snoozeActs = [NSMutableArray arrayWithCapacity:3];
-    for (NSInteger k = NBSnoozeKind15Min; k <= NBSnoozeKindNextMorning; k++) {
-        NBSnoozeKind kind = (NBSnoozeKind)k;
-        UIAction *a = [UIAction actionWithTitle:[NBSnoozeScheduler menuTitleForKind:kind]
-                                         image:nil
-                                    identifier:nil
-                                       handler:^(__kindof UIAction *act) {
-            [weakSelf nbSnoozeRow:row kind:kind];
-        }];
-        [snoozeActs addObject:a];
-    }
-    // 🔴 用的是**带 identifier:options:** 的那个重载。短版本 `menuWithTitle:image:children:`
-    //    并不存在 —— CI 在 `no known class method for selector` 上直接报错。
-    [acts addObject:[UIMenu menuWithTitle:@"稍后提醒"
-                                    image:[UIImage systemImageNamed:@"clock"]
-                               identifier:nil
-                                  options:0
-                                 children:snoozeActs]];
-
     // ================= v0.0.168：临时静音 =================
-    // 与「稍后提醒」是两件事，别混：
-    //   稍后提醒 = 过 N 分钟**再响一次**（要本地通知权限）；
-    //   临时静音 = 从现在起 N 小时**不弹这个 App**（记录照旧，不需要任何权限）。
+    // 与「稍后提醒」是两件事，别混（🔴 后者已在 v0.0.175 整个删除）：
+    //   稍后提醒 = 过 N 分钟**再响一次**（要本地通知权限 ⇒ 越狱 App 拿不到，下线）
+    //   临时静音 = 从现在起 N 小时**不弹这个 App**（记录照旧，不需要任何权限）
     // 🔴 当前已静音时，**第一项不是"再静音一次"而是"现在到什么时候"** ——
     //    不然用户点开菜单看不出自己之前静过、还剩多久，只能靠回忆。
     //    那一项设成 disabled：它是状态显示，不是动作（摆一个点了没反应的动作更糟）。
@@ -3912,61 +3889,6 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                                  children:muteActs]];
 
     return [UIMenu menuWithTitle:@"" children:acts];
-}
-
-// 排一条"稍后提醒"。
-- (void)nbSnoozeRow:(NSDictionary *)row kind:(NBSnoozeKind)kind {
-    if (![row isKindOfClass:[NSDictionary class]]) return;
-
-    id tv = row[@"title"];
-    NSString *title = [tv isKindOfClass:[NSString class]] ? (NSString *)tv : nil;
-
-    NSString *name = [self appNameForBundle:row[@"bundle"]];
-    NSString *subtitle = name.length
-                       ? [NSString stringWithFormat:@"稍后提醒 · %@", name]
-                       : @"稍后提醒";
-
-    // 正文可能很长（营销短信、群公告）⇒ 截到 140 个**完整字符**。
-    // 🔴 用 `rangeOfComposedCharacterSequencesForRange:` 而不是裸 `substringToIndex:`：
-    //    裸截会把 emoji / 组合字符劈成半个码点，通知里出现"口"字方块。
-    NSString *body = [self nbBodyTextForRow:row];
-    if (body.length > 140) {
-        NSRange r = [body rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, 140)];
-        body = [[body substringWithRange:r] stringByAppendingString:@"…"];
-    }
-
-    __weak typeof(self) weakSelf = self;
-    [NBSnoozeScheduler scheduleKind:kind
-                         alertTitle:title
-                           subtitle:subtitle
-                               body:body
-                         completion:^(BOOL ok, NSString *message) {
-        if (!message.length) return;
-
-        if (ok) {
-            [weakSelf nbToast:message];
-            return;
-        }
-
-        // 🔴 v0.0.169：**失败不再走 toast**。
-        //    失败文案现在带着 error domain / code 和授权状态（那是判断根因的唯一线索），
-        //    长度和重要性都不是一个 2 秒 toast 能承载的 —— 用户还没来得及读就没了，
-        //    于是只能报"它说没有通知权限"，而那正是把三种病因混成一句话的旧版本。
-        // ⚠️ 延后 0.35 秒：这段回调虽然是异步的（UN 的回调 + 已 hop 主线程），
-        //    但仍可能赶在长按菜单收起动画的窗口里；在这个窗口 present 会被系统静默丢掉。
-        //    （本项目在「打开 App」上栽过同形态，那次是同步 present，这里多一道保险。）
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            UIAlertController *a = [UIAlertController
-                                    alertControllerWithTitle:@"稍后提醒没排上"
-                                                     message:message
-                                              preferredStyle:UIAlertControllerStyleAlert];
-            [a addAction:[UIAlertAction actionWithTitle:@"好"
-                                                  style:UIAlertActionStyleCancel
-                                                handler:nil]];
-            [weakSelf presentViewController:a animated:YES completion:nil];
-        });
-    }];
 }
 
 // ================= v0.0.168：临时静音的写入 =================
