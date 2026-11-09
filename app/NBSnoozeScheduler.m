@@ -273,6 +273,56 @@ static NSString *NBTweakVersionReport(void) {
     return s;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.0.174：系统通知库里有没有「我」。
+//
+// 🔴🔴🔴 这一节要回答的问题只有一个：**usernotificationsd 到底有没有为这个 App 建过记录？**
+//    真机 v0.0.172/173 两版的读数都是「未决 + 三个不支持」，用户点过允许、状态不动、
+//    系统设置里翻不到。这有两种完全不同的病因，修法相反：
+//      ① 记录建过，但那次「允许」没写进去  ⇒ 是授权流程的问题（重试 / 修 entitlement）
+//      ② 记录从来没建过                    ⇒ 是"这个 App 在系统眼里不算已安装的 App"
+//    在此之前我拿不到任何能区分的读数，只能请用户点按钮、再把屏幕上的话念给我 ——
+//    已经消耗了三轮。⇒ 直接去列系统通知库的目录，一眼定死。
+//
+// ⚠️ 靠的是 v0.0.174 新加的 **read-only** 沙箱白名单（见 entitlements 注释）。
+// ⚠️ 三态必须分开报：**读不到 ≠ 没有**。这是本项目最贵的那条纪律。
+//    读不到说明白名单没生效；「没有」说明系统真没建记录。把它们合成一句，
+//    这一整节就等于没做。
+static NSString *NBRecordLookup(NSString *dir, NSString *label) {
+    NSError *e = nil;
+    NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:&e];
+    if (!items) {
+        // 🔴 单列一支，并且把 errno 写出来（257 = NSFileReadNoPermissionError，沙箱拒绝）
+        return [NSString stringWithFormat:@"%@：读不到（errno=%ld %@）",
+                label, (long)e.code, e.localizedDescription ?: @"?"];
+    }
+    NSMutableArray *hits = [NSMutableArray array];
+    NSString *fold = @"notifybox";
+    for (NSString *n in items) {
+        if ([[n lowercaseString] rangeOfString:fold].location != NSNotFound) {
+            [hits addObject:n];
+        }
+    }
+    if (hits.count) {
+        // 🔴 有就明说是哪几个 —— "有 1 条"这种数法在名字对不上时毫无意义
+        return [NSString stringWithFormat:@"%@：**有我的记录** %@",
+                label, [hits componentsJoinedByString:@"、"]];
+    }
+    // 没有也要报出"目录里有几项"，这样我能判断它到底是空目录还是根本没被扫到
+    return [NSString stringWithFormat:@"%@：没有（目录 %lu 项，无一提及 notifybox）",
+            label, (unsigned long)items.count];
+}
+
+static NSString *NBSystemNotificationStoreReport(void) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendString:NBRecordLookup(@"/var/mobile/Library/UserNotifications",
+                                   @"UserNotifications")];
+    [s appendString:@"\n"];
+    [s appendString:NBRecordLookup(@"/var/mobile/Library/BulletinBoard",
+                                   @"BulletinBoard")];
+    return s;
+}
+
 @implementation NBSnoozeScheduler
 
 + (NSString *)tweakVersionMismatchNotice {
@@ -324,6 +374,11 @@ static NSString *NBTweakVersionReport(void) {
         NSString *report = [NSString stringWithFormat:
             @"授权状态：%@\n"
             @"弹窗 %@ ｜ 声音 %@ ｜ 通知中心 %@\n"
+            // ⚠️ 标题里**不许写版本号**：它会被编进 __ustring，于是下一版验包时
+            //    「旧版本串已清零」必然 FAIL。v0.0.173 就是栽在这（当时写的是
+            //    「（v0.0.172 验收）」）。**文案属判据域**，一行都不许带。
+            @"— 系统通知库里有没有我 —\n"
+            @"%@\n"
             @"Bundle：%@\n"
             @"App 路径：%@\n"
             @"— 系统看到的身份 —\n"
@@ -339,10 +394,12 @@ static NSString *NBTweakVersionReport(void) {
             NBSettingText(s.alertSetting),
             NBSettingText(s.soundSetting),
             NBSettingText(s.notificationCenterSetting),
+            // 🔴 紧跟在授权状态后面：它是那个"未决"的直接注释
+            NBSystemNotificationStoreReport(),
             bundle, path,
             NBEntitlementValue(@"application-identifier"),
             NBEntitlementValue(@"platform-application"),
-            // 🔴 v0.0.172：这一行现在**应该**显示「没有」。它显示「有」= 装的是旧包。
+            // 🔴 v0.0.172：这一行现在**应该**显示「没有这个键」。显示「有」= 装的是旧包。
             NBEntitlementValue(@"com.apple.private.security.no-container"),
             // 数组型 entitlement 会印成「(非标量 type=…)」——那正是"它在"的旁证，
             // 别把它改成"读不到"。真要看内容得解包，不是这一页的事。

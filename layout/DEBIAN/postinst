@@ -1,5 +1,5 @@
 #!/bin/sh
-# NotifyBox · v0.0.173
+# NotifyBox · v0.0.174
 #
 # 🔴🔴 v0.0.173：**这里不再自动重启 SpringBoard**。
 #    用户明确要求「下次不用自动注销，我自己手动操作就行」——这是他的设备，
@@ -8,18 +8,30 @@
 #    装完不重启 ⇒ 盒子 App 是新的、SpringBoard 里跑的过滤逻辑还是旧的，
 #    症状与「代码没改」完全同形（v0.0.168~171 连着四版就是栽在这上面）。
 #    ⇒ 所以"手动"必须配一个**看得见的提示**：盒子 App 每次进主页都比
-#      `.tweak_ctor` 里的版本号和自己这一份，不一致就在顶部挂一条字
-#      「正在跑旧版，请重启一次」。不靠用户记，也不靠他真的会去看自检页。
+#      `.tweak_ctor` 里的版本号和自己这一份，不一致就弹一次「还差一次重启」。
+#     不靠用户记，也不靠他真的会去看自检页。
 #
-# 🔴 这个脚本现在只做一件事：把数据目录的**属主和权限**摆正。
+# 🔴 这个脚本做两件事：摆正数据目录的属主/权限 + 补一次 LaunchServices 注册。
+#
+# ① 数据目录属主/权限：
 #    v0.0.157 的教训：0777 只写在 NBDataDir() 里，而 backboardd **从不调它**
 #    ⇒ 真机目录一直是 755，「预防」在唯一那个 root 进程里是空的。
 #    这里是唯一以 root 身份、在"装完那一刻"跑的代码，补得上。
 #    写成功也要设 mode：落盘 mode 由 umask 决定，不 chmod 就等于把
 #    「标记在不在」的判定权交给 umask（跨身份读不到 ≡ 没写）。
-#
 #    ⚠️ 这些都**不能替代** entitlement 白名单：白名单没生效时沙箱直接 EPERM，
 #    Unix 权限再宽也白搭。这条只是把"Unix 那一层"先摆正，免得它伪装成白名单的错。
+#
+# ② 🔴🔴 v0.0.174：补一次 LaunchServices 注册（uicache）。
+#    起因（查到的确凿事实）：App Store / installd 安装时，installd 会更新
+#    LaunchServices 缓存并让系统各服务知道"多了个 App"；而**通过 Cydia/Sileo
+#    装的 App，installd 完全不参与**，缓存得手工刷新。
+#    这很可能就是「授权框点了允许、状态仍是未决定、设置→通知里翻不到」的根因：
+#    usernotificationsd 不认识这个 App，于是连一条记录都不给它建。
+#    ⚠️ **不加 `-r`**：uicache 带 -r 会自己 respring，那是用户明确不许的动作。
+#    只刷新缓存，重启仍由用户自己决定。
+#    ⚠️ 找不到 App 路径就静默跳过（roothide 的 App 在 jbroot 下，路径不是 /Applications）：
+#    这个脚本**绝不能因为找不到 App 就返回非 0**，否则 dpkg 会把包标成配置失败。
 
 DATADIR=/var/mobile/Library/NotifyBox
 
@@ -30,6 +42,34 @@ if [ -d "$DATADIR" ]; then
     chmod 0666 "$DATADIR"/*.plist 2>/dev/null || true
     chmod 0666 "$DATADIR"/.tweak_ctor 2>/dev/null || true
     chmod 0666 "$DATADIR"/.tweak_ctor_root 2>/dev/null || true
+fi
+
+# ---- LaunchServices 注册（可选步骤，失败不影响安装结果）----
+# roothide 把根目录重定向到 /var/containers/Bundle/Application/jbroot-<id>，
+# 而本脚本没有 libroothide 的路径映射 ⇒ /Applications 那个写法在这里是空的。
+# ⇒ 两种写法都找一遍，找到哪个用哪个。
+APPDIR=""
+for cand in /Applications/NotifyBoxApp.app \
+            /private/var/containers/Bundle/Application/jbroot-*/Applications/NotifyBoxApp.app; do
+    if [ -d "$cand" ]; then
+        APPDIR="$cand"
+        break
+    fi
+done
+
+if [ -n "$APPDIR" ]; then
+    for U in /usr/bin/uicache /var/jb/usr/bin/uicache /private/var/jb/usr/bin/uicache; do
+        if [ -x "$U" ]; then
+            # 🔴 只调 `-p <路径>`（精确注册这一个 App），**不退回全量扫描**：
+            #    全量 uicache 会重建所有 App 的缓存，慢且副作用面大，而我要的只是
+            #    "让 LaunchServices 认识 NotifyBoxApp"这一件事。
+            #    `-p` 不被这个版本支持就静默跳过 —— 这一步是顺手帮忙，不是安装成功的前提。
+            #    ⚠️ 参数按 procursus/uikittools 的 uicache 写（roothide 用的就是这套）：
+            #       -p 精确路径 ／ -a 全量 ／ -r 才是 respring。**绝不许带 -r**。
+            "$U" -p "$APPDIR" >/dev/null 2>&1 || true
+            break
+        fi
+    done
 fi
 
 exit 0

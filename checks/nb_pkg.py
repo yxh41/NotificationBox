@@ -428,6 +428,12 @@ MUST_PRESENT_APP = [
     #    必须有一条**用户看得见的**提示把「没重启」和「代码写错了」分开。
     "还差一次重启",
     "重启一次手机（或注销）",
+    # 🔴 v0.0.174：判断"系统认不认我"那一节的三条。缺一条，那节就等于没做 ——
+    #    「有我的记录」和「无一提及 notifybox」必须各有一个串，
+    #    否则"读到了但没我的记录"和"压根读不到"在屏幕上又会混成一种。
+    "系统通知库里有没有我",
+    "有我的记录",
+    "无一提及 notifybox",
 ]
 
 
@@ -514,9 +520,16 @@ def main(argv):
                             if not l.strip().startswith("#"))
         chk("postinst 不再自动重启（可执行行里没有 killall）",
             "killall" not in pi_code)
-        # 反过来：它现在唯一该做的事不能一起被删掉
+        # 🔴🔴 v0.0.174：`uicache -r` 会自己 respring —— 与上面那条是同一个约束的
+        #    另一种写法。用户明确要求"我自己手动操作"，所以任何会重启的开关都不许出现。
+        #    只判 killall 会漏掉这一条（"名字差一个词 ≠ 同一把刀"）。
+        chk("postinst 里没有 uicache -r（它也会 respring）",
+            "uicache -r" not in pi_code)
+        # 反过来：它现在该做的事不能一起被删掉
         chk("postinst 仍然在修数据目录权限（chmod 0777）",
             "chmod 0777" in pi_code)
+        chk("postinst 会尝试一次 LaunchServices 注册（uicache）",
+            "uicache" in pi_code)
 
     print("\n===== 0.5 🔴 App 的 entitlements（v0.0.172 的核心改动）=====")
     # 这一节比的是**签名里的那一条 blob**，不是代码里的字符串 —— 理由见 entitlements_xml()。
@@ -535,6 +548,12 @@ def main(argv):
             "/var/mobile/Library/NotifyBox" in ent)
         chk("platform-application 还在",
             "<key>platform-application</key>" in ent)
+        # 🔴 v0.0.174：只读白名单是「系统通知库里有没有我」那一节的唯一依据，
+        #    少了它自检页只会显示"读不到"，而读不到和"没有"是两件事。
+        chk("有 absolute-path.read-only（用于读系统通知库）",
+            "absolute-path.read-only" in ent)
+        chk("只读白名单里写了 UserNotifications",
+            "/var/mobile/Library/UserNotifications" in ent)
 
     print("\n===== 1 🔴 真的改了代码？（大小相等也要逐字节比）=====")
     for nm, x, y in (("App", a0, ab), ("dylib", d0, db)):
