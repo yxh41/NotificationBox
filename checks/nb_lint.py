@@ -559,6 +559,101 @@ def _(c):
     return (not bad, "不平衡：%s" % bad if bad else "%d 个文件平衡" % len(c["files"]))
 
 
+# ── I. 列表动效的挂钩与顺序（v0.0.176）─────────────────────────
+
+def _func_body(m, anchor):
+    """在 mask 过的源码里，从 anchor 起截到下一个方法的开头（`\\n- (` 或 `\\n#pragma`）。
+
+    ⚠️ 这是"够用"的切法，不是语法分析：本项目的函数体里既没有嵌套的
+       `\\n- (` 也没有 `#pragma`，所以切不歪。⛔ 别拿它去切别的文件。
+    """
+    i = m.find(anchor)
+    if i < 0:
+        return None
+    ends = [x for x in (m.find("\n- (", i + len(anchor)),
+                        m.find("\n#pragma", i + len(anchor))) if x > 0]
+    return m[i:min(ends)] if ends else m[i:]
+
+
+@chk("I1", "列表动效三挂钩齐全，且布防排在 loadData 之前", baseline="red")
+def _(c):
+    """🔴 v0.0.176 新增。每一条坏掉都**不报错、界面上也看不出来**，所以必须机械守：
+
+       ① `nbArmSlideFromIndex:` 若排到 `[self loadData]` **之后** —— 布防发生在
+          `reloadData` 之后，那一次布局已经过了 ⇒ 动画永远不播，功能却一切正常。
+          这正是本项目反复栽的「用"到不了的轮次"当触发 = 交了等于没交」。
+       ② `willDisplayCell:` 里必须**两个量都读**（`nbEntranceUntil` / `nbSlideDX`）。
+          只写一处等于只做了一半动效，而"少一个动效"和"本来就该这样"在截图上同形。
+       ③ `prepareForReuse` 里必须把静音态复位（`nbSetMutedLook:NO`）：不复位 ⇒
+          暗卡片串到**没被静音**的 App 的行上，用户会以为静音串 App 了
+          —— 静音表其实是对的，画面在说假话。
+
+       ⚠️🔴 判据域一律用 `mask()` 之后的源码。这几个名字在我自己写的注释里全都出现过，
+          不 mask 就是**拿自己的解释当证据**（本项目刚为这个坑付过账：
+          `MUST_BE_GONE` 里的裸串被文件头注释误伤，脚本连跑两遍都报残留）。
+    """
+    vc = mask(c["files"].get("app/ViewController.m", ""))
+    nc = mask(c["files"].get("app/NotifyCell.m", ""))
+    problems = []
+
+    for name, anchor in (("onTime:", "\n- (void)onTime:(UISegmentedControl *)seg {"),
+                         ("onUnread:", "\n- (void)onUnread:(UISegmentedControl *)seg {")):
+        body = _func_body(vc, anchor)
+        if body is None:
+            problems.append("%s 找不到" % name)
+            continue
+        i_arm = body.find("nbArmSlideFromIndex:")
+        i_load = body.find("[self loadData]")
+        if i_arm < 0:
+            problems.append("%s 没有布防" % name)
+        elif i_load < 0:
+            problems.append("%s 没有 loadData" % name)
+        elif i_arm > i_load:
+            problems.append("%s 布防排在 loadData 之后" % name)
+
+    wd = _func_body(vc, "\n- (void)tableView:(UITableView *)tableView\n  willDisplayCell:")
+    if wd is None:
+        wd = _func_body(vc, "willDisplayCell:")
+    if wd is None:
+        problems.append("willDisplayCell: 找不到")
+    else:
+        # 🔴 `willDisplayCell:` 的签名跨了三行，所以先用整段签名找；找不到才退到裸名字。
+        #    裸名字能匹配到"别处提到它"，所以它只当兜底，而且兜底失败要**明说**，
+        #    不许静默通过（"找不到"和"通过了"在输出上必须能分开）。
+        for tok in ("nbEntranceUntil", "nbSlideDX"):
+            if tok not in wd:
+                problems.append("willDisplayCell: 没读 %s" % tok)
+
+    # ④ 入场错落的布防点：必须在 `viewWillAppear:`，**且绝不能落在重建列表的那两处**。
+    #    这组一正两负，缺一条就等于只判了一半：
+    #    · 丢了 viewWillAppear 那处 ⇒ 首屏永远不播（A 变成死功能）；
+    #    · 布防漏进 `applyItemsAndRefreshUI`（**两条刷新路径的共用尾部**，`reloadData`
+    #      就在里面）⇒ 前台回来/删除/标已读/从详情页返回全都重播一遍，列表一直在抖。
+    #      🔴 我第一版把这条判在 `loadData` 上，**判错了地方**：`loadData` 里根本没有
+    #      `reloadData`，它只是查完数据就交给共用尾部。判据写在那儿永远绿 ——
+    #      是"变异跑不红"当场把它抓出来的（M18 恒绿），不是我看出来的。
+    vwa = _func_body(vc, "\n- (void)viewWillAppear:")
+    if vwa is None:
+        problems.append("viewWillAppear: 找不到")
+    elif "nbArmEntrance" not in vwa:
+        problems.append("viewWillAppear: 没布防入场")
+
+    for fname in ("\n- (void)loadData {", "\n- (void)applyItemsAndRefreshUI {"):
+        fb = _func_body(vc, fname)
+        if fb is None:
+            problems.append("%s 找不到" % fname.strip())
+        elif "nbArmEntrance" in fb:
+            problems.append("%s 里布防了入场（会让每次刷新都重播）" % fname.strip())
+
+    pfr = _func_body(nc, "\n- (void)prepareForReuse")
+    if pfr is None:
+        problems.append("NotifyCell prepareForReuse 找不到")
+    elif "nbSetMutedLook:NO" not in pfr.replace(" ", ""):
+        problems.append("prepareForReuse 没复位静音态")
+
+    return (not problems, "；".join(problems) if problems else "三挂钩齐全、顺序正确")
+
+
 # ───────────────────────────── 跑判据 ─────────────────────────────
 
 
@@ -632,6 +727,24 @@ MUTATIONS = [
     ("M12 少一个右花括号", "NotifyStore.m",
      "BOOL NBCanWriteSharedFiles(void) {",
      "BOOL NBCanWriteSharedFiles(void) {{", "H1"),
+    # 🔴 v0.0.176：两条变异分别打 I1 的**两个不同条件**（顺序 / 复位）。
+    #    只测一个的话，"判据在另一个维度上是瞎的"看不出来 —— 这是本项目
+    #    「变异要挑两个条件同时成立的反例」那条的常规用法。
+    ("M15 布防挪到 loadData 之后（交了就等于没交）", "app/ViewController.m",
+     "    [self nbArmSlideFromIndex:self.nbPrevTimeIdx toIndex:to];\n"
+     "    self.nbPrevTimeIdx = to;\n"
+     "    [self loadData];",
+     "    self.nbPrevTimeIdx = to;\n"
+     "    [self loadData];\n"
+     "    [self nbArmSlideFromIndex:self.nbPrevTimeIdx toIndex:to];", "I1"),
+    ("M16 prepareForReuse 不复位静音态", "app/NotifyCell.m",
+     "    [self nbSetMutedLook:NO animated:NO];", "    ;", "I1"),
+    ("M17 入场布防从 viewWillAppear 删掉（首屏永远不播）", "app/ViewController.m",
+     "        self.nbEntranceDone = YES;\n        [self nbArmEntrance];",
+     "        self.nbEntranceDone = YES;", "I1"),
+    ("M18 把入场布防塞进共用尾部 applyItemsAndRefreshUI（每次刷新都重播）", "app/ViewController.m",
+     "    [self nbRebuildOverview];\n\n    [self.table reloadData];",
+     "    [self nbRebuildOverview];\n    [self nbArmEntrance];\n\n    [self.table reloadData];", "I1"),
 ]
 
 

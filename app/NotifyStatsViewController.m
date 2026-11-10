@@ -82,6 +82,12 @@
 @property (nonatomic, strong) UISegmentedControl *dimSeg;      // 维度：App / 小时 / 天
 @property (nonatomic, strong) UISegmentedControl *rangeSeg;    // 时间窗：全部 / 7天 / 30天
 @property (nonatomic, strong) UILabel *summaryLabel;
+// v0.0.176：数字滚动用的定时器。60fps 手动推，滚完自己 invalidate。
+// ⚠️ 为什么用 NSTimer 而不是 CADisplayLink：这里只需要 0.3s 的短动画，
+//    CADisplayLink 要额外持一个 target、还得在 dealloc/消失时精准 invalidate，
+//    出错就是"页面走了定时器还在跑"。NSTimer 一个 strong 属性 + dealloc 里掐掉就够。
+// ⛔ 无论谁跑，都必须能被 invalidate：刷新一次就起一个，绝不允许叠加。
+@property (nonatomic, strong) NSTimer *nbRollTimer;
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSArray<NSDictionary *> *rows;
 @property (nonatomic, strong) NSDictionary<NSString *, NSString *> *names;   // bid -> 显示名
@@ -194,6 +200,71 @@
 @end
 
 @implementation NotifyStatsViewController
+
+- (void)dealloc {
+    // ⛔ 少了这一句，定时器会继续持着 block 里的 weakSelf 跑完 0.3s；
+    // 虽然跑完自己会停，但"页面已经销毁、定时器还在推"是不该存在的状态。
+    [_nbRollTimer invalidate];
+}
+
+// v0.0.176：三个数一起从 0 滚到目标值（共 N 条 · 未读 M · 覆盖 K 个 App）。
+//
+// 🔴 只滚**三个计数**，不滚「最早」那个日期：日期是绝对时间，
+//    从某个过去时刻滚到另一个过去时刻，滚出来的全是**不存在的日期**。
+//    这类"看起来很酷但中间态是假的"的动画，本项目的判据口径是不接受的。
+//
+// 🔴 起新的一轮前**必须先掐掉上一轮**：切时间段会连续刷新，
+//    不掐就会有两个定时器同时往同一个 label 上写，数字抖成随机数。
+- (void)nbRollSummaryTotal:(NSInteger)total unread:(NSInteger)unread apps:(NSInteger)apps
+                     when:(NSString *)when {
+    [self.nbRollTimer invalidate];
+    self.nbRollTimer = nil;
+
+    // 🔴🔴 这里**不能用 `self.view.window` 当闸门**（我第一版就是这么写的，会永久关掉动效）。
+    //    唯一的调用路径是 `viewWillAppear:` → `reloadData` → 这里，而那一刻视图
+    //    **还没上屏**，`view.window` 必然是 nil ⇒ 每次都走"直接给终值"那条路，
+    //    屏幕上永远不会有滚动。而它和"本来就该这样"完全同形，谁也发现不了。
+    //    这就是本项目记过的那条：「用'到不了的轮次'当触发 = 交了等于没交」。
+    //    代价只是"页面不可见时也滚 0.3 秒"，可以接受 —— 那比"永远不滚"便宜得多。
+    if (!self.isViewLoaded) {
+        self.summaryLabel.text = [NSString stringWithFormat:
+                                  @"共 %ld 条 · 未读 %ld · 覆盖 %ld 个 App · 最早 %@",
+                                  (long)total, (long)unread, (long)apps, when];
+        return;
+    }
+
+    NSDate *t0 = [NSDate date];
+    const NSTimeInterval dur = 0.30;   // 轻快档：和列表那几处 0.22~0.24 是同一手感
+    __weak typeof(self) weakSelf = self;
+
+    self.nbRollTimer = [NSTimer scheduledTimerWithTimeInterval:(1.0 / 60.0)
+                                                       repeats:YES
+                                                         block:^(NSTimer *timer) {
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (!self2) { [timer invalidate]; return; }
+
+        CGFloat k = (CGFloat)(-[t0 timeIntervalSinceNow] / dur);
+        if (k >= 1.0) {
+            k = 1.0;
+            [timer invalidate];
+            self2.nbRollTimer = nil;      // 完成即释放，不留一个"已经停了的"定时器
+        }
+        // ease-out：前段快、收尾慢，和 `UIViewAnimationOptionCurveEaseOut` 观感一致。
+        // ⛔ 不用 powf：少引一个 math.h，三次方手写更清楚。
+        CGFloat inv = 1.0 - k;
+        CGFloat e = 1.0 - inv * inv * inv;
+
+        // `+0.5` 取整而不用 `lround`：少引一个 math.h，而且这三个数恒非负，
+        // 用不到 lround 对负数的处理。（⛔ 别改成 `(long)x` —— 那是截断，
+        // 计数会全程偏小，最后一下才跳到位，看起来像"卡了一下"。）
+        self2.summaryLabel.text = [NSString stringWithFormat:
+                                   @"共 %ld 条 · 未读 %ld · 覆盖 %ld 个 App · 最早 %@",
+                                   (long)((double)total * e + 0.5),
+                                   (long)((double)unread * e + 0.5),
+                                   (long)((double)apps * e + 0.5),
+                                   when];
+    }];
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -315,9 +386,9 @@
     if (total <= 0) {
         self.summaryLabel.text = @"这个时间窗里没有记录";
     } else {
-        self.summaryLabel.text = [NSString stringWithFormat:
-                                  @"共 %ld 条 · 未读 %ld · 覆盖 %ld 个 App · 最早 %@",
-                                  (long)total, (long)unread, (long)apps, when];
+        // v0.0.176：改成数字滚动。文案一字没动 —— 滚的只是中间那三个数，
+        // 「最早」那个日期是绝对时间，滚它没有意义（滚出来的是不存在的日期）。
+        [self nbRollSummaryTotal:total unread:unread apps:apps when:when];
     }
 
     NSInteger dim = self.dimSeg.selectedSegmentIndex;

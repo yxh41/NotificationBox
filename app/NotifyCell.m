@@ -12,6 +12,9 @@
 //    · 卡片比 cell 窄 12pt/侧 ⇒ 视觉上有"内缩"，更像现代列表
 //    · 所有内部布局都改成**相对卡片**算，这样横竖屏/分屏宽度变了也不用改常量
 @property (nonatomic, strong) UIView *cardView;
+// v0.0.176：整 App 静音时左缘那条琥珀竖条。懒建（大多数人一次都不会看到它），
+// 挂在 cardView 里 ⇒ 自动被圆角裁掉，长得就像卡片自带的边。
+@property (nonatomic, strong) UIView *nbMuteBar;
 @property (nonatomic, strong) UIView *iconBox;
 @property (nonatomic, strong) UIImageView *iconView;
 @property (nonatomic, strong) UILabel *letterLabel;
@@ -777,6 +780,14 @@ static void NBHapticFire(NBHapticKind kind) {
     //    只认负值的话，右滑到一半遇到布局重算（比如刚滚进屏幕、或大字体下重排），
     //    蓝块宽度会被打回 52 而卡片还停在几十 pt 外 ⇒ 露出一条灰缝。
     if (fabs(self.nbOffset) > 0.5) [self nbApplyOffset:self.nbOffset];
+
+    // v0.0.176：静音竖条的高度只能在这里算 —— 它是"贴着卡片左缘的一条"，
+    // 而卡片高度只在本方法里才确定。⛔ 不要在 `nbSetMutedLook:` 里算：
+    // 那个方法可能早于布局被调用（cellForRow 时 cardView 还是 0 高），
+    // 算出来是 1pt，之后卡片长高了也不会自己变 —— 症状是"竖条只有顶上一个小点"。
+    if (self.nbMuteBar) {
+        self.nbMuteBar.frame = CGRectMake(0.0, 0.0, 3.0, self.cardView.bounds.size.height);
+    }
 }
 
 // ================= v0.0.92：左滑删除 =================
@@ -1402,7 +1413,69 @@ static void NBHapticFire(NBHapticKind kind) {
     [self setNeedsLayout];
 }
 
+// ================= v0.0.176：整 App 静音后的视觉态 =================
+//
+// 只做两件事：卡片压暗 + 左缘一条琥珀竖条。
+//
+// 🔴 为什么不是"把图标划掉"（铃铛划线那种）：卡片上那个图标是 **App 自己的图标**，
+//    划掉它等于说"这个 App 坏了"，而静音只是"它的声音被关小了"。
+//    压暗（亮度）+ 琥珀色（可逆的提醒色）才是对得上的隐喻。
+//    ⛔ 也不用红色：红色在这个 App 里已经是"删除/危险"（红块、destructive），
+//       静音是可撤销的，抢那个语义会让用户不敢点。
+//
+// ⚠️ 只碰 `cardView.alpha` 和自建的竖条。`cardView.transform` / `iconBox.alpha`
+//    归 `nbApplyOffset:` 独占（位移的唯一出口），这条纪律见那个函数头上的注释。
+- (void)nbSetMutedLook:(BOOL)muted animated:(BOOL)animated {
+    if (!self.nbMuteBar) {
+        UIView *bar = [[UIView alloc] initWithFrame:CGRectZero];
+        bar.backgroundColor = [UIColor colorWithRed:(239.0 / 255.0)
+                                              green:(159.0 / 255.0)
+                                               blue:(39.0 / 255.0)
+                                              alpha:1.0];
+        bar.userInteractionEnabled = NO;
+        bar.hidden = YES;
+        // 挂在 cardView 里 ⇒ 自动被圆角裁掉，看着就是卡片自带的边，不用另做形状。
+        [self.cardView addSubview:bar];
+        self.nbMuteBar = bar;
+    }
+
+    CGFloat cardAlpha = muted ? 0.52 : 1.0;
+    CGFloat barAlpha  = muted ? 1.0 : 0.0;
+
+    if (!animated) {
+        // 直接回终态。⛔ 先掐在跑的动画：不然它下一帧还会把中间值写回来，
+        //    表现为"复用的行先亮一下再变暗"。
+        [self.cardView.layer removeAllAnimations];
+        [self.nbMuteBar.layer removeAllAnimations];
+        self.cardView.alpha = cardAlpha;
+        self.nbMuteBar.alpha = barAlpha;
+        self.nbMuteBar.hidden = !muted;
+        return;
+    }
+
+    // 取消静音时也要先显形再淡出：`hidden` 的视图**没有 alpha 动画**，
+    // 直接 `hidden = NO` 会是"啪一下出现"。
+    self.nbMuteBar.hidden = NO;
+    [UIView animateWithDuration:0.22
+                          delay:0.0
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState)
+                     animations:^{
+        self.cardView.alpha = cardAlpha;
+        self.nbMuteBar.alpha = barAlpha;
+    } completion:^(BOOL finished) {
+        if (!muted) self.nbMuteBar.hidden = YES;
+    }];
+}
+
 - (void)prepareForReuse {
+    // 🔴 v0.0.176：静音态**必须**在这里复位，理由和下面橙条/×N 徽章完全一样
+    //    （"凡是 setter 改过的外观，prepareForReuse 必须改回去"）。
+    //    不复位的症状比橙条更坏：一条被静音的 App 的暗卡片和琥珀竖条会串到
+    //    另一个**根本没被静音**的 App 的行上 ⇒ 用户以为"静音串到别的 App 了"，
+    //    而实际上静音表是对的，只是画面在说假话。
+    //    `animated:NO` ⇒ 直接回到终态，不要给复用池里的行留半个动画。
+    [self nbSetMutedLook:NO animated:NO];
     [super prepareForReuse];
     // 🔴 v0.0.70：卡片底色必须复位。
     //    复用池里如果留着一次"按下时的高亮色"（`setHighlighted:` 换的 tertiarySystemFill），

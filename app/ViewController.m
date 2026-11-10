@@ -158,6 +158,29 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // v0.0.71：顶部控制区的那张白卡片（时间分段/搜索/★+未读/两条提示都装在里面）
 @property (nonatomic, strong) UIView *topCard;
 @property (nonatomic, strong) UITableView *table;
+
+// ================= v0.0.176：列表动效（A 入场错落 / B 筛选横滑）=================
+//
+// 🔴🔴 为什么用「时间窗」而不是布尔开关来限制动画范围 —— 这是本节唯一需要解释的设计：
+//    `reloadData` **不同步**建 cell。它只把列表标记成"要重载"，真正的 `cellForRow` /
+//    `willDisplayCell` 发生在**之后某一次布局**里。于是：
+//      · 用 BOOL 开关 ⇒ 要么在 reloadData 后立刻清掉（cell 还没建，动画永远不播），
+//        要么不清（以后每次滚动进来的 cell 都播一遍，列表看起来一直在抖）。
+//      · `dispatch_async` 清标志也不行：主队列块的执行时机和 CA 提交/布局的先后
+//        没有保证（有时块先跑，动画就又没了）。
+//    ⇒ 给一个 **0.30s 的窗口**：窗口内进入屏幕的 cell 播动画，之后的不播。
+//      这段窗口刚好覆盖 `reloadData` 后那一次布局，而人手滚一屏远不止 0.30s，
+//      所以不会出现"滚动时一路抖"。这是**有意的、有界的**取舍，不是凑数。
+@property (nonatomic) CFAbsoluteTime nbEntranceUntil;   // 入场错落的截止时刻
+@property (nonatomic) CFAbsoluteTime nbSlideUntil;      // 筛选横滑的截止时刻
+@property (nonatomic) CGFloat nbSlideDX;                // 横滑方向（±26pt，0 = 不滑）
+// 上一次的段号 —— 用来判断用户是"往左换档"还是"往右换档"，决定内容从哪一侧进来。
+// 🔴 不能用 `timeSeg.selectedSegmentIndex` 自己跟自己比：`onTime:` 被调用时段号**已经改完了**。
+@property (nonatomic) NSInteger nbPrevTimeIdx;
+@property (nonatomic) NSInteger nbPrevUnreadIdx;
+// 入场错落是否已经播过（本次进程内只播一次，见 viewWillAppear:）。
+@property (nonatomic) BOOL nbEntranceDone;
+
 @property (nonatomic, strong) NSArray<NSDictionary *> *items;
 // 🔴 v0.0.163：按天分组的**唯一**数据源 —— 每项 `@{@"title": 日期标题, @"items": 这一天的行}`。
 //    标题与行**一对一捆在同一个字典里**，不另存一份平行的 titles 数组：
@@ -410,6 +433,11 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)nbOverviewSelectBundle:(nullable NSString *)bid;
 // v0.0.37：全部 / 只看未读（自己的分段控件，替掉没渲染出来的系统 scope bar）
 - (void)onUnread:(UISegmentedControl *)seg;
+// v0.0.176：动效布防。两个入口分开写而不是合成一个带 flag 的 —— 它们的**触发条件不同**：
+//   入场错落只跟"整屏重建"有关，横滑只跟"用户换了哪一档"有关，
+//   合成一个就得在里面判断"这次是哪一种"，那种判断最容易在新增入口时漏掉一个分支。
+- (void)nbArmEntrance;
+- (void)nbArmSlideFromIndex:(NSInteger)from toIndex:(NSInteger)to;
 // v0.0.49：★ 只看标星开关；以及"有没有任何规则带 ★ 动作"（★ 视图为空时区分
 //    "这个范围没有标星的" 和 "根本没有任何规则会标星"，后者必须点醒用户去建规则）。
 - (void)onStar:(id)sender;
@@ -538,6 +566,8 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    写盘失败、条目超上限、值超上限——三条路都返回 YES 给保存函数但在判定侧是"不生效"。
 - (void)nbMuteRow:(NSDictionary *)row kind:(NBMuteKind)kind;
 - (void)nbUnmuteRow:(NSDictionary *)row;
+// v0.0.176：把某个 App 的静音态动画铺到所有可见行（见实现里的注释：为什么不是只动一行）。
+- (void)nbAnimateMuteLookForBundle:(nullable NSString *)bid muted:(BOOL)muted;
 // 「打开」的落点。🔴 只发请求 + toast，**绝不 present** ——
 //    这个动作是在菜单正在收起的瞬间执行的，此时 present 会被系统静默丢掉。
 - (void)nbOpenAppWithBundle:(NSString *)bundleId;
@@ -678,6 +708,15 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // 不会白 reload 一次（否则每次进入 App 都闪一下）。
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    // v0.0.176：入场错落**只在本次启动的第一次出现播一次**。
+    // 🔴 为什么不挂在 `loadData` 里：`refreshIfChanged`（前台回前台、库变了）、
+    //    删除、标已读、批量操作全都走 `loadData` —— 那样每次回到这一页、
+    //    甚至从详情页返回，列表都会重新飞一遍。那不叫动效，那叫抖。
+    //    ⇒ 布防点只放在**用户主动换内容**的入口（onIcon / 总览卡片 / ★）和这里一次。
+    if (!self.nbEntranceDone) {
+        self.nbEntranceDone = YES;
+        [self nbArmEntrance];
+    }
     [self refreshIfChanged];
     // v0.0.99：每次进列表都请 tweak 扫一次通知中心现状。
     // 🔴 放在 `refreshIfChanged` **之后**：那个只在库变了才重查，而"通知中心变了"
@@ -2123,10 +2162,19 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     NSArray *list = [@[@"全部"] arrayByAddingObjectsFromArray:self.bundles];
     NSString *bid = list[sender.tag];
     self.filterBundle = [bid isEqualToString:@"全部"] ? nil : bid;
+    // v0.0.176：换了 App 筛选 = 整屏内容被换掉 ⇒ 走入场错落。
+    // 🔴 布防点必须落在**用户动作的入口**，不能落在 `loadData` 里 —— 见 `nbArmEntrance` 的注释。
+    [self nbArmEntrance];
     [self loadData];
 }
 
 - (void)onTime:(UISegmentedControl *)seg {
+    // v0.0.176：先按"从哪一档换到哪一档"布防，再重查。
+    // 🔴 布防必须在 `loadData` **之前**：动画的触发点在 `willDisplayCell:`，
+    //    而那一次布局是由 `loadData` 里的 `reloadData` 引出来的。
+    NSInteger to = seg.selectedSegmentIndex;
+    [self nbArmSlideFromIndex:self.nbPrevTimeIdx toIndex:to];
+    self.nbPrevTimeIdx = to;
     [self loadData];
 }
 
@@ -2240,6 +2288,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    并且排在 `reloadData` **之前** —— 换 `tableHeaderView` 会改列表的 contentSize，
     //    和 reloadData 抢同一帧时，滚动位置会被夹一次（症状是"刷新后列表自己跳了一下"）。
     [self nbRebuildOverview];
+
     [self.table reloadData];
     [self updateEmptyView];
     // v0.0.98：残留提示条。放在这里是因为它依赖 `applyAliveFilter` 刚算出来的
@@ -3200,6 +3249,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     //    只改 hidden 不重布局的话，按钮会压在分段控件上。
     self.markAllBtn.hidden = !self.unreadOnly;
     [self.view setNeedsLayout];
+    // v0.0.176：同理，布防排在 `loadData` 之前。段号顺序是「全部(0) → 只看未读(1)」，
+    // 所以去右边那档时内容从右侧进来，回来时从左侧。
+    NSInteger to = seg.selectedSegmentIndex;
+    [self nbArmSlideFromIndex:self.nbPrevUnreadIdx toIndex:to];
+    self.nbPrevUnreadIdx = to;
     [self loadData];
 }
 
@@ -3211,6 +3265,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 - (void)onStar:(id)sender {
     self.starOnly = !self.starOnly;
     self.starBtn.selected = self.starOnly;
+    // v0.0.176：★ 也是一个"整屏内容被换掉"的入口，同样走入场错落。
+    [self nbArmEntrance];
     [self loadData];
 }
 
@@ -3466,6 +3522,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     if (self.filterBundle.length && [self.filterBundle isEqualToString:bid]) return;
 
     self.filterBundle = bid;
+    // v0.0.176：和 `onIcon:` 一样 —— 换筛选 = 整屏内容被换掉 ⇒ 入场错落。
+    [self nbArmEntrance];
     [self loadData];
 
     // 换筛选后列表要回到顶部 —— 否则用户点的是"抖音 11 条"，
@@ -3476,6 +3534,25 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
                           atScrollPosition:UITableViewScrollPositionTop
                                   animated:NO];
     }
+}
+
+#pragma mark - v0.0.176 动效布防
+
+// 入场错落：整屏重建后 0.30s 内进入屏幕的行，按行号错开淡入上浮。
+- (void)nbArmEntrance {
+    self.nbEntranceUntil = CFAbsoluteTimeGetCurrent() + 0.30;
+}
+
+// 筛选横滑：告诉列表"内容整体从哪一侧进来"。
+- (void)nbArmSlideFromIndex:(NSInteger)from toIndex:(NSInteger)to {
+    // 换到更靠后的那一档 ⇒ 内容从右侧进来；换回前面 ⇒ 从左侧。
+    // 🔴 `to == from` 时**必须显式置 0**：不清的话上一次的方向会留在属性里，
+    //    于是下一次由别的原因（点图标筛 App、清空搜索框）触发的 loadData
+    //    会莫名其妙地带上一次的方向滑一下 —— 而那次根本没有"换档"这回事。
+    if (to > from)      self.nbSlideDX = 26.0;
+    else if (to < from) self.nbSlideDX = -26.0;
+    else                self.nbSlideDX = 0.0;
+    self.nbSlideUntil = CFAbsoluteTimeGetCurrent() + 0.30;
 }
 
 #pragma mark - UITableView
@@ -3494,6 +3571,49 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     if (section < 0 || section >= (NSInteger)self.sectionModels.count) return nil;
     id t = self.sectionModels[section][@"title"];
     return [t isKindOfClass:[NSString class]] ? (NSString *)t : nil;
+}
+
+// v0.0.176：列表动效的**唯一执行点**。
+//
+// 🔴 为什么放在 `willDisplayCell:` 而不是 `cellForRow:`：`cellForRow` 只负责"配内容"，
+//    它被调用时 cell 往往还没被加到窗口上；而 `willDisplayCell` 是"它就要上屏了",
+//    此刻设初始值再动画，第一帧就已经是初始状态，看不到"先闪一下正常状态再跳回去"。
+//
+// ⚠️ 两个已知边界，都是有意接受而不是没想到：
+//   ① 动画期间如果整表重载（比如 0.2s 内连点两次筛选），前一次的动画会被
+//      `reloadData` 打断 —— 但**不会留下错值**：终态（identity / alpha 1）在动画
+//      开始那一刻就已经写进 model 了，被打断只是"没看清"，不是"停在中途"。
+//   ② `row < 16` 是第二道闸：万一将来有人把窗口调大，也不至于让一屏几十行一起播。
+- (void)tableView:(UITableView *)tableView
+  willDisplayCell:(UITableViewCell *)cell
+forRowAtIndexPath:(NSIndexPath *)indexPath {
+    // 复用池里回来的 cell 身上可能还挂着上一条的 transform / alpha —— 先归零。
+    // 🔴 这一步**必须无条件做**，不能只在"要播动画"时做：不播动画的那些行
+    //    正需要它来擦掉残留。
+    cell.transform = CGAffineTransformIdentity;
+    cell.alpha = 1.0;
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    BOOL sliding  = (self.nbSlideDX != 0.0) && (now < self.nbSlideUntil);
+    BOOL entrance = (!sliding) && (now < self.nbEntranceUntil) && (indexPath.row < 16);
+    if (!sliding && !entrance) return;
+
+    CGFloat dx = sliding ? self.nbSlideDX : 0.0;
+    CGFloat dy = entrance ? 12.0 : 0.0;
+    // 错落节奏：每行 35ms，最多累计 0.20s。再长就会有人觉得"卡"。
+    NSTimeInterval delay = entrance ? MIN(indexPath.row * 0.035, 0.20) : 0.0;
+
+    cell.transform = CGAffineTransformMakeTranslation(dx, dy);
+    cell.alpha = 0.0;
+    [UIView animateWithDuration:0.24
+                          delay:delay
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState |
+                                 UIViewAnimationOptionAllowUserInteraction)
+                     animations:^{
+        cell.transform = CGAffineTransformIdentity;
+        cell.alpha = 1.0;
+    } completion:nil];
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -3548,6 +3668,20 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 它是 cell 的"默认可见装饰"里唯一一个由外部决定显隐的，
     // 漏调一次就是"上一条的橙条留在这一行上"（复用池串味的经典形态）。
     [c setAliveTag:[self aliveStateForRow:d]];
+
+    // v0.0.176：整 App 静音态（卡片压暗 + 左缘琥珀竖条）。
+    // 🔴 **必须无条件调**（静音时传 YES、没静音时也要传 NO）——
+    //    和 `setAliveTag:` 完全同一条纪律：它是由外部决定的"默认外观"，
+    //    漏调一次就是"上一条的暗卡片 + 竖条留在这一行上"（复用池串味的经典形态，
+    //    而且症状极具误导性：用户会以为静音串到别的 App 上去了）。
+    // 🔴 判据直接问 `NotifyFilter`，**不在这里另写一份静音表判断** ——
+    //    tweak 那边丢弃通知用的是同一个函数。两边各写一份的话，
+    //    "界面显示已静音但通知照弹"（或反过来）就成了没法查的双真值。
+    [c nbSetMutedLook:[NotifyFilter shouldDropForMute:(bid.length ? bid : @"")
+                                                  now:nil
+                                               reason:NULL
+                                              problem:NULL]
+             animated:NO];
 
     // ---------- v0.0.92：左滑删除的两个回调（自绘，见 NotifyCell.h） ----------
     // 🔴 捕获 **rowId**：不捕获 indexPath（滚动/删除后就失效），也不捕获字典快照
@@ -3953,6 +4087,30 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 
     NSString *name = [self appNameForBundle:bid];
     [self nbToast:[NSString stringWithFormat:@"%@ 已静音 · %@", name.length ? name : bid, why ?: @""]];
+
+    // v0.0.176：熄铃。写在**回读校验通过之后** —— 动画表示"生效了"，
+    // 所以绝不能排在 `ok` 判断之前：那样写盘失败也会画一遍熄灯，
+    // 用户看到的就是"已经静音了"，而实际通知照弹（本项目最贵的那类假读数）。
+    [self nbAnimateMuteLookForBundle:bid muted:YES];
+}
+
+// v0.0.176：把某个 App 的静音态动画铺到**所有可见行**上。
+// 🔴 为什么不是"只动刚点的那一行"：静音是按 App 的，同屏可能有 5 行属于它。
+//    只亮一行的话，用户滚一下就会看到另外 4 行还是亮的，第一反应是"静音没生效"。
+// 🔴 用 `cellForRowAtIndexPath:` 取 cell（而不是自己遍历可见 cell 的 subviews 猜类别）：
+//    它是唯一"行 → cell"的官方映射，猜出来的东西在分组/复用时会对错行。
+- (void)nbAnimateMuteLookForBundle:(NSString *)bid muted:(BOOL)muted {
+    if (!bid.length) return;
+    for (NSIndexPath *ip in [self.table indexPathsForVisibleRows]) {
+        NSDictionary *d = [self nbItemAtIndexPath:ip];
+        if (![d isKindOfClass:[NSDictionary class]]) continue;
+        id b = d[@"bundle"];
+        if (![b isKindOfClass:[NSString class]] || ![b isEqualToString:bid]) continue;
+        UITableViewCell *cell = [self.table cellForRowAtIndexPath:ip];
+        if ([cell isKindOfClass:[NotifyCell class]]) {
+            [(NotifyCell *)cell nbSetMutedLook:muted animated:YES];
+        }
+    }
 }
 
 // 取消静音。只删本 App 那一条 —— 但 `"*"`（全部 App）若还在生效，它照旧静音，
@@ -3994,9 +4152,13 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     NSString *why = nil;
     if ([NotifyFilter shouldDropForMute:@"*" now:nil reason:&why problem:NULL]) {
         [self nbToast:[NSString stringWithFormat:@"已取消本 App · 但全局静音仍在（%@）", why ?: @""]];
+        // v0.0.176：**故意不撤熄灯效果** —— 全局静音还在，这些行确实还被压着，
+        // 界面跟着"变亮"就是画面在说假话。判据和 tweak 丢弃通知用的是同一个函数。
         return;
     }
     [self nbToast:@"已取消静音"];
+    // v0.0.176：亮灯。同样排在回读校验之后（没真删掉就不许装作亮起来了）。
+    [self nbAnimateMuteLookForBundle:bid muted:NO];
 }
 
 // 标题 / 正文 / 副标题按顺序拼，空的跳过。

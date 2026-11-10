@@ -68,6 +68,21 @@ NS_ASSUME_NONNULL_BEGIN
 //    调晚了角标会先用着默认蓝、再被刷掉（表现为角标闪一下颜色）。
 - (void)setBrandColor:(nullable UIColor *)brand;
 
+// ================= v0.0.176：整 App 被临时静音时的视觉态 =================
+// `muted` ⇒ 卡片整体压暗 + 左缘一条琥珀竖条；`animated` ⇒ 0.22s 过渡（熄灯感）。
+//
+// 🔴 为什么这个状态必须落在 **cell** 上，而不是"VC 给某一行的 cell 加个遮罩"：
+//    静音是**按 App** 的（`NotifyFilter shouldDropForMute:` 的唯一判据就是 bundleId），
+//    同屏可能有 5 行属于同一个 App。只给"刚点的那一行"做效果 ⇒ 滚出去再滚回来就没了，
+//    另外 4 行还亮着，用户根本看不出"这个 App 现在不响"。
+//    ⇒ 由 `cellForRow` 每次**无条件**刷（和 `setAliveTag:` 同一条纪律：
+//      "凡是 setter 改过的外观，prepareForReuse 必须改回去"）。
+//
+// ⚠️ 只动 `cardView.alpha` 和自建的那条竖条，**不碰 `cardView.transform` / `iconBox`**
+//    —— 那几样归 `nbApplyOffset:` 独占（位移的唯一出口），碰了就会出现
+//    "滑到一半卡片自己变亮"这类没法解释的闪动。
+- (void)nbSetMutedLook:(BOOL)muted animated:(BOOL)animated;
+
 // ================= v0.0.92：自定义左滑删除 =================
 // 🔴 为什么不用系统的 `trailingSwipeActionsConfigurationForRowAtIndexPath:`：
 //    它把**整个 cell**（含 `contentView`）一起左移，而图标就挂在 `contentView` 上
