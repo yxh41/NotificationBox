@@ -1034,6 +1034,101 @@ def _(c):
             "未读/★/×N/静音都折进唯一出口，traits 与 a11y 元素身份未被覆盖")
 
 
+@chk("I6", "统计页：占比与条长各用各的分母、条长只传比例、图表可念、页头重设不递归", baseline="red")
+def _(c):
+    """🔴 v0.0.181 新增。守的是统计页的**口径**，不是长相。
+
+       这一版把统计页整个重写了（KPI 卡 + 自绘柱状图 + 品牌色排行），
+       而统计页最容易错的从来不是画得好不好看，是**两个分母混用**：
+         · 「占比 25.5%」的分母必须是**本时间窗总条数**（`grandTotal`）；
+         · 「条形长度」的分母必须是**本屏最大值**（`max`，这样第一名满格）。
+       写反了屏幕上完全看不出来 —— 第一名会显示 100%，而真实占比可能是 4%。
+       本项目栽过的同族事故（v0.0.37：红点按全库算、列表按时间窗查）就在这个位置。
+
+       另外三条都是"看不见的错"：
+         · **条长用像素宽**时，cell 刚 dequeue 那一下 `barBox.bounds` 还是 0
+           ⇒ 首屏几行条形画不出来，滚一下再回来又正常（时序型 bug，最难复现）；
+         · **`tableHeaderView` 的高度不会自动跟随内容**，改完 frame 必须重新赋一次，
+           而重新赋值会触发 layout ⇒ 没有 `inSync` 就是死循环（表现为切一下维度就卡住）；
+         · **日期解析不设 `en_US_POSIX`**：系统日历是佛历/和历时 `dateFromString:` 会错，
+           而 SQL 侧 `strftime` 输出的永远是公历 —— 两边不对齐，星期几就会标错一天。
+
+       ⚠️🔴 判据域用 `strip_comments()`：要判的「总条数」「未读」都是字符串字面量。
+    """
+    raw = c["files"].get("app/NotifyStatsViewController.m", "")
+    stats = strip_comments(raw)
+    store = strip_comments(c["files"].get("NotifyStore.m", ""))
+    problems = []
+
+    # ---------- ① KPI 卡：前两格是固定语义，切维度不许变 ----------
+    if "NBKpiCard" not in stats:
+        problems.append("KPI 卡不存在（退回一行小字的形态）")
+    for lit in ("总条数", "未读"):
+        if lit not in stats:
+            problems.append("KPI 里没有「%s」" % lit)
+
+    # ---------- ② 两个分母必须分开 ----------
+    body = func_body(stats, "- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:")
+    if not body:
+        problems.append("cellForRow 找不到 —— 锚点失效")
+    else:
+        if "grandTotal" not in body:
+            problems.append("占比没走 grandTotal（分母必须是本时间窗总数）")
+        m = re.search(r"share\s*=[^;]{0,240};", body)
+        if not m:
+            problems.append("找不到 share 的赋值（占比没算？）")
+        elif re.search(r"self\s*\.\s*max", m.group(0)):
+            problems.append("占比错用 self.max 当分母（第一名会显示 100%，真实占比被藏掉）")
+        if "ratio" not in body:
+            problems.append("条长没传比例（像素宽必须在 cell 里算）")
+        if "barFill.frame" in body:
+            problems.append("cellForRow 直接写 barFill.frame（那一刻槽宽可能还是 0 ⇒ 首屏条形画不出来）")
+
+    # ---------- ③ 像素宽只许出现在 cell 内部两处 ----------
+    n_fill = stats.count("barFill.frame")
+    if n_fill != 2:
+        problems.append("barFill.frame 出现 %d 次（只许 2 次：layoutSubviews 算宽度、prepareForReuse 归零）"
+                        % n_fill)
+
+    # ---------- ④ 图表必须念得出来（v0.0.180 的教训） ----------
+    if stats.count("chart.summary") < 2:
+        problems.append("图表没设 summary（VoiceOver 扫过去是一块空白，两种维度各要一处）")
+
+    # ---------- ⑤ 页头重设必须有防递归闸门，且 YES/NO 成对 ----------
+    if not re.search(r"if\s*\(\s*self\s*\.\s*inSync\s*\)\s*return", stats):
+        problems.append("没有 `if (self.inSync) return`（重设 tableHeaderView 会递归）")
+    if stats.count("self.inSync =") < 2:
+        problems.append("inSync 只设了一边（YES/NO 必须成对，否则一次重设就永久卡住不再更新）")
+
+    # ---------- ⑥ 汇总必须一条 SQL 出齐，且空串不算"有正文" ----------
+    # 🔴🔴 判据域**必须收进 `statsSummarySince:` 的函数体**：整个 NotifyStore.m 里
+    #    `MAX(ts)` 出现 4 次（别处的查询也在用）⇒ 拿全文判「有没有 MAX(ts)」
+    #    等于没判，改动这个函数照样绿。实测：M47 第一版就恒绿，真因就是这个。
+    sum_body = func_body(store, "+ (NSDictionary *)statsSummarySince:")
+    if not sum_body:
+        problems.append("statsSummarySince: 找不到 —— 锚点失效")
+    else:
+        if "MAX(ts)" not in sum_body:
+            problems.append("汇总没取 MAX(ts)（算不出最晚一条 / 真实跨度）")
+        if "message<>''" not in sum_body:
+            problems.append("「有正文」没排除空串（库里空正文有 NULL 和空串两种）")
+        if sum_body.count("SELECT COUNT(*)") != 1:
+            problems.append("汇总的 SELECT 不是一条（六个值必须一次出齐，否则口径会分裂）")
+
+    # ---------- ⑦ 按天补齐：上限 + 时区对齐 ----------
+    if "maxFill" not in store:
+        problems.append("按天没有补齐上限（全库 200 天会把列表撑成 200 行）")
+    if not re.search(r"fmt\s*\.\s*timeZone\s*=", store):
+        problems.append("补齐用的日期格式没设 timeZone（和 SQL 的 'localtime' 对不上 ⇒ 有记录的天也会写成 0）")
+
+    # ---------- ⑧ 网页日历陷阱：解析必须用 POSIX locale ----------
+    if "en_US_POSIX" not in stats:
+        problems.append("解析日期没设 en_US_POSIX（佛历/和历系统下星期几会算错一天）")
+
+    return (not problems, "；".join(problems) if problems else
+            "两个分母分离，条长只传比例，图表可念，页头重设不递归")
+
+
 # ───────────────────────────── 跑判据 ─────────────────────────────
 
 def run_all(ctx, verbose=True):
@@ -1230,6 +1325,40 @@ MUTATIONS = [
     ("M44 复用直接写 timeLabel.text（nbTimeText 残留上一条）", "app/NotifyCell.m",
      "    [self setTimeText:nil];",
      "    self.timeLabel.text = nil;", "I5"),
+
+    # ===== v0.0.181：统计页（I6）=====
+    # 🔴 两个分母各一条变异：写反的表现完全不同（第一名恒 100% vs 条长算不出），
+    #    共用一条会在"只错一个"时漏掉。
+    ("M45 条长改回像素宽（cell 刚 dequeue 时槽宽是 0 ⇒ 首屏没条形）", "app/NotifyStatsViewController.m",
+     "    c.ratio = (self.max > 0) ? ((CGFloat)n / (CGFloat)self.max) : 0;",
+     "    c.barFill.frame = CGRectMake(0, 0, 100, 6);\n"
+     "    c.ratio = (self.max > 0) ? ((CGFloat)n / (CGFloat)self.max) : 0;", "I6"),
+    ("M46 占比错用本屏最大值当分母（第一名恒 100%）", "app/NotifyStatsViewController.m",
+     "        ? ((CGFloat)n * 100.0 / (CGFloat)self.grandTotal) : 0;",
+     "        ? ((CGFloat)n * 100.0 / (CGFloat)MAX((NSInteger)1, self.max)) : 0;", "I6"),
+    ("M47 汇总不取 MAX(ts)（算不出真实跨度）", "NotifyStore.m",
+     '        @"COUNT(DISTINCT bundle), MIN(ts), MAX(ts), "',
+     '        @"COUNT(DISTINCT bundle), MIN(ts), MIN(ts), "', "I6"),
+    ("M48 有正文数不排空串（NULL 和空串是两回事）", "NotifyStore.m",
+     '@"SUM(CASE WHEN message IS NOT NULL AND message<>\'\' THEN 1 ELSE 0 END) "',
+     '@"SUM(CASE WHEN message IS NOT NULL THEN 1 ELSE 0 END) "', "I6"),
+    ("M49 补齐用的日期格式不设时区（和 SQL 的 localtime 对不上）", "NotifyStore.m",
+     "    fmt.timeZone = [NSTimeZone localTimeZone];",
+     "    ;", "I6"),
+    ("M50 日期解析不设 en_US_POSIX（佛历系统下星期几算错）", "app/NotifyStatsViewController.m",
+     '            in.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];',
+     "            ;", "I6"),
+    # 🔴🔴 变异必须**改行为/改字面**，不能只改可达性。
+    #    第一版写的是 `if (NO) self.header.chart.summary = …`，字面还在原地
+    #    ⇒ 判据按 `chart.summary` 计数，数出来还是 2，**恒绿**。
+    #    （这正是 MEMORY 里那条「变异要改行为，不能只改可达性/字面」，
+    #      180 刚记过、181 自己又踩了一次。）
+    ("M51 按天图表改设到 accessibilityLabel（summary 少一处 ⇒ 图表念不出）", "app/NotifyStatsViewController.m",
+     "    self.header.chart.summary = (peakN > 0 && peakIdx >= 0)",
+     "    self.header.chart.accessibilityLabel = (peakN > 0 && peakIdx >= 0)", "I6"),
+    ("M52 去掉 inSync 闸门（重设 tableHeaderView 递归）", "app/NotifyStatsViewController.m",
+     "    if (self.inSync) return;",
+     "    ;", "I6"),
 ]
 
 

@@ -254,14 +254,24 @@ typedef NS_ENUM(NSInteger, NBSyncClearOutcome) {
                                        beforeTs:(NSTimeInterval)beforeTs
                                           limit:(NSInteger)limit;
 // 按时间桶分组。`byHour` = YES 时返回 **24 个桶（含 0 条的）**，key 是 @"hour"（0~23）；
-// NO 时按天，key 是 @"day"（yyyy-MM-dd），只回有记录的天。
+// NO 时按天，key 是 @"day"（yyyy-MM-dd）。
 // 🔴 用 `localtime`：库里存的是 unix 时间戳，**不转换会得到 UTC 的小时**
 //    ⇒ 用户看到"我明明晚上收到的，却算在凌晨"。
+// 🔴🔴 v0.0.181：按天**也补齐空白日**（原来只回有记录的天）。不补的话，
+//    选「30 天」而中间空了 12 天时柱状图只剩 18 根、横轴被压缩成连续的 18 格
+//    ⇒ 图上看起来"天天都有"。「没有」和「这一格不存在」必须是两种信息。
+// 🔴 `maxFill`：按天时只保留**最近 maxFill 天**（≤0 = 不补齐，返回有记录的天）。
+//    护栏的意义是把"全库 200 天"挡在列表外 —— 200 行没人看得下去。
+//    `byHour` 忽略这个参数（恒补 24）。
 + (NSArray<NSDictionary *> *)statsBucketsSince:(NSTimeInterval)since
                                      beforeTs:(NSTimeInterval)beforeTs
-                                       byHour:(BOOL)byHour;
-// 统计页顶部那一行：总条数、未读、覆盖多少个 App、最早一条的时间。
-// 🔴 返回的字典里 key 固定为 total / unread / apps / earliest（earliest 是 NSDate 或 nil）。
+                                       byHour:(BOOL)byHour
+                                      maxFill:(NSInteger)maxFill;
+// 统计页顶部 KPI：总条数、未读、覆盖多少个 App、**最早 / 最晚**一条、有正文的条数。
+// 🔴 返回字典的 key 固定为 total / unread / apps / withBody（都恒有），
+//    以及 earliest / latest（NSDate，空表时**这两个键不存在**，不是 nil 值）。
+// 🔴 六个值全在**同一条 SQL** 里出：KPI 卡上「总条数」和「有正文 78%」并排摆着，
+//    分两条查就可能出现两个口径，加起来超过 100%。
 + (NSDictionary *)statsSummarySince:(NSTimeInterval)since beforeTs:(NSTimeInterval)beforeTs;
 
 // 设置（App 侧的**唯一**读写入口；tweak 侧读走 NotifyCommon.h 的 NBLoadSettings）

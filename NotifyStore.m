@@ -775,7 +775,8 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
 
 + (NSArray<NSDictionary *> *)statsBucketsSince:(NSTimeInterval)since
                                      beforeTs:(NSTimeInterval)beforeTs
-                                       byHour:(BOOL)byHour {
+                                       byHour:(BOOL)byHour
+                                      maxFill:(NSInteger)maxFill {
     sqlite3 *db = [self openDB];
     if (!db) return @[];
     NSString *expr = byHour
@@ -793,7 +794,19 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         return @{ @"day": (s ? [NSString stringWithUTF8String:s] : @""),
                   @"total": @(sqlite3_column_int(st, 1)) };
     });
+    // 🔴 v0.0.181：按天补齐要知道"最早一条是哪天"，而「全部」窗口时 `since` 是 0。
+    //    这里在**同一个连接**里顺手查一次 MIN(ts)，不为一个数再 openDB 一遍
+    //    （本文件顶上那条注释已经算过这笔账：200 个 App 就是 200 次建表检查）。
+    double dbMinTs = 0;
+    if (!byHour && since <= 0) {
+        sqlite3_stmt *ms = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT MIN(ts) FROM notifications;", -1, &ms, NULL) == SQLITE_OK) {
+            if (sqlite3_step(ms) == SQLITE_ROW) dbMinTs = sqlite3_column_double(ms, 0);
+            sqlite3_finalize(ms);
+        }
+    }
     sqlite3_close(db);
+
     if (byHour) {
         // 🔴 24 个桶**补齐**：SQL 的 GROUP BY 只回有记录的小时。
         //    不补的话，"凌晨 3 点一条都没有"这个信息在界面上就变成了"那一格不存在"，
@@ -806,7 +819,53 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         }
         return out;
     }
-    return rows;
+
+    // ================= v0.0.181：按天也要补齐 =================
+    // 🔴🔴 为什么必须补：原来只回**有记录的天**。选「30 天」而中间空了 12 天时，
+    //    柱状图只剩 18 根、**横轴被压缩成连续的 18 格** ⇒ 图上看起来"天天都有"，
+    //    而真实情况是一半天数一条都没有。这和小时那 24 个桶是同一条纪律：
+    //    "没有"和"这一格不存在"在用户眼里是两回事。
+    //
+    // 🔴 `maxFill` 是**防止一个 200 天跨度的全库把列表撑成 200 行**：
+    //    > 0 时只保留**最近 maxFill 天**（柱状图看趋势，最近的够用），
+    //    ≤ 0 时不补齐（返回原始的"有记录的天"）。
+    NSTimeInterval winEnd = (beforeTs > 0) ? beforeTs : [[NSDate date] timeIntervalSince1970];
+    NSTimeInterval winStart = (since > 0) ? since : dbMinTs;
+    NSMutableDictionary *dayMap = [NSMutableDictionary dictionary];
+    for (NSDictionary *d in rows) {
+        if (d[@"day"]) dayMap[d[@"day"]] = d[@"total"];
+    }
+    if (winStart <= 0 || winEnd <= winStart) return rows;      // 空库 / 窗口无效：原样交回
+    if (maxFill <= 0) return rows;
+
+    // 🔴 天数的**估算**只用来判"要不要裁窗口"，真正的遍历交给 NSCalendar：
+    //    86400 除法在有夏令时的时区会差一小时，算出来的天数可能多一天或少一天。
+    //    估算这里只用于和 maxFill 比大小，差一天不影响结论。
+    double approxDays = (winEnd - winStart) / 86400.0;
+    if (approxDays > (double)maxFill) {
+        winStart = winEnd - (double)(maxFill - 1) * 86400.0;
+    }
+
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"yyyy-MM-dd";
+    // 🔴 必须和 SQL 里的 `'localtime'` 同一时区。两边不一致时，
+    //    补齐的键和查询回来的键**对不上** ⇒ 有记录的那天也会被写成 0。
+    fmt.timeZone = [NSTimeZone localTimeZone];
+
+    NSDate *d = [cal startOfDayForDate:[NSDate dateWithTimeIntervalSince1970:winStart]];
+    NSDate *dEnd = [cal startOfDayForDate:[NSDate dateWithTimeIntervalSince1970:winEnd]];
+    NSMutableArray *out = [NSMutableArray array];
+    // 🔴 硬上限防死循环：`dateByAddingUnit:` 万一因为时区跳变不前进，
+    //    没有这个闸门就是"切一下维度风扇狂转"。maxFill 也是同一量级，取 400 够宽。
+    NSInteger guard = 0;
+    while (d && [d compare:dEnd] != NSOrderedDescending && guard++ < 400) {
+        NSString *k = [fmt stringFromDate:d];
+        if (k.length) [out addObject:@{ @"day": k, @"total": dayMap[k] ?: @0 }];
+        d = [cal dateByAddingUnit:NSCalendarUnitDay value:1 toDate:d options:0];
+    }
+    // 补出来一个都没有（比如日历算不出日期）⇒ 退回原始行，别交一张空表
+    return out.count ? out : rows;
 }
 
 // ---------- v0.0.84：盒子侧的重复量（只读，三个聚合查询）----------
@@ -883,9 +942,18 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
 + (NSDictionary *)statsSummarySince:(NSTimeInterval)since beforeTs:(NSTimeInterval)beforeTs {
     sqlite3 *db = [self openDB];
     if (!db) return @{};
+    // v0.0.181：补两列 —— `MAX(ts)`（= 最晚一条）和「有正文的条数」。
+    // 🔴 为什么都在**同一条 SQL** 里出：KPI 卡上「总条数」和「有正文 78%」并排摆着，
+    //    分两条查就有可能出现"A 口径的总数 + B 口径的正文数"，两个数加起来超过 100%。
+    //    本项目的口径纪律是「同一屏里互相解释的两个指标必须同口径」。
+    // 🔴 `message<>''` 要显式判空串：库里正文为空时有的行是 NULL、有的是空串
+    //    （写入路径上 `message.length ? message : nil` 只挡了前者），
+    //    只判 `IS NOT NULL` 会把空串算成"有正文"。
     NSMutableString *sql = [NSMutableString stringWithString:
         @"SELECT COUNT(*), SUM(CASE WHEN read=0 THEN 1 ELSE 0 END), "
-        @"COUNT(DISTINCT bundle), MIN(ts) FROM notifications WHERE 1=1"];
+        @"COUNT(DISTINCT bundle), MIN(ts), MAX(ts), "
+        @"SUM(CASE WHEN message IS NOT NULL AND message<>'' THEN 1 ELSE 0 END) "
+        @"FROM notifications WHERE 1=1"];
     if (since > 0) [sql appendString:@" AND ts>=?"];
     if (beforeTs > 0) [sql appendString:@" AND ts<?"];
     sqlite3_stmt *st = NULL;
@@ -899,8 +967,12 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
             out[@"unread"] = @(sqlite3_column_int(st, 1));
             out[@"apps"] = @(sqlite3_column_int(st, 2));
             double ts = sqlite3_column_double(st, 3);
-            // 🔴 空表时 MIN(ts) 是 NULL ⇒ sqlite3_column_double 给 0 ⇒ 不能当"1970 年"显示
+            // 🔴 空表时 MIN/MAX(ts) 是 NULL ⇒ sqlite3_column_double 给 0
+            //    ⇒ 不能当"1970 年"显示，也不要塞一个 0 进字典（调用方无从分辨）
             if (ts > 0) out[@"earliest"] = [NSDate dateWithTimeIntervalSince1970:ts];
+            double tsEnd = sqlite3_column_double(st, 4);
+            if (tsEnd > 0) out[@"latest"] = [NSDate dateWithTimeIntervalSince1970:tsEnd];
+            out[@"withBody"] = @(sqlite3_column_int(st, 5));
         }
         sqlite3_finalize(st);
     }

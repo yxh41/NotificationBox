@@ -1,16 +1,238 @@
 #import "NotifyStatsViewController.h"
 #import "NotifyStore.h"
 #import "InstalledApps.h"
+#import "AppIconLoader.h"
 #import "NBTheme.h"
 
-#pragma mark - 一行统计（名称 + 条数 + 一根条形）
+// ================= v0.0.181：统计页改版 =================
+// 这一版只动**统计页自己**（数据层另外加了「最晚一条 / 有正文数 / 按天补齐」）。
+// 三条设计纪律，先写在最前面免得后人推翻：
+//
+// ① 🔴 卡片一律用 `NBNewCard()`（白底压灰底），**不许加边框**。
+//    设置页就是这个风格，统一 token 的意义就在这儿（v0.0.71 那次把圆角/边距
+//    收成一套的结果）。设计稿上画了边框只是为了在浅灰背景里看得清边界。
+// ② 🔴 品牌色只用于**条形填充**，不染卡片底、不染文字。
+//    统计页是"读数"的地方，一屏十几张彩色卡会把数字本身淹掉 ——
+//    而首页那套淡染是"信息流"，两者的用途不同，别照抄。
+// ③ 🔴 图表全部**自绘**：本仓库没有、也不允许引入第三方图表库
+//    （越狱插件里多一个依赖就多一处注入失败的可能）。
 
-// 🔴🔴 条形用**手机上的涨红跌绿无关**、这里只是数量多少 ⇒ 用系统蓝，别套行情色。
+static const CGFloat kNBStatsPad     = 14.0;
+// 按 App 维度只取前 30：这是"谁最烦人"的排名，不是完整名单。
+static const NSInteger kNBStatsTopN  = 30;
+// 按天补齐的上限。🔴 不是"最多显示 92 天"，而是**防止全库 200 天把列表撑成 200 行**：
+// 柱状图看的是趋势，最近的够用。
+static const NSInteger kNBStatsDayFillMax = 92;
+
+#pragma mark - KPI 卡（4 格数字）
+
+// 2 列 × 2 行。每格 = 一个数字 + 一行小标签。
+//
+// 🔴 为什么不用 Auto Layout：本页所有子视图都是**本页私有、位置固定**，
+//    手算 frame 在这个文件里更直观（和 NotifyCell / 设置页的做法一致）。
+//    用约束反而要多写十几行、还得处理 header 换宽时的更新。
+@interface NBKpiCard : UIView
+@property (nonatomic, strong) NSArray<UILabel *> *valueLabels;   // 4 个
+@property (nonatomic, strong) NSArray<UILabel *> *nameLabels;    // 4 个
+- (void)setValueText:(NSString *)t atIndex:(NSInteger)i;
+- (void)setValueColor:(UIColor *)c atIndex:(NSInteger)i;
+- (void)setNameText:(NSString *)t atIndex:(NSInteger)i;
+@end
+
+@implementation NBKpiCard {
+    UIView *_vLine;
+    UIView *_hLine;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+
+    NSMutableArray *vs = [NSMutableArray array];
+    NSMutableArray *ns = [NSMutableArray array];
+    for (NSInteger i = 0; i < 4; i++) {
+        UILabel *v = [[UILabel alloc] init];
+        v.font = [UIFont systemFontOfSize:21 weight:UIFontWeightMedium];
+        v.textColor = [UIColor labelColor];
+        v.adjustsFontSizeToFitWidth = YES;
+        v.minimumScaleFactor = 0.6;
+        v.numberOfLines = 1;
+        [self addSubview:v];
+        [vs addObject:v];
+
+        UILabel *n = [[UILabel alloc] init];
+        n.font = [UIFont systemFontOfSize:11];
+        n.textColor = [UIColor secondaryLabelColor];
+        n.numberOfLines = 1;
+        [self addSubview:n];
+        [ns addObject:n];
+    }
+    self.valueLabels = vs;
+    self.nameLabels = ns;
+
+    _vLine = [[UIView alloc] init];
+    _vLine.backgroundColor = NBSepColor();
+    [self addSubview:_vLine];
+    _hLine = [[UIView alloc] init];
+    _hLine.backgroundColor = NBSepColor();
+    [self addSubview:_hLine];
+    return self;
+}
+
+- (void)setValueText:(NSString *)t atIndex:(NSInteger)i {
+    if (i < 0 || i >= (NSInteger)self.valueLabels.count) return;
+    self.valueLabels[i].text = t;
+}
+- (void)setValueColor:(UIColor *)c atIndex:(NSInteger)i {
+    if (i < 0 || i >= (NSInteger)self.valueLabels.count) return;
+    self.valueLabels[i].textColor = c;
+}
+- (void)setNameText:(NSString *)t atIndex:(NSInteger)i {
+    if (i < 0 || i >= (NSInteger)self.nameLabels.count) return;
+    self.nameLabels[i].text = t;
+}
+
+// 卡高 112：两行各 42（数字 26 + 标签 14 + 2pt 缝），上下各留 14。
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.bounds.size.width;
+    CGFloat h = self.bounds.size.height;
+    CGFloat pad = kNBStatsPad;
+    CGFloat colW = (w - pad * 2) / 2.0;
+    CGFloat rowH = (h - pad * 2) / 2.0;
+
+    for (NSInteger i = 0; i < 4; i++) {
+        CGFloat col = (i % 2);
+        CGFloat row = (i / 2);
+        CGFloat x = pad + col * colW;
+        CGFloat y = pad + row * rowH;
+        self.valueLabels[i].frame = CGRectMake(x, y, colW - 8, 26);
+        self.nameLabels[i].frame  = CGRectMake(x, y + 27, colW - 8, 14);
+    }
+    _vLine.frame = CGRectMake(pad + colW, pad, 0.5, h - pad * 2);
+    _hLine.frame = CGRectMake(pad, pad + rowH, w - pad * 2, 0.5);
+}
+
+@end
+
+#pragma mark - 柱状图（自绘）
+
+// 🔴 只画柱子 + 一条基线，不画网格、不画渐变、不做动画：
+//    统计页要的是"一眼看出哪根高"，多余的装饰只会让柱子本身变细。
+//
+// 🔴 0 值的格子**照样画一根 3pt 的底槽**：这是全站同一条纪律 ——
+//    "这一格是空的"和"这一格不存在"必须长得不一样。按天补齐后
+//    空白日会真的以 0 出现，画成什么都没有就等于没补。
+@interface NBStatsChartView : UIView
+@property (nonatomic, copy) NSArray<NSNumber *> *values;
+@property (nonatomic, copy) NSArray<NSString *> *axis;      // 与 values 等长，nil 项不画
+@property (nonatomic, strong) UIColor *barColor;
+@property (nonatomic, copy) NSString *summary;              // 无障碍概述
+@end
+
+@implementation NBStatsChartView
+
+- (void)setValues:(NSArray<NSNumber *> *)values axis:(NSArray<NSString *> *)axis {
+    self.values = values ?: @[];
+    self.axis = axis;
+    [self setNeedsDisplay];
+}
+
+- (void)drawRect:(CGRect)rect {
+    [super drawRect:rect];
+    NSArray<NSNumber *> *vals = self.values;
+    NSInteger n = (NSInteger)vals.count;
+    if (n <= 0) return;
+
+    CGFloat pad = kNBStatsPad;
+    CGFloat axisH = 14.0;                       // 底部留给轴标
+    CGFloat usableW = self.bounds.size.width - pad * 2;
+    CGFloat baseY = self.bounds.size.height - axisH;      // 基线
+    CGFloat topY = 6.0;
+    CGFloat plotH = baseY - topY;
+    if (usableW <= 0 || plotH <= 0) return;
+
+    NSInteger mx = 0;
+    for (NSNumber *v in vals) {
+        if ([v integerValue] > mx) mx = [v integerValue];
+    }
+
+    CGFloat slot = usableW / (CGFloat)n;
+    // 柱宽 = 槽宽的 62%，最少 1.5pt（按天 92 根时槽宽只有 ~2.6pt）。
+    // 🔴 最少值不能取 1.0：1pt 的柱子在 2x 屏上会被抹成半透明，看图的人会以为"数据缺失"。
+    CGFloat barW = MAX(1.5, slot * 0.62);
+    if (barW > 14.0) barW = 14.0;               // 只有 3~5 根时不要变成粗方块
+
+    UIColor *empty = [UIColor tertiarySystemFillColor];
+    UIColor *fill = self.barColor ?: [UIColor systemBlueColor];
+
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+
+    for (NSInteger i = 0; i < n; i++) {
+        NSInteger v = [vals[i] integerValue];
+        CGFloat x = pad + slot * (CGFloat)i + (slot - barW) / 2.0;
+        CGFloat hgt;
+        if (v <= 0 || mx <= 0) {
+            // 空槽：高度固定 3pt，颜色用底槽色 ⇒ "这里是一格空的"
+            [empty setFill];
+            hgt = 3.0;
+        } else {
+            [fill setFill];
+            hgt = plotH * (CGFloat)v / (CGFloat)mx;
+            if (hgt < 3.0) hgt = 3.0;            // 有值但很矮时也要看得见（1 条 ≠ 0 条）
+        }
+        UIBezierPath *p = [UIBezierPath bezierPathWithRoundedRect:
+                           CGRectMake(x, baseY - hgt, barW, hgt)
+                                                    cornerRadius:MIN(2.0, barW / 2.0)];
+        [p fill];
+    }
+
+    [[UIColor quaternaryLabelColor] setFill];
+    UIRectFill(CGRectMake(pad, baseY, usableW, 0.5));
+
+    // 轴标：只画打了点的那几格（VC 侧已经算好，这里按索引取）
+    if (self.axis.count == (NSUInteger)n) {
+        NSDictionary *attrs = @{ NSFontAttributeName: [UIFont systemFontOfSize:10],
+                                 NSForegroundColorAttributeName: [UIColor tertiaryLabelColor] };
+        for (NSInteger i = 0; i < n; i++) {
+            NSString *t = self.axis[i];
+            if (![t isKindOfClass:[NSString class]] || !t.length) continue;
+            CGSize sz = [t sizeWithAttributes:attrs];
+            // 夹在图内：两端那几格的标签会顶到卡片外面
+            CGFloat cx = pad + slot * (CGFloat)i + slot / 2.0;
+            CGFloat tx = cx - sz.width / 2.0;
+            if (tx < 0) tx = 0;
+            if (tx + sz.width > self.bounds.size.width) tx = self.bounds.size.width - sz.width;
+            [t drawAtPoint:CGPointMake(tx, baseY + 3) withAttributes:attrs];
+        }
+    }
+}
+
+- (void)setSummary:(NSString *)summary {
+    _summary = [summary copy];
+    self.isAccessibilityElement = YES;
+    self.accessibilityTraits = UIAccessibilityTraitImage;
+    self.accessibilityLabel = summary;
+}
+
+@end
+
+#pragma mark - 一行明细
+
 @interface NBStatCell : UITableViewCell
+@property (nonatomic, strong) UILabel *rankLabel;
 @property (nonatomic, strong) UILabel *nameLabel;
 @property (nonatomic, strong) UILabel *cntLabel;
+@property (nonatomic, strong) UILabel *subLabel;
 @property (nonatomic, strong) UIView *barBox;
 @property (nonatomic, strong) UIView *barFill;
+// 🔴🔴 v0.0.181：**条长用比例，不用像素宽**。
+//    原来（v0.0.171~180）是 cellForRow 里直接算 `w * n / max` 写进 barFill.frame，
+//    而那一刻 `barBox.bounds` 可能还是 0（cell 刚 dequeue、layoutSubviews 还没跑）
+//    ⇒ 首次上屏的几行条形宽度算成 0，**滚动一下再回来才正常**。
+//    比例存下来、由 layoutSubviews 乘上真实的槽宽，时序问题就从结构上消失了。
+@property (nonatomic, assign) CGFloat ratio;
 @end
 
 @implementation NBStatCell
@@ -18,6 +240,14 @@
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
     self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
     if (!self) return nil;
+    self.backgroundColor = [UIColor clearColor];
+    self.selectionStyle = UITableViewCellSelectionStyleNone;
+
+    self.rankLabel = [[UILabel alloc] init];
+    self.rankLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+    self.rankLabel.textColor = [UIColor tertiaryLabelColor];
+    self.rankLabel.textAlignment = NSTextAlignmentLeft;
+    [self.contentView addSubview:self.rankLabel];
 
     self.nameLabel = [[UILabel alloc] init];
     self.nameLabel.font = [UIFont systemFontOfSize:14];
@@ -31,12 +261,11 @@
     self.cntLabel.textAlignment = NSTextAlignmentRight;
     [self.contentView addSubview:self.cntLabel];
 
-    // 条形底槽（浅）+ 填充（蓝）。分两层而不是改一个 view 的背景色：
-    // 这样"占比 0"时底槽还在，用户能看出**这里确实有一格**，只是它是空的
-    // —— 和"这一行没画出来"是两种完全不同的信息。
+    // 条形底槽（浅）+ 填充（品牌色）。分两层而不是改一个 view 的背景色：
+    // 这样"占比 0"时底槽还在，用户能看出**这里确实有一格**，只是它是空的。
     self.barBox = [[UIView alloc] init];
     self.barBox.backgroundColor = [UIColor tertiarySystemFillColor];
-    self.barBox.layer.cornerRadius = 2;
+    self.barBox.layer.cornerRadius = 3;
     self.barBox.clipsToBounds = YES;
     [self.contentView addSubview:self.barBox];
 
@@ -44,63 +273,132 @@
     self.barFill.backgroundColor = [UIColor systemBlueColor];
     [self.barBox addSubview:self.barFill];
 
+    // 右下角彩蛋行：未读数 / 占比之外的补充说明（各维度含义不同，由 VC 决定写什么）
+    self.subLabel = [[UILabel alloc] init];
+    self.subLabel.font = [UIFont systemFontOfSize:11];
+    self.subLabel.textColor = [UIColor tertiaryLabelColor];
+    self.subLabel.textAlignment = NSTextAlignmentRight;
+    [self.contentView addSubview:self.subLabel];
+
     return self;
 }
 
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat w = self.contentView.bounds.size.width;
-    CGFloat pad = 14;
-    // 🔴 右侧条数/未读标签按内容宽度自适应（不再写死 96 ⇒ 长文本被截断「显示不全」）。
-    //    给名字至少留 80pt；超出则截断右侧标签本身，绝不挤压名字到看不见。
-    CGFloat maxCnt = w - pad * 2 - 80;
+    CGFloat pad = kNBStatsPad;
+
+    BOOL hasRank = self.rankLabel.text.length > 0;
+    CGFloat rankW = hasRank ? 20.0 : 0.0;
+    self.rankLabel.frame = CGRectMake(pad, 8, rankW, 19);
+
+    // 🔴 右侧条数按内容宽度自适应（不写死 96 ⇒ 长文本被截断「显示不全」）。
+    //    给名字至少留 90pt；超出则截断右侧标签本身，绝不挤压名字到看不见。
+    CGFloat left = pad + rankW;
+    CGFloat maxCnt = w - left - pad - 90.0;
     CGFloat cntW = self.cntLabel.intrinsicContentSize.width;
     if (cntW > maxCnt) cntW = maxCnt;
     if (cntW < 0) cntW = 0;
-    self.cntLabel.frame  = CGRectMake(w - pad - cntW, 9, cntW, 18);
-    self.nameLabel.frame = CGRectMake(pad, 7, w - pad * 2 - cntW - 8, 20);
-    self.barBox.frame    = CGRectMake(pad, 32, w - pad * 2, 8);
-    // `barFill` 的高度跟着底槽，宽度由外部按占比设（见 cellForRow）
-    self.barFill.frame   = CGRectMake(0, 0, self.barFill.frame.size.width,
+
+    self.cntLabel.frame  = CGRectMake(w - pad - cntW, 8, cntW, 19);
+    self.nameLabel.frame = CGRectMake(left, 7, w - left - pad - cntW - 8, 20);
+    self.subLabel.frame  = CGRectMake(left, 41, w - left - pad, 14);
+    self.barBox.frame    = CGRectMake(left, 31, w - left - pad, 6);
+    // 条长在这一处算：槽宽只有这里才知道（见 `ratio` 的注释）
+    self.barFill.frame   = CGRectMake(0, 0, self.barBox.bounds.size.width * self.ratio,
                                       self.barBox.bounds.size.height);
 }
 
-// 🔴 复用池必须清：条形的宽度是"上一次的值"，
-//    不清的话滚一下就会看到"新行的名字 + 上一行的条长"（本项目已栽过三次同类）。
+// 🔴 复用池必须清：条形的宽度是"上一次的值"，不清的话滚一下就会看到
+//    "新行的名字 + 上一行的条长"（本项目已栽过三次同类）。
 - (void)prepareForReuse {
     [super prepareForReuse];
+    self.rankLabel.text = nil;
     self.nameLabel.text = nil;
     self.cntLabel.text = nil;
+    self.subLabel.text = nil;
+    self.ratio = 0;
     self.barFill.frame = CGRectMake(0, 0, 0, self.barBox.bounds.size.height);
+    self.barFill.backgroundColor = [UIColor systemBlueColor];
+    self.accessibilityLabel = nil;
 }
 
 @end
 
-#pragma mark - 统计页
+#pragma mark - 页头（KPI 卡 + 图表卡 + 分组标题）
 
-@interface NotifyStatsViewController () <UITableViewDataSource, UITableViewDelegate>
-@property (nonatomic, strong) UISegmentedControl *dimSeg;      // 维度：App / 小时 / 天
-@property (nonatomic, strong) UISegmentedControl *rangeSeg;    // 时间窗：全部 / 7天 / 30天
-@property (nonatomic, strong) UILabel *summaryLabel;
-// v0.0.176：数字滚动用的定时器。60fps 手动推，滚完自己 invalidate。
-// ⚠️ 为什么用 NSTimer 而不是 CADisplayLink：这里只需要 0.3s 的短动画，
-//    CADisplayLink 要额外持一个 target、还得在 dealloc/消失时精准 invalidate，
-//    出错就是"页面走了定时器还在跑"。NSTimer 一个 strong 属性 + dealloc 里掐掉就够。
-// ⛔ 无论谁跑，都必须能被 invalidate：刷新一次就起一个，绝不允许叠加。
-@property (nonatomic, strong) NSTimer *nbRollTimer;
-@property (nonatomic, strong) UITableView *table;
-@property (nonatomic, strong) NSArray<NSDictionary *> *rows;
-@property (nonatomic, strong) NSDictionary<NSString *, NSString *> *names;   // bid -> 显示名
-@property (nonatomic, assign) NSInteger max;                   // 本屏最大值，条形按比例
-@property (nonatomic, assign) NSTimeInterval customSince;      // 自定义时间窗起点（0 = 未设）
-@property (nonatomic, assign) NSTimeInterval customBeforeTs;   // 自定义时间窗上界（0 = 未设）
+@interface NBStatsHeaderView : UIView
+@property (nonatomic, strong) NBKpiCard *kpi;
+@property (nonatomic, strong) UIView *chartCard;
+@property (nonatomic, strong) UILabel *chartTitle;
+@property (nonatomic, strong) NBStatsChartView *chart;
+@property (nonatomic, strong) UILabel *sectionLabel;
+@property (nonatomic, assign) BOOL showsChart;
+- (CGFloat)preferredHeight;
+@end
 
-- (void)onDim:(UISegmentedControl *)seg;
-- (void)onRange:(UISegmentedControl *)seg;
-- (void)reloadData;
-- (NSTimeInterval)sinceFromSeg;
-- (NSTimeInterval)beforeTsFromSeg;
-- (NSString *)nameForRow:(NSDictionary *)d;
+@implementation NBStatsHeaderView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+
+    self.kpi = [[NBKpiCard alloc] initWithFrame:CGRectZero];
+    self.kpi.backgroundColor = NBCardBG();
+    self.kpi.layer.cornerRadius = NBCardRadius;
+    self.kpi.clipsToBounds = YES;
+    [self addSubview:self.kpi];
+
+    self.chartCard = [[UIView alloc] init];
+    self.chartCard.backgroundColor = NBCardBG();
+    self.chartCard.layer.cornerRadius = NBCardRadius;
+    self.chartCard.clipsToBounds = YES;
+    [self addSubview:self.chartCard];
+
+    self.chartTitle = [[UILabel alloc] init];
+    self.chartTitle.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    self.chartTitle.textColor = [UIColor secondaryLabelColor];
+    [self.chartCard addSubview:self.chartTitle];
+
+    self.chart = [[NBStatsChartView alloc] initWithFrame:CGRectZero];
+    self.chart.backgroundColor = [UIColor clearColor];
+    [self.chartCard addSubview:self.chart];
+
+    self.sectionLabel = [[UILabel alloc] init];
+    self.sectionLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    self.sectionLabel.textColor = [UIColor secondaryLabelColor];
+    [self addSubview:self.sectionLabel];
+    return self;
+}
+
+- (CGFloat)preferredHeight {
+    CGFloat y = 10.0;
+    y += 112.0;                        // KPI 卡
+    if (self.showsChart) y += 12.0 + 170.0;
+    y += 14.0 + 18.0;                  // 分组标题
+    return y + 8.0;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.bounds.size.width;
+    CGFloat pad = kNBStatsPad;
+    CGFloat cw = w - pad * 2;
+    CGFloat y = 10.0;
+
+    self.kpi.frame = CGRectMake(pad, y, cw, 112.0);
+    y += 112.0;
+
+    if (self.showsChart) {
+        y += 12.0;
+        self.chartCard.frame = CGRectMake(pad, y, cw, 170.0);
+        self.chartTitle.frame = CGRectMake(pad, 12, cw - pad * 2, 16);
+        self.chart.frame = CGRectMake(pad, 34, cw - pad * 2, 170.0 - 34.0 - 10.0);
+        y += 170.0;
+    }
+    self.sectionLabel.frame = CGRectMake(pad + 2, y + 14.0, cw - 4, 18);
+}
+
 @end
 
 #pragma mark - 自定义时间窗：起止日期选择器（模态）
@@ -199,6 +497,34 @@
 }
 @end
 
+#pragma mark - 统计页
+
+@interface NotifyStatsViewController () <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) UISegmentedControl *dimSeg;      // 维度：App / 小时 / 天
+@property (nonatomic, strong) UISegmentedControl *rangeSeg;    // 时间窗：全部 / 7天 / 30天 / 自定义
+@property (nonatomic, strong) NBStatsHeaderView *header;
+@property (nonatomic, strong) UITableView *table;
+@property (nonatomic, strong) NSArray<NSDictionary *> *rows;
+@property (nonatomic, strong) NSDictionary<NSString *, NSString *> *names;       // bid -> 显示名
+@property (nonatomic, strong) NSDictionary<NSString *, UIColor *> *brands;       // bid -> 品牌色
+@property (nonatomic, assign) NSInteger max;                   // 本屏最大值，条形按比例
+@property (nonatomic, assign) NSInteger grandTotal;            // 本时间窗总条数（占比的分母）
+@property (nonatomic, assign) NSTimeInterval customSince;
+@property (nonatomic, assign) NSTimeInterval customBeforeTs;
+// v0.0.181：数字滚动用于 KPI 前两格（总条数 / 未读）。
+@property (nonatomic, strong) NSTimer *nbRollTimer;
+@property (nonatomic, assign) BOOL inSync;                     // 防 tableHeaderView 重设递归
+@property (nonatomic, assign) NSInteger lastRollTotal;         // 上次滚到的终值
+@property (nonatomic, assign) NSInteger lastRollUnread;
+
+- (void)onDim:(UISegmentedControl *)seg;
+- (void)onRange:(UISegmentedControl *)seg;
+- (void)reloadData;
+- (NSTimeInterval)sinceFromSeg;
+- (NSTimeInterval)beforeTsFromSeg;
+- (NSString *)nameForRow:(NSDictionary *)d;
+@end
+
 @implementation NotifyStatsViewController
 
 - (void)dealloc {
@@ -207,69 +533,10 @@
     [_nbRollTimer invalidate];
 }
 
-// v0.0.176：三个数一起从 0 滚到目标值（共 N 条 · 未读 M · 覆盖 K 个 App）。
-//
-// 🔴 只滚**三个计数**，不滚「最早」那个日期：日期是绝对时间，
-//    从某个过去时刻滚到另一个过去时刻，滚出来的全是**不存在的日期**。
-//    这类"看起来很酷但中间态是假的"的动画，本项目的判据口径是不接受的。
-//
-// 🔴 起新的一轮前**必须先掐掉上一轮**：切时间段会连续刷新，
-//    不掐就会有两个定时器同时往同一个 label 上写，数字抖成随机数。
-- (void)nbRollSummaryTotal:(NSInteger)total unread:(NSInteger)unread apps:(NSInteger)apps
-                     when:(NSString *)when {
-    [self.nbRollTimer invalidate];
-    self.nbRollTimer = nil;
-
-    // 🔴🔴 这里**不能用 `self.view.window` 当闸门**（我第一版就是这么写的，会永久关掉动效）。
-    //    唯一的调用路径是 `viewWillAppear:` → `reloadData` → 这里，而那一刻视图
-    //    **还没上屏**，`view.window` 必然是 nil ⇒ 每次都走"直接给终值"那条路，
-    //    屏幕上永远不会有滚动。而它和"本来就该这样"完全同形，谁也发现不了。
-    //    这就是本项目记过的那条：「用'到不了的轮次'当触发 = 交了等于没交」。
-    //    代价只是"页面不可见时也滚 0.3 秒"，可以接受 —— 那比"永远不滚"便宜得多。
-    if (!self.isViewLoaded) {
-        self.summaryLabel.text = [NSString stringWithFormat:
-                                  @"共 %ld 条 · 未读 %ld · 覆盖 %ld 个 App · 最早 %@",
-                                  (long)total, (long)unread, (long)apps, when];
-        return;
-    }
-
-    NSDate *t0 = [NSDate date];
-    const NSTimeInterval dur = 0.30;   // 轻快档：和列表那几处 0.22~0.24 是同一手感
-    __weak typeof(self) weakSelf = self;
-
-    self.nbRollTimer = [NSTimer scheduledTimerWithTimeInterval:(1.0 / 60.0)
-                                                       repeats:YES
-                                                         block:^(NSTimer *timer) {
-        __strong typeof(weakSelf) self2 = weakSelf;
-        if (!self2) { [timer invalidate]; return; }
-
-        CGFloat k = (CGFloat)(-[t0 timeIntervalSinceNow] / dur);
-        if (k >= 1.0) {
-            k = 1.0;
-            [timer invalidate];
-            self2.nbRollTimer = nil;      // 完成即释放，不留一个"已经停了的"定时器
-        }
-        // ease-out：前段快、收尾慢，和 `UIViewAnimationOptionCurveEaseOut` 观感一致。
-        // ⛔ 不用 powf：少引一个 math.h，三次方手写更清楚。
-        CGFloat inv = 1.0 - k;
-        CGFloat e = 1.0 - inv * inv * inv;
-
-        // `+0.5` 取整而不用 `lround`：少引一个 math.h，而且这三个数恒非负，
-        // 用不到 lround 对负数的处理。（⛔ 别改成 `(long)x` —— 那是截断，
-        // 计数会全程偏小，最后一下才跳到位，看起来像"卡了一下"。）
-        self2.summaryLabel.text = [NSString stringWithFormat:
-                                   @"共 %ld 条 · 未读 %ld · 覆盖 %ld 个 App · 最早 %@",
-                                   (long)((double)total * e + 0.5),
-                                   (long)((double)unread * e + 0.5),
-                                   (long)((double)apps * e + 0.5),
-                                   when];
-    }];
-}
-
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"统计";
-    self.view.backgroundColor = NBPageBG();   // v0.0.71 与全站统一：分组灰底 + 白卡片
+    self.view.backgroundColor = NBPageBG();
 
     self.dimSeg = [[UISegmentedControl alloc] initWithItems:@[@"按 App", @"按小时", @"按天"]];
     self.dimSeg.selectedSegmentIndex = 0;
@@ -283,21 +550,22 @@
             forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.rangeSeg];
 
-    self.summaryLabel = [[UILabel alloc] init];
-    self.summaryLabel.numberOfLines = 0;
-    self.summaryLabel.font = [UIFont systemFontOfSize:12];
-    self.summaryLabel.textColor = [UIColor secondaryLabelColor];
-    [self.view addSubview:self.summaryLabel];
-
     self.table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     self.table.dataSource = self;
     self.table.delegate = self;
-    self.table.rowHeight = 48;
+    self.table.rowHeight = 62;
+    self.table.backgroundColor = [UIColor clearColor];
+    self.table.separatorStyle = UITableViewCellSeparatorStyleNone;
     [self.table registerClass:[NBStatCell class] forCellReuseIdentifier:@"stat"];
     // 🔴 空列表不要留一片白底配一堆留白：给一句"这个时间窗里没有记录"，
     //    否则用户分不清"没数据"和"页面坏了"。
     self.table.tableFooterView = [[UIView alloc] init];
+    // 内容整体上移一点，让卡片贴着分段控件（默认 inset 会多出一段空白）
+    self.table.contentInset = UIEdgeInsetsMake(0, 0, 16, 0);
     [self.view addSubview:self.table];
+
+    self.header = [[NBStatsHeaderView alloc] initWithFrame:CGRectMake(0, 0, 320, 200)];
+    self.table.tableHeaderView = self.header;
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -310,16 +578,16 @@
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
     CGFloat top = self.view.safeAreaInsets.top;
-    CGFloat pad = 14;
+    CGFloat pad = kNBStatsPad;
 
-    self.dimSeg.frame   = CGRectMake(pad, top + 10, w - pad * 2, 32);
-    self.rangeSeg.frame = CGRectMake(pad, top + 50, w - pad * 2, 32);
-    self.summaryLabel.frame = CGRectMake(pad, top + 90, w - pad * 2, 34);
-    CGFloat ty = top + 128;
+    self.dimSeg.frame   = CGRectMake(pad, top + 8, w - pad * 2, 32);
+    self.rangeSeg.frame = CGRectMake(pad, top + 48, w - pad * 2, 32);
+    CGFloat ty = top + 88;
     self.table.frame = CGRectMake(0, ty, w, h - ty);
+    [self syncHeaderSize];
 }
 
-#pragma mark - 数据
+#pragma mark - 时间窗
 
 // 🔴 时间窗和列表完全同一个口径（`ts >= since`），不另发明一套 ——
 //    两个指标打架是这个项目最贵的一类事故（v0.0.37 的红点）。
@@ -366,6 +634,32 @@
     [self reloadData];
 }
 
+#pragma mark - 页头尺寸
+
+// 🔴🔴 `tableHeaderView` 的**高度不会自动跟随内部内容**：它按你赋进去那一刻的
+//     frame 定死。所以要改高度必须"改 frame + 重新赋一次"。而重新赋值会触发
+//     table 的 layout ⇒ 可能再次进到这个函数 ⇒ 必须靠 `inSync` 断开，
+//     ⛔ 不能靠"高度没变就 return"单独挡（宽度变了高度没变时也得重排）。
+- (void)syncHeaderSize {
+    if (self.inSync) return;
+    CGFloat w = self.table.bounds.size.width;
+    if (w <= 0) return;
+    self.inSync = YES;
+
+    self.header.showsChart = (self.dimSeg.selectedSegmentIndex != 0);
+    CGFloat h = [self.header preferredHeight];
+    if (fabs(self.header.frame.size.width - w) > 0.5 ||
+        fabs(self.header.frame.size.height - h) > 0.5) {
+        self.header.frame = CGRectMake(0, 0, w, h);
+        [self.header setNeedsLayout];
+        [self.header layoutIfNeeded];
+        self.table.tableHeaderView = self.header;
+    }
+    self.inSync = NO;
+}
+
+#pragma mark - 数据
+
 - (void)reloadData {
     NSTimeInterval since = [self sinceFromSeg];
     NSTimeInterval before = [self beforeTsFromSeg];
@@ -374,39 +668,40 @@
     NSInteger total  = [sum[@"total"] integerValue];
     NSInteger unread = [sum[@"unread"] integerValue];
     NSInteger apps   = [sum[@"apps"] integerValue];
+    NSInteger withBody = [sum[@"withBody"] integerValue];
     NSDate *earliest = sum[@"earliest"];
-    NSString *when = @"—";
-    if (earliest) {
-        NSDateFormatter *f = [[NSDateFormatter alloc] init];
-        f.dateFormat = @"yyyy-MM-dd HH:mm";
-        when = [f stringFromDate:earliest];
-    }
-    // 🔴 总数为 0 时**直说"这个时间窗里没有记录"**，别显示"最早 —"
-    //    —— 那会让用户以为时间解析坏了。
-    if (total <= 0) {
-        self.summaryLabel.text = @"这个时间窗里没有记录";
-    } else {
-        // v0.0.176：改成数字滚动。文案一字没动 —— 滚的只是中间那三个数，
-        // 「最早」那个日期是绝对时间，滚它没有意义（滚出来的是不存在的日期）。
-        [self nbRollSummaryTotal:total unread:unread apps:apps when:when];
-    }
+    NSDate *latest   = sum[@"latest"];
+    self.grandTotal = total;
 
     NSInteger dim = self.dimSeg.selectedSegmentIndex;
+
     if (dim == 0) {
-        // 🔴 只取前 30：这是"谁最烦人"的排名，不是完整名单。
-        //    全列出来 200 个 App 反而看不出重点。
-        self.rows = [NotifyStore statsBundlesSince:since beforeTs:before limit:30];
+        self.rows = [NotifyStore statsBundlesSince:since beforeTs:before limit:kNBStatsTopN];
         NSMutableDictionary *m = [NSMutableDictionary dictionary];
         for (InstalledApp *a in [InstalledApps all]) {
             if (a.bundleId.length) m[a.bundleId] = a.name;
         }
         self.names = m;
+        // 🔴 品牌色**只在这里算一次**（滚动时 cellForRow 会被调几十次）。
+        //    取不到就走 `NBBrandFallback`（按 bundle 稳定哈希）：
+        //    没有品牌色时绝不许染出一个随机色，那比无色更可疑。
+        NSMutableDictionary *bm = [NSMutableDictionary dictionary];
+        for (NSDictionary *d in self.rows) {
+            NSString *bid = d[@"bundle"];
+            if (!bid.length) continue;
+            UIColor *c = [AppIconLoader brandColorForBundle:bid];
+            bm[bid] = c ?: (NBBrandFallback(bid) ?: [UIColor systemBlueColor]);
+        }
+        self.brands = bm;
     } else {
-        self.rows = [NotifyStore statsBucketsSince:since beforeTs:before byHour:(dim == 1)];
+        self.rows = [NotifyStore statsBucketsSince:since beforeTs:before
+                                            byHour:(dim == 1)
+                                           maxFill:kNBStatsDayFillMax];
         self.names = @{};
+        self.brands = @{};
     }
 
-    // 条形的分母：本屏最大值。max 为 0 时（全空）不该除零 ⇒ 下面用 `max > 0 ? … : 0`
+    // 条形的分母 = 本屏最大值。max 为 0 时（全空）不该除零 ⇒ 下面用 `max > 0 ? … : 0`
     NSInteger mx = 0;
     for (NSDictionary *d in self.rows) {
         NSInteger n = [d[@"total"] integerValue];
@@ -414,7 +709,222 @@
     }
     self.max = mx;
 
+    // ---------- KPI ----------
+    // 🔴 前两格**固定**（总条数 / 未读）—— 切维度时它们不能变，
+    //    否则用户每次换页签都要重新找"总数在哪"。后两格随维度给出该维度的洞察。
+    CGFloat rate = (total > 0) ? ((CGFloat)unread * 100.0 / (CGFloat)total) : 0;
+    NSInteger days = [self windowDaysWithEarliest:earliest latest:latest];
+
+    [self.header.kpi setNameText:@"总条数" atIndex:0];
+    [self.header.kpi setNameText:(total > 0
+        ? [NSString stringWithFormat:@"未读 · 占 %.0f%%", rate]
+        : @"未读") atIndex:1];
+    [self.header.kpi setValueColor:[UIColor labelColor] atIndex:0];
+    [self.header.kpi setValueColor:(unread > 0 ? [UIColor systemRedColor]
+                                              : [UIColor labelColor]) atIndex:1];
+    [self.header.kpi setValueText:(total > 0 ? [NSString stringWithFormat:@"%ld", (long)apps] : @"—")
+                          atIndex:2];
+    [self.header.kpi setNameText:@"来源 App" atIndex:2];
+
+    if (dim == 0) {
+        [self.header.kpi setValueText:[self dailyAverageText:total days:days] atIndex:3];
+        [self.header.kpi setNameText:(withBody > 0 && total > 0
+            ? [NSString stringWithFormat:@"日均条数 · 有正文 %.0f%%",
+               (CGFloat)withBody * 100.0 / (CGFloat)total]
+            : @"日均条数") atIndex:3];
+    } else if (dim == 1) {
+        // 高峰时段 / 最忙一小时都从**同一份 rows** 里取，不另查一次库
+        NSInteger peakHour = -1, peakN = 0, sumN = 0;
+        for (NSDictionary *d in self.rows) {
+            NSInteger n = [d[@"total"] integerValue];
+            sumN += n;
+            if (n > peakN) { peakN = n; peakHour = [d[@"hour"] integerValue]; }
+        }
+        [self.header.kpi setValueText:(peakHour >= 0 && peakN > 0
+            ? [NSString stringWithFormat:@"%ld 点", (long)peakHour] : @"—") atIndex:2];
+        [self.header.kpi setNameText:@"高峰时段" atIndex:2];
+        [self.header.kpi setValueText:(peakN > 0 ? [NSString stringWithFormat:@"%ld", (long)peakN] : @"—")
+                              atIndex:3];
+        [self.header.kpi setNameText:(sumN > 0
+            ? [NSString stringWithFormat:@"最忙一小时 · 均 %.1f",
+               (CGFloat)sumN / 24.0]
+            : @"最忙一小时") atIndex:3];
+    } else {
+        [self.header.kpi setValueText:(days > 0 ? [NSString stringWithFormat:@"%ld", (long)days] : @"—")
+                              atIndex:2];
+        [self.header.kpi setNameText:@"覆盖天数" atIndex:2];
+        [self.header.kpi setValueText:[self dailyAverageText:total days:days] atIndex:3];
+        [self.header.kpi setNameText:@"日均条数" atIndex:3];
+    }
+
+    // ---------- 图表 + 分组标题 ----------
+    if (dim == 0) {
+        [self setChartHidden:YES];
+        self.header.sectionLabel.text = (total > 0)
+            ? [NSString stringWithFormat:@"来源排行 · 前 %ld 个 App", (long)MIN((NSInteger)self.rows.count, kNBStatsTopN)]
+            : @"这个时间窗里没有记录";
+    } else if (dim == 1) {
+        [self setChartHidden:NO];
+        self.header.chartTitle.text = @"24 小时分布";
+        [self feedHourChart];
+        self.header.sectionLabel.text = (total > 0) ? @"各时段明细" : @"这个时间窗里没有记录";
+    } else {
+        [self setChartHidden:NO];
+        self.header.chartTitle.text = @"按天趋势";
+        [self feedDayChart];
+        self.header.sectionLabel.text = (total > 0)
+            ? [NSString stringWithFormat:@"每天明细 · %ld 天", (long)self.rows.count]
+            : @"这个时间窗里没有记录";
+    }
+
+    [self syncHeaderSize];
     [self.table reloadData];
+
+    // v0.0.178 起统一的触觉层：切维度/时间窗不该"点了没反应"
+    // （本页只有滚动，没有开关，所以只给这一下轻反馈）
+    if (total <= 0) {
+        [self.header.kpi setValueText:@"0" atIndex:0];
+        [self.header.kpi setValueText:@"0" atIndex:1];
+    } else {
+        [self nbRollTotal:total unread:unread];
+    }
+}
+
+// 日均：分母用**窗口天数**（不是"有记录的天数"）。
+// 🔴 两个分母给出的数是两种意思：「这 30 天平均每天 38 条」vs「忙的那 18 天平均 60 条」。
+//    用户问"我一天被烦多少次"时想的是前者，所以固定用窗口天数，并在标签里写明。
+- (NSString *)dailyAverageText:(NSInteger)total days:(NSInteger)days {
+    if (days <= 0 || total <= 0) return @"—";
+    return [NSString stringWithFormat:@"%.1f", (CGFloat)total / (CGFloat)days];
+}
+
+- (NSInteger)windowDaysWithEarliest:(NSDate *)earliest latest:(NSDate *)latest {
+    NSInteger i = self.rangeSeg.selectedSegmentIndex;
+    if (i == 1) return 7;
+    if (i == 2) return 30;
+    if (i == 3) {
+        if (self.customSince <= 0 || self.customBeforeTs <= 0) return 0;
+        NSInteger d = (NSInteger)((self.customBeforeTs - self.customSince) / 86400.0 + 0.5);
+        return d > 0 ? d : 1;
+    }
+    // 「全部」：用库里实际的跨度（最早一条 → 最晚一条），至少算 1 天
+    if (!earliest) return 0;
+    NSTimeInterval end = latest ? [latest timeIntervalSince1970]
+                                : [[NSDate date] timeIntervalSince1970];
+    NSInteger d = (NSInteger)((end - [earliest timeIntervalSince1970]) / 86400.0) + 1;
+    return d > 0 ? d : 1;
+}
+
+- (void)setChartHidden:(BOOL)hidden {
+    self.header.showsChart = !hidden;
+}
+
+// 24 小时：轴标只打 0 / 6 / 12 / 18 / 23 五处（每根都打会糊成一片）
+- (void)feedHourChart {
+    NSMutableArray<NSNumber *> *vals = [NSMutableArray array];
+    NSMutableArray<NSString *> *axis = [NSMutableArray array];
+    NSInteger peakHour = 0, peakN = 0;
+    for (NSDictionary *d in self.rows) {
+        NSInteger h = [d[@"hour"] integerValue];
+        NSInteger n = [d[@"total"] integerValue];
+        [vals addObject:@(n)];
+        BOOL mark = (h == 0 || h == 6 || h == 12 || h == 18 || h == 23);
+        [axis addObject:(mark ? [NSString stringWithFormat:@"%ld", (long)h] : @"")];
+        if (n > peakN) { peakN = n; peakHour = h; }
+    }
+    self.header.chart.barColor = [UIColor systemBlueColor];
+    [self.header.chart setValues:vals axis:axis];
+    self.header.chart.summary = (peakN > 0)
+        ? [NSString stringWithFormat:@"24 小时分布柱状图，共 %ld 个时段，最高是 %ld 点 %ld 条",
+           (long)vals.count, (long)peakHour, (long)peakN]
+        : @"24 小时分布柱状图，这个时间窗里没有记录";
+}
+
+// 按天：轴标取首 / 中 / 尾三处，显示成 MM-dd（带年份太长，卡片里挤不下）
+- (void)feedDayChart {
+    NSMutableArray<NSNumber *> *vals = [NSMutableArray array];
+    NSMutableArray<NSString *> *axis = [NSMutableArray array];
+    NSInteger n = (NSInteger)self.rows.count;
+    NSInteger peakIdx = -1, peakN = 0;
+    for (NSInteger i = 0; i < n; i++) {
+        NSDictionary *d = self.rows[i];
+        NSInteger c = [d[@"total"] integerValue];
+        [vals addObject:@(c)];
+        if (c > peakN) { peakN = c; peakIdx = i; }
+    }
+    for (NSInteger i = 0; i < n; i++) {
+        BOOL mark = (n <= 3) || (i == 0) || (i == n / 2) || (i == n - 1);
+        NSString *day = self.rows[i][@"day"];
+        // 「2026-11-11」→「11-11」：只截后 5 位，不重新解析（原串就来自 SQL 的 localtime）
+        NSString *shortDay = (day.length >= 5) ? [day substringFromIndex:day.length - 5] : day;
+        [axis addObject:(mark ? (shortDay ?: @"") : @"")];
+    }
+    self.header.chart.barColor = [UIColor systemBlueColor];
+    [self.header.chart setValues:vals axis:axis];
+    self.header.chart.summary = (peakN > 0 && peakIdx >= 0)
+        ? [NSString stringWithFormat:@"按天趋势柱状图，共 %ld 天，最高是 %@ 共 %ld 条",
+           (long)n, self.rows[peakIdx][@"day"] ?: @"", (long)peakN]
+        : @"按天趋势柱状图，这个时间窗里没有记录";
+}
+
+// ================= KPI 数字滚动 =================
+// 🔴 只滚**两个计数**（总条数 / 未读）。⛔ 不滚「高峰时段」这类数：
+//    从 0 滚到 18 会经过 7 点、12 点这些**不存在的高峰**，
+//    和"滚日期"同属"中间态是假的"，本项目的判据口径不接受。
+// 🔴 起新的一轮前**必须先掐掉上一轮**：切时间段会连续刷新，
+//    不掐就会有两个定时器同时往同一个 label 上写，数字抖成随机数。
+- (void)nbRollTotal:(NSInteger)total unread:(NSInteger)unread {
+    // 🔴🔴 v0.0.181：**数值没变就不重滚**。
+    //    切维度 / 切时间窗会连着走 reloadData，每次都从 0 滚到 1284
+    //    意味着用户每点一下页签，两个数字就闪一遍 —— 而"总数没变"恰恰是
+    //    用户想确认的事，闪一下反而让人以为变了。信息量为零的动效就是噪声。
+    if (total == self.lastRollTotal && unread == self.lastRollUnread
+        && self.header.kpi.valueLabels.firstObject.text.length > 0) {
+        return;
+    }
+    self.lastRollTotal = total;
+    self.lastRollUnread = unread;
+
+    [self.nbRollTimer invalidate];
+    self.nbRollTimer = nil;
+
+    // 🔴🔴 这里**不能用 `self.view.window` 当闸门**（v0.0.176 第一版就是那么写的，会永久关掉动效）。
+    //    唯一的调用路径是 `viewWillAppear:` → `reloadData` → 这里，而那一刻视图
+    //    **还没上屏**，`view.window` 必然是 nil ⇒ 每次都走"直接给终值"那条路，
+    //    屏幕上永远不会有滚动。而它和"本来就该这样"完全同形，谁也发现不了。
+    if (!self.isViewLoaded) {
+        [self.header.kpi setValueText:[NSString stringWithFormat:@"%ld", (long)total] atIndex:0];
+        [self.header.kpi setValueText:[NSString stringWithFormat:@"%ld", (long)unread] atIndex:1];
+        return;
+    }
+
+    NSDate *t0 = [NSDate date];
+    const NSTimeInterval dur = 0.30;   // 轻快档：和列表那几处 0.22~0.24 是同一手感
+    __weak typeof(self) weakSelf = self;
+
+    self.nbRollTimer = [NSTimer scheduledTimerWithTimeInterval:(1.0 / 60.0)
+                                                       repeats:YES
+                                                         block:^(NSTimer *timer) {
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (!self2) { [timer invalidate]; return; }
+
+        CGFloat k = (CGFloat)(-[t0 timeIntervalSinceNow] / dur);
+        if (k >= 1.0) {
+            k = 1.0;
+            [timer invalidate];
+            self2.nbRollTimer = nil;      // 完成即释放，不留一个"已经停了的"定时器
+        }
+        // ease-out：前段快、收尾慢，和 `UIViewAnimationOptionCurveEaseOut` 观感一致
+        CGFloat inv = 1.0 - k;
+        CGFloat e = 1.0 - inv * inv * inv;
+
+        // `+0.5` 取整而不用 `lround`：少引一个 math.h，而且这两个数恒非负。
+        // ⛔ 别改成 `(long)x` —— 那是截断，计数会全程偏小，最后一下才跳到位。
+        [self2.header.kpi setValueText:[NSString stringWithFormat:@"%ld",
+                                        (long)((double)total * e + 0.5)] atIndex:0];
+        [self2.header.kpi setValueText:[NSString stringWithFormat:@"%ld",
+                                        (long)((double)unread * e + 0.5)] atIndex:1];
+    }];
 }
 
 - (NSString *)nameForRow:(NSDictionary *)d {
@@ -431,7 +941,32 @@
         return [NSString stringWithFormat:@"%02ld:00 – %02ld:00",
                 (long)h, (long)((h + 1) % 24)];
     }
-    return d[@"day"] ?: @"";
+    NSString *day = d[@"day"] ?: @"";
+    // 按天维度补上星期几：看趋势时"周末为什么少"是最常问的问题
+    if (day.length >= 10) {
+        // 🔴🔴 `locale` 必须显式设 en_US_POSIX：`NSDateFormatter` 的默认 locale 跟着
+        //    用户系统走，系统日历是佛历 / 和历时，`dateFromString:@"2026-11-11"`
+        //    会解析成别的年份甚至 nil ⇒ 星期几算错或整行退回裸日期。
+        //    而 SQL 侧 `strftime('%Y-%m-%d')` 输出的**永远是公历**，两边必须对齐。
+        // 🔴 formatter 提到 static：按天维度最多 92 行，每行建一个 formatter
+        //    是 92 次 locale/calendar 初始化，滚动时会明显掉帧。
+        static NSDateFormatter *in = nil;
+        static NSArray *wk = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            in = [[NSDateFormatter alloc] init];
+            in.dateFormat = @"yyyy-MM-dd";
+            in.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+            in.timeZone = [NSTimeZone localTimeZone];
+            wk = @[@"周日", @"周一", @"周二", @"周三", @"周四", @"周五", @"周六"];
+        });
+        NSDate *dt = [in dateFromString:day];
+        if (dt) {
+            NSInteger wd = [[NSCalendar currentCalendar] component:NSCalendarUnitWeekday fromDate:dt] - 1;
+            if (wd >= 0 && wd < 7) return [NSString stringWithFormat:@"%@ %@", day, wk[wd]];
+        }
+    }
+    return day;
 }
 
 #pragma mark - UITableView
@@ -444,22 +979,60 @@
     NBStatCell *c = [tv dequeueReusableCellWithIdentifier:@"stat" forIndexPath:ip];
     NSDictionary *d = self.rows[ip.row];
     NSInteger n = [d[@"total"] integerValue];
+    NSInteger dim = self.dimSeg.selectedSegmentIndex;
 
-    c.nameLabel.text = [self nameForRow:d];
-    // 按 App 维度额外显示未读：知道"京东来了 300 条"之外，
-    // 用户真正想管的往往是"其中 12 条还没看"。
-    NSInteger un = [d[@"unread"] integerValue];
-    if (self.dimSeg.selectedSegmentIndex == 0 && un > 0) {
-        c.cntLabel.text = [NSString stringWithFormat:@"%ld 条 · 未读 %ld", (long)n, (long)un];
+    NSString *name = [self nameForRow:d];
+    c.nameLabel.text = name;
+
+    // 排名只在「按 App」维度有意义（那是排行榜）；按小时/按天是时间序列，序号没用
+    if (dim == 0 && ip.row < 99) {
+        c.rankLabel.text = [NSString stringWithFormat:@"%ld", (long)(ip.row + 1)];
     } else {
-        c.cntLabel.text = [NSString stringWithFormat:@"%ld 条", (long)n];
+        c.rankLabel.text = nil;
     }
 
-    CGFloat w = c.barBox.bounds.size.width;
-    CGFloat fill = (self.max > 0 && w > 0) ? (w * (CGFloat)n / (CGFloat)self.max) : 0;
-    c.barFill.frame = CGRectMake(0, 0, fill, c.barBox.bounds.size.height);
+    // 占比的分母是**本时间窗的总条数**（不是本屏最大值）。
+    // 🔴 两个分母差别很大：max 是"第一名多少条"，占比要的是"占全部的多少"。
+    //    拿 max 当分母会让第一名永远显示 100%，那是彻底的错。
+    CGFloat share = (self.grandTotal > 0)
+        ? ((CGFloat)n * 100.0 / (CGFloat)self.grandTotal) : 0;
+    NSInteger un = [d[@"unread"] integerValue];
+    if (dim == 0) {
+        c.cntLabel.text = [NSString stringWithFormat:@"%ld 条 · %.1f%%", (long)n, share];
+        c.subLabel.text = (un > 0)
+            ? [NSString stringWithFormat:@"未读 %ld · 该 App 未读率 %.0f%%",
+               (long)un, (CGFloat)un * 100.0 / (CGFloat)MAX((NSInteger)1, n)]
+            : nil;
+    } else {
+        c.cntLabel.text = [NSString stringWithFormat:@"%ld 条 · %.1f%%", (long)n, share];
+        c.subLabel.text = (un > 0) ? [NSString stringWithFormat:@"未读 %ld", (long)un] : nil;
+    }
+
+    // 条形长度按**本屏最大值**归一：这样第一名总是满格，视觉上能看出相对差距。
+    // 🔴 条长和占比用的是两个不同的分母 —— 这是刻意的，不是 bug：
+    //    条长回答"谁最多"，百分比回答"占全部多少"。两个数各有各的用处。
+    // 🔴 只给比例，像素宽由 cell 的 layoutSubviews 乘（见 `ratio` 的注释）。
+    c.ratio = (self.max > 0) ? ((CGFloat)n / (CGFloat)self.max) : 0;
     // 🔴 0 条的行也要看得见"这是一格空的"，所以底槽保留、只让填充宽度为 0
     c.barFill.hidden = (n <= 0);
+    UIColor *brand = (dim == 0) ? self.brands[d[@"bundle"] ?: @""] : nil;
+    c.barFill.backgroundColor = brand ?: [UIColor systemBlueColor];
+
+    // ---------- a11y ----------
+    // v0.0.180 的教训：设了显式 label 之后子视图不再被聚合，
+    // 所以要念的东西必须**自己拼全**，别指望系统去聚合那几个 label。
+    NSMutableArray *parts = [NSMutableArray array];
+    if (name.length) [parts addObject:name];
+    if (dim == 0 && ip.row < 99) [parts addObject:[NSString stringWithFormat:@"第 %ld 名", (long)(ip.row + 1)]];
+    [parts addObject:[NSString stringWithFormat:@"%ld 条", (long)n]];
+    [parts addObject:[NSString stringWithFormat:@"占 %.1f%%", share]];
+    if (un > 0) [parts addObject:[NSString stringWithFormat:@"未读 %ld 条", (long)un]];
+    c.accessibilityLabel = [parts componentsJoinedByString:@"，"];
+
+    // 🔴 必须显式要求重排：`rankLabel.text` 从有值变成 nil 时，
+    //    "名字起点要不要左移 20pt"只有 layoutSubviews 知道，
+    //    而改 text 本身**不会**触发重排 —— 复用的行会带着上一行的缩进。
+    [c setNeedsLayout];
     return c;
 }
 
