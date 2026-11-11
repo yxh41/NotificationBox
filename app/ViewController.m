@@ -2061,6 +2061,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 
     [self.iconBar.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
     self.bundles = [NotifyStore distinctBundles];
+    // ================= v0.0.179：App 名映射**先**建（原来在函数尾部）=================
+    // 🔴 为什么往前挪：图标栏的无障碍标签在下面那个循环里读 `appNameForBundle:`。
+    //    留在尾部的话，**新 App 第一次来通知**那一轮读到的是兜底短名（bundle 末段，
+    //    比如 `bijia` 而不是「比价」）—— 看得见的人看图标完全不受影响，
+    //    只有 VoiceOver 用户会听到一个怪名字，而且下一轮自己就好了（最难查的那种）。
+    // 🔴 挪动是安全的：这中间没有任何东西读 `appNameMap`
+    //    （`shortName:` 只看 bundle 串，`distinctBundles` / `bundlesWithUnreadSince:` 只看库）。
+    // 🔴 成本可忽略：`InstalledApps +all` 自己有 `gCache`，这里只是把数组塞进字典。
+    [self rebuildAppNames];
     // v0.0.36：一次查出来，下面建每个图标时直接用（别在循环里一个个查库）
     // v0.0.37：红点只算**当前时间窗内**的未读 —— 和列表同口径，点得进去也清得掉。
     NSSet *unread = [NotifyStore bundlesWithUnreadSince:[self sinceFromSeg]];
@@ -2139,18 +2148,48 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
             [holder addSubview:dot];
             self.unreadDots[bid] = dot;
         }
+
+        // ================= v0.0.179：无障碍（图标栏）=================
+        // 🔴 为什么只有图标栏要单独写这一段：它是全 App **唯一**「纯图片、零文字」的在屏控件
+        //    —— 时间胶囊有 `setTitle:tn[i]`、★ 有 `setTitle:@"★ 标星"`、分段控件自带标题，
+        //    VoiceOver 都能读到文字。图标栏里每个格子只有一个 image（真 App 图标 / `tray.full`），
+        //    所以滑到这里只能念「按钮」，一排全都一样。
+        //    由此丢掉的恰好是三样**只有视觉才能表达**的信息：
+        //      ① 这是哪个 App —— 而图标栏会随记录增删**重排**，"数第几个"根本不成立
+        //      ② 有没有未读 —— 红点是 9pt 纯色 UIView，没有文字，完全不读
+        //      ③ 当前筛的是哪个 —— 选中态只是一条 3pt 短横线，也读不到
+        //    ⇒ 这三样必须**折进 label / traits**，不能指望 VoiceOver 去念那两个装饰。
+        //
+        // 🔴 精度只许到「有未读」，不许写「N 条」：红点本身就是二值的。
+        //    label 说得比视觉更细，就成了"两个界面在讲不同的话"（本项目那条：
+        //    界面反馈都是**结论**，不许一处比另一处知道得更多）。要写条数就得再查库，
+        //    而这是每次重建图标栏都跑的循环 —— 为一个文案加 N 条 SQL 不值。
+        //
+        // ⛔ **不要**把 `holder` 设成 accessibility 元素（`holder.isAccessibilityElement = YES`）。
+        //    看着更"整块"，但那样里面的 `b` 会被吞掉，VoiceOver 双击走的是
+        //    `accessibilityActivate` —— 没实现就**双击没反应**。界面上表现为
+        //    "名字念对了、就是点不动"，比完全不做更糟。
+        //    `holder` 保持默认（不是 a11y 元素）⇒ `dot` / `ul` 也自然读不到（它们本来就没字）。
+        NSString *a11yName = [self appNameForBundle:bid];
+        // 🔴 取不到名字也不许留空 label：空 label 等于回到「按钮」，白做。
+        if (!a11yName.length) a11yName = bid;
+        // 「全部」不建红点 ⇒ 这一句对它恒 NO，正好（它不该说"有未读"）。
+        BOOL a11yUnread = [unread containsObject:bid];
+        b.accessibilityLabel = a11yUnread
+            ? [NSString stringWithFormat:@"%@，有未读", a11yName]
+            : a11yName;
+        // 选中态用 **trait**，不往 label 里拼「已选中」：VoiceOver 对
+        // `UIAccessibilityTraitSelected` 有本地化播报（中文「已选中」），
+        // 而且用户能在系统设置里关掉；自己拼进 label 就永远关不掉，还会和系统说法不一致。
+        b.accessibilityTraits = UIAccessibilityTraitButton
+                             | (selected ? UIAccessibilityTraitSelected : 0);
+
         x += size + 8;
     }
     self.iconBar.contentSize = CGSizeMake(x, 56);
     // 夹回滚动位置（内容变短时也安全）
     CGFloat maxX = MAX(0, x - self.iconBar.bounds.size.width);
     self.iconBar.contentOffset = CGPointMake(MIN(barOff.x, maxX), barOff.y);
-
-    // v0.0.42：App 名映射跟着图标栏一起重建。
-    // 🔴 为什么挂在这里：新 App 第一次来通知时 `self.bundles` 会变长，
-    //    这时列表里马上就会出现它的记录。映射若只建一次，那一行就没名字。
-    // 🔴 成本可忽略：`InstalledApps +all` 自己有 `gCache`，这里只是把数组塞进字典。
-    [self rebuildAppNames];
 }
 
 #pragma mark - v0.0.42 App 名（列表显示 + 搜索匹配）

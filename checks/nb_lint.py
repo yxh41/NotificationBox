@@ -847,6 +847,52 @@ def _(c):
             "下拉闭环 / 键盘 / 触觉入口 / 链接配置 全齐")
 
 
+# ── I4. 图标栏的无障碍（v0.0.179）────────────────────────────
+
+@chk("I4", "图标栏：名字/未读/选中都折进 label·traits，且 holder 不许变成 a11y 元素", baseline="red")
+def _(c):
+    """🔴 v0.0.179 新增。这一条守的是**看不见的界面**：
+
+       图标栏是全 App 唯一「纯图片、零文字」的在屏控件（时间胶囊 `setTitle:`、
+       ★ `setTitle:`、分段控件都自带文字）⇒ VoiceOver 滑到那里只会念「按钮」，
+       一排全都一样。于是三样**只有视觉才能表达**的信息全丢：是哪个 App、
+       有没有未读（红点是 9pt 纯色块）、当前筛的是哪个（3pt 短横线）。
+       而这些装饰**结构上不可能**被读出来 —— 它们压根没有文字。
+       ⇒ 必须折进 `accessibilityLabel` / `accessibilityTraits`，否则等于没做。
+
+       🔴🔴 反向那一条（`holder` 不许被设成 a11y 元素）才是这条判据里最值钱的：
+          一旦 `holder.isAccessibilityElement = YES`，里面的 button 会被**吞掉**，
+          VoiceOver 双击走 `accessibilityActivate` —— 没实现就**双击没反应**。
+          表现在界面上是"名字念对了、就是点不动"，比完全不做更糟，而且
+          光看代码/截图完全看不出来。所以必须机械守。
+
+       ⚠️🔴 判据域用 `strip_comments()` 而不是 `mask()`：这里要判的 `有未读` 是
+          **字符串字面量**，而 `mask()` 会把整个 `@""` 抹成空格 ⇒ 判据恒红；
+          反过来只 `strip_comments()` 又会让**我自己写的解释注释**（里面反复出现
+          `accessibilityLabel` / `isAccessibilityElement` / 「有未读」）变成假证据
+          ⇒ 假绿。两个方向都踩过，所以是"先剥注释、再留字符串"这一种。
+    """
+    raw = c["files"].get("app/ViewController.m", "")
+    body = func_body(strip_comments(raw), "\n- (void)reloadIconBar {")
+    if not body:
+        return (False, "reloadIconBar 找不到 —— 锚点失效，判据作废")
+    problems = []
+    if "accessibilityLabel" not in body:
+        problems.append("没有 accessibilityLabel（VoiceOver 只会念「按钮」）")
+    if "appNameForBundle" not in body:
+        problems.append("名字没走 appNameForBundle（必须和列表同源，不许自己拼 bundle 串）")
+    if "有未读" not in body:
+        problems.append("未读没折进 label（红点是纯色块，读不到）")
+    if "UIAccessibilityTraitSelected" not in body:
+        problems.append("选中态没折进 traits（3pt 短横线，读不到）")
+    # 反向：holder 一旦成为 a11y 元素，里面的按钮就点不动了
+    if (re.search(r"holder\s*\.\s*isAccessibilityElement\s*=", body)
+            or "[holder setIsAccessibilityElement:" in body):
+        problems.append("holder 被设成 a11y 元素（会吞掉按钮 ⇒ VoiceOver 双击没反应）")
+    return (not problems, "；".join(problems) if problems else
+            "名字 / 未读 / 选中都折进去了，holder 仍是普通容器")
+
+
 # ───────────────────────────── 跑判据 ─────────────────────────────
 
 
@@ -962,6 +1008,25 @@ MUTATIONS = [
     ("M25 删掉收尾里的 endRefreshing（转圈永不消失）", "app/ViewController.m",
      "    self.nbPullBusy = NO;\n    [self.nbRefresh endRefreshing];",
      "    self.nbPullBusy = NO;", "I3"),
+    # 🔴 v0.0.179：五条，**每个条件各一条**（不是一条打三个）。
+    #    理由：一条变异同时干掉三个条件时，判据"有分辨力"这句话就说不清是哪一条有 ——
+    #    而这三个条件坏掉的表现完全不同（念不出名字 / 听不出未读 / 听不出选中），
+    #    将来某一条被改坏、另外两条还在，共用一条变异就会漏掉。
+    #    M29 是唯一的**反向**判据，也是真机上唯一会"点了没反应"的那种坏法。
+    ("M26 label 写成 hint（VoiceOver 不念，等于回到「按钮」）", "app/ViewController.m",
+     "        b.accessibilityLabel = a11yUnread",
+     "        b.accessibilityHint = a11yUnread", "I4"),
+    ("M27 未读不折进 label（只剩那个读不到的红点）", "app/ViewController.m",
+     '@"%@，有未读"', '@"%@"', "I4"),
+    ("M28 名字改用兜底短名（audit 用户听到 bijia 而不是比价）", "app/ViewController.m",
+     "        NSString *a11yName = [self appNameForBundle:bid];",
+     "        NSString *a11yName = [self shortName:bid];", "I4"),
+    ("M29 把 holder 设成 a11y 元素（按钮被吞掉 ⇒ 双击没反应）", "app/ViewController.m",
+     "        [holder addSubview:b];",
+     "        holder.isAccessibilityElement = YES;\n        [holder addSubview:b];", "I4"),
+    ("M30 选中态不进 traits（只靠那条 3pt 短横线）", "app/ViewController.m",
+     "                             | (selected ? UIAccessibilityTraitSelected : 0);",
+     "                             | (selected ? 0 : 0);", "I4"),
 ]
 
 
