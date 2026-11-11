@@ -2135,6 +2135,13 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         b.imageView.contentMode = UIViewContentModeScaleAspectFit;
         [holder addSubview:b];
 
+        // v0.0.179：未读这个量**只算一次**，红点和无障碍标签都读它。
+        // 🔴 为什么不让 label 自己再算一遍 `[unread containsObject:bid]`：那样"红点在不在"
+        //    和"念不念有未读"就成了两条独立规则，改一条必漏一条 —— 而漏掉之后
+        //    屏幕上是"红点亮着、VoiceOver 说没有未读"，两个界面互相打脸，且不报错。
+        //    （本项目那条：提示语与判定必须同源，同一行也不行。）
+        BOOL hasUnread = [unread containsObject:bid];
+
         // v0.0.36：有未读就在右上角点一个红点。「全部」不点 —— 它不是某个 App，
         // 而且"全部"聚合了所有 App，「红点 = 全部还有未读」会让人以为没有。
         if (![bid isEqualToString:@"全部"]) {
@@ -2144,7 +2151,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
             // 描边用页面底色：红点压在图标上时轮廓更清楚
             dot.layer.borderWidth = 1.5;
             dot.layer.borderColor = [UIColor systemBackgroundColor].CGColor;
-            dot.hidden = ![unread containsObject:bid];
+            dot.hidden = !hasUnread;
             [holder addSubview:dot];
             self.unreadDots[bid] = dot;
         }
@@ -2173,9 +2180,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         NSString *a11yName = [self appNameForBundle:bid];
         // 🔴 取不到名字也不许留空 label：空 label 等于回到「按钮」，白做。
         if (!a11yName.length) a11yName = bid;
-        // 「全部」不建红点 ⇒ 这一句对它恒 NO，正好（它不该说"有未读"）。
-        BOOL a11yUnread = [unread containsObject:bid];
-        b.accessibilityLabel = a11yUnread
+        // 未读读的就是红点用的那个量（`hasUnread`），不另算 —— 「全部」恒 NO，正好。
+        b.accessibilityLabel = hasUnread
             ? [NSString stringWithFormat:@"%@，有未读", a11yName]
             : a11yName;
         // 选中态用 **trait**，不往 label 里拼「已选中」：VoiceOver 对

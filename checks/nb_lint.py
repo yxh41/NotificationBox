@@ -885,6 +885,12 @@ def _(c):
         problems.append("未读没折进 label（红点是纯色块，读不到）")
     if "UIAccessibilityTraitSelected" not in body:
         problems.append("选中态没折进 traits（3pt 短横线，读不到）")
+    # 同源： 「有没有未读」这个量只许算一次 —— 红点和 label 必须读同一个变量。
+    # 算两次就是两条规则：改一条必漏一条，屏幕上是"红点亮着、VoiceOver 说没有未读"，
+    # 而且不报错（本项目「提示语与判定必须同源，同一行也不行」）。
+    n_rule = body.count("[unread containsObject:")
+    if n_rule != 1:
+        problems.append("「有没有未读」被算了 %d 次（只许 1 次：红点与 label 必须同源）" % n_rule)
     # 反向：holder 一旦成为 a11y 元素，里面的按钮就点不动了
     if (re.search(r"holder\s*\.\s*isAccessibilityElement\s*=", body)
             or "[holder setIsAccessibilityElement:" in body):
@@ -1014,8 +1020,8 @@ MUTATIONS = [
     #    将来某一条被改坏、另外两条还在，共用一条变异就会漏掉。
     #    M29 是唯一的**反向**判据，也是真机上唯一会"点了没反应"的那种坏法。
     ("M26 label 写成 hint（VoiceOver 不念，等于回到「按钮」）", "app/ViewController.m",
-     "        b.accessibilityLabel = a11yUnread",
-     "        b.accessibilityHint = a11yUnread", "I4"),
+     "        b.accessibilityLabel = hasUnread",
+     "        b.accessibilityHint = hasUnread", "I4"),
     ("M27 未读不折进 label（只剩那个读不到的红点）", "app/ViewController.m",
      '@"%@，有未读"', '@"%@"', "I4"),
     ("M28 名字改用兜底短名（audit 用户听到 bijia 而不是比价）", "app/ViewController.m",
@@ -1027,6 +1033,11 @@ MUTATIONS = [
     ("M30 选中态不进 traits（只靠那条 3pt 短横线）", "app/ViewController.m",
      "                             | (selected ? UIAccessibilityTraitSelected : 0);",
      "                             | (selected ? 0 : 0);", "I4"),
+    # M31 打的不是"有没有做"，而是"是不是只做了一次" —— 同源这条最难自查，
+    # 因为两条规则的**初始值一样**，只有改了其中一条的那天才看得出来。
+    ("M31 红点自己再算一遍未读（与 label 变成两条规则）", "app/ViewController.m",
+     "            dot.hidden = !hasUnread;",
+     "            dot.hidden = ![unread containsObject:bid];", "I4"),
 ]
 
 
