@@ -1541,6 +1541,15 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 顶部 App 图标栏（横向滚动）
     self.iconBar = [[UIScrollView alloc] init];
     self.iconBar.showsHorizontalScrollIndicator = NO;
+    // 🔴🔴 v0.0.177：**必须关掉 scrollsToTop**，否则「点状态栏回到顶部」在整个 App 里失效。
+    //    UIKit 的规则是：「同时有**多个** `scrollsToTop == YES` 的 scroll view 在屏上 ⇒
+    //    这个手势**全都不响应**」（不是"响应最上面那个"，是"全失效"）。
+    //    而这个属性**默认就是 YES**，全仓又一处都没显式设过 ⇒ `iconBar` 和 `table`
+    //    两个都为 YES ⇒ 用户在长列表里点状态栏，一点反应都没有。
+    //    ⚠️ 这条我按 API 规则推的，装到机上点一下状态栏即可证实/证伪。
+    //    🔴 为什么只关 iconBar、不显式给 table 置 YES：默认已经是 YES，
+    //       多写一句"看起来像在设什么"的代码，反而是下一个人改动时的噪声。
+    self.iconBar.scrollsToTop = NO;
     // v0.0.131：图标栏挂进 `topCard`（那张白卡现在是它的底），不再是浮在灰底上的裸条。
     // 🔴 坐标语义没变：`reloadIconBar` 里 `holder` 的 x/y 本来就是相对 iconBar 的，
     //    只有布局里那一处 frame 要按"相对 topCard"算（见 `viewDidLayoutSubviews`）。

@@ -654,6 +654,41 @@ def _(c):
     return (not problems, "；".join(problems) if problems else "三挂钩齐全、顺序正确")
 
 
+@chk("I2", "列表页除 table 外的 scrollView 必须显式关掉 scrollsToTop", baseline="red")
+def _(c):
+    """🔴 v0.0.177 新增，起因是一处**功能被静默顶掉**的 bug：
+
+       UIKit 的规则是「同时有**多个** `scrollsToTop == YES` 的 scroll view 在屏上 ⇒
+       点状态栏回到顶部这个手势**全都不响应**」—— 不是"响应最上面那个"，是全部失效。
+       而这个属性**默认 YES**，全仓一处都没显式设过 ⇒ `iconBar`（横向图标栏）和
+       `table` 两个都是 YES ⇒ 长列表里点状态栏毫无反应。
+
+       ⚠️ 这条判据只覆盖 `ViewController.m`：只有列表页同时挂着两个 scroll view。
+         别的页面（设置/规则测试/统计）自己那一屏只有一个，保持默认才对
+          —— 把它们也一起判，会逼着我在那些页面上写一堆没用的 `= YES`。
+
+       🔴 判据域用 `mask()` 之后的源码：我在这条修复旁边写了段解释，里面反复出现
+          `scrollsToTop` 这个词 —— 不 mask 就等于**拿自己的注释当"已经设过了"的证据**。
+    """
+    vc = mask(c["files"].get("app/ViewController.m", ""))
+    total = vc.count("[[UIScrollView alloc]")
+    if total == 0:
+        # 找不到锚点必须报红，不许当"没有风险"放过去（判据静默失效比没有更糟）。
+        return (False, "一个 `[[UIScrollView alloc]` 都没找到 —— 锚点失效，判据作废")
+    bad, i = [], 0
+    while True:
+        i = vc.find("[[UIScrollView alloc]", i)
+        if i < 0:
+            break
+        win = vc[i:i + 2000]
+        if "scrollsToTop" not in win:
+            ls = vc.rfind("\n", 0, i)
+            bad.append((vc[ls + 1:i].strip() or "(匿名)")[:40])
+        i += 1
+    return (not bad, "没关掉 scrollsToTop：%s" % bad if bad
+            else "%d 个非 table 的 scrollView 都显式关掉了" % total)
+
+
 # ───────────────────────────── 跑判据 ─────────────────────────────
 
 
@@ -745,6 +780,8 @@ MUTATIONS = [
     ("M18 把入场布防塞进共用尾部 applyItemsAndRefreshUI（每次刷新都重播）", "app/ViewController.m",
      "    [self nbRebuildOverview];\n\n    [self.table reloadData];",
      "    [self nbRebuildOverview];\n    [self nbArmEntrance];\n\n    [self.table reloadData];", "I1"),
+    ("M19 删掉 iconBar 的 scrollsToTop = NO（点状态栏回顶全失效）", "app/ViewController.m",
+     "    self.iconBar.scrollsToTop = NO;", "    ;", "I2"),
 ]
 
 
