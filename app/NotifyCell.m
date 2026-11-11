@@ -1,5 +1,6 @@
 #import "NotifyCell.h"
 #import "NBTheme.h"
+#import "NBHaptic.h"
 
 // 🔴 v0.0.92：cell 自己要当 pan 手势的 delegate —— 判"这次滑动算不算左滑"必须
 //    在手势**开始之前**答（`gestureRecognizerShouldBegin:`），识别之后再判就晚了：
@@ -342,40 +343,15 @@ static const CGFloat kNBOvershootDrag = 0.35;
 //
 // ⚠️ 不需要切主线程：`nbPan:` / `nbApplyOffset:` 全在主线程（手势回调 + 布局），
 //    而 haptic 的 API 也要求主线程 —— 这里天然满足，别加 dispatch_async（加了反而慢一帧）。
-typedef NS_ENUM(NSInteger, NBHapticKind) {
-    NBHapticKindArm = 0,    // 刚进入「松手删除」—— 柔
-    NBHapticKindDelete = 1, // 真的执行了删除 —— 稍实一点，但仍是 Light
-    NBHapticKindStop = 2    // v0.0.128 / v0.0.129：右滑越过开锁线那一下 —— 和 Arm 同档（柔）
-};
-
-static UIImpactFeedbackGenerator *NBHapticGen(NBHapticKind kind) {
-    static UIImpactFeedbackGenerator *soft = nil;
-    static UIImpactFeedbackGenerator *light = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        if (@available(iOS 13.0, *)) {
-            soft = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleSoft];
-        } else {
-            // iOS 12 及以下没有 Soft，退到 Light（部署目标是 14，这条只是兜底）
-            soft = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-        }
-        light = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-    });
-    // 🔴 v0.0.128：判据从「是 Arm 就柔」改成「**只有 Delete 用轻**」。
-    //    原来是 `(kind == NBHapticKindArm) ? soft : light` —— 那样新增的 Stop 会**静默**
-    //    落到 light（比"顶住"该有的分量重一档），而且看不出是漏改还是故意的。
-    //    改成黑名单式之后，以后再加的档默认都是"柔"，要重就显式点名。
-    return (kind == NBHapticKindDelete) ? light : soft;
-}
-
-// 预热：进手势时调一次，把 TapticEngine 唤醒（不预热第一次会慢/不震）
-static void NBHapticPrepare(NBHapticKind kind) {
-    [NBHapticGen(kind) prepare];
-}
-
-static void NBHapticFire(NBHapticKind kind) {
-    [NBHapticGen(kind) impactOccurred];
-}
+//
+// 🔴🔴 v0.0.178：**实现搬走了** —— 枚举 + 三个函数原来就在这里，而且是 `static`
+//    且不在头文件里 ⇒ 列表页（`ViewController.m`）根本调不到。
+//    账：`NBHapticFire` 在 `ViewController.m` 里出现过 **0 次** ——
+//    所以"换筛选 / 点图标栏 / 标已读 / 静音"从来没震过，不是忘了写，是写不了。
+//    现在统一在 `NBHaptic.h` / `NBHaptic.m`（全 App 一份实现）。
+//    档位名也从**动作名**（Arm / Delete / Stop）改成**分量名**（Soft / Light / …）：
+//    动作名一旦被第二个动作复用就开始说谎。
+//    ⛔ 别再往这个文件里加 `static` 的触觉实现 —— 那是这次要消掉的东西。
 
 + (CGFloat)height { return kNBCardInteriorH + kNBCardInsetY * 2; }
 
@@ -888,7 +864,7 @@ static void NBHapticFire(NBHapticKind kind) {
         self.nbArmed = armed;
         self.swipeLabel.text = armed ? @"松手删除" : @"删除";
         // 往"要删"的方向走才震；退回来不震（否则来回滑会一直抖）
-        if (armed) NBHapticFire(NBHapticKindArm);
+        if (armed) NBHapticFire(NBHapticKindSoft);
     }
 }
 
@@ -928,7 +904,7 @@ static void NBHapticFire(NBHapticKind kind) {
     // 复位在 `nbPan:` 的 Began（**不是**"余量回到 0"）—— 理由见属性那处的注释。
     if (over > 0.0 && self.nbOverflowArmed) {
         self.nbOverflowArmed = NO;
-        NBHapticFire(NBHapticKindStop);
+        NBHapticFire(NBHapticKindSoft);
     }
 }
 
@@ -956,7 +932,7 @@ static void NBHapticFire(NBHapticKind kind) {
     if (w < 1.0) w = self.bounds.size.width;
     if (w < 1.0) {
         // 宽度都拿不到就别做动画了（退化路径：宁愿少个动画，也不能不删）
-        NBHapticFire(NBHapticKindDelete);
+        NBHapticFire(NBHapticKindLight);
         if (self.nbOnDelete) self.nbOnDelete();
         return;
     }
@@ -970,7 +946,7 @@ static void NBHapticFire(NBHapticKind kind) {
         [self nbSettleTo:0.0 animated:NO];
         // v0.0.94：真正执行删除的那一下再给一次（Light，比进入时稍实）。
         // 位置在复位之后、回调之前：回调里可能 reload + 弹提示，震感要压在动作本身上。
-        NBHapticFire(NBHapticKindDelete);
+        NBHapticFire(NBHapticKindLight);
         if (self.nbOnDelete) self.nbOnDelete();
     }];
 }
@@ -998,7 +974,7 @@ static void NBHapticFire(NBHapticKind kind) {
             self.nbOverflowArmed = YES;
             // v0.0.94：唤醒 TapticEngine（预热）。放这里而不是第一次要震的时候：
             // 预热有提前量，等到"进入待删态"那一下再 prepare 就晚了，手感慢半拍。
-            NBHapticPrepare(NBHapticKindArm);
+            NBHapticPrepare(NBHapticKindSoft);
             // 同一时刻只允许一行打开：通知列表把别的那行收起
             if (self.nbOnSwipeBegin) self.nbOnSwipeBegin();
             break;
@@ -1089,7 +1065,7 @@ static void NBHapticFire(NBHapticKind kind) {
     [self nbSettleTo:0.0 animated:YES];
     // 复用删除那一档轻震：翻转已读也是"一次确定的动作"，需要触觉确认。
     // ⛔ 不为它单开一个 NBHapticKind —— 手感分不出差别，却多一处要维护的枚举。
-    NBHapticFire(NBHapticKindDelete);
+    NBHapticFire(NBHapticKindLight);
     // 🔴 这里**不再判断方向**（不读 isUnread）：文案已经由 `nbUpdateLeadLabel` 定好，
     //    动作必须跟着文案走。判两处就会出现"按钮写着标已读、按下去却标成未读"。
     if (self.nbOnToggleRead) self.nbOnToggleRead();

@@ -156,8 +156,8 @@ def rd(p):
 
 SRC_EXT = (".m", ".x", ".h")
 
-# 除源码外还要读的文件（版本号判据要它们）
-EXTRA_FILES = ("control", "Resources/Info.plist")
+# 除源码外还要读的文件（版本号判据要它们；I3 要 Makefile 判"新文件有没有进 FILES"）
+EXTRA_FILES = ("control", "Resources/Info.plist", "Makefile")
 
 
 def wanted(rel):
@@ -226,7 +226,7 @@ def load_baseline(root, rev):
         return None, None
     files, raw = {}, {}
     for rel in listing.stdout.splitlines():
-        if not (rel.endswith(SRC_EXT) or rel in ("control", "Resources/Info.plist")):
+        if not (rel.endswith(SRC_EXT) or rel in EXTRA_FILES):
             continue
         if rel.startswith("checks/"):
             continue
@@ -522,7 +522,7 @@ def _(c):
 
 # ── G. 文件格式 ─────────────────────────────────────────────────
 
-@chk("G1", "源码/control/Info.plist 纯 LF", baseline="red")
+@chk("G1", "源码/control/Info.plist/Makefile 纯 LF", baseline="red")
 def _(c):
     """🔴 判据域必须是**被测上下文**（`c["raw"]`），不许回头去读磁盘上的当前仓库 ——
        否则 `--baseline` 模式下它量的是别人。这条是第一次跑反向对照当场抓到的 bug
@@ -689,6 +689,164 @@ def _(c):
             else "%d 个非 table 的 scrollView 都显式关掉了" % total)
 
 
+# ── I3. 下拉刷新的闭环 / 键盘收起 / 触觉入口（v0.0.178）──────────
+
+@chk("I3", "下拉刷新闭环、键盘收起、触觉入口齐全", baseline="red")
+def _(c):
+    """🔴 v0.0.178 新增。这一版加的三件事**坏掉以后界面上都不报错**，所以必须机械守：
+
+       ① 下拉刷新必须是**闭环**：挂载 → 重查 → 两个出口收转圈 → 无出口时看门狗兜底。
+          任何一环漏掉的表现都不是"报错"，而是"一直转圈"或"转一下就没了" ——
+          前者只能杀 App，后者会被读成"下拉没反应"。
+       ② 下拉**绝不能**走 `refreshIfChanged`：它第一句是 `if (!dbFingerprintChanged) return;`
+          ⇒ 库没变时什么都不做、转圈照样消失、界面一个像素都不变。
+          这是"交了等于没交"的典型，而且看起来完全正常 —— 所以写成**反向判据**。
+       ③ 触觉必须落在**用户动作的入口**（换筛选 / 点图标 / 标已读 / 静音 / 下拉）。
+          漏一个的后果是那个动作"手感上不存在"，没有任何日志会报。
+          另外成功那档必须排在**回读校验之后**：写盘失败也震"成功"，
+          用户摸到的就是"成了"，而通知照弹（和 v0.0.176 熄灯动画同一条纪律）。
+       ④ `NotifyCell.m` 里**不许**再出现自己那份 `static` 触觉实现。
+          v0.0.178 之前就是它导致列表页一次都没震过 —— 死实现留着，
+          下一个人会以为"已经有触觉了"，然后发现调不到、再抄一份。
+
+       ⚠️ 判据域一律 `mask()` 之后：这几版的解释注释里把这些名字全写过一遍，
+          不 mask 就是拿自己的注释当证据（两个方向都会中：假红 + 假绿）。
+    """
+    vc = mask(c["files"].get("app/ViewController.m", ""))
+    nc = mask(c["files"].get("app/NotifyCell.m", ""))
+    ha = mask(c["files"].get("app/NBHaptic.m", ""))
+    problems = []
+
+    # ---------- ① 挂载 + 唯一收尾 + 两个出口 ----------
+    if "self.table.refreshControl" not in vc:
+        problems.append("没见过把 refreshControl 挂到 table 上")
+
+    end = _func_body(vc, "\n- (void)nbEndPullRefresh {")
+    if end is None:
+        problems.append("nbEndPullRefresh 找不到")
+    else:
+        if "endRefreshing" not in end:
+            problems.append("nbEndPullRefresh 里没有 endRefreshing")
+        if "nbPullBeginAt" not in end:
+            problems.append("nbEndPullRefresh 没复核最短可见时长")
+        # 🔴 "唯一收尾出口"：全文的 `endRefreshing` 只许出现在这一个函数里。
+        #    散出去以后就会出现"两个地方都能收"⇒ 先到的那个把转圈收掉，
+        #    用户看到的是"转圈提前消失"，而日志里看不出谁收的。
+        if vc.count("endRefreshing") != end.count("endRefreshing"):
+            problems.append("endRefreshing 有 %d 处，只有 1 处该在 nbEndPullRefresh 里"
+                            % vc.count("endRefreshing"))
+
+    nw = _func_body(vc, "\n- (void)ncWaitAndReload:(NSInteger)left {")
+    if nw is None:
+        problems.append("ncWaitAndReload: 找不到")
+    elif nw.count("nbEndPullRefresh") < 2:
+        # "什么都没变"那条 `return` 是最常走的一条；漏了它，转圈只能靠 2.5s 看门狗收
+        # ⇒ 表现是"每次都转满 2.5 秒"，像卡住。
+        problems.append("ncWaitAndReload: 只收 %d 处转圈（两个出口都要收）"
+                        % nw.count("nbEndPullRefresh"))
+
+    pr = _func_body(vc, "\n- (void)nbOnPullRefresh:(UIRefreshControl *)rc {")
+    if pr is None:
+        problems.append("nbOnPullRefresh: 找不到")
+    else:
+        if "nbPullBusy" not in pr:
+            problems.append("nbOnPullRefresh: 没有重入闸门")
+        if "dispatch_after" not in pr:
+            problems.append("nbOnPullRefresh: 没有兜底定时器（永不回调时转圈不收）")
+        if "reloadKeepingOffset" not in pr:
+            problems.append("nbOnPullRefresh: 没走完整重查")
+        if "refreshIfChanged" in pr:
+            problems.append("nbOnPullRefresh: 用了带指纹闸门的 refreshIfChanged（库没变就空转）")
+        if "NBHapticFire" not in pr:
+            problems.append("nbOnPullRefresh: 没触觉")
+        if "requestNCSnapshotIfDue" in pr:
+            problems.append("nbOnPullRefresh: 用了节流出口（手动动作不许被挡）")
+
+    # ---------- ② 键盘 ----------
+    if "keyboardDismissMode" not in vc:
+        problems.append("没设 keyboardDismissMode")
+    did = _func_body(vc, "\n- (void)tableView:(UITableView *)tableView "
+                         "didSelectRowAtIndexPath:(NSIndexPath *)indexPath {")
+    if did is None:
+        problems.append("didSelectRowAtIndexPath: 找不到")
+    elif "resignFirstResponder" not in did:
+        problems.append("didSelectRow 没把键盘收掉（键盘会跟到详情页上）")
+
+    # ---------- ③ 触觉入口 ----------
+    entries = [
+        ("onTime:", "\n- (void)onTime:(UISegmentedControl *)seg {"),
+        ("onUnread:", "\n- (void)onUnread:(UISegmentedControl *)seg {"),
+        ("onStar:", "\n- (void)onStar:(id)sender {"),
+        ("onIcon:", "\n- (void)onIcon:(UIButton *)sender {"),
+        ("nbOverviewSelectBundle:", "\n- (void)nbOverviewSelectBundle:(NSString *)bid {"),
+        ("doMarkAllRead", "\n- (void)doMarkAllRead {"),
+    ]
+    for name, anchor in entries:
+        fb = _func_body(vc, anchor)
+        if fb is None:
+            problems.append("%s 找不到" % name)
+        elif "NBHapticFire" not in fb:
+            problems.append("%s 没有触觉" % name)
+
+    # 成功那档必须排在回读校验之后（写盘失败也震"成功" = 手指收到假结论）
+    for name, anchor, verify in (
+            ("nbMuteRow:", "\n- (void)nbMuteRow:(NSDictionary *)row kind:(NBMuteKind)kind {",
+             "BOOL ok ="),
+            ("nbUnmuteRow:", "\n- (void)nbUnmuteRow:(NSDictionary *)row {",
+             "BOOL exactStill")):
+        fb = _func_body(vc, anchor)
+        if fb is None:
+            problems.append("%s 找不到" % name)
+            continue
+        if "NBHapticFire" not in fb:
+            problems.append("%s 没有触觉" % name)
+            continue
+        i_ok = fb.find(verify)
+        i_su = fb.find("NBHapticKindSuccess")
+        if i_ok < 0:
+            problems.append("%s 找不到回读校验（%s）" % (name, verify))
+        elif i_su < 0:
+            problems.append("%s 没有成功触觉" % name)
+        elif i_su < i_ok:
+            problems.append("%s 的成功触觉排在回读校验之前" % name)
+
+    # ---------- ④ 死实现 / 死名字 / 链接配置 ----------
+    if "static void NBHapticFire" in nc or "static UIImpactFeedbackGenerator" in nc:
+        problems.append("NotifyCell.m 里又出现自己那份 static 触觉实现")
+    for dead in ("NBHapticKindArm", "NBHapticKindDelete", "NBHapticKindStop"):
+        if dead in nc or dead in vc:
+            problems.append("旧档位名 %s 还在（死名字会让人以为还有另一套）" % dead)
+    if "void NBHapticFire(NBHapticKind kind)" not in ha:
+        problems.append("NBHaptic.m 里没有 NBHapticFire 的实现")
+    # 档位的判定必须是**黑名单**式（只有 Light 用轻，其余一律柔）。
+    # 写成白名单 `? soft : light` 时，以后新增的档会静默落到 light —— 分量偏重且看不出来。
+    if "? light : soft" not in ha:
+        problems.append("NBHaptic.m 的档位判定不是黑名单式（`? light : soft`）")
+    if "? soft : light" in ha:
+        problems.append("NBHaptic.m 的档位判定是白名单式（新增档会静默变重）")
+    # 🔴🔴 Makefile 这一条**不能复用 `mask()`**：`mask` 只认 C 的 `//` 和 `/* */`，
+    #    不认 Makefile 的 `#` 注释。而我在上面那段说明里正好写了 "新增 app/NBHaptic.m"
+    #    ⇒ mask 之后那句话还在 ⇒ 判据永远绿。
+    #    这不是假设：第一版就是这么写的，是 **M23 变异跑不红**当场抓出来的。
+    #    （同族账：本项目已为"解释性注释污染判据域"付过两次 —— 一次是裸串被文件头
+    #      注释误伤，一次是 `MUST_BE_GONE` 里放裸串。这是第三次，形态换了：
+    #      换成了一个 mask 不认识的注释语法。）
+    #    ⇒ 正解不是再补一套"剥 # 注释"，而是**只认那一行赋值**：
+    #      注释里提到文件名叫"说明"，`FILES` 行里有它才叫"编进去了"。
+    files_line = next((ln for ln in c["files"].get("Makefile", "").splitlines()
+                       if ln.lstrip().startswith("NotifyBoxApp_FILES")), "")
+    if not files_line:
+        problems.append("Makefile 里找不到 NotifyBoxApp_FILES 赋值行 —— 锚点失效，判据作废")
+    elif "app/NBHaptic.m" not in files_line:
+        # 🔴 这是本项目"新文件忘了进 Makefile"的**第九次**防守点。
+        #    失败形态是链接期 undefined symbol（`_NBHapticFire`，连 _OBJC_CLASS_$_ 前缀都没有），
+        #    看着像代码问题。判据放在这里，就再也不用靠记忆。
+        problems.append("Makefile 的 App FILES 里没有 app/NBHaptic.m（链接期 undefined symbol）")
+
+    return (not problems, "；".join(problems) if problems else
+            "下拉闭环 / 键盘 / 触觉入口 / 链接配置 全齐")
+
+
 # ───────────────────────────── 跑判据 ─────────────────────────────
 
 
@@ -782,6 +940,28 @@ MUTATIONS = [
      "    [self nbRebuildOverview];\n    [self nbArmEntrance];\n\n    [self.table reloadData];", "I1"),
     ("M19 删掉 iconBar 的 scrollsToTop = NO（点状态栏回顶全失效）", "app/ViewController.m",
      "    self.iconBar.scrollsToTop = NO;", "    ;", "I2"),
+    # 🔴 v0.0.178：六条分别打 I3 的**六个独立条件**。
+    #    只测一条的话，"判据在另外五个维度上是瞎的"完全看不出来 ——
+    #    M21 尤其重要：它是本判据里唯一的**反向**判据（"不许用 refreshIfChanged"），
+    #    肯定式判据挡不住"换成另一个看起来合理的调用"。
+    ("M20 删掉「什么都没变」出口的收转圈（转圈只能靠看门狗收）", "app/ViewController.m",
+     "            [self2 nbEndPullRefresh];\n            return;",
+     "            return;", "I3"),
+    ("M21 下拉改成走 refreshIfChanged（库没变就什么都不做）", "app/ViewController.m",
+     "    [self requestNCSnapshot];\n    [self reloadKeepingOffset];",
+     "    [self refreshIfChanged];\n    [self reloadKeepingOffset];", "I3"),
+    ("M22 删掉 keyboardDismissMode（搜索时键盘不收）", "app/ViewController.m",
+     "    self.table.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;",
+     "    ;", "I3"),
+    ("M23 把 NBHaptic.m 从 Makefile 的 App FILES 里删掉", "Makefile",
+     "app/NBHaptic.m NotifyStore.m", "NotifyStore.m", "I3"),
+    ("M24 删掉点图标栏的触觉", "app/ViewController.m",
+     "    NBHapticFire(NBHapticKindSoft);\n"
+     '    self.filterBundle = [bid isEqualToString:@"全部"] ? nil : bid;',
+     '    self.filterBundle = [bid isEqualToString:@"全部"] ? nil : bid;', "I3"),
+    ("M25 删掉收尾里的 endRefreshing（转圈永不消失）", "app/ViewController.m",
+     "    self.nbPullBusy = NO;\n    [self.nbRefresh endRefreshing];",
+     "    self.nbPullBusy = NO;", "I3"),
 ]
 
 

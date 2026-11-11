@@ -11,6 +11,8 @@
 #import "NotifyExport.h"     // v0.0.44 导出
 // v0.0.71：统一视觉层（颜色 / 圆角 / 图标 / 分组卡片的唯一来源）
 #import "NBTheme.h"
+// v0.0.178：触觉反馈的唯一实现（原来是 NotifyCell.m 里的 static 函数，本文件调不到）
+#import "NBHaptic.h"
 // v0.0.118：长按菜单里的「打开」⇒ 按 bundleId 打开对应 App（两条路 + 失败留痕都在那个模块里）
 #import "AppLauncher.h"
 // v0.0.164：列表顶部的双列总览网格（只负责画，聚合与取值都在本文件里算）
@@ -180,6 +182,18 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 @property (nonatomic) NSInteger nbPrevUnreadIdx;
 // 入场错落是否已经播过（本次进程内只播一次，见 viewWillAppear:）。
 @property (nonatomic) BOOL nbEntranceDone;
+
+// ================= v0.0.178：下拉刷新 =================
+// 🔴 三个量，每一个都有用，别合并：
+//   · `nbRefresh`     —— 控件本身。收尾必须用**同一个实例**调 `endRefreshing`，
+//                        临时 `self.table.refreshControl` 去取在重建后可能已经是别的对象。
+//   · `nbPullBusy`    —— 重入闸门。连拉两下时第二次直接忽略：否则会有两个"等待轮次"
+//                        同时在跑，先回来的那个把转圈收掉，后回来的那个再收一次 ⇒
+//                        "转圈莫名提前消失"，而且日志里看着像刷新做了两遍。
+//   · `nbPullBeginAt` —— 起始时刻。只为一件事：**最短可见时长**（见 `nbEndPullRefresh`）。
+@property (nonatomic, strong) UIRefreshControl *nbRefresh;
+@property (nonatomic) BOOL nbPullBusy;
+@property (nonatomic) CFAbsoluteTime nbPullBeginAt;
 
 @property (nonatomic, strong) NSArray<NSDictionary *> *items;
 // 🔴 v0.0.163：按天分组的**唯一**数据源 —— 每项 `@{@"title": 日期标题, @"items": 这一天的行}`。
@@ -400,6 +414,16 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 - (void)updateSummaryRow;
 - (NSInteger)activeFilterCount;
 - (void)onClearFilters;
+
+// v0.0.178：下拉刷新。
+// 🔴 `nbOnPullRefresh:` 必须在这里声明：它要用于 `@selector(...)`。
+//    不声明 ⇒ ARC 下返回类型被推断成 `id` ⇒ CI 的 `-Werror` 直接挂
+//    （v0.0.33 的 `doDelete`/`str:`、v0.0.35 的 `onClear:` 都是这么挂过一次的）。
+// 🔴 `nbEndPullRefresh` 也要声明：它被 `ncWaitAndReload:` 的 block 里以
+//    `[self2 nbEndPullRefresh]` 调用，而那块代码在本文件里位置**更靠后**
+//    —— 同一个类里靠后的代码看得见靠前的声明，看不见靠后的定义。
+- (void)nbOnPullRefresh:(UIRefreshControl *)rc;
+- (void)nbEndPullRefresh;
 
 - (void)onDiag:(id)sender;
 - (void)onSettings:(id)sender;
@@ -1023,13 +1047,19 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
     [self loadData];
 
     if (n > 0) {
+        // v0.0.178：标已读是"确定的动作"，给稍实一档（和左滑删除同一个分量）。
+        NBHapticFire(NBHapticKindLight);
         [self alertTitle:@"已标记"
                     text:[NSString stringWithFormat:@"把 %ld 条标成了已读。", (long)n]];
     } else if (n == 0) {
         // `UPDATE ... WHERE read=0` 命中 0 行照样返回 SQLITE_DONE ⇒ 不能当成功。
+        // v0.0.178：既不是成功也不是失败 ⇒ 最轻档。**不能**静音不震：
+        // 那样"点了没反应"和"点了但确实没有未读"手感一样，用户会连点。
+        NBHapticFire(NBHapticKindSoft);
         [self alertTitle:@"没有变化"
                     text:@"这个范围里已经没有未读了（可能刚被标过）。列表已刷新。"];
     } else {
+        NBHapticFire(NBHapticKindWarning);
         [self alertTitle:@"标记失败"
                     text:@"打不开数据库。列表已刷新，可以重启 App 再试。"];
     }
@@ -1574,6 +1604,35 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     [self.table registerClass:[NotifyCell class] forCellReuseIdentifier:@"c"];
     self.table.rowHeight = [NotifyCell height];
     [self.view addSubview:self.table];
+
+    // ================= v0.0.178：下拉刷新 =================
+    // 🔴 用户要的是"手动刷新一次"，所以这条**不能走 `refreshIfChanged`**：
+    //    那个函数第一句就是 `if (![self dbFingerprintChanged]) return;` —— 库没变时
+    //    它什么都不做，用户拉一下松手、转圈消失、界面一点变化没有 ⇒
+    //    结论是"下拉刷新是坏的"。手动入口的语义是"我要求你重查一遍"，不是"变了才查"。
+    //    ⇒ 走 `reloadKeepingOffset`（完整重查 + 保住滚动位置），并在下面请 tweak 重扫。
+    UIRefreshControl *rc = [[UIRefreshControl alloc] init];
+    [rc addTarget:self action:@selector(nbOnPullRefresh:)
+        forControlEvents:UIControlEventValueChanged];
+    // 🔴 挂在 `table.refreshControl` 上，而不是 `addSubview:` 到 table：
+    //    系统只在 `refreshControl` 这一条路上管"下拉出来的距离 / 收回去的动画 / inset"。
+    //    自己 addSubview 得把这些**全部**重做一遍，而且十有八九漏掉某一种（弹回、分页、编辑态）。
+    self.table.refreshControl = rc;
+    self.nbRefresh = rc;
+    // 🔴 空列表时也必须能下拉 —— 而"一条记录都没有"恰恰是最想刷新的时候。
+    //    UITableView 的 `alwaysBounceVertical` 默认就是 YES，这里显式写一遍是为了把它
+    //    **钉在代码里**：以后谁给某个筛选态调了 `bounces = NO`（比如"空列表不要橡皮筋"），
+    //    下拉刷新就会**只在空列表时静默失效** —— 而那一刻用户唯一的想法是"这 App 坏了"。
+    self.table.alwaysBounceVertical = YES;
+
+    // ================= v0.0.178：键盘收起 =================
+    // 🔴 搜索框是**常驻**的（v0.0.132 起），所以"一边看结果一边被键盘挡住半屏"
+    //    是常态而不是偶发。列表滚一下就收键盘 = 系统列表的标准行为。
+    // 🔴 选 `OnDrag` 而不是 `Interactive`：`Interactive` 会让键盘跟着手指走，
+    //    但本表有 section header 吸顶 + 自绘 card 的位移手势（`nbApplyOffset:`），
+    //    手指在卡片上的竖直位移会**同时**喂给两个东西 ⇒ 表现为"键盘抖、卡片也抖"。
+    //    `OnDrag` 是"一开始拖就收"，行为确定，不跟手势抢。
+    self.table.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
 
     // v0.0.132：首帧前先给时间胶囊上色（样式只由 `updateTimePills` 管，loadData 也会调）。
     [self updateTimePills];
@@ -2170,6 +2229,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 - (void)onIcon:(UIButton *)sender {
     NSArray *list = [@[@"全部"] arrayByAddingObjectsFromArray:self.bundles];
     NSString *bid = list[sender.tag];
+    // v0.0.178：点图标栏给一次最轻的触觉。
+    // 🔴 为什么这里"必须有"：图标栏是**自绘**的 UIImageView/UIButton 组合，
+    //    系统不会白送任何反馈（UISegmentedControl / UIButton 那套自带的东西，自绘一概没有）。
+    NBHapticFire(NBHapticKindSoft);
     self.filterBundle = [bid isEqualToString:@"全部"] ? nil : bid;
     // v0.0.176：换了 App 筛选 = 整屏内容被换掉 ⇒ 走入场错落。
     // 🔴 布防点必须落在**用户动作的入口**，不能落在 `loadData` 里 —— 见 `nbArmEntrance` 的注释。
@@ -2178,6 +2241,12 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 }
 
 - (void)onTime:(UISegmentedControl *)seg {
+    // v0.0.178：切时间档给一次最轻的触觉。
+    // 🔴 放在 `onTime:` 而**不是** `onTimePillTapped:`：v0.0.37 起时间筛选是自绘胶囊，
+    //    点胶囊会**手动**调 `onTime:`（程序改 selectedSegmentIndex 不触发事件）。
+    //    两处都写就是一次点击震两下；只写在胶囊那边的话，将来任何直接设段号的路径又没声了。
+    //    ⇒ 认"唯一的执行出口"，不认"手指落在哪儿"。
+    NBHapticFire(NBHapticKindSoft);
     // v0.0.176：先按"从哪一档换到哪一档"布防，再重查。
     // 🔴 布防必须在 `loadData` **之前**：动画的触发点在 `willDisplayCell:`，
     //    而那一次布局是由 `loadData` 里的 `reloadData` 引出来的。
@@ -2789,6 +2858,11 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
             // v0.0.122：**这条提前返回必须留痕**。它是 v0.0.121 省下来的那笔主要开销，
             //    但静默的话，"省下来"和"根本没跑"在日志上完全一样。
             NBRefNote(NBRefKindNoSnapChange);
+            // v0.0.178：下拉刷新的转圈**在这里也要收**。
+            // 🔴 这条 `return` 就是"什么都没变"那条路 —— 而它恰恰是最常走的一条
+            //    （用户拉一下，通知中心确实没变）。漏了它 = 转圈只能靠 2.5s 看门狗收，
+            //    表现是"每次都转满 2.5 秒"，看着像卡住。幂等，重复调无害。
+            [self2 nbEndPullRefresh];
             return;
         }
         // ---------- ③ 通知中心真的变了 ----------
@@ -2801,6 +2875,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         } else {
             [self2 refreshItemsKeepingOffset];
         }
+        // v0.0.178：下拉刷新的第二个收尾点（"通知中心真的变了"这条路）。
+        // 🔴 必须排在两条刷新**之后**：转圈消失的瞬间界面应该已经是新的 ——
+        //    先收转圈再刷新，用户会看到"圈没了、界面才跳"。
+        [self2 nbEndPullRefresh];
     });
 }
 
@@ -3251,6 +3329,9 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 //    而"只看未读"应该是在数据库层筛（数量完全不同的两类查询）。
 // v0.0.37：改由自己的 `unreadSeg` 驱动（系统 scope bar 在 iOS 16 上没渲染出来）。
 - (void)onUnread:(UISegmentedControl *)seg {
+    // v0.0.178：同样是最轻一档。位置在**改状态之前**：这一下震的是"你按到了"，
+    // 不是"数据已更新"—— 后者由列表内容本身说明。
+    NBHapticFire(NBHapticKindSoft);
     self.unreadOnly = (seg.selectedSegmentIndex == 1);
     // v0.0.38：「全标已读」跟着这一段进出。
     // 🔴 必须 `setNeedsLayout`：分段控件的宽度在「只看未读」时要收窄
@@ -3272,6 +3353,8 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 // 🔴 不需要 `setNeedsLayout`：starBtn 常驻、分段行宽度不随 starOnly 变
 //    （布局分支只认 unreadOnly）—— 提示条的出现/消失由 loadData 末尾统一触发。
 - (void)onStar:(id)sender {
+    // v0.0.178：★ 也是自绘按钮（`starBtn`），系统同样不送反馈。
+    NBHapticFire(NBHapticKindSoft);
     self.starOnly = !self.starOnly;
     self.starBtn.selected = self.starOnly;
     // v0.0.176：★ 也是一个"整屏内容被换掉"的入口，同样走入场错落。
@@ -3530,6 +3613,10 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     if (!bid.length) return;
     if (self.filterBundle.length && [self.filterBundle isEqualToString:bid]) return;
 
+    // v0.0.178：和 `onIcon:` 同一个反馈（这两条本来就是同一件事，见下面注释）。
+    // 🔴 位置在两道闸门**之后**：点自己当前的 App 什么都没发生时，不该震
+    //    —— "震了但屏幕上没变化"会被读成"点了但坏了"。
+    NBHapticFire(NBHapticKindSoft);
     self.filterBundle = bid;
     // v0.0.176：和 `onIcon:` 一样 —— 换筛选 = 整屏内容被换掉 ⇒ 入场错落。
     [self nbArmEntrance];
@@ -3562,6 +3649,65 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     else if (to < from) self.nbSlideDX = -26.0;
     else                self.nbSlideDX = 0.0;
     self.nbSlideUntil = CFAbsoluteTimeGetCurrent() + 0.30;
+}
+
+#pragma mark - v0.0.178 下拉刷新
+
+// 用户下拉松手 ⇒ 这里。**只做两件事**：整表重查 + 请 tweak 重扫通知中心。
+//
+// 🔴 为什么不用 `refreshIfChanged`：见 viewDidLoad 里挂控件那段注释 ——
+//    它带指纹闸门，库没变就什么都不做，用户会以为下拉坏了。
+// 🔴 为什么刷新请求排在重查**之前**：`requestNCSnapshot` 是异步的
+//    （Darwin 通知 → tweak 主队列 → 写文件 → 本 App 等 0.45s 再读），
+//    先发出去能把它跟本地重查**并行**掉；排在后面等于白等一截。
+// 🔴 为什么它**不走** `requestNCSnapshotIfDue`：那个出口带节流，专治
+//    "回前台太频繁"。下拉是用户**明确点的**，被节流挡掉的话
+//    "我拉了但残留标记没变"——和"按钮坏了"分不开（v0.0.121 的既定纪律）。
+- (void)nbOnPullRefresh:(UIRefreshControl *)rc {
+    // 🔴 重入闸门：连拉两下时第二次直接忽略。否则会有两个等待轮次同时在跑，
+    //    先回来的把转圈收掉 ⇒ "转圈莫名提前消失"，而且看着像刷了两遍。
+    if (self.nbPullBusy) return;
+    self.nbPullBusy = YES;
+    self.nbPullBeginAt = CFAbsoluteTimeGetCurrent();
+    NBHapticFire(NBHapticKindSoft);
+
+    [self requestNCSnapshot];
+    [self reloadKeepingOffset];
+
+    // 🔴 **看门狗**：转圈不能只靠 `ncWaitAndReload:` 收尾。
+    //    两条路会让它永远不回调 ——
+    //      ① tweak 没在跑（只装了 App 没 respring、或 SpringBoard 的 dylib 没注入）；
+    //      ② `ncScanPending` 已经是 YES（自动扫描正在等），此时 `requestNCSnapshot`
+    //         第一句就 return，**不会**起新的等待轮次。
+    //    没有这个兜底，屏幕上就是"一直转圈"，用户只能杀掉 App —— 比"刷新不了"糟得多。
+    //    ⚠️ 这是"熔断标记必须带超时"那条纪律的具体样子：闸门是 `nbPullBusy`，
+    //       而解除它的条件**不能**依赖"上次成功返回"（失败恰恰不返回）。
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [ws nbEndPullRefresh];
+    });
+}
+
+// 收尾：**幂等**，从任何地方调都安全（`ncWaitAndReload:` 的两个出口 + 看门狗）。
+- (void)nbEndPullRefresh {
+    if (!self.nbPullBusy) return;
+    // 🔴 最短可见时长 0.55s。为什么需要它：正常路径上 `ncWaitAndReload:` 至少等 0.45s，
+    //    但"自动扫描刚好在等"那条路上可能 50ms 就回来了 ⇒ 转圈一闪而过，
+    //    看起来像"下拉没反应"（本项目那条"提示语与判定必须同源"的同类问题：
+    //    界面上的反馈短到看不见，等于没有）。
+    // 🔴 递归调用是**有界**的：left 单调减到 ≤0 时走下面的收尾分支，最多再延一次。
+    NSTimeInterval left = 0.55 - (CFAbsoluteTimeGetCurrent() - self.nbPullBeginAt);
+    if (left > 0.02) {
+        __weak typeof(self) ws = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(left * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [ws nbEndPullRefresh];
+        });
+        return;
+    }
+    self.nbPullBusy = NO;
+    [self.nbRefresh endRefreshing];
 }
 
 #pragma mark - UITableView
@@ -3848,6 +3994,13 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         return;
     }
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    // v0.0.178：进详情页前先把键盘收掉。
+    // 🔴 不收会怎样：搜索框是**常驻**的，用户搜完直接点一条 ⇒ 键盘跟着 push 到详情页上，
+    //    挡住正文下半部分，而详情页里没有任何东西能把它收回去（那里没有输入框）。
+    //    用户唯一的出路是返回列表再滚一下 —— 这就是"点进去看不全"。
+    // ⚠️ 只在这个"真要进详情"的分支里收：上面那个"点一下收起左滑"的分支不该动键盘
+    //    （用户只是想把滑出来的按钮收回去，没收搜索的意思）。
+    if (self.searchBar.isFirstResponder) [self.searchBar resignFirstResponder];
     NSDictionary *d = [self nbItemAtIndexPath:indexPath];
     // v0.0.95：这一行可能是 ×N 的组 ⇒ 点开就等于"整组都看过了"，
     // 否则会出现"点开过、卡片还是未读"（组内其它几条的 read 全是 0）。
@@ -4053,6 +4206,12 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     id bv = row[@"bundle"];
     NSString *bid = [bv isKindOfClass:[NSString class]] ? (NSString *)bv : nil;
     if (!bid.length) {
+        // v0.0.178：三条失败出口都震 Warning 一档。
+        // 🔴 为什么失败要震、而且要和成功**不同档**：静音是"看起来生效了但可能没生效"
+        //    的典型 —— 卡片暗了、可通知照弹。只靠一句 toast 的话，手指按下去没有任何
+        //    差别，用户会以为成功了（本项目最贵的那类假读数：界面在说假话）。
+        //    ⚠️ Warning ≠ 通用错误音：只给"你以为成了、其实没成"这种场合。
+        NBHapticFire(NBHapticKindWarning);
         [self nbToast:@"这条没有 bundle id，没法按 App 静音"];
         return;
     }
@@ -4065,6 +4224,7 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     // 🔴 到顶就拒绝新的（不淘汰旧的）：静音是个位数级的手动操作，到顶说明写坏了；
     //    此时"少静音一个、并说出来"比"悄悄挤掉一个你不知道的"安全。
     if (!tbl[bid] && tbl.count >= NB_MUTE_MAX_ENTRIES) {
+        NBHapticFire(NBHapticKindWarning);
         [self nbToast:[NSString stringWithFormat:
                        @"静音条目已经 %d 条，先取消几个再试", NB_MUTE_MAX_ENTRIES]];
         return;
@@ -4089,11 +4249,16 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     BOOL ok = saved && exact
            && [NotifyFilter shouldDropForMute:bid now:nil reason:&why problem:NULL];
     if (!ok) {
+        NBHapticFire(NBHapticKindWarning);
         [self nbToast:[NSString stringWithFormat:@"静音没有生效（%@）",
                        saved ? @"写进去了但判定侧不认，看日志 MUTE-BAD#" : @"写盘失败"]];
         return;
     }
 
+    // v0.0.178：回读校验通过 = 真的生效了 ⇒ 给"成功"那一档。
+    // 🔴 位置和下面那句熄灯动画**同一条纪律**：必须排在 `ok` 判断之后。
+    //    写盘失败也震 Success 的话，用户摸到的就是"成了"，而通知照弹。
+    NBHapticFire(NBHapticKindSuccess);
     NSString *name = [self appNameForBundle:bid];
     [self nbToast:[NSString stringWithFormat:@"%@ 已静音 · %@", name.length ? name : bid, why ?: @""]];
 
@@ -4153,6 +4318,7 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         if ([e[@"bundle"] isEqualToString:bid]) { exactStill = YES; break; }
     }
     if (!saved || exactStill) {
+        NBHapticFire(NBHapticKindWarning);
         [self nbToast:saved ? @"取消没生效：条目还在，看日志 MUTE-BAD#"
                             : @"取消没生效：写盘失败"];
         return;
@@ -4160,11 +4326,16 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     // 本 App 的没了、但全局静音还在 —— 这是最容易误判成"取消失败"的状态，必须点名。
     NSString *why = nil;
     if ([NotifyFilter shouldDropForMute:@"*" now:nil reason:&why problem:NULL]) {
+        // v0.0.178：这一支也要 Warning —— 用户在弹菜单里点的是"取消静音"，
+        // 看到的 toast 却写着"全局静音仍在"。不震一下成果音的话，手指那一下
+        // 和"完全成功"没有任何区别，而它们**不是**同一个结果。
+        NBHapticFire(NBHapticKindWarning);
         [self nbToast:[NSString stringWithFormat:@"已取消本 App · 但全局静音仍在（%@）", why ?: @""]];
         // v0.0.176：**故意不撤熄灯效果** —— 全局静音还在，这些行确实还被压着，
         // 界面跟着"变亮"就是画面在说假话。判据和 tweak 丢弃通知用的是同一个函数。
         return;
     }
+    NBHapticFire(NBHapticKindSuccess);
     [self nbToast:@"已取消静音"];
     // v0.0.176：亮灯。同样排在回读校验之后（没真删掉就不许装作亮起来了）。
     [self nbAnimateMuteLookForBundle:bid muted:NO];
