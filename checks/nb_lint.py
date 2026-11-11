@@ -899,8 +899,142 @@ def _(c):
             "名字 / 未读 / 选中都折进去了，holder 仍是普通容器")
 
 
-# ───────────────────────────── 跑判据 ─────────────────────────────
+@chk("I5", "列表 cell 整行文案由唯一出口接管：未读/★/×N/静音都念得出，且不覆盖 traits", baseline="red")
+def _(c):
+    """🔴 v0.0.180 新增。守的是列表**每一行**的听觉版本。
 
+       病根不是"cell 没有无障碍元素" —— `UITableViewCell` 默认就是，VoiceOver 一直
+       能扫到每一行。问题是**这一行念什么全靠系统聚合子视图**，于是：
+         ① 未读角标里只有个数字（`3` / `99+`）⇒ 念成孤零零一个「3」，什么意思猜不出来；
+         ② ★ 是 `starLabel.text = @"★"` ⇒ 念「星号」或者被当成符号跳过；
+         ③ **静音态零文本**（卡片压暗 + 琥珀竖条都是纯视觉的）⇒「这个 App 现在不响」
+            这件事对 VoiceOver 用户**完全不存在**，他会以为通知没收到；
+         ④ ×N 徽章念成「叉三」。
+       ⇒ 正解是设 `accessibilityLabel` 把整行接管过来（cell 是无障碍元素，一旦有了
+         显式 label，子视图就不再被聚合，①②④ 那些怪念法一并消失）。
+
+       🔴🔴 反向那两条（⛔ 不许覆盖 `accessibilityTraits` / `isAccessibilityElement`）
+          才是这条判据里最值钱的：cell 的双击走 `didSelectRow`、长按走
+          `UIContextMenuInteraction`，全靠系统按自己的 traits 派发。覆盖掉之后
+          双击**没反应**，而单指扫、左右滑全都正常 —— 这种坏法在真机上极难归因。
+          我校准的是"念什么"，不是"能干什么"。
+
+       🔴🔴 另一条值钱的是「`(无标题)` / `(无正文)` 必须排除」：那两个串是**给眼睛看的
+          兜底**，念出来是「左括号无正文右括号」，等于把占位符变成了正文内容，
+          而且跟着每一条空正文的记录出现，听感上就像坏了。判据要求用
+          `isEqualToString:`（完整串比较），⛔ 不是 `containsString:` ——
+          正文里真写了「(无正文)」四个字（有人在群里聊这个 bug）就会被误吞。
+
+       ⚠️🔴 判据域用 `strip_comments()`：要判的「已标星」「已静音」都是**字符串字面量**，
+          `mask()` 会把 `@""` 整段抹成空格 ⇒ 恒红。反过来只 `strip_comments()` 又会让
+          我写的解释注释（里面反复出现这些词）变成假证据 ⇒ 假绿。两个方向都踩过，
+          所以照 I4 的做法：先剥注释、再只在函数体里判。
+    """
+    raw = c["files"].get("app/NotifyCell.m", "")
+    sc = strip_comments(raw)
+    body = func_body(sc, "\n- (void)nbUpdateA11y {")
+    if not body:
+        return (False, "nbUpdateA11y 找不到 —— 锚点失效，判据作废")
+    problems = []
+
+    # ---------- ① 三样"只有视觉能表达"的状态必须折进文案 ----------
+    for lit, why in (
+            ("未读", "角标里只有一个数字，念出来是孤零零的「3」"),
+            ("已标星", "★ 是「★」字符本身，念成「星号」或被跳过"),
+            ("相同内容", "×N 徽章会被念成「叉三」"),
+            ("已静音", "静音态零文本，不念等于这个状态不存在"),
+    ):
+        if lit not in body:
+            problems.append("文案里没有「%s」：%s" % (lit, why))
+
+    # ---------- ② 出口只许读原始量 ----------
+    # 两个视图状态（`timeLabel.text` / `cardView.alpha`）尤其不许读：
+    # 前者在 prepareForReuse 里曾经是直接写 label 清的，后者带动画时是中间值。
+    for var, why in (
+            ("rawAppName", "App 名不在文案出口里"),
+            ("rawTitle", "标题不在文案出口里"),
+            ("rawBody", "正文不在文案出口里"),
+            ("nbTimeText", "时间不在文案出口里（新加的原始量白加了）"),
+            ("isUnread", "未读判据不在文案出口里"),
+            ("unreadCount", "未读条数不在文案出口里"),
+            ("starred", "★ 判据不在文案出口里"),
+            ("groupCount", "×N 判据不在文案出口里"),
+            ("nbMuted", "静音判据不在文案出口里"),
+    ):
+        if var not in body:
+            problems.append("%s（%s）" % (why, var))
+
+    # ---------- ③ 视觉兜底串必须按完整串排除 ----------
+    for lit in ("(无标题)", "(无正文)"):
+        if not re.search(r'isEqualToString:\s*@"%s"' % re.escape(lit), body):
+            problems.append("「%s」没按完整串排除（兜底文案会念成「左括号…右括号」）" % lit)
+
+    # ---------- ④ 反向：不许覆盖 cell 自己那套无障碍身份 ----------
+    if (re.search(r"self\s*\.\s*accessibilityTraits\s*=", sc)
+            or "[self setAccessibilityTraits:" in sc):
+        problems.append("覆盖了 accessibilityTraits（会弄坏双击进详情）")
+    if (re.search(r"self\s*\.\s*isAccessibilityElement\s*=", sc)
+            or "[self setIsAccessibilityElement:" in sc):
+        problems.append("覆盖了 isAccessibilityElement（cell 默认 YES，多设一处就跟系统版本打架）")
+
+    # ---------- ⑤ 文案只许出现在两处：出口设一次、复用复位清一次 ----------
+    # 多一处就是"同一个量算两遍"（v0.0.179 图标栏刚栽过：改一条必漏一条）。
+    n_lbl = sc.count("accessibilityLabel")
+    if n_lbl != 2:
+        problems.append("accessibilityLabel 出现 %d 次（只许 2 次：出口设、复用清）" % n_lbl)
+
+    # ---------- ⑥ 七个 setter 一个都不许漏 ----------
+    for sig in ("\n- (void)setAppName:",
+                "\n- (void)setTitleText:",
+                "\n- (void)setTimeText:",
+                "\n- (void)setUnread:",
+                "\n- (void)setStarred:",
+                "\n- (void)setGroupCount:",
+                "\n- (void)nbSetMutedLook:"):
+        sb = func_body(sc, sig)
+        if not sb:
+            problems.append("%s 找不到 —— 锚点失效" % sig.strip())
+        elif "nbUpdateA11y" not in sb:
+            problems.append("%s 结尾没调 nbUpdateA11y（输入变了文案不跟着变）" % sig.strip())
+
+    # ---------- ⑦ 静音状态必须记在早返回之前，且不许从 alpha 反推 ----------
+    mb = func_body(sc, "\n- (void)nbSetMutedLook:")
+    if not mb:
+        problems.append("nbSetMutedLook: 找不到 —— 锚点失效")
+    else:
+        i_ret = mb.find("return;")
+        i_set = mb.find("self.nbMuted =")
+        i_upd = mb.find("[self nbUpdateA11y]")
+        if i_set < 0:
+            problems.append("静音状态没存进 nbMuted（既念不出，也躲不开从 alpha 反推）")
+        elif i_ret >= 0 and i_set > i_ret:
+            problems.append("静音状态记在早返回之后（animated:NO 那条路不更新文案）")
+        if i_upd < 0:
+            problems.append("nbSetMutedLook: 里没调 nbUpdateA11y")
+        elif i_ret >= 0 and i_upd > i_ret:
+            problems.append("nbUpdateA11y 排在早返回之后（animated:NO 那条路不更新文案）")
+        if re.search(r"nbMuted\s*=\s*[^;]*alpha", mb):
+            problems.append("静音态从 cardView.alpha 反推（动画途中读到中间值 ⇒ 时念时不念）")
+
+    # ---------- ⑧ 复用必须清文案 ----------
+    rb = func_body(sc, "\n- (void)prepareForReuse {")
+    if not rb:
+        problems.append("prepareForReuse 找不到 —— 锚点失效")
+    else:
+        if not re.search(r"self\s*\.\s*accessibilityLabel\s*=\s*nil", rb):
+            problems.append("prepareForReuse 没清 accessibilityLabel（复用会念上一条的内容）")
+        # ⚠️ 时间也要走 setter 清：`nbTimeText` 是喂给文案的原始量，
+        #    直接写 `timeLabel.text = nil` 会把它留下来 ⇒ 复用回来的行文案里
+        #    挂着上一条的时间。而上面那条（清 accessibilityLabel）看不出来这件事：
+        #    label 反正会被下一次重算覆盖，只有 `nbTimeText` 会真的残留下去。
+        if re.search(r"self\s*\.\s*timeLabel\s*\.\s*text\s*=", rb):
+            problems.append("prepareForReuse 直接写 timeLabel.text（绕过 setTimeText:，nbTimeText 会残留）")
+
+    return (not problems, "；".join(problems) if problems else
+            "未读/★/×N/静音都折进唯一出口，traits 与 a11y 元素身份未被覆盖")
+
+
+# ───────────────────────────── 跑判据 ─────────────────────────────
 
 def run_all(ctx, verbose=True):
     bad = {}
@@ -1038,6 +1172,64 @@ MUTATIONS = [
     ("M31 红点自己再算一遍未读（与 label 变成两条规则）", "app/ViewController.m",
      "            dot.hidden = !hasUnread;",
      "            dot.hidden = ![unread containsObject:bid];", "I4"),
+
+    # ===== v0.0.180：cell 整行文案（I5）=====
+    # 四个状态各一条变异：它们坏掉的表现完全不同（听不出未读 / 听不出星标 /
+    # 听不出×N / 听不出静音），共用一条变异会在"只坏一个"时漏掉。
+    ("M32 兜底串改成前缀判断（正文里真有「(无正文)」就被误吞）", "app/NotifyCell.m",
+     'if (self.rawTitle.length && ![self.rawTitle isEqualToString:@"(无标题)"]) {',
+     'if (self.rawTitle.length && ![self.rawTitle hasPrefix:@"(无"]) {', "I5"),
+    ("M33 未读不进文案（角标只剩孤零零一个数字）", "app/NotifyCell.m",
+     "    if (self.isUnread) {\n"
+     "        NSInteger n = self.unreadCount;\n"
+     "        if (n > 1) {\n"
+     '            [parts addObject:[NSString stringWithFormat:@"未读，这个 App 共 %ld 条未读", (long)n]];\n'
+     "        } else {\n"
+     '            [parts addObject:@"未读"];\n'
+     "        }\n"
+     "    }",
+     "    ;", "I5"),
+    ("M34 ★ 不进文案（念「星号」或被跳过）", "app/NotifyCell.m",
+     '    if (self.starred) [parts addObject:@"已标星"];',
+     "    ;", "I5"),
+    ("M35 静音不进文案（压暗 + 琥珀竖条零文本 ⇒ 状态不存在）", "app/NotifyCell.m",
+     '    if (self.nbMuted) [parts addObject:@"这个 App 已静音"];',
+     "    ;", "I5"),
+    # 这条打的是"读回时机"：带动画时 alpha 是中间值，念出来取决于谁来问、什么时候问
+    ("M36 静音态从 cardView.alpha 反推（动画途中读到中间值）", "app/NotifyCell.m",
+     "    self.nbMuted = muted;",
+     "    self.nbMuted = (self.cardView.alpha < 0.9);", "I5"),
+    ("M37 复用不清文案（念的是上一条的内容）", "app/NotifyCell.m",
+     "    self.accessibilityLabel = nil;",
+     "    ;", "I5"),
+    ("M38 setAppName: 漏调文案出口", "app/NotifyCell.m",
+     "    self.rawAppName = name.length ? name : nil;\n"
+     "    [self nbRender];\n"
+     "    [self nbUpdateA11y];",
+     "    self.rawAppName = name.length ? name : nil;\n"
+     "    [self nbRender];", "I5"),
+    # 「提前返回必须留痕」：状态只记在动画分支里，静默 return 与"没调过"同形
+    ("M39 nbSetMutedLook 早返回漏调文案出口", "app/NotifyCell.m",
+     "    self.nbMuted = muted;\n    [self nbUpdateA11y];",
+     "    self.nbMuted = muted;", "I5"),
+    ("M40 覆盖 accessibilityTraits（双击进详情失灵）", "app/NotifyCell.m",
+     '    self.accessibilityLabel = parts.count ? [parts componentsJoinedByString:@"，"] : nil;',
+     "    self.accessibilityTraits = UIAccessibilityTraitButton;\n"
+     '    self.accessibilityLabel = parts.count ? [parts componentsJoinedByString:@"，"] : nil;', "I5"),
+    ("M41 ×N 念成「共 3 条」（与未读混淆）", "app/NotifyCell.m",
+     '@"共 %ld 条相同内容"',
+     '@"共 %ld 条"', "I5"),
+    # 同源：文案只许有一个生产者，多一处就是两条规则、改一条必漏一条
+    ("M42 ★ 顺手再设一次 accessibilityLabel（两条规则）", "app/NotifyCell.m",
+     '    if (self.starred) [parts addObject:@"已标星"];',
+     '    if (self.starred) self.accessibilityLabel = @"★";\n'
+     '    if (self.starred) [parts addObject:@"已标星"];', "I5"),
+    ("M43 时间改读视图状态（绕过 nbTimeText）", "app/NotifyCell.m",
+     "    if (self.nbTimeText.length) [parts addObject:self.nbTimeText];",
+     "    if (self.timeLabel.text.length) [parts addObject:self.timeLabel.text];", "I5"),
+    ("M44 复用直接写 timeLabel.text（nbTimeText 残留上一条）", "app/NotifyCell.m",
+     "    [self setTimeText:nil];",
+     "    self.timeLabel.text = nil;", "I5"),
 ]
 
 

@@ -143,8 +143,26 @@
 //    长按要求"按住不动"，`nbPan` 要求"横向移动"，谁先满足谁开始。
 @property (nonatomic, strong) UIContextMenuInteraction *nbMenu;
 
+// ================= v0.0.180：cell 的 VoiceOver 文案 =================
+// 🔴 为什么需要单独两个原始量：能说出这一行状态的量一共有 8 个
+//    （App 名 / 标题 / 副标题 / 正文 / 时间 / 未读 / ★ / ×N / 静音），
+//    其中 7 个本来就有 ivar，只剩「时间」和「静音」没有 —— 而它们偏偏是
+//    **只能从视图反推**的两个（`timeLabel.text`、`cardView.alpha`）。
+//    ⛔ 上一行那个"从视图反推"正是本项目反复栽的坑（attributedText 时序、
+//       标星、未读角标、aliveState 各一次），所以这里补两个原始量，
+//       让文案出口**只读 ivar、一个视图状态都不碰**。
+// 🔴 静音态尤其不能用 `cardView.alpha` 反推：`nbSetMutedLook:animated:YES`
+//    是有动画的，动画途中读 alpha 会读到 0.8 这种中间值 ⇒ 念出来的状态
+//    取决于"VoiceOver 什么时候来问"，同一行时念时不念。
+@property (nonatomic, copy) NSString *nbTimeText;
+@property (nonatomic, assign) BOOL nbMuted;
+
 // 🔴 内部方法必须显式声明（项目开 -Werror，靠"定义在前面"解析选择器太脆）
 - (void)nbRender;
+// v0.0.180：整行文案的**唯一出口**。8 个输入对应的 7 个 setter 末尾各调它一次，
+// ⛔ 不许在某个 setter 里就地拼一句 label —— 那就是"同一个量算两遍"
+//   （v0.0.179 图标栏刚栽过：红点和 label 各算一遍 ⇒ 改一条必漏一条）。
+- (void)nbUpdateA11y;
 // v0.0.72：未读书签的唯一入口（数字 + 显隐）。和 nbRender 分开：
 // 书签不参与高亮，混进 nbRender 会让"只翻了一次未读"也重算一遍正文富文本。
 - (void)nbUpdatePin;
@@ -1253,6 +1271,7 @@ static const CGFloat kNBOvershootDrag = 0.35;
     //    而且实际路径上不会发生（`ViewController` 的 `appNameForBundle:` 会兜底成 bundle 末段）。
     self.rawAppName = name.length ? name : nil;
     [self nbRender];
+    [self nbUpdateA11y];
 }
 
 - (void)setTitleText:(NSString *)title message:(NSString *)message subtitle:(NSString *)subtitle {
@@ -1285,6 +1304,7 @@ static const CGFloat kNBOvershootDrag = 0.35;
         self.rawBodyColor = [UIColor tertiaryLabelColor];
     }
     [self nbRender];
+    [self nbUpdateA11y];
 }
 
 - (void)setHighlightQuery:(NSString *)query {
@@ -1308,8 +1328,100 @@ static const CGFloat kNBOvershootDrag = 0.35;
                                                self.rawBodyColor ?: [UIColor secondaryLabelColor]);
 }
 
+// ================= v0.0.180：整行 VoiceOver 文案的唯一出口 =================
+// 用户报的问题：「列表 cell 的 a11y —— 未读 / ★ / 静音态读不到」。
+//
+// 病根不是"cell 没有 a11y 元素"（UITableViewCell 默认就是，VoiceOver 一直能扫到每一行），
+// 而是**这一行念什么全靠系统自己聚合子视图**：
+//   ① 未读角标里的数字（`3` / `99+`）会被当成孤零零一个数字拼进去 ——
+//      用户听到「微信 标题 正文 3」，那个 3 是什么意思完全猜不出来；
+//   ② ★ 是 `starLabel.text = @"★"`，念出来是「星号」或者干脆被当成符号跳过；
+//   ③ **静音态一个字都没有** —— 卡片压暗 + 琥珀竖条是纯视觉的，
+//      结构上不存在任何可念的文本，所以"这个 App 现在不响"这件事对 VoiceOver 用户完全不存在；
+//   ④ ×N 徽章的「×3」同样念成「叉三」这种东西。
+// ⇒ 正解是**把整行文案接管过来**：设 `accessibilityLabel` 之后，cell 作为无障碍元素
+//   只念这一段，子视图不再被聚合（所以 ①②④ 那些怪念法一并消失）。
+//
+// 🔴🔴 只设 label，**不碰 `accessibilityTraits`**：cell 的双击走 `didSelectRow`、
+//    长按走 `UIContextMenuInteraction`，这两条都是系统按自己的 traits 派发的。
+//    我校准的是"念什么"，不是"能干什么" —— 覆盖 traits 会把双击进详情弄坏，
+//    而那种坏法（双击没反应、单指扫却正常）在真机上极难归因。
+//    ⛔ 同理也不许设 `isAccessibilityElement`：cell 默认就是 YES，
+//      显式再设一次只是多一处会跟系统版本打架的地方。
+//
+// 🔴 顺序 = 用户扫列表时想知道的先后：谁发的 → 说了什么 → 什么时候 →
+//    **状态**（未读 / 标星 / ×N / 静音）。状态放最后是因为它变化最频繁，
+//    固定在句尾用户才能学会"听到最后那半句就够"。
+//
+// 🔴 全部读 ivar / 原始量，**一个视图状态都不读**（理由见头文件段的注释）。
+- (void)nbUpdateA11y {
+    NSMutableArray<NSString *> *parts = [NSMutableArray arrayWithCapacity:8];
+
+    // ---------- ① App 名 ----------
+    if (self.rawAppName.length) [parts addObject:self.rawAppName];
+
+    // ---------- ② 标题 / 副标题 / 正文 ----------
+    // 🔴🔴 `(无标题)` / `(无正文)` 是**给眼睛看的兜底**，⛔ 不许念出来。
+    //    那两个串存在的意义是"让人看出这里空着"，而听觉通道没有"空着"这个概念 ——
+    //    念「左括号无正文右括号」等于把一句占位符变成了正文内容，
+    //    而且这话会跟着每一条空正文的记录出现，听感上像坏了。
+    //    ⚠️ 判据必须比较**完整串**（`isEqualToString:`），⛔ 不许用 `containsString:` ——
+    //       正文里真有「(无正文)」四个字（比如有人在群里聊这个 bug）就会被误吞。
+    if (self.rawTitle.length && ![self.rawTitle isEqualToString:@"(无标题)"]) {
+        [parts addObject:self.rawTitle];
+    }
+    if (self.rawSubtitle.length) [parts addObject:self.rawSubtitle];
+    if (self.rawBody.length && ![self.rawBody isEqualToString:@"(无正文)"]) {
+        [parts addObject:self.rawBody];
+    }
+
+    // ---------- ③ 时间 ----------
+    // 🔴 念的是**屏幕上那一串原文**（`MM-dd HH:mm`），不在这里另做一份"人话时间"：
+    //    能看又能听的人必须对得上同一行字；而且自己格式化一份就多一处口径
+    //    （屏幕上 `11-11 12:04`、耳朵里「昨天下午」这种不一致，比念得生硬更糟）。
+    if (self.nbTimeText.length) [parts addObject:self.nbTimeText];
+
+    // ---------- ④ 未读 ----------
+    // 🔴 两个数语义不同，文案必须分开说清：
+    //    · 这里的 `unreadCount` = **这个 App 在当前列表里一共几条未读**（角标上的数字）；
+    //    · 下面的 `groupCount` = **同内容归并了几条**（「×N」徽章）。
+    //    都念成「3 条」的话，用户分不清"我还有 3 条没看"和"这条重复了 3 次"。
+    //    所以这边用「这个 App 共 N 条未读」，那边用「共 N 条相同内容」。
+    if (self.isUnread) {
+        NSInteger n = self.unreadCount;
+        if (n > 1) {
+            [parts addObject:[NSString stringWithFormat:@"未读，这个 App 共 %ld 条未读", (long)n]];
+        } else {
+            [parts addObject:@"未读"];
+        }
+    }
+
+    // ---------- ⑤ 标星 ----------
+    if (self.starred) [parts addObject:@"已标星"];
+
+    // ---------- ⑥ ×N 归并 ----------
+    // ⚠️ 判据 `>= 2` 必须和 `setGroupCount:` / `layoutSubviews` 里那条**同口径**
+    //    （那两处都是"小于 2 就不占位"）。三处各写一个数，改一处必漏另外两处。
+    if (self.groupCount >= 2) {
+        [parts addObject:[NSString stringWithFormat:@"共 %ld 条相同内容", (long)self.groupCount]];
+    }
+
+    // ---------- ⑦ 静音 ----------
+    // 🔴 这是本轮最值钱的一句：静音态原本**零文本**。不念的话，
+    //    "这个 App 现在不响"对 VoiceOver 用户完全不存在 ——
+    //    他会以为通知没收到，而实际上是被静音丢掉了。
+    if (self.nbMuted) [parts addObject:@"这个 App 已静音"];
+
+    // 兜底：一个片段都没有（极端情况，正常路径上不可能）⇒ 交 nil 回到系统默认聚合，
+    // ⛔ 不要写空串 —— 空串会让这一行变成"完全没有名字的元素"，比默认聚合更差。
+    self.accessibilityLabel = parts.count ? [parts componentsJoinedByString:@"，"] : nil;
+}
+
 - (void)setTimeText:(NSString *)text {
     self.timeLabel.text = text;
+    // 🔴 v0.0.180：时间也要进 a11y 文案，所以存一份原始量（见属性注释）。
+    self.nbTimeText = text;
+    [self nbUpdateA11y];
 }
 
 // v0.0.72：未读 = 卡片角标（带未读数）。v0.0.88 起在**右下角**、圆形。
@@ -1325,6 +1437,10 @@ static const CGFloat kNBOvershootDrag = 0.35;
     //    只改 hidden 不重排的话，从"未读"翻成"已读"之后正文还是窄的
     //    —— 表现为"这一条读过之后，正文右边莫名空一块"。
     [self setNeedsLayout];
+    // v0.0.180：未读态进 a11y 文案。
+    // 🔴 必须排在 `_isUnread` / `unreadCount` 两个赋值**之后**（本例就在末尾）——
+    //    调早了文案读到的还是上一条的状态，表现为"右滑标已读之后，VoiceOver 还在说有未读"。
+    [self nbUpdateA11y];
 }
 
 - (void)nbUpdatePin {
@@ -1353,6 +1469,9 @@ static const CGFloat kNBOvershootDrag = 0.35;
 - (void)setStarred:(BOOL)starred {
     _starred = starred;
     self.starLabel.hidden = !starred;
+    // v0.0.180：★ 进 a11y 文案。⛔ 念的**不是** `starLabel.text`（那是「★」，
+    // VoiceOver 会念成「星号」或直接跳过一个符号），而是文案出口里那句「已标星」。
+    [self nbUpdateA11y];
 }
 
 // v0.0.95：同内容归并的「×N」徽章。
@@ -1371,6 +1490,8 @@ static const CGFloat kNBOvershootDrag = 0.35;
         self.groupLabel.hidden = YES;
     }
     [self setNeedsLayout];
+    // v0.0.180：×N 进 a11y 文案（念「共 N 条相同内容」，⛔ 不是「×N」那个符号）。
+    [self nbUpdateA11y];
 }
 
 // ================= v0.0.98 / v0.0.106：通知中心残留标记 =================
@@ -1402,6 +1523,16 @@ static const CGFloat kNBOvershootDrag = 0.35;
 // ⚠️ 只碰 `cardView.alpha` 和自建的竖条。`cardView.transform` / `iconBox.alpha`
 //    归 `nbApplyOffset:` 独占（位移的唯一出口），这条纪律见那个函数头上的注释。
 - (void)nbSetMutedLook:(BOOL)muted animated:(BOOL)animated {
+    // ================= v0.0.180：先把状态记下来 =================
+    // 🔴🔴 这两句必须排在**下面所有 return 之前**（尤其是 `!animated` 那条早返回）。
+    //    「提前返回必须留痕」是本项目的老账：状态只存在动画分支里，
+    //    静默 return 与"没调过这个方法"长得一模一样 ⇒ 卡片明明暗着，
+    //    VoiceOver 却说没静音，而且复现条件取决于调用方传的 `animated`。
+    // 🔴 文案只依赖 `nbMuted` 这个原始量、不依赖动画进度，
+    //    所以调一次就够（⛔ 不要在两个出口各调一次：两处就是两条规则）。
+    self.nbMuted = muted;
+    [self nbUpdateA11y];
+
     if (!self.nbMuteBar) {
         UIView *bar = [[UIView alloc] initWithFrame:CGRectZero];
         bar.backgroundColor = [UIColor colorWithRed:(239.0 / 255.0)
@@ -1489,7 +1620,10 @@ static const CGFloat kNBOvershootDrag = 0.35;
     self.rawBody = nil;
     self.rawBodyColor = nil;
     self.hlQuery = nil;
-    self.timeLabel.text = nil;
+    // v0.0.180：改走 setter（原来是直接写 `timeLabel.text = nil`）——
+    // 时间现在还有一份原始量喂给 a11y 文案，直接写 label 会把那份留下来，
+    // 于是复用回来的行文案里挂着**上一条的时间**。走 setter 一次清两处。
+    [self setTimeText:nil];
     // 🔴 v0.0.72：未读书签**必须连同数字一起复位**。
     //    v0.0.35 那会儿只复位 `dotView.hidden` 就够了（点没有内容）；
     //    书签里**有数字**，只藏视图不清 text 的话，下一行是未读时
@@ -1538,6 +1672,17 @@ static const CGFloat kNBOvershootDrag = 0.35;
     // 🔴 这个 block 尤其危险：它改的是 `read`，删错行还能看出来少了一条，
     //    标错行则是"某条莫名其妙的记录变成已读/未读"，很难联想到是复用残留。
     self.nbOnToggleRead = nil;
+
+    // ================= v0.0.180：整行无障碍文案复位 =================
+    // 🔴🔴 必须**显式**清 `accessibilityLabel`，⛔ 不能指望"下一个 setter 会覆盖它"。
+    //    原因很具体：本方法第一句 `nbSetMutedLook:NO` 会先算一次文案（那时读的还是
+    //    上一条的 ivar），而随后清 raw 串全是**直接写 ivar**（不触发重算）
+    //    ⇒ 复用的这一行会带着上一行的文案，直到 `cellForRow` 把它全设完为止。
+    //    这中间 VoiceOver 恰好扫过来，念的就是刚才那条 —— 而且**屏幕上一点异常都没有**，
+    //    用户只会觉得"念的东西跟看到的不一样"，归不到复用池头上。
+    //    （`setGroupCount:0` 会顺带重算一次，但那时时间还没清 ⇒ 算出「11-11 12:04」这种
+    //     只剩时间一句的残文。所以复位要放在**最后**，把所有输入都清干净之后再落一句。）
+    self.accessibilityLabel = nil;
 }
 
 @end
