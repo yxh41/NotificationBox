@@ -24,6 +24,10 @@ static const CGFloat kNBStatsPad     = 14.0;
 static const CGFloat kNBStatsChartH  = 176.0;
 // 按 App 维度只取前 30：这是"谁最烦人"的排名，不是完整名单。
 static const NSInteger kNBStatsTopN  = 30;
+// v0.0.184：环形图只画前 6 片（其余合并「其他」）。
+// 🔴 不是"最多 6 个 App"—— 本机实测 67 个，全画出来每片不到 2°，颜色也分不开。
+//    尾部占比本来就不是这一屏要回答的问题（下面的排行列表才是完整名单）。
+static const NSInteger kNBStatsPieTopN = 6;
 // 按天补齐的上限。🔴 不是"最多显示 92 天"，而是**防止全库 200 天把列表撑成 200 行**：
 // 柱状图看的是趋势，最近的够用。
 static const NSInteger kNBStatsDayFillMax = 92;
@@ -127,23 +131,67 @@ static const NSInteger kNBStatsDayFillMax = 92;
 // 🔴 0 值的格子**照样画一根 3pt 的底槽**：这是全站同一条纪律 ——
 //    "这一格是空的"和"这一格不存在"必须长得不一样。按天补齐后
 //    空白日会真的以 0 出现，画成什么都没有就等于没补。
+// v0.0.184：一个视图两种形态。柱状（按小时/按天）+ 环形（按 App 的来源占比）。
+//
+// 🔴🔴 为什么合成一个类而不是新建 `NBPieChartView`：
+//    页头里只有一个 `chart` 视图，`showsChart` 的 setter 只管它的 hidden。
+//    拆成两个视图之后，页头就要额外管"哪个显示、哪个隐藏"
+//    ⇒ 又变成两个生产者 —— 而这轮刚修完的 bug（v0.0.182 图表卡盖住列表）
+//      就是同一个毛病：显隐状态有两个地方在写。
+//
+// 🔴🔴 两种数据源**互斥**，由 `setKind:` 统一清理（见实现里那段注释）：
+//    设成环形就清空 values/axis，设成柱状就清空 slices。
+//    不这么做的话，切换维度后残留的另一半数据会让 `drawRect` 画出
+//    "用柱状数据画的饼图"或者干脆什么都不画 —— 而且**不报错**。
+typedef NS_ENUM(NSInteger, NBChartKind) {
+    NBChartKindBars  = 0,   // 柱状：按小时 24 根 / 按天 N 根
+    NBChartKindDonut = 1,   // 环形：按 App 的来源占比
+};
+
 @interface NBStatsChartView : UIView
+@property (nonatomic, assign) NBChartKind kind;
 @property (nonatomic, copy) NSArray<NSNumber *> *values;
 @property (nonatomic, copy) NSArray<NSString *> *axis;      // 与 values 等长，nil 项不画
 @property (nonatomic, strong) UIColor *barColor;
+// kind == NBChartKindDonut 时用。每项：@{@"value":NSNumber, @"color":UIColor, @"name":NSString}
+@property (nonatomic, copy) NSArray<NSDictionary *> *slices;
 @property (nonatomic, copy) NSString *summary;              // 无障碍概述
 @end
 
 @implementation NBStatsChartView
 
+// 🔴 唯一的类型入口，顺带做数据互斥清理。
+- (void)setKind:(NBChartKind)kind {
+    _kind = kind;
+    if (kind == NBChartKindDonut) {
+        _values = @[];
+        _axis = nil;
+    } else {
+        _slices = @[];
+    }
+    [self setNeedsDisplay];
+}
+
+- (void)setSlices:(NSArray<NSDictionary *> *)slices {
+    _slices = [slices copy] ?: @[];
+    // 数据到了就把类型定死，调用方只喂数据、不必记得先设 kind
+    if (_slices.count > 0) self.kind = NBChartKindDonut;
+    [self setNeedsDisplay];
+}
+
 - (void)setValues:(NSArray<NSNumber *> *)values axis:(NSArray<NSString *> *)axis {
     self.values = values ?: @[];
     self.axis = axis;
+    if (self.values.count > 0) self.kind = NBChartKindBars;
     [self setNeedsDisplay];
 }
 
 - (void)drawRect:(CGRect)rect {
     [super drawRect:rect];
+    if (self.kind == NBChartKindDonut) {
+        [self nbDrawDonut];
+        return;
+    }
     NSArray<NSNumber *> *vals = self.values;
     NSInteger n = (NSInteger)vals.count;
     if (n <= 0) return;
@@ -218,6 +266,118 @@ static const NSInteger kNBStatsDayFillMax = 92;
     self.isAccessibilityElement = YES;
     self.accessibilityTraits = UIAccessibilityTraitImage;
     self.accessibilityLabel = summary;
+}
+
+#pragma mark - v0.0.184 环形图
+
+// 🔴 环形而不是实心饼：
+//    ① 中间那块空白正好写总数，省掉一个额外的 label；
+//    ② 实心饼在"最大那片超过 60%"时会显得像一整个圆（用户以为只有一种 App），
+//       环形有内圈做参照，比例更容易看出来。
+//
+// 🔴 只画前 6 片 + 「其他」：本机 67 个 App，全画出来每片不到 2°，
+//    颜色也分不开。占比的**尾部**本来就不是这一屏要回答的问题（下面的排行列表
+//    才是完整名单）。
+//
+// ⚠️ 图例（右侧那几行）用 `drawInRect:` 画，不用 UILabel：
+//    这几种形态共用同一个视图，用子视图就得管"环形时显示、柱状时隐藏"，
+//    又是一处显隐状态的两个生产者。
+- (void)nbDrawDonut {
+    NSArray<NSDictionary *> *sl = self.slices;
+    NSInteger n = (NSInteger)sl.count;
+    if (n <= 0) return;
+
+    CGFloat pad = kNBStatsPad;
+    CGFloat W = self.bounds.size.width;
+    CGFloat H = self.bounds.size.height;
+    if (W <= 0 || H <= 0) return;
+
+    NSInteger total = 0;
+    for (NSDictionary *d in sl) total += [d[@"value"] integerValue];
+    if (total <= 0) return;
+
+    // 环形直径：高度的 92% 与宽度的 42%，取小的那个；再给个下限防止极窄时画成小点
+    CGFloat D = MIN(H - 8.0, W * 0.42);
+    if (D < 72.0) D = MIN(H - 8.0, 72.0);
+    if (D < 40.0) return;
+    CGFloat cx = pad + D / 2.0;
+    CGFloat cy = H / 2.0;
+    CGFloat outerR = D / 2.0;
+    CGFloat innerR = outerR * 0.56;
+
+    CGFloat start = -M_PI_2;                    // 从 12 点开始，最像"表盘"
+    for (NSDictionary *d in sl) {
+        NSInteger v = [d[@"value"] integerValue];
+        if (v <= 0) continue;
+        CGFloat sweep = 2.0 * M_PI * (CGFloat)v / (CGFloat)total;
+        // 🔴 只有一片（或者某片占 100%）时，整圆弧的接缝会露出一条白线。
+        //    留 0.02° 的缺口看不出来，但接缝没了。
+        if (sweep > 2.0 * M_PI - 0.001) sweep = 2.0 * M_PI - 0.001;
+
+        UIBezierPath *p = [UIBezierPath bezierPath];
+        [p addArcWithCenter:CGPointMake(cx, cy) radius:outerR
+                  startAngle:start endAngle:start + sweep clockwise:YES];
+        [p addArcWithCenter:CGPointMake(cx, cy) radius:innerR
+                  startAngle:start + sweep endAngle:start clockwise:NO];
+        [p closePath];
+        UIColor *c = d[@"color"];
+        [(c ?: [UIColor systemBlueColor]) setFill];
+        [p fill];
+        start += sweep;
+    }
+
+    // ---------- 环形中间：总数 ----------
+    NSMutableParagraphStyle *mid = [[NSMutableParagraphStyle alloc] init];
+    mid.alignment = NSTextAlignmentCenter;
+    CGFloat midW = innerR * 2.0 - 4.0;
+    NSString *big = [NSString stringWithFormat:@"%ld", (long)total];
+    [big drawInRect:CGRectMake(cx - midW / 2.0, cy - 16.0, midW, 20.0)
+     withAttributes:@{ NSFontAttributeName: [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold],
+                       NSForegroundColorAttributeName: [UIColor labelColor],
+                       NSParagraphStyleAttributeName: mid }];
+    [@"条" drawInRect:CGRectMake(cx - midW / 2.0, cy + 4.0, midW, 13.0)
+       withAttributes:@{ NSFontAttributeName: [UIFont systemFontOfSize:10],
+                         NSForegroundColorAttributeName: [UIColor tertiaryLabelColor],
+                         NSParagraphStyleAttributeName: mid }];
+
+    // ---------- 右侧图例 ----------
+    CGFloat lx = pad + D + 10.0;
+    CGFloat lw = W - lx - pad;
+    if (lw < 66.0) return;                      // 太窄就不画图例，环本身已经说明问题
+
+    CGFloat rowH = MIN(19.0, (H - 4.0) / (CGFloat)n);
+    CGFloat ly = (H - rowH * (CGFloat)n) / 2.0;
+    NSDictionary *nameAttrs = @{ NSFontAttributeName: [UIFont systemFontOfSize:11],
+                                 NSForegroundColorAttributeName: [UIColor labelColor] };
+    NSDictionary *pctAttrs  = @{ NSFontAttributeName: [UIFont systemFontOfSize:11],
+                                 NSForegroundColorAttributeName: [UIColor secondaryLabelColor] };
+
+    for (NSDictionary *d in sl) {
+        NSInteger v = [d[@"value"] integerValue];
+        // 色点
+        UIColor *c = d[@"color"];
+        [(c ?: [UIColor systemBlueColor]) setFill];
+        UIBezierPath *dot = [UIBezierPath bezierPathWithRoundedRect:
+                             CGRectMake(lx, ly + (rowH - 7.0) / 2.0, 7.0, 7.0) cornerRadius:2.0];
+        [dot fill];
+
+        // 百分比（先画右侧，名字用剩下的宽度，避免长名字把数字挤出去）
+        NSString *pct = [NSString stringWithFormat:@"%.0f%%", (CGFloat)v * 100.0 / (CGFloat)total];
+        CGSize pctSz = [pct sizeWithAttributes:pctAttrs];
+        CGFloat pctX = lx + lw - pctSz.width;
+        [pct drawAtPoint:CGPointMake(pctX, ly + (rowH - pctSz.height) / 2.0)
+          withAttributes:pctAttrs];
+
+        // 名字（截断）
+        NSString *nm = d[@"name"];
+        if (![nm isKindOfClass:[NSString class]] || !nm.length) nm = @"—";
+        CGFloat nameW = pctX - (lx + 12.0) - 6.0;
+        if (nameW > 4.0) {
+            [nm drawInRect:CGRectMake(lx + 12.0, ly + (rowH - 14.0) / 2.0, nameW, 14.0)
+            withAttributes:nameAttrs];
+        }
+        ly += rowH;
+    }
 }
 
 @end
@@ -666,7 +826,15 @@ static const NSInteger kNBStatsDayFillMax = 92;
     if (w <= 0) return;
     self.inSync = YES;
 
-    self.header.showsChart = (self.dimSeg.selectedSegmentIndex != 0);
+    // 🔴🔴 v0.0.184：这里**不再判断显隐**。
+    //    原来这里按 `dimSeg.selectedSegmentIndex` 又算了一遍"要不要显示图表"
+    //    —— 那是"按 App 维度不显示图表"时代的规则。现在按 App 也有环形图，
+    //    这一句会在 reloadData 之后把它重新关掉（顺序上 syncHeaderSize 在后），
+    //    表现是"饼图的数据都算好了，卡片却不见了"。
+    //    ⇒ 显隐的**唯一生产者**是 reloadData 里的 `setChartHidden:`，
+    //      这里只按当前状态算高度。
+    //    ⚠️ 注释里**故意不把那行旧代码写出来** —— 写了就成了存在性判据的假证据
+    //       （删了 X 又留一句"X 已删除"，两向都会中）。
     CGFloat h = [self.header preferredHeight];
     if (fabs(self.header.frame.size.width - w) > 0.5 ||
         fabs(self.header.frame.size.height - h) > 0.5) {
@@ -779,11 +947,14 @@ static const NSInteger kNBStatsDayFillMax = 92;
 
     // ---------- 图表 + 分组标题 ----------
     if (dim == 0) {
-        [self setChartHidden:YES];
-        // 图表卡隐藏时也要清标题/摘要：卡片虽然不显示，但文本留着的话，
-        // 下一次把卡片改回可见时会先闪一帧"按小时"的旧标题。
-        self.header.chartTitle.text = nil;
-        self.header.chart.summary = nil;
+        // v0.0.184：按 App 也有图了 —— 来源占比环形图。
+        // 🔴 只有"这个时间窗一条都没有"时才藏卡片：那时环形图无内容可画，
+        //    留一张空白卡比不显示更让人以为坏了。
+        // ⚠️ 别再写成无条件的 `setChartHidden:YES` —— v0.0.182 那个
+        //    "图表卡盖住排行前 3 名"就是因为隐藏与显隐状态不同步。
+        [self setChartHidden:(total <= 0)];
+        self.header.chartTitle.text = @"来源占比";
+        [self feedPieChart];
         self.header.sectionLabel.text = (total > 0)
             ? [NSString stringWithFormat:@"来源排行 · 前 %ld 个 App", (long)MIN((NSInteger)self.rows.count, kNBStatsTopN)]
             : @"这个时间窗里没有记录";
@@ -846,6 +1017,63 @@ static const NSInteger kNBStatsDayFillMax = 92;
 }
 
 // 24 小时：轴标只打 0 / 6 / 12 / 18 / 23 五处（每根都打会糊成一片）
+// v0.0.184：来源占比环形图（按 App 维度）。
+//
+// 🔴 「其他」那一片的颜色用 `tertiaryLabelColor`，**不**参与品牌色轮转：
+//    它代表"剩下的 60 个 App 加起来"，给它一个像样的品牌色会让用户以为
+//    它是一个具体的 App。
+- (void)feedPieChart {
+    NSMutableArray<NSDictionary *> *slices = [NSMutableArray array];
+    NSInteger otherSum = 0, shownSum = 0, maxN = 0;
+    NSString *maxName = nil;
+    NSInteger shownCount = 0;
+
+    for (NSInteger i = 0; i < (NSInteger)self.rows.count; i++) {
+        NSDictionary *d = self.rows[i];
+        NSInteger n = [d[@"total"] integerValue];
+        if (n <= 0) continue;
+        if (i < kNBStatsPieTopN) {
+            NSString *bid = d[@"bundle"];
+            if (![bid isKindOfClass:[NSString class]]) bid = @"";
+            NSString *nm = self.names[bid];
+            if (![nm isKindOfClass:[NSString class]] || !nm.length) {
+                nm = bid.length ? bid : @"未知";
+            }
+            UIColor *c = self.brands[bid];
+            if (![c isKindOfClass:[UIColor class]]) c = [UIColor systemBlueColor];
+            [slices addObject:@{ @"value": @(n), @"color": c, @"name": nm }];
+            shownSum += n;
+            shownCount++;
+            if (n > maxN) { maxN = n; maxName = nm; }
+        } else {
+            otherSum += n;
+        }
+    }
+    if (otherSum > 0) {
+        [slices addObject:@{ @"value": @(otherSum),
+                             @"color": [UIColor tertiaryLabelColor],
+                             @"name": @"其他" }];
+    }
+
+    // 喂数据时 `setSlices:` 会把 kind 定成环形并清掉柱状数据（互斥在图表类里管）
+    self.header.chart.slices = slices;
+
+    // 🔴 播报文案**只有一个赋值点**（先算进 sum，最后统一赋）。
+    //    写成两个分支各赋一次的话，"不设 summary"这个坏状态需要同时删两处才能测出来
+    //    ⇒ 变异变得只能测"删掉其中一处"，实际坏的是"一处都不剩"。
+    NSInteger tot = shownSum + otherSum;
+    NSString *sum;
+    if (tot <= 0) {
+        sum = @"来源占比环形图，这个时间窗里没有记录";
+    } else {
+        sum = [NSString stringWithFormat:
+               @"来源占比环形图，画了前 %ld 个 App，最多是 %@ 占 %.0f%%",
+               (long)shownCount, maxName ?: @"—",
+               (CGFloat)maxN * 100.0 / (CGFloat)tot];
+    }
+    self.header.chart.summary = sum;
+}
+
 - (void)feedHourChart {
     NSMutableArray<NSNumber *> *vals = [NSMutableArray array];
     NSMutableArray<NSString *> *axis = [NSMutableArray array];

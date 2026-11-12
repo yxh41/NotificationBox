@@ -13,7 +13,6 @@
 // v0.0.28：按 App 分配提示音的总览页（列表 + 进子页改音）
 #import "SoundAppsViewController.h"
 #import "InstalledApps.h"
-#import "NotifyStatsViewController.h"
 // v0.0.175：「稍后提醒」已删（越狱 App 拿不到通知授权，真机实测），
 // 这个头现在只提供**只读诊断**（容器 / 写权限 / 记录数 / dylib 版本）。
 #import "NBDiagnostics.h"
@@ -134,7 +133,6 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
 // v0.0.45 批量清理。**必须显式声明**：`onBatchClean:` 要调 `pickAppToClean`，
 // 而后者定义在它**之后** —— 项目开 -Werror，靠定义顺序解析选择器会直接编不过。
 - (void)onBatchClean:(id)sender;
-- (void)onStats:(id)sender;
 - (void)onRuleTester:(id)sender;   // v0.0.162
 - (void)confirmDeleteTitle:(NSString *)title
                     bundle:(NSString *)bundle
@@ -423,9 +421,13 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     // 这里可以把一条样例通知喂给引擎同一套判定函数，先看清结果再发真通知。
     [self addActionRow:@"规则测试器" sub:@"发通知前先试一条" icon:@"doc.text.magnifyingglass"
                   tint:gray key:@"ruletest" destructive:NO action:@selector(onRuleTester:)];
-    // v0.0.46：统计，排在"诊断"之前 —— 诊断是排查用的，统计是天天想看的。
-    [self addActionRow:@"统计" sub:@"哪个 App 最烦人" icon:@"chart.bar.fill" tint:gray
-                   key:@"stats" destructive:NO action:@selector(onStats:)];
+    // 🔴 v0.0.184：这里原来有一行「统计」（v0.0.46 加的）。统计已经是首页底部
+    //    的第二个页签，设置里再留一个入口就是**两个地方进同一个页面**，
+    //    而且从设置进的那个没有 tab bar，观感和 tab 里进去的不一样。
+    //    ⛔ 不是"藏起来"：那个 handler 方法和它的头文件 import 一起删了。
+    //    留着没人调的方法会在二进制里留下一个永不复活的选择器。
+    //    ⚠️ 注释里**故意不写出那个方法名** —— 判据要判"设置页里还有没有统计入口"，
+    //       一旦注释里写上方法名，判据就会量到我自己的说明文字（已栽过三次）。
     // v0.0.45：批量清理。**放在「清空全部记录」上面** ——
     // 用户想清的是"某一批"，而"全清"是那个操作的极端形式；
     // 把"更常用、更安全的"排在前面，能少一点误点全清。
@@ -1489,13 +1491,10 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     [self presentViewController:a animated:YES completion:nil];
 }
 
-#pragma mark - v0.0.46 统计
+#pragma mark - v0.0.48 关键词规则
 
-- (void)onStats:(id)sender {
-    [self.view endEditing:YES];
-    NotifyStatsViewController *v = [[NotifyStatsViewController alloc] init];
-    [self.navigationController pushViewController:v animated:YES];
-}
+// 🔴 v0.0.184：统计入口在这里删掉了（统计改成首页的第二个页签）。
+//    不保留空壳方法：它会在 `__objc_methname` 里留下一个永远没人发的选择器。
 
 // v0.0.48：关键词规则编辑页。
 - (void)onKeywordRules:(id)sender {

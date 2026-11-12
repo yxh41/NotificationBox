@@ -1096,7 +1096,8 @@ def _(c):
     #    就把计数从 2 补到 3 ⇒ M51（把按天的 summary 改到 accessibilityLabel）
     #    **立刻变成恒绿**。计数型判据只要有别处能顺手把数字填满，就等于没判。
     for sig, label in (("- (void)feedHourChart {", "按小时"),
-                       ("- (void)feedDayChart {", "按天")):
+                       ("- (void)feedDayChart {", "按天"),
+                       ("- (void)feedPieChart {", "按 App 环形")):
         fb = func_body(stats, sig)
         if not fb:
             problems.append("%s图表函数找不到 —— 锚点失效" % label)
@@ -1169,6 +1170,56 @@ def _(c):
         problems.append("setChartHidden: 找不到 —— 锚点失效")
     elif "chartCard" in sch:
         problems.append("setChartHidden: 自己碰了 chartCard（第二个生产者）")
+
+    # ---------- ⑩ 按 App 维度也要有图（v0.0.184 的环形） ----------
+    # 三个维度各一张图：按 App 环形 / 按小时柱状 / 按天柱状。
+    # ⛔ 不许把按 App 那条退回 `setChartHidden:YES`（用户明确要了饼图）。
+    if "feedPieChart" not in stats:
+        problems.append("按 App 维度没有环形图（用户明确要求加饼图）")
+    if "chart.slices" not in stats:
+        problems.append("环形图的数据没喂给 chart.slices")
+
+    # 🔴 判"被用在那里"而不是"常量存在"：常量定义在文件顶部，
+    #    把使用点改成 `if (YES)` 之后常量照样在 ⇒ 存在性判据恒绿。
+    pie = func_body(stats, "- (void)feedPieChart {")
+    if not pie:
+        problems.append("feedPieChart 找不到 —— 锚点失效")
+    elif "kNBStatsPieTopN" not in pie:
+        problems.append("环形图没有分片上限（本机 67 个 App 全画出来每片不到 2°）")
+
+    # 🔴 判"被调用"而不是只判"存在"：函数写好了却没人调 = 图上什么都没有，
+    #    而存在性判据照样绿（本项目栽过"分支写了、条件到不了"好几次）。
+    rel = func_body(stats, "- (void)reloadData {")
+    if not rel:
+        problems.append("reloadData 找不到 —— 锚点失效")
+    else:
+        for f, label in (("feedPieChart", "按 App 环形"),
+                         ("feedHourChart", "按小时柱状"),
+                         ("feedDayChart", "按天柱状")):
+            if f not in rel:
+                problems.append("%s图表的 feed 没在 reloadData 里调用（图永远不显示）" % label)
+
+    kind_body = func_body(stats, "- (void)setKind:(NBChartKind)kind {")
+    if not kind_body:
+        problems.append("chart 没有 setKind:（两种形态共用同一视图，必须有类型入口）")
+    else:
+        # 🔴 两种数据源必须互斥清理：残留的那一半会让 drawRect 画出
+        #    "用柱状数据画的饼图"，而且**不报错、不崩**。
+        if "_values" not in kind_body:
+            problems.append("setKind: 没清柱状数据（切到环形后 values 残留）")
+        if "_slices" not in kind_body:
+            problems.append("setKind: 没清环形数据（切回柱状后 slices 残留）")
+
+    # ---------- ⑪ 显隐不许在 syncHeaderSize 里再判一次 ----------
+    # 🔴🔴 v0.0.182 的 bug 就是这个形状：显隐有两个写入点，其中一个在
+    #    reloadData 之后执行（syncHeaderSize 更晚），把刚设好的状态又改回去。
+    #    当时的表现是"图表卡盖住排行前 3 名"；v0.0.184 加饼图时同样的位置
+    #    会把饼图重新关掉（"数据算好了、卡片不见了"）。
+    sync_body = func_body(stats, "- (void)syncHeaderSize {")
+    if not sync_body:
+        problems.append("syncHeaderSize 找不到 —— 锚点失效")
+    elif re.search(r"showsChart\s*=", sync_body):
+        problems.append("syncHeaderSize 又自己算了一遍显隐（唯一的显隐生产者必须是 reloadData）")
 
     return (not problems, "；".join(problems) if problems else
             "两个分母分离，条长只传比例，图表可念，页头重设不递归，图表显隐只有一个生产者")
@@ -1250,6 +1301,15 @@ def _(c):
     if "app/NBHomeTabBarController.m" not in line:
         problems.append("Makefile 的 NotifyBoxApp_FILES 里没有 NBHomeTabBarController.m"
                         "（报错符号是 _OBJC_CLASS_$_NBHomeTabBarController）")
+
+    # ⑧ 统计入口只许在页签里，设置页那条必须删干净（v0.0.184）
+    # ⚠️ `sets` 是 strip_comments 之后的文本 ⇒ 注释里写的"已删除"不会造成假红。
+    if "onStats" in sets:
+        problems.append("设置页还留着统计入口的 handler（统计只该在页签里）")
+    if "NotifyStatsViewController" in sets:
+        problems.append("设置页还 import 了统计页（入口没删干净）")
+    if 'addActionRow:@"统计"' in sets:
+        problems.append("设置页还有一行叫「统计」的入口")
 
     return (not problems, "；".join(problems) if problems else
             "两个页签各带 nav，根没套 nav，tab 外观不透明，临时页收起页签，新文件已进 FILES")
@@ -1523,6 +1583,27 @@ MUTATIONS = [
     ("M62 设置页不收起页签（点进设置底下还挂着两个页签）", "app/SettingsViewController.m",
      "    self.hidesBottomBarWhenPushed = YES;",
      "    ;", "I7"),
+
+    # ===== v0.0.184：设置页去入口 + 按 App 环形图 =====
+    ("M63 设置页加回统计入口（两个地方进同一个页面）", "app/SettingsViewController.m",
+     "    [self addActionRow:@\"规则测试器\"",
+     "    [self addActionRow:@\"统计\" sub:nil icon:@\"chart.bar.fill\" tint:gray\n"
+     "                   key:@\"stats\" destructive:NO action:@selector(onStats:)];\n"
+     "    [self addActionRow:@\"规则测试器\"", "I7"),
+    ("M64 环形图不设 summary（VoiceOver 扫过去是空白）", "app/NotifyStatsViewController.m",
+     "    self.header.chart.summary = sum;",
+     "    ;", "I6"),
+    ("M65 setKind: 不清柱状数据（切到环形后 values 残留）", "app/NotifyStatsViewController.m",
+     "    if (kind == NBChartKindDonut) {\n        _values = @[];\n        _axis = nil;",
+     "    if (kind == NBChartKindDonut) {\n        _axis = nil;", "I6"),
+    ("M66 reloadData 不调 feedPieChart（饼图永远不显示）", "app/NotifyStatsViewController.m",
+     "        [self feedPieChart];", "        ;", "I6"),
+    ("M67 syncHeaderSize 又自己算一遍显隐（v0.0.182 同族回归）", "app/NotifyStatsViewController.m",
+     "    CGFloat h = [self.header preferredHeight];",
+     "    self.header.showsChart = (self.dimSeg.selectedSegmentIndex != 0);\n"
+     "    CGFloat h = [self.header preferredHeight];", "I6"),
+    ("M68 环形图不分片上限（67 个 App 全画，每片不到 2°）", "app/NotifyStatsViewController.m",
+     "        if (i < kNBStatsPieTopN) {", "        if (YES) {", "I6"),
 ]
 
 
