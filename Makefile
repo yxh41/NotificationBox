@@ -109,7 +109,7 @@ APPLICATION_NAME = NotifyBoxApp
 #    （`_NBHapticFire` / `_NBHapticPrepare`），不带 `_OBJC_CLASS_$_` 前缀
 #    ⇒ 看到 undefined symbol 更加想不到是 Makefile 漏了文件。
 #    ⚠️ **只进 App，不进 tweak**：tweak 侧不需要触觉，多编一份只是多一个链接面。
-NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/KeywordRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m app/NotifyExport.m app/NotifyStatsViewController.m app/RuleTesterViewController.m app/OverviewGridView.m app/NBTextExtract.m app/NBDiagnostics.m app/NBTheme.m app/AppLauncher.m app/NBHaptic.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m NBAppName.m
+NotifyBoxApp_FILES = app/main.m app/AppDelegate.m app/ViewController.m app/SettingsViewController.m app/ReplaceRulesViewController.m app/KeywordRulesViewController.m app/NotifyCell.m app/NotifyDetailViewController.m app/AppIconLoader.m app/AppPickerViewController.m app/VoicePickerViewController.m app/SoundFilePickerViewController.m app/SoundAppsViewController.m app/InstalledApps.m app/NotifyExport.m app/NotifyStatsViewController.m app/RuleTesterViewController.m app/OverviewGridView.m app/NBTextExtract.m app/NBDiagnostics.m app/NBTheme.m app/AppLauncher.m app/NBHaptic.m app/NBHomeTabBarController.m NotifyStore.m NotifyFilter.m NotifySoundDiag.m NBAppName.m
 NotifyBoxApp_INFOPLIST = Resources/Info.plist
 # 🔴🔴 v0.0.50：桌面图标资源。**必须显式声明** —— theos 的 application.mk 只打包
 #      FILES 里列的 .m 和 INFOPLIST，Resources/ 目录下的其他文件**不会自动进包**：

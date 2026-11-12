@@ -42,6 +42,8 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"通知详情";
+    // v0.0.183：详情页是「临时进去」的，不留底部页签（理由同设置页）。
+    self.hidesBottomBarWhenPushed = YES;
     // 🔴 v0.0.70：和列表页、设置页统一到**分组灰底 + 白卡片**。
     //    以前这里是纯白底，而 `headerBox` / `bodyView` 用的是 `secondarySystemBackground` ——
     //    浅色模式下它正好也是 #F2F2F7 那种浅灰 ⇒ 白底上两块浅灰块，看着像"没加载完"。

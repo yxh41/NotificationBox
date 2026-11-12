@@ -1,5 +1,9 @@
 #import "AppDelegate.h"
+// v0.0.183：根视图换成 tab 容器。`ViewController.h` 保留不动 —— 它历史上被
+// 当作"顺手引入一批 UIKit/自定义类型"的头用着，删掉要重新验证一遍编译，
+// 而多一个未使用的 #import 不会触发 -Werror。等下次真正改这个文件时再一起清。
 #import "ViewController.h"
+#import "NBHomeTabBarController.h"
 #import "NotifyFilter.h"
 #import "NotifyStore.h"
 // 🔴 v0.0.137：NBDataDir() / NBAltDataDir() / NBSharedLog() / NBHealDataDirOwnership() 都在这份头里。
@@ -70,8 +74,11 @@
     (void)[NotifyStore dedupeBySysId];
 
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    self.window.rootViewController = [[UINavigationController alloc]
-        initWithRootViewController:[[ViewController alloc] init]];
+    // 🔴🔴 v0.0.183：根视图从「一个 UINavigationController」换成 tab 容器。
+    //    ⛔ 不要再在外面套一层 UINavigationController —— `UITabBarController`
+    //       必须是 root，套一层 nav 会让 tab bar 变成"nav 的 child"，
+    //       表现为 tab bar 出现在导航栏下面、或者两个 nav 抢着管标题。
+    self.window.rootViewController = [[NBHomeTabBarController alloc] init];
     self.window.backgroundColor = [UIColor systemBackgroundColor];
     [self.window makeKeyAndVisible];
     return YES;

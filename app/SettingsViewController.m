@@ -173,6 +173,11 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     [super viewDidLoad];
     self.title = @"设置";
     self.view.backgroundColor = NBPageBG();
+    // v0.0.183：设置是「临时进去」的页面，底部不该留着「记录/统计」两个页签。
+    // 🔴 这一句同时管住了从设置再往里 push 的所有子页（关键词规则、声音 App…）：
+    //    它们不是 tab 的直接 child，tab bar 一旦在这里收起就不会再冒出来。
+    //    ⛔ 不在每个 push 点各写一遍 —— 那是 7 处，漏一处就是"某个子页多出一条 tab bar"。
+    self.hidesBottomBarWhenPushed = YES;
     // 本页是表单、不是内容列表 ⇒ 不跟首页抢大标题
     // 🔴 常量全名是 `UINavigationItemLargeTitleDisplayModeNever`，不是
     //    `UILargeTitleDisplayModeNever`（少了 `UINavigationItem` 前缀，编译期直接报

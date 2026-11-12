@@ -1174,8 +1174,88 @@ def _(c):
             "两个分母分离，条长只传比例，图表可念，页头重设不递归，图表显隐只有一个生产者")
 
 
-# ───────────────────────────── 跑判据 ─────────────────────────────
+@chk("I7", "首页是两个页签（记录/统计）：各自带 nav、根不许再套 nav、tab 外观不透明、临时页收起页签", baseline="red")
+def _(c):
+    """🔴 v0.0.183 新增。守的是**导航骨架**，不是长相。
 
+       用户看完统计页说「这个统计是不是放首页会比较好」，选了「底部两个页签」。
+       骨架类改动一旦错了，表现都是"整页打不开"或者"tab bar 出现在奇怪的位置"，
+       而且几乎不可能靠读代码回推。这里钉住五件事：
+
+       ① 两个页签的标题必须是中文「记录」「统计」（英文/`stats` 用户看不懂）；
+       ② **每个 child 必须各自包一层 UINavigationController** ——
+          首页会 push 设置/详情、统计页会 push 自定义时间窗；没有 nav 的话
+          `pushViewController:` **静默什么都不做**（不报错、不崩、点了没反应）；
+       ③ **根不许再套一层 nav**：`UITabBarController` 必须是 root。
+          外面套 nav 会让 tab bar 变成 nav 的 child，出现在导航栏下面；
+       ④ iOS 15+ 的 `scrollEdgeAppearance` 默认**透明**：页面滚到边缘时 tab bar
+          背景消失、内容从下面透上来（本 App 是自绘灰底白卡片，透上来非常明显）；
+       ⑤ 临时页（设置/详情）要 `hidesBottomBarWhenPushed`，否则用户点进设置，
+          底下还挂着「记录/统计」两个页签。
+       ⚠️🔴 判据域：Makefile 那条**只认 `NotifyBoxApp_FILES` 那一行赋值**，
+          不能对整个文件判 —— Makefile 的 `#` 注释不是 C 注释，`mask()` 不认它。
+    """
+    tab = strip_comments(c["files"].get("app/NBHomeTabBarController.m", ""))
+    app = strip_comments(c["files"].get("app/AppDelegate.m", ""))
+    sets = strip_comments(c["files"].get("app/SettingsViewController.m", ""))
+    detail = strip_comments(c["files"].get("app/NotifyDetailViewController.m", ""))
+    mk = c["files"].get("Makefile", "")
+    problems = []
+
+    if not tab:
+        problems.append("NBHomeTabBarController.m 不存在（还是单页结构）")
+    else:
+        # ① 标题
+        for lit in ('@"记录"', '@"统计"'):
+            if lit not in tab:
+                problems.append("页签标题缺 %s" % lit)
+
+        # ② 两个 child 各自带 nav
+        n_nav = tab.count("[[UINavigationController alloc] initWithRootViewController:")
+        if n_nav != 2:
+            problems.append("UINavigationController 建了 %d 个（必须 2 个：每个页签各一层，"
+                            "否则那个页面的 push 会静默失效）" % n_nav)
+
+        # ③ viewControllers 必须同时含两个 nav
+        m = re.search(r"self\s*\.\s*viewControllers\s*=\s*@\[([^\]]*)\]", tab)
+        if not m:
+            problems.append("找不到 self.viewControllers = @[…] —— 锚点失效")
+        else:
+            body = m.group(1)
+            if body.count(",") < 1:
+                problems.append("viewControllers 只塞了一个页签")
+            for nm in ("recordsNav", "statsNav"):
+                if nm not in body:
+                    problems.append("viewControllers 里少了 %s" % nm)
+
+        # ④ iOS 15+ 外观不许留透明
+        if "scrollEdgeAppearance" not in tab:
+            problems.append("没设 scrollEdgeAppearance（iOS 15+ 滚到边缘时 tab bar 变透明、"
+                            "列表内容从下面透上来）")
+
+    # ⑤ 根不许再套 nav
+    if "NBHomeTabBarController" not in app:
+        problems.append("AppDelegate 没用 NBHomeTabBarController 当根")
+    if re.search(r"initWithRootViewController:\s*\[\[ViewController alloc\] init\]", app):
+        problems.append("AppDelegate 里还留着旧写法（nav 包 ViewController）⇒ 根被套了两层")
+
+    # ⑥ 临时页收起页签
+    if "hidesBottomBarWhenPushed" not in sets:
+        problems.append("设置页没设 hidesBottomBarWhenPushed（点进设置底下还挂着两个页签）")
+    if "hidesBottomBarWhenPushed" not in detail:
+        problems.append("详情页没设 hidesBottomBarWhenPushed")
+
+    # ⑦ 新文件必须进 FILES（只认那一行赋值，别对整个 Makefile 判）
+    line = next((ln for ln in mk.splitlines() if ln.lstrip().startswith("NotifyBoxApp_FILES")), "")
+    if "app/NBHomeTabBarController.m" not in line:
+        problems.append("Makefile 的 NotifyBoxApp_FILES 里没有 NBHomeTabBarController.m"
+                        "（报错符号是 _OBJC_CLASS_$_NBHomeTabBarController）")
+
+    return (not problems, "；".join(problems) if problems else
+            "两个页签各带 nav，根没套 nav，tab 外观不透明，临时页收起页签，新文件已进 FILES")
+
+
+# ───────────────────────────── 跑判据 ─────────────────────────────
 def run_all(ctx, verbose=True):
     bad = {}
     for cid, desc, _bl, fn in CHECKS:
@@ -1280,7 +1360,8 @@ MUTATIONS = [
      "    self.table.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;",
      "    ;", "I3"),
     ("M23 把 NBHaptic.m 从 Makefile 的 App FILES 里删掉", "Makefile",
-     "app/NBHaptic.m NotifyStore.m", "NotifyStore.m", "I3"),
+     "app/NBHaptic.m app/NBHomeTabBarController.m NotifyStore.m",
+     "app/NBHomeTabBarController.m NotifyStore.m", "I3"),
     ("M24 删掉点图标栏的触觉", "app/ViewController.m",
      "    NBHapticFire(NBHapticKindSoft);\n"
      '    self.filterBundle = [bid isEqualToString:@"全部"] ? nil : bid;',
@@ -1418,6 +1499,30 @@ MUTATIONS = [
     ("M56 preferredHeight 用回字面量（页头高度与 layoutSubviews 不同步）", "app/NotifyStatsViewController.m",
      "    if (self.showsChart) y += 12.0 + kNBStatsChartH;",
      "    if (self.showsChart) y += 12.0 + 170.0;", "I6"),
+
+    # ===== v0.0.183：底部两个页签（I7）=====
+    # 🔴 六条各打一个条件：标题 / 页签数 / 数量 / 外观 / 根结构 / 临时页。
+    #    坏掉的表现完全不同（点了没反应 / tab bar 悬在导航栏下 / 内容透上来），
+    #    共用一条会在"只坏一个"时漏掉。
+    ("M57 AppDelegate 换回旧写法（nav 包 ViewController，根被套两层）", "app/AppDelegate.m",
+     "    self.window.rootViewController = [[NBHomeTabBarController alloc] init];",
+     "    self.window.rootViewController = [[UINavigationController alloc]\n"
+     "        initWithRootViewController:[[ViewController alloc] init]];", "I7"),
+    ("M58 只留一个页签（统计没了）", "app/NBHomeTabBarController.m",
+     "    self.viewControllers = @[recordsNav, statsNav];",
+     "    self.viewControllers = @[recordsNav];", "I7"),
+    ("M59 Makefile 漏掉 NBHomeTabBarController.m（链接期才炸）", "Makefile",
+     "app/NBHaptic.m app/NBHomeTabBarController.m NotifyStore.m",
+     "app/NBHaptic.m NotifyStore.m", "I7"),
+    ("M60 统计页签标题写成英文（用户看不懂）", "app/NBHomeTabBarController.m",
+     '        [[UITabBarItem alloc] initWithTitle:@"统计"',
+     '        [[UITabBarItem alloc] initWithTitle:@"Stats"', "I7"),
+    ("M61 不设 scrollEdgeAppearance（滚到边缘 tab bar 变透明、内容透上来）", "app/NBHomeTabBarController.m",
+     "        self.tabBar.scrollEdgeAppearance = ap;",
+     "        ;", "I7"),
+    ("M62 设置页不收起页签（点进设置底下还挂着两个页签）", "app/SettingsViewController.m",
+     "    self.hidesBottomBarWhenPushed = YES;",
+     "    ;", "I7"),
 ]
 
 
@@ -1447,9 +1552,14 @@ def selftest(files, base_ctx):
                 continue
             old = old.replace("@VER@", cur)
             new = new.replace("@VER@", cur)
-        if src.count(old) != 1:
-            print("  ✗ %s —— 锚点出现 %d 次（必须唯一）：%r" % (name, src.count(old), old))
-            bad[name] = "锚点不唯一"
+        # 🔴 "0 次"和"N 次"是**两种病**，不许共用一句诊断：
+        #    0 次 = 原文被改过（变异过期了，要更新锚点）；
+        #    N 次 = 锚点不够具体（要加长锚点）。混成一句"不唯一"会让人去改错东西。
+        n_anchor = src.count(old)
+        if n_anchor != 1:
+            print("  ✗ %s —— 锚点出现 %d 次（必须唯一）：%r" % (name, n_anchor, old))
+            bad[name] = ("锚点找不到（0 次：原文被改过，变异已过期）" if n_anchor == 0
+                         else "锚点不唯一（%d 次：锚点不够具体）" % n_anchor)
             continue
         mut = dict(files)
         mut[key] = src.replace(old, new)
