@@ -1091,8 +1091,17 @@ def _(c):
                         % n_fill)
 
     # ---------- ④ 图表必须念得出来（v0.0.180 的教训） ----------
-    if stats.count("chart.summary") < 2:
-        problems.append("图表没设 summary（VoiceOver 扫过去是一块空白，两种维度各要一处）")
+    # 🔴🔴 判据域必须收进**各自图表的函数体**，⛔ 别用「全文件 chart.summary 出现几次」。
+    #    第一版就是全局计数 `>= 2`，而 dim==0 分支里新增一句「隐藏时清 summary」
+    #    就把计数从 2 补到 3 ⇒ M51（把按天的 summary 改到 accessibilityLabel）
+    #    **立刻变成恒绿**。计数型判据只要有别处能顺手把数字填满，就等于没判。
+    for sig, label in (("- (void)feedHourChart {", "按小时"),
+                       ("- (void)feedDayChart {", "按天")):
+        fb = func_body(stats, sig)
+        if not fb:
+            problems.append("%s图表函数找不到 —— 锚点失效" % label)
+        elif "chart.summary" not in fb:
+            problems.append("%s图表的 summary 没设（VoiceOver 扫过去是一块空白）" % label)
 
     # ---------- ⑤ 页头重设必须有防递归闸门，且 YES/NO 成对 ----------
     if not re.search(r"if\s*\(\s*self\s*\.\s*inSync\s*\)\s*return", stats):
@@ -1125,8 +1134,44 @@ def _(c):
     if "en_US_POSIX" not in stats:
         problems.append("解析日期没设 en_US_POSIX（佛历/和历系统下星期几会算错一天）")
 
+    # ---------- ⑨ 图表卡的显隐：showsChart 只许有一个生产者 ----------
+    # 🔴🔴 这一条是 v0.0.181 的用户现场反馈换来的（第一个靠真人截图抓到的 bug）：
+    #    从「按小时」切回「按 App」后，图表卡留着上一轮的 170pt frame，
+    #    **盖住列表前 3 行**，页头高度却已经缩回去了。
+    #    现场表现是"来源排行"和"24 小时分布"两个标题叠在同一个 y 上，
+    #    用户的原话是「来源排行跟下面的 24 小时太紧凑了，然后前几个 App 被挡住了」。
+    #    病根：`showsChart` 有两条赋值路径（setChartHidden: / syncHeaderSize），
+    #    而 `chartCard.hidden` 谁都不管，`layoutSubviews` 只在 showsChart 为 YES 时赋 frame。
+    #    ⇒ 正解是让 setter 一个人管 hidden + frame 归零，调用点一个都不许碰。
+    if "static const CGFloat kNBStatsChartH" not in stats:
+        problems.append("图表卡高度没抽成常量（preferredHeight 与 layoutSubviews 会各写一份数字）")
+    ph = func_body(stats, "- (CGFloat)preferredHeight {")
+    if not ph:
+        problems.append("preferredHeight 找不到 —— 锚点失效")
+    elif "kNBStatsChartH" not in ph:
+        problems.append("preferredHeight 没用高度常量 ⇒ 页头高度会和内容错位（卡片被裁或列表被盖）")
+
+    st = func_body(stats, "- (void)setShowsChart:(BOOL)showsChart {")
+    if not st:
+        problems.append("showsChart 没有自定义 setter ⇒ 图表卡的显隐没人管（这次的真 bug）")
+    else:
+        if "chartCard.hidden" not in st:
+            problems.append("setter 没设 chartCard.hidden ⇒ 切回「按 App」时卡片继续盖住列表前几行")
+        if "CGRectZero" not in st:
+            problems.append("setter 没把 chartCard.frame 归零 ⇒ 旧高度会残留到下一轮")
+
+    n_hide = stats.count("chartCard.hidden")
+    if n_hide != 1:
+        problems.append("chartCard.hidden 出现 %d 次（只许 1 次，就在 setter 里；"
+                        "多一处就是第二个生产者，hidden 会和 showsChart 打架）" % n_hide)
+    sch = func_body(stats, "- (void)setChartHidden:(BOOL)hidden {")
+    if not sch:
+        problems.append("setChartHidden: 找不到 —— 锚点失效")
+    elif "chartCard" in sch:
+        problems.append("setChartHidden: 自己碰了 chartCard（第二个生产者）")
+
     return (not problems, "；".join(problems) if problems else
-            "两个分母分离，条长只传比例，图表可念，页头重设不递归")
+            "两个分母分离，条长只传比例，图表可念，页头重设不递归，图表显隐只有一个生产者")
 
 
 # ───────────────────────────── 跑判据 ─────────────────────────────
@@ -1359,6 +1404,20 @@ MUTATIONS = [
     ("M52 去掉 inSync 闸门（重设 tableHeaderView 递归）", "app/NotifyStatsViewController.m",
      "    if (self.inSync) return;",
      "    ;", "I6"),
+
+    # ===== v0.0.181 修订：图表卡显隐（用户截图报的真 bug）=====
+    ("M53 setter 不设 chartCard.hidden（切回「按 App」后卡片盖住列表前几行）", "app/NotifyStatsViewController.m",
+     "    self.chartCard.hidden = !showsChart;",
+     "    (void)0;", "I6"),
+    ("M54 setter 不把 frame 归零（旧高度残留到下一轮）", "app/NotifyStatsViewController.m",
+     "    if (!showsChart) self.chartCard.frame = CGRectZero;",
+     "    if (!showsChart) self.chartCard.frame = CGRectMake(0, 0, 0, 176);", "I6"),
+    ("M55 setChartHidden: 自己再设一次 chartCard.hidden（两个生产者打架）", "app/NotifyStatsViewController.m",
+     "    self.header.showsChart = !hidden;",
+     "    self.header.showsChart = !hidden;\n    self.header.chartCard.hidden = hidden;", "I6"),
+    ("M56 preferredHeight 用回字面量（页头高度与 layoutSubviews 不同步）", "app/NotifyStatsViewController.m",
+     "    if (self.showsChart) y += 12.0 + kNBStatsChartH;",
+     "    if (self.showsChart) y += 12.0 + 170.0;", "I6"),
 ]
 
 

@@ -18,6 +18,10 @@
 //    （越狱插件里多一个依赖就多一处注入失败的可能）。
 
 static const CGFloat kNBStatsPad     = 14.0;
+// 图表卡高度。🔴 抽成常量是因为 `preferredHeight` 与 `layoutSubviews` **必须用同一个值**：
+//    两处写两份数字的话，改了一处就会变成"页头高度比内容高/矮"，
+//    而那种错位在屏幕上看起来像"图表被截了一截"，不会有人想到是高度算错。
+static const CGFloat kNBStatsChartH  = 176.0;
 // 按 App 维度只取前 30：这是"谁最烦人"的排名，不是完整名单。
 static const NSInteger kNBStatsTopN  = 30;
 // 按天补齐的上限。🔴 不是"最多显示 92 天"，而是**防止全库 200 天把列表撑成 200 行**：
@@ -371,12 +375,27 @@ static const NSInteger kNBStatsDayFillMax = 92;
     return self;
 }
 
+// 🔴🔴 `showsChart` 有**两条赋值路径**：`setChartHidden:`（reloadData 按维度设）
+//      和 `syncHeaderSize`（按 selectedSegmentIndex 重设）。原来两边各写各的，
+//      而 chartCard 的 hidden 谁都不管 ⇒ 切回「按 App」时卡片留着上一轮的 170pt
+//      frame 盖住列表前 3 行，页头高度却已经缩回去了。
+//      ⇒ hidden 与 frame 归零一律由 setter 管，任何赋值路径都逃不掉。
+//      这是"同一个量只许有一个生产者"在本页的落点，别再往调用点补 hidden。
+- (void)setShowsChart:(BOOL)showsChart {
+    _showsChart = showsChart;
+    self.chartCard.hidden = !showsChart;
+    if (!showsChart) self.chartCard.frame = CGRectZero;
+    [self setNeedsLayout];
+}
+
 - (CGFloat)preferredHeight {
+    // 🔴 这里的每一个数字都必须和 `layoutSubviews` 一一对应。差一处的后果不是
+    //    "多留白"，而是页头和内容错位（卡片被裁 / 列表被盖）。
     CGFloat y = 10.0;
     y += 112.0;                        // KPI 卡
-    if (self.showsChart) y += 12.0 + 170.0;
-    y += 14.0 + 18.0;                  // 分组标题
-    return y + 8.0;
+    if (self.showsChart) y += 12.0 + kNBStatsChartH;
+    y += 20.0 + 18.0;                  // 分组标题（上间距 20：原来 14 贴着图表卡太挤）
+    return y + 12.0;
 }
 
 - (void)layoutSubviews {
@@ -391,12 +410,13 @@ static const NSInteger kNBStatsDayFillMax = 92;
 
     if (self.showsChart) {
         y += 12.0;
-        self.chartCard.frame = CGRectMake(pad, y, cw, 170.0);
-        self.chartTitle.frame = CGRectMake(pad, 12, cw - pad * 2, 16);
-        self.chart.frame = CGRectMake(pad, 34, cw - pad * 2, 170.0 - 34.0 - 10.0);
-        y += 170.0;
+        self.chartCard.frame = CGRectMake(pad, y, cw, kNBStatsChartH);
+        self.chartTitle.frame = CGRectMake(pad, 14, cw - pad * 2, 16);
+        self.chart.frame = CGRectMake(pad, 38, cw - pad * 2, kNBStatsChartH - 38.0 - 12.0);
+        y += kNBStatsChartH;
     }
-    self.sectionLabel.frame = CGRectMake(pad + 2, y + 14.0, cw - 4, 18);
+    // 隐藏这一侧不用管 frame：`showsChart` 的 setter 已经把它归零并 hidden 了。
+    self.sectionLabel.frame = CGRectMake(pad + 2, y + 20.0, cw - 4, 18);
 }
 
 @end
@@ -760,6 +780,10 @@ static const NSInteger kNBStatsDayFillMax = 92;
     // ---------- 图表 + 分组标题 ----------
     if (dim == 0) {
         [self setChartHidden:YES];
+        // 图表卡隐藏时也要清标题/摘要：卡片虽然不显示，但文本留着的话，
+        // 下一次把卡片改回可见时会先闪一帧"按小时"的旧标题。
+        self.header.chartTitle.text = nil;
+        self.header.chart.summary = nil;
         self.header.sectionLabel.text = (total > 0)
             ? [NSString stringWithFormat:@"来源排行 · 前 %ld 个 App", (long)MIN((NSInteger)self.rows.count, kNBStatsTopN)]
             : @"这个时间窗里没有记录";
@@ -816,6 +840,8 @@ static const NSInteger kNBStatsDayFillMax = 92;
 }
 
 - (void)setChartHidden:(BOOL)hidden {
+    // 真正干活的是 `showsChart` 的 setter（它负责 hidden + frame 归零 + 重排）。
+    // ⛔ 这里不要自己碰 chartCard —— 否则又多一个生产者。
     self.header.showsChart = !hidden;
 }
 
