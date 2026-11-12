@@ -28,6 +28,82 @@ static const NSInteger kNBStatsTopN  = 30;
 // 🔴 不是"最多 6 个 App"—— 本机实测 67 个，全画出来每片不到 2°，颜色也分不开。
 //    尾部占比本来就不是这一屏要回答的问题（下面的排行列表才是完整名单）。
 static const NSInteger kNBStatsPieTopN = 6;
+
+// ================= v0.0.185：相邻色去重 =================
+//
+// 🔴 为什么需要：环形每一片、列表每一根条形，颜色都取自**各自的 App 图标主色**，
+//    而图标主色不受我控制。真实数据里蓝色系扎堆（京麦 / 知乎 / 支付宝…），
+//    相邻两片就糊成一片 —— 用户会以为"饼图只画了一片"。
+//
+// 🔴🔴 为什么放在 `self.brands` 生成时、而不是画图那一刻：
+//    这个字典同时喂给环形图和下面的排行条形。只在画图时调色的话，
+//    同一个 App 在饼图里是 A 色、在列表里是 B 色 —— 那比撞色更让人困惑。
+//    ⛔ 绝不改 `[AppIconLoader brandColorForBundle:]` 的返回值：它带**全局缓存**，
+//       卡片染色等别处也在用，改它会漫到整 App。
+
+static void NBHSB(UIColor *c, CGFloat *h, CGFloat *s, CGFloat *v) {
+    CGFloat hh = 0, ss = 0, vv = 0;
+    CGFloat aa = 1;
+    if (![c getHue:&hh saturation:&ss brightness:&vv alpha:&aa]) {
+        // 灰度色给不出色相 ⇒ 退回感知亮度，饱和记 0（下面按"灰阶"那一支处理）
+        CGFloat r = 0, g = 0, b = 0;
+        if ([c getRed:&r green:&g blue:&b alpha:&aa]) {
+            vv = 0.299 * r + 0.587 * g + 0.114 * b;
+        }
+        ss = 0;
+    }
+    if (h) *h = hh;
+    if (s) *s = ss;
+    if (v) *v = vv;
+}
+
+// 🔴 色相是**环**：0.95 和 0.05 只差 0.10，不能直接相减。
+//
+// 🔴🔴 v0.0.185 修订：判"太像"必须看**三个维度**（色相 / 亮度 / 饱和度），
+//    只判前两个会把"淡粉 vs 艳红"这种一眼能分的组合判成撞色，
+//    然后把 B 站的粉硬改成橙色 —— 那是为了解决撞色而丢掉品牌识别，不值。
+//    实测：#FB7299 与 #FF2442 色相差 0.02、亮度差 0.02，但**饱和差 0.38**，
+//    肉眼看得很清楚。加上第三个条件后它们不再被误判。
+//    ⇒ 两色不可分 ⟺ 三者**同时**接近。
+static BOOL NBColorsTooClose(UIColor *a, UIColor *b) {
+    if (!a || !b) return NO;
+    CGFloat ha, sa, va, hb, sb, vb;
+    NBHSB(a, &ha, &sa, &va);
+    NBHSB(b, &hb, &sb, &vb);
+    if (sa < 0.18 && sb < 0.18) {
+        // 两边都接近灰阶 ⇒ 色相没有意义，只能靠亮度分
+        return fabs(va - vb) < 0.16;
+    }
+    CGFloat dh = fabs(ha - hb);
+    if (dh > 0.5) dh = 1.0 - dh;
+    return (dh < 0.075)                 // ≈27°
+        && (fabs(va - vb) < 0.14)       // 亮度
+        && (fabs(sa - sb) < 0.25);      // 饱和度
+}
+
+// 把 `c` 调到和 `prev` 能分辨为止。⛔ 不改色相除非必须 —— 色相是用户认 App 的线索。
+static UIColor *NBSeparateFromColor(UIColor *c, UIColor *prev) {
+    if (!c || !prev) return c;
+    if (!NBColorsTooClose(c, prev)) return c;
+
+    CGFloat h, s, v;
+    NBHSB(c, &h, &s, &v);
+    CGFloat pv = 0;
+    NBHSB(prev, NULL, NULL, &pv);
+
+    // 第一刀：调亮度，朝**远离 prev** 的方向（否则越调越像）
+    CGFloat nv = (v >= pv) ? MAX(0.34, v - 0.26) : MIN(0.96, v + 0.26);
+    UIColor *byV = [UIColor colorWithHue:h saturation:s brightness:nv alpha:1.0];
+    if (!NBColorsTooClose(byV, prev)) return byV;
+
+    // 第二刀：转色相 40°（≈0.111），同时把饱和度抬到"看得出色相"的下限
+    CGFloat nh = fmod(h + 0.111, 1.0);
+    UIColor *byH = [UIColor colorWithHue:nh saturation:MAX(s, 0.5) brightness:v alpha:1.0];
+    if (!NBColorsTooClose(byH, prev)) return byH;
+
+    // 兜底：退成灰阶，靠亮度分
+    return [UIColor colorWithWhite:(v > 0.5 ? 0.42 : 0.70) alpha:1.0];
+}
 // 按天补齐的上限。🔴 不是"最多显示 92 天"，而是**防止全库 200 天把列表撑成 200 行**：
 // 柱状图看的是趋势，最近的够用。
 static const NSInteger kNBStatsDayFillMax = 92;
@@ -306,6 +382,7 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
     CGFloat innerR = outerR * 0.56;
 
     CGFloat start = -M_PI_2;                    // 从 12 点开始，最像"表盘"
+    UIColor *seam = NBCardBG();                 // 分隔缝的颜色 = 卡片底色
     for (NSDictionary *d in sl) {
         NSInteger v = [d[@"value"] integerValue];
         if (v <= 0) continue;
@@ -323,6 +400,22 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
         UIColor *c = d[@"color"];
         [(c ?: [UIColor systemBlueColor]) setFill];
         [p fill];
+
+        // 🔴🔴 v0.0.185：每片再描一圈**卡片底色** ⇒ 相邻两片之间露出一条细缝。
+        //    两道防线的分工要说清，否则以后有人会以为这条缝是冗余的：
+        //    ① `NBSeparateFromColor`（在生成 brands 那一步）让**颜色本身**尽量不同；
+        //    ② 这条缝保证"两个 App 的图标主色真的一模一样时也能看出边界"。
+        //    ⚠️ ② 还盖住了一个 ① 结构上管不到的位置：**环形的首尾**。
+        //       饼图是闭环，第 1 片和第 N 片视觉上相邻，但它们不是"前后项"
+        //       （序列去重只跟 prev 比）⇒ 首尾撞色只能靠这条缝兜底。
+        //       ⛔ 别为了首尾再去改 slices 里最后一片的颜色：那会让同一个 App
+        //          在饼图里是 A 色、在下面排行条形里是 B 色，比撞色更让人困惑。
+        //    ⚠️ 用描边而不是"把扇形缩小留缝"：留缝会改变每片的**实际面积**，
+        //       占比就不准了；描边压在边界上，数据面积不变。
+        [seam setStroke];
+        p.lineWidth = 1.2;
+        [p stroke];
+
         start += sweep;
     }
 
@@ -873,12 +966,24 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
         // 🔴 品牌色**只在这里算一次**（滚动时 cellForRow 会被调几十次）。
         //    取不到就走 `NBBrandFallback`（按 bundle 稳定哈希）：
         //    没有品牌色时绝不许染出一个随机色，那比无色更可疑。
+        //
+        // 🔴🔴 v0.0.185：**逐项和上一项比一次，太近就拉开**。
+        //    环形图的片和列表的条形都用这份字典 ⇒ 两处颜色必须一致，
+        //    所以去重必须在"生成字典"这一步做，不能在画图时做。
+        //    ⚠️ `prev` 用的是**调整后**的颜色：链式去重，
+        //       保证"任意相邻两项"都能分辨（只跟原始色比的话，
+        //       连续三个同色系 Adjust 之后又会撞回去）。
         NSMutableDictionary *bm = [NSMutableDictionary dictionary];
+        UIColor *prevBrand = nil;
         for (NSDictionary *d in self.rows) {
             NSString *bid = d[@"bundle"];
             if (!bid.length) continue;
             UIColor *c = [AppIconLoader brandColorForBundle:bid];
-            bm[bid] = c ?: (NBBrandFallback(bid) ?: [UIColor systemBlueColor]);
+            if (!c) c = NBBrandFallback(bid);
+            if (!c) c = [UIColor systemBlueColor];
+            c = NBSeparateFromColor(c, prevBrand);
+            bm[bid] = c;
+            prevBrand = c;
         }
         self.brands = bm;
     } else {

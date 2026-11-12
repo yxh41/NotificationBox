@@ -1221,6 +1221,40 @@ def _(c):
     elif re.search(r"showsChart\s*=", sync_body):
         problems.append("syncHeaderSize 又自己算了一遍显隐（唯一的显隐生产者必须是 reloadData）")
 
+    # ---------- ⑫ 相邻色不许撞（v0.0.185） ----------
+    # 🔴 用户实际用下来报的第一个视觉问题就是"品牌色撞色"：环形相邻两片
+    #    糊成一片，看起来像只画了一片。根因是颜色取自各 App 的图标主色，
+    #    而图标主色不受控制（蓝色系 App 扎堆）。
+    #    两道防线缺一不可：①按 HSB 拉开（颜色本身不同）②片间描一圈底色缝
+    #    （就算颜色真的相同，也能看出边界在哪）。
+    close_body = func_body(stats, "static BOOL NBColorsTooClose(UIColor *a, UIColor *b) {")
+    if not close_body:
+        problems.append("没有「两个颜色是否太像」的判定（撞了也发现不了）")
+    else:
+        # 🔴 色相是**环**：0.95 和 0.05 只差 0.10。直接相减会把它们当成差很远。
+        if "1.0 - dh" not in close_body:
+            problems.append("色相差没按环处理（0.95 与 0.05 只差 0.10，直接相减会漏判）")
+        if "0.18" not in close_body:
+            problems.append("没处理「两边都接近灰阶」的情况（灰阶拿不到色相，只能靠亮度分）")
+
+    if not func_body(stats, "static UIColor *NBSeparateFromColor(UIColor *c, UIColor *prev) {"):
+        problems.append("没有相邻色去重函数")
+
+    # 去重必须落在**生成 brands 字典**那一步：这个字典同时喂给环形和排行条形。
+    # 只在画图时调色 ⇒ 同一个 App 在饼图里 A 色、在列表里 B 色，比撞色更困惑。
+    if not rel:
+        pass
+    elif "NBSeparateFromColor" not in rel:
+        problems.append("生成 brands 时没做相邻去重（环形与列表会各撞各的）")
+
+    donut_body = func_body(stats, "- (void)nbDrawDonut {")
+    if not donut_body:
+        problems.append("nbDrawDonut 找不到 —— 锚点失效")
+    # 🔴 必须同时有"设线宽"和"真的描边"：只设 lineWidth 不 stroke 等于没缝，
+    #    而只判 lineWidth 会在删掉 stroke 之后照样绿（M70 第一版就这么恒绿的）。
+    elif "lineWidth" not in donut_body or "stroke]" not in donut_body:
+        problems.append("环形各片之间没有分隔缝（设了线宽却没描边，或压根没设）")
+
     return (not problems, "；".join(problems) if problems else
             "两个分母分离，条长只传比例，图表可念，页头重设不递归，图表显隐只有一个生产者")
 
@@ -1604,6 +1638,15 @@ MUTATIONS = [
      "    CGFloat h = [self.header preferredHeight];", "I6"),
     ("M68 环形图不分片上限（67 个 App 全画，每片不到 2°）", "app/NotifyStatsViewController.m",
      "        if (i < kNBStatsPieTopN) {", "        if (YES) {", "I6"),
+
+    # ===== v0.0.185：相邻色去重（I6 ⑫）=====
+    ("M69 生成 brands 时不做相邻去重（撞色回潮）", "app/NotifyStatsViewController.m",
+     "            c = NBSeparateFromColor(c, prevBrand);",
+     "            (void)0;", "I6"),
+    ("M70 环形各片之间不描缝（两个 App 主色一样时完全分不清）", "app/NotifyStatsViewController.m",
+     "        [p stroke];", "        ;", "I6"),
+    ("M71 色相差不按环处理（0.95 与 0.05 会被当成差很远）", "app/NotifyStatsViewController.m",
+     "    if (dh > 0.5) dh = 1.0 - dh;", "    ;", "I6"),
 ]
 
 
