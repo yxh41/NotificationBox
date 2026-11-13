@@ -216,6 +216,13 @@ static int gMuteDropped = 0;
 // v0.0.168：静音表存在却没能生效的次数（到期值读不出 / 超上限）。
 // 单独计数是因为它对应的是「我配了静音却还在响」，与"真的拦了 N 条"是相反的证据。
 static int gMuteBad = 0;
+// v0.0.189：冷却期拦下的条数。**必须再分一个**：
+// 它和免打扰/静音都会让"通知不弹"，但排查方向完全不同（一个是"刷屏 App 的第 2 条"，
+// 一个是"时段"、一个是"到期时刻"）。合成一个数之后看到 30 条被拦，哪个都不是。
+static int gCoolDropped = 0;
+// v0.0.189：冷却配了但没能生效的次数（窗口值读不出 / 被上限截断）。
+// 与 gMuteBad 同一条纪律：「配了却没生效」和「真的拦了 N 条」是相反的证据，必须分开。
+static int gCoolBad = 0;
 static int gSoundApplied = 0; // v0.0.21：尝试过换提示音的条数（成没成看 SOUND# 那行）
 // 去重表：key -> 最后一次记录的时间戳
 static NSMutableDictionary *gRecent = nil;
@@ -4949,6 +4956,40 @@ static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *
             gMuteBad++;
             NBLog(@"MUTE-BAD#%d bundle=%@ 静音配置没生效：%@ ⇒ 本次照常弹",
                   gMuteBad, bid, muteBad);
+        }
+
+        // ②.7 冷却期（v0.0.189）
+        //
+        // 与免打扰/静音**同一个语义**（不弹、仍记进盒子），区别只是回答的问题不同：
+        //   那两者是"哪段时间别吵我"，这个是"刷屏的 App 别连珠炮"。
+        //
+        // 🔴 顺序必须排在这两者**之后**（越具体越靠前）。若排在前面，一个正在静音的 App
+        //    会被记成"冷却拦的"，日志里就只剩 COOL# 而看不到 MUTE# —— 归因直接反了。
+        // 🔴 更实质的一条：冷却是**有状态**的（会记下"上次放行时刻"）。只有走到这一步
+        //    ——前两道闸门都已放行—— 才允许推进窗口。否则被静音/黑名单拦下的那些通知
+        //    会白白占掉冷却名额：用户静音一小时结束后，回来的第一条正常通知会被
+        //    "刚才那条被拦的"挤掉，看起来像"静音没结束"。
+        // 🔴 它必须带 title/message：同一条通知会过三个入口，冷却的结论必须复用，
+        //    否则"哪个入口负责呈现"就决定了那条通知弹不弹（详见 NotifyFilter.h）。
+        NSString *coolWhy = nil;
+        NSString *coolBad = nil;
+        BOOL coolDrop = [NotifyFilter shouldDropForCooldownForBundle:bid title:t message:m now:nil
+                                                              reason:&coolWhy problem:&coolBad];
+        // 🔴 「配置没按原样生效」这句**不许**照抄上面静音那行的"⇒ 本次照常弹"：
+        //    静音的 problem 一定意味着不生效，而冷却的 problem 有两种（读不出=不生效、
+        //    超上限=**按上限生效**）。抄过来就会在"截断后确实拦了"的情况下打出一句假话，
+        //    而假日志比没日志更贵（本项目第 N 次）。
+        if (coolBad.length && gCoolBad < 3) {
+            gCoolBad++;
+            NBLog(@"COOL-BAD#%d bundle=%@ 冷却配置没按原样生效：%@", gCoolBad, bid, coolBad);
+        }
+        if (coolDrop) {
+            gCoolDropped++;
+            if (gCoolDropped <= 8 || (gCoolDropped % 50) == 0) {
+                NBLog(@"COOL#%d bundle=%@ tag=%@ %@ ⇒ 不弹（仍记进盒子）",
+                      gCoolDropped, bid, tag, coolWhy ?: @"?");
+            }
+            return NBDeny();
         }
 
         // ③ 内容替换（只改呈现，库里留着原文）

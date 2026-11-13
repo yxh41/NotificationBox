@@ -1238,7 +1238,7 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //   它只在手动触发那一趟打，不会淹屏幕；而它承载的「段= / 精确= / 忽略大小写=」
 //   正是判断「这条记录到底是不是同一条」的唯一读数。
 static NSString * const kNBKeyLineTable =
-    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级|直达|直开|打开|路径|[源]|[自动清]|NC-ID|补ID|[残]|MUTE";
+    @"NBKEYLINES|===|-->|hit#|P#|drop |DROP#|REPL#|PROBE|DND#|SOUND#|SD#|APP-ALIVE|G3 首次|失败|!!!|探针|payload|降级|直达|直开|打开|路径|[源]|[自动清]|NC-ID|补ID|[残]|MUTE|COOL#|COOL-BAD#";
 
 static NSArray<NSString *> *NBKeyLineKeywords(void) {
     return [kNBKeyLineTable componentsSeparatedByString:@"|"];
@@ -1458,7 +1458,7 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
     // 搜索
     self.searchBar = [[UISearchBar alloc] init];
     self.searchBar.delegate = self;
-    self.searchBar.placeholder = @"搜索标题或正文";
+    self.searchBar.placeholder = @"搜标题/正文/App　-排除　\"短语\"";
     // 🔴 v0.0.70：底色已经是分组灰，搜索框还用默认样式的话会叠出一块**同色灰**，
     //    整条搜索栏看起来像"糊在背景上"、边界不清。Minimal 样式只画里面那个圆角输入框，
     //    和外层的灰底有明确的层次。
@@ -2294,14 +2294,34 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 
 - (NSArray<NSString *> *)bundlesMatchingSearch:(NSString *)q {
     if (!q.length) return nil;
+    // ---------- v0.0.189：搜索支持语法（引号 / AND / 排除）----------
+    // App 名匹配从「整串去匹配」改成「**第一个正向词**去匹配」。两个理由：
+    //  ① 整串匹配在带语法之后必然失效：`微信 红包` 这一整串哪个 App 名都不含 ⇒
+    //     以前是"搜不到"（整串 LIKE 也搜不到），现在是"少了一半"（库里没有"微信"这几个字，
+    //     App 名又匹配不上 ⇒ 那个 AND 永远不成立）。这条必须跟着语法一起改，否则新语法
+    //     看起来像是"把搜索改坏了"。
+    //  ② SQL 里 `bundle IN (...)` 只能挂一个括号组，而它只能挂在**第一个正向词**上
+    //     （挂在别的词上就是"两个 App 名同时命中"，永远为空）。
+    // 🔴 解析一律走 `[NotifyStore searchTermsFromString:]` —— 那是唯一口径。
+    //    在这里自己 `componentsSeparatedByString:@" "` 就会出现"库里认引号、界面不认"，
+    //    症状是搜带引号的短语时 App 名匹配突然失灵，而列表里照样有结果，很难发现。
+    NSString *firstPos = nil;
+    for (NSDictionary *t in [NotifyStore searchTermsFromString:q]) {
+        if ([t[@"neg"] boolValue]) continue;
+        NSString *txt = t[@"text"];
+        if ([txt isKindOfClass:[NSString class]] && txt.length) { firstPos = txt; break; }
+    }
+    // 只有排除词（`-红包`）⇒ 没有"搜哪个 App"这回事：那是"全部记录里去掉含红包的"。
+    if (!firstPos.length) return nil;
+
     NSMutableArray<NSString *> *out = [NSMutableArray array];
     for (NSString *bid in self.appNameMap) {
         NSString *name = self.appNameMap[bid];
         // ① 匹配 App 显示名（用户想的是「微信」，不是 com.tencent.xin）
-        NSRange r1 = [name rangeOfString:q
+        NSRange r1 = [name rangeOfString:firstPos
                                  options:NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch];
         // ② 也匹配 bundle id 本身（懂行的人会直接搜 `tencent`）
-        NSRange r2 = [bid rangeOfString:q options:NSCaseInsensitiveSearch];
+        NSRange r2 = [bid rangeOfString:firstPos options:NSCaseInsensitiveSearch];
         if (r1.location != NSNotFound || r2.location != NSNotFound) {
             [out addObject:bid];
         }

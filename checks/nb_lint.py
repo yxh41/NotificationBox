@@ -1763,6 +1763,194 @@ def _(c):
             "写入核心唯一且回读精确、提示贴容器、长按与无障碍两条入口齐全、预览无白底")
 
 
+# ── I10. 搜索语法 + 冷却期（v0.0.189）────────────────────────────
+
+@chk("I10", "搜索语法（引号/AND/排除）逐词生效 + 冷却期有状态但不是滑动窗口", baseline="red")
+def _(c):
+    """🔴 v0.0.189 新增。两件事，各有各的"最容易写错的那一处"。
+
+       【一】搜索语法
+       ① **解析只有一份。** `searchTermsFromString:` 是唯一口径：SQL 拼装和 App 名匹配
+          都读它。界面若自己 `componentsSeparatedByString:@" "`，就会出现
+          "库里认引号、界面不认" —— 症状是搜带引号的短语时 App 名匹配失灵，
+          而列表里照样有结果，极难发现。
+       ② **SQL 文本与绑定值必须同一个循环生成。** 少绑一条**不报错**（SQLite 把没绑的
+          参数当 NULL，`x LIKE NULL` 恒不成立）⇒ "搜出来的东西莫名其妙少一半"，
+          而且后面的 `bundle IN` 参数会整体前移一格、绑错值。
+          这里数 `[binds addObject:like];` 必须**正好 6 处**（正向 3 + 排除 3，两个分支
+          三种字段）—— 少一处就是少绑一个 `?`。
+       ③ **排除词必须 `IFNULL`。** `NULL LIKE ?` 是 NULL，`NOT NULL` 还是 NULL，
+          WHERE 里 NULL 不成立 ⇒ 那些**副标题为空**的正常记录会被一起排除掉。
+       ④ **词数要有上限。** 每词占 3 个 SQL 参数；无限加会让 `prepare` 失败，而这里的
+          `prepare` 失败返回 NULL，在调用处看起来和「库里没有记录」一模一样
+          （v0.0.141「记录全没了」就是这么发生的）。上限那条 `if` 必须**直接**跟日志，
+          写成 `if (NO)` 就等于没有。
+
+       【二】冷却期
+       ⑤ **状态只在内存里。** 盘上只放"窗口多长"。落盘的话一次写坏 = 某个 App 永远不弹，
+          而用户看到的只是"它不响了"（无报错、无日志）。⇒ 判定函数里不许出现 `saveSettings`。
+       ⑥ **同一条通知的结论必须复用。** PB/PBR/PBRS 三个入口会先后对同一条通知走流水线。
+          冷却是有状态的，若各判一次：第一个入口放行并记时刻 ⇒ 第二、三个落在窗口内被拦
+          ⇒ 那条通知反而不弹，而且"成败取决于哪个入口负责呈现"——这件事在 iOS 16 上
+          没有稳定答案。⇒ 必须有 `NSArray *cached = notes[noteKey];` 这条读。
+       ⑦ **被拦下的不推进窗口。** 窗口从"第一条"算起，不是"每条之后再等 N 秒"。
+          后者在刷屏 App 上是**永久静音**，是另一种灾难。⇒ 推进那一句必须带 `if (!drop)`。
+       ⑧ **超上限要硬封顶。** 单位搞错（毫秒当秒写成 60000）会让某个 App 一小时只弹一条。
+          夹取那条 `if` 必须真在（`if (NO)` 不算）。
+       ⑨ **只许流水线调它。** 它有副作用（会开真实窗口）⇒ App 侧一次都不许出现，
+          否则"试运行/诊断"点一下就足以让用户某个 App 突然不弹。
+       ⑩ **`COOL-BAD` 那句话不许说"照常弹"。** 静音的 problem 一定等于不生效，而这个
+          有两种（读不出=不生效、超上限=**按上限生效**）。照抄静音那行就会在"截断后确实拦了"
+          的情况下打出一句假话 —— 假日志比没日志更贵。
+       ⑪ **顺序：静音 → 冷却 → 内容替换。** 排在静音前面，被静音的通知会白占冷却名额，
+          日志里也只剩 COOL# 看不到 MUTE#（归因直接反了）。
+    """
+    ns  = strip_comments(c["files"].get("NotifyStore.m", ""))
+    nsh = strip_comments(c["files"].get("NotifyStore.h", ""))
+    nf  = strip_comments(c["files"].get("NotifyFilter.m", ""))
+    nfh = strip_comments(c["files"].get("NotifyFilter.h", ""))
+    nch = strip_comments(c["files"].get("NotifyCommon.h", ""))
+    vc  = strip_comments(c["files"].get("app/ViewController.m", ""))
+    st  = strip_comments(c["files"].get("app/SettingsViewController.m", ""))
+    tw  = strip_comments(c["files"].get("Tweak.x", ""))
+    problems = []
+
+    # ───────────── 一① 解析器 ─────────────
+    tok = func_body(ns, "+ (NSArray<NSDictionary *> *)searchTermsFromString:(NSString *)raw {")
+    if tok is None:
+        problems.append("找不到 searchTermsFromString:（搜索语法没有唯一解析口径）")
+    else:
+        if not re.search(r"""if \(\[raw characterAtIndex:i\] == '"'\) \{""", tok):
+            problems.append("解析器不认引号 ⇒ 短语语法没了（而且 `if (NO)` 这种「改可达性」不算实现）")
+        if "if (c == '-') {" not in tok:
+            problems.append("解析器不认词首的 `-` ⇒ 排除语法没了")
+        # 🔴 上限那条 if 必须**直接**带着日志：只判"常量名出现过"会被一个字面量撑绿。
+        if not re.search(r"if \(out\.count >= kNBMaxSearchTerms\) \{\s*\n\s*NBStoreLog\(", tok):
+            problems.append("词数没有真正生效的上限（超限会让 prepare 失败 ⇒ 列表变空，"
+                            "而那种空看起来像「库里没记录」）")
+    if "searchTermsFromString" not in nsh:
+        problems.append("NotifyStore.h 没暴露 searchTermsFromString:（界面就会自己 split 一遍）")
+
+    # ───────────── 一② 逐词 SQL + 绑定值同源 ─────────────
+    scope = func_body(ns, "static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nullable tail,")
+    if scope is None:
+        problems.append("切不到 NBPrepareScope 函数体")
+    else:
+        for frag, why in (
+                ("for (NSDictionary *t in terms)", "搜索没按词循环 ⇒ 还是一整串 LIKE"),
+                ("for (id v in binds)", "绑参没照 `binds` 的顺序念 ⇒ 两条路径会走岔"),
+                ("posIdx == 0 && searchBundles.count", "`bundle IN` 没挂在第一个正向词上"
+                 "（挂到别的词上等于要求两条记录同时命中两个 App 名，永远为空）"),
+        ):
+            if frag not in scope:
+                problems.append(why)
+        n_bind = scope.count("[binds addObject:like];")
+        if n_bind != 6:
+            problems.append("`[binds addObject:like];` 是 %d 处，应为 6 处"
+                            "（正向 3 + 排除 3，标题/正文/副标题各一条）—— 少一处就是少绑一个 ?,"
+                            "多一处就是多一个没有占位符的参数" % n_bind)
+        # 一③ 排除词必须 IFNULL
+        if "NOT (IFNULL(title,'')" not in scope:
+            problems.append("排除词没 IFNULL ⇒ `NOT (NULL LIKE ?)` 仍是 NULL，"
+                            "副标题为空的正常记录会被一起排除掉（「排除一个词少一大半」）")
+    # 一② 旧的"整串 LIKE"形态不许回来
+    if 'format:@"%%%@%%", search]' in ns:
+        problems.append("还在拿**整串** search 拼 LIKE ⇒ 新语法的词解析形同虚设，"
+                        "而且绑定值会与逐词 SQL 错位")
+
+    # ───────────── 一② 界面侧共用解析 ─────────────
+    bms = func_body(vc, "- (NSArray<NSString *> *)bundlesMatchingSearch:(NSString *)q {")
+    if bms is None:
+        problems.append("找不到 bundlesMatchingSearch:")
+    else:
+        if "searchTermsFromString" not in bms:
+            problems.append("App 名匹配没走唯一解析口径（自己 split 就会和 SQL 走岔）")
+        if "componentsSeparatedByString" in bms:
+            problems.append("App 名匹配自己按空格 split 了 ⇒ 引号短语会被拆成 AND")
+        if "[t[@\"neg\"] boolValue]" not in bms:
+            problems.append("App 名匹配没跳过排除词 ⇒ 搜 `-红包` 会去匹配 App 名")
+
+    # ───────────── 二⑤~⑧ 冷却判定 ─────────────
+    cool = func_body(nf, "+ (BOOL)shouldDropForCooldownForBundle:(NSString *)bundle title:(NSString *)title message:(NSString *)message now:(NSDate *)now reason:(NSString **)reason problem:(NSString **)problem {")
+    if cool is None:
+        problems.append("找不到 shouldDropForCooldownForBundle:…（冷却期判定）")
+    else:
+        if "NBCoolLastAllowed()" not in cool:
+            problems.append("没有「上次提醒时刻」的状态表 ⇒ 判不出窗口")
+        if "NSArray *cached = notes[noteKey];" not in cool:
+            problems.append("没有同一条通知的结论复用 ⇒ 三个入口各判一次："
+                            "第一个入口放行后第二、三个落在窗口内被拦 ⇒ 那条通知反而不弹")
+        if "if (!drop) last[bi] = @(nowTs);" not in cool:
+            problems.append("被拦下的通知也在推进窗口 ⇒ 刷屏 App 会变成**永久静音**"
+                            "（窗口必须从第一条算起）")
+        if "if (win > NB_COOLDOWN_MAX_SECONDS) {" not in cool:
+            problems.append("窗口值没有真正生效的上限（单位搞错会让某个 App 一小时只弹一条）")
+        if "if (problem) *problem" not in cool:
+            problems.append("配了但没生效（值读不出/被截断）没有单独输出 ⇒ 现场与「压根没配」同形")
+        if "saveSettings" in cool:
+            problems.append("冷却状态被写盘了 ⇒ 一次写坏就是某个 App 永远不弹，"
+                            "而现场没有任何线索（窗口是秒级的，只该活在内存里）")
+        if "@synchronized (last)" not in cool:
+            problems.append("状态表没加锁（SpringBoard 里多线程读 ⇒ 表可能被写坏）")
+    if "shouldDropForCooldownForBundle" not in nfh:
+        problems.append("NotifyFilter.h 没声明冷却判定（Tweak.x 将无法调用）")
+
+    # ───────────── 二⑨ 只许流水线调 ─────────────
+    for rel in sorted(c["files"]):
+        if not rel.startswith("app/"):
+            continue
+        if "shouldDropForCooldownForBundle" in strip_comments(c["files"][rel]):
+            problems.append("%s 调了冷却判定 —— 它有副作用（会开真实窗口），"
+                            "⛔ 试运行/诊断里点一下就会让用户某个 App 突然不弹" % rel)
+
+    # ───────────── 二⑪ 顺序 + 计数 + 二⑩ 不许说假话 ─────────────
+    pipe = func_body(tw, "static NBDecision NBPipeline(id obj, NSString *sectionHint, NSString *tag, int *counter) {")
+    if pipe is None:
+        problems.append("切不到 NBPipeline 函数体")
+    else:
+        i_mute = pipe.find("shouldDropForMute")
+        i_cool = pipe.find("shouldDropForCooldownForBundle")
+        i_repl = pipe.find("applyReplaceRulesTo")
+        if i_cool < 0:
+            problems.append("流水线里没有冷却判定 ⇒ 设置填了也不会生效")
+        elif i_mute < 0 or i_repl < 0:
+            problems.append("流水线里找不到静音/替换的锚点 —— 判据作废（先修锚点，别当绿）")
+        elif not (i_mute < i_cool < i_repl):
+            problems.append("顺序不是 静音 → 冷却 → 内容替换（冷却排太前会让被静音的通知"
+                            "白占冷却名额，日志里也只剩 COOL# 看不到 MUTE#）")
+        if "gCoolDropped++" not in pipe:
+            problems.append("冷却拦下的条数没有独立计数（和静音混在一起就分不清病因）")
+        i_bad = pipe.find("COOL-BAD")
+        if i_bad < 0:
+            problems.append("冷却「配了没按原样生效」这条没有留痕")
+        elif "照常弹" in pipe[i_bad:i_bad + 220]:
+            problems.append("`COOL-BAD` 那句写了「本次照常弹」—— 而超上限的那种情况是"
+                            "**按上限生效**，这句话在截断后确实拦了的时候是假的")
+
+    # ───────────── 二⑤ 配置键与设置页 ─────────────
+    for k in ("#define NB_KEY_COOLDOWN_SECONDS", "#define NB_COOLDOWN_MAX_SECONDS",
+              "#define NB_COOLDOWN_NOTE_TTL"):
+        if k not in nch:
+            problems.append("NotifyCommon.h 缺 %s" % k.split()[-1])
+    row = "NB_KEY_COOLDOWN_SECONDS"
+    if row not in st:
+        problems.append("设置页没有冷却期这一项（引擎支持了但没人能打开它）")
+    else:
+        br = after(st, "} else if ([key isEqualToString:NB_KEY_COOLDOWN_SECONDS]) {")
+        if br is None:
+            problems.append("保存时没有冷却期的校验分支（填什么都会被原样吃下去）")
+        else:
+            if "[sc scanInteger:&n]" not in br:
+                problems.append("冷却期没严格校验（`[v integerValue]` 对 abc 返回 0，"
+                                "而 0 正是「关闭」⇒ 一个手滑就把功能关了，界面还显示保存成功）")
+            if "NB_COOLDOWN_MAX_SECONDS" not in br:
+                problems.append("界面没有沿用引擎那个上限常量 ⇒ 出现「界面让填、引擎悄悄截」的分歧")
+
+    return (not problems, "；".join(problems) if problems else
+            "搜索逐词生效且绑定值同源、App 名挂第一个正向词、冷却期有状态但不落盘、"
+            "结论复用、非滑动窗口、有上限、只有流水线能调")
+
+
 # ───────────────────────────── 跑判据 ─────────────────────────────
 def run_all(ctx, verbose=True):
     bad = {}
@@ -2202,6 +2390,71 @@ MUTATIONS = [
      "app/NotifyStatsViewController.m",
      "return [UIContextMenuConfiguration configurationWithIdentifier:ip",
      "return [UIContextMenuConfiguration configurationWithIdentifier:nil", "I9"),
+    # ── v0.0.189：搜索语法 + 冷却期 ──
+    ("M105 冷却期不复用同一条通知的结论（三个入口各判一次 ⇒ 那条通知反而不弹）",
+     "NotifyFilter.m",
+     "            NSArray *cached = notes[noteKey];",
+     "            NSArray *cached = nil;", "I10"),
+    ("M106 冷却状态写盘（一次写坏 = 某个 App 永远不弹，而现场没有线索）",
+     "NotifyFilter.m",
+     "            if (!drop) last[bi] = @(nowTs);",
+     "            if (!drop) { last[bi] = @(nowTs); [NotifyStore saveSettings:[self prefs]]; }", "I10"),
+    ("M107 被拦下的也推进窗口（滑动窗口 ⇒ 刷屏 App 变成永久静音）",
+     "NotifyFilter.m",
+     "            if (!drop) last[bi] = @(nowTs);",
+     "            last[bi] = @(nowTs);", "I10"),
+    ("M108 窗口上限那条 if 改成 if (NO)（单位搞错就一小时只弹一条）",
+     "NotifyFilter.m",
+     "        if (win > NB_COOLDOWN_MAX_SECONDS) {",
+     "        if (NO) {", "I10"),
+    ("M109 词数上限那条 if 改成 if (NO)（超限让 prepare 失败 ⇒ 列表变空，看着像库里没记录）",
+     "NotifyStore.m",
+     "        if (out.count >= kNBMaxSearchTerms) {",
+     "        if (NO) {", "I10"),
+    ("M110 排除词去掉 IFNULL（副标题为空的正常记录被一起排除）",
+     "NotifyStore.m",
+     '@" AND NOT (IFNULL(title,\'\') LIKE ? OR IFNULL(message,\'\') LIKE ?"',
+     '@" AND NOT (title LIKE ? OR message LIKE ?"', "I10"),
+    ("M111 正向词少绑一条（三条 LIKE 只绑两条 ⇒ 后面 bundle IN 参数整体前移一格）",
+     "NotifyStore.m",
+     '            [sql appendString:@" AND (IFNULL(title,\'\') LIKE ? OR IFNULL(message,\'\') LIKE ?"\n'
+     '                               @" OR IFNULL(subtitle,\'\') LIKE ?"];\n'
+     "            [binds addObject:like];\n"
+     "            [binds addObject:like];\n"
+     "            [binds addObject:like];",
+     '            [sql appendString:@" AND (IFNULL(title,\'\') LIKE ? OR IFNULL(message,\'\') LIKE ?"\n'
+     '                               @" OR IFNULL(subtitle,\'\') LIKE ?"];\n'
+     "            [binds addObject:like];\n"
+     "            [binds addObject:like];", "I10"),
+    ("M112 试运行里去调冷却判定（点一下就让用户某个 App 突然不弹）",
+     "app/RuleTesterViewController.m",
+     "    BOOL dnd = [NotifyFilter shouldDropForDND:bid now:[NSDate date] reason:&dndReason];",
+     "    BOOL dnd = [NotifyFilter shouldDropForDND:bid now:[NSDate date] reason:&dndReason];\n"
+     "    (void)[NotifyFilter shouldDropForCooldownForBundle:bid title:nil message:nil"
+     " now:[NSDate date] reason:NULL problem:NULL];", "I10"),
+    ("M113 冷却期保存不校验（填 abc 变成 0 = 关闭，界面还显示保存成功）",
+     "app/SettingsViewController.m",
+     "                NSScanner *sc = [NSScanner scannerWithString:v];\n"
+     "                NSInteger n = 0;\n"
+     "                if (![sc scanInteger:&n] || !sc.isAtEnd\n"
+     "                    || n < 0 || (double)n > NB_COOLDOWN_MAX_SECONDS) {",
+     "                NSInteger n = [v integerValue];\n"
+     "                if (n < 0) {", "I10"),
+    ("M114 解析器不认引号（短语语法没了；if (NO) 这种只改可达性也算变异）",
+     "NotifyStore.m",
+     '        if ([raw characterAtIndex:i] == \'"\') {',
+     "        if (NO) {", "I10"),
+    ("M115 COOL-BAD 照抄静音那句「本次照常弹」（截断后确实拦了的时候是假话）",
+     "Tweak.x",
+     'NBLog(@"COOL-BAD#%d bundle=%@ 冷却配置没按原样生效：%@", gCoolBad, bid, coolBad);',
+     'NBLog(@"COOL-BAD#%d bundle=%@ 冷却配置没生效：%@ ⇒ 本次照常弹", gCoolBad, bid, coolBad);',
+     "I10"),
+    ("M116 冷却判定插到拦截判定之前（被静音的通知白占冷却名额，归因也反了）",
+     "Tweak.x",
+     "        if ([NotifyFilter shouldDropBundle:bid title:t message:m subtitle:s]) {",
+     "        if ([NotifyFilter shouldDropForCooldownForBundle:bid title:t message:m now:nil"
+     " reason:NULL problem:NULL]) return NBDeny();\n"
+     "        if ([NotifyFilter shouldDropBundle:bid title:t message:m subtitle:s]) {", "I10"),
 ]
 
 

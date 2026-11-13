@@ -401,11 +401,16 @@ static NSString *NBClockText(NSInteger minutes) {
 //    静音表存在、返回的却是 NO，这在现场与"压根没配"长得一模一样。
 //    不把它说成一句话，用户看到的就是"我明明静音了还在响"，而我手上没有任何读数。
 
-// 到期值可能是 NSNumber，也可能是手改 plist 写成的字符串。
+// 数值配置的严格解析：可能是 NSNumber，也可能是手改 plist 写成的字符串。
 // 🔴 字符串必须**整串**都是数字才认：`[v doubleValue]` 对 "abc" 返回 0，
-//    而 0 是"1970 年到期"= 已过期 = 不生效 —— 这看着安全，其实把"配置写错了"
+//    而 0 在静音里是"1970 年到期"= 已过期 = 不生效 —— 这看着安全，其实把"配置写错了"
 //    伪装成"过期了"，两者在日志里完全不同。用扫描器 + isAtEnd 严格判。
-static BOOL NBMuteUntilValue(id v, NSTimeInterval *out) {
+// v0.0.189：改名（原 `NBMuteUntilValue`）—— 冷却期也用它解析窗口秒数，
+//    一个叫 "MuteUntil" 的函数去解析冷却秒数，读代码的人会以为那是同一个量。
+//    🔴 同一个解析口径（严格、整串、拒绝 "abc"）必须只有**一份**：
+//      两处各写一遍，就会出现"静音填 abc 不生效、冷却填 abc 却变成 0（= 关闭）"这种
+//      只有拿手改 plist 才能触发的分歧。
+static BOOL NBStrictNumberValue(id v, NSTimeInterval *out) {
     if (!v) return NO;
     if ([v isKindOfClass:[NSNumber class]]) { *out = [(NSNumber *)v doubleValue]; return YES; }
     if ([v isKindOfClass:[NSString class]]) {
@@ -508,7 +513,7 @@ static BOOL NBMuteUntilValue(id v, NSTimeInterval *out) {
             if (!v) continue;
 
             NSTimeInterval until = 0;
-            if (!NBMuteUntilValue(v, &until)) {
+            if (!NBStrictNumberValue(v, &until)) {
                 bad = [NSString stringWithFormat:@"“%@”的到期值读不出（是 %@）",
                        k, NSStringFromClass([v class])];
                 continue;
@@ -542,7 +547,7 @@ static BOOL NBMuteUntilValue(id v, NSTimeInterval *out) {
         for (NSString *k in tbl) {
             if (![k isKindOfClass:[NSString class]]) continue;
             NSTimeInterval until = 0;
-            if (!NBMuteUntilValue(tbl[k], &until)) continue;
+            if (!NBStrictNumberValue(tbl[k], &until)) continue;
             if (until <= nowTs) continue;
             if (until - nowTs > NB_MUTE_MAX_SECONDS) continue;   // 与判定同口径：不算生效
             [out addObject:@{ @"bundle": k,
@@ -561,6 +566,140 @@ static BOOL NBMuteUntilValue(id v, NSTimeInterval *out) {
         return [a[@"bundle"] compare:b[@"bundle"]];
     }];
     return out;
+}
+
+// ---------- v0.0.189：冷却期 ----------
+//
+// 语义：**同一个 App 在 N 秒内只弹第一条**，其余的不弹、仍记进盒子。
+//
+// 🔴 这个功能唯一的难点不是判定，是"状态放哪儿"：
+//    · 落盘（照静音那样存时间戳）⇒ 一次写坏就是"这个 App 永远不弹"，
+//      而用户看到的只是"它不响了" —— 没有报错、没有日志、无从下手。方向错误。
+//    · 只放进程内存 ⇒ SpringBoard 重启时窗口清零，最坏结果是"重启后多弹一条"。方向正确。
+//    ⇒ 盘上只有"窗口多长"这一项纯配置（`cooldownSeconds`），时间戳一律只在内存里。
+//      这是刻意与静音相反的取舍：静音是用户手动设的、期望活过重启；冷却窗口是秒级的、清零无害。
+//
+// 🔴🔴 三个入口的结论必须一致 —— 这不是优化，是正确性：
+//   PB / PBR / PBRS 会先后对**同一条通知**走 NB 流水线。冷却是有状态的判定，
+//   若每个入口都独立算：第一个入口放行并记下时刻 ⇒ 第二、第三个入口落在窗口内 ⇒ 被拦。
+//   而"到底哪个入口负责真正呈现"在 iOS 16 上没有稳定答案（随系统/App 不同）。
+//   ⇒ 同一条通知的结论按 (bundle|title|message) 缓存 `NB_COOLDOWN_NOTE_TTL` 秒，
+//     三个入口拿到的一定是同一个答案。缓存里的结论连 reason 一起存，
+//     这样第二、三个入口的日志里也有同一句话，而不是一句"冷却中"就没了首条时刻。
+//
+// 🔴 失效方向一律是"照常弹"：设置读不出（problem 报出来）、状态表满（整体清空）、
+//    任何异常（返回 NO）。反过来写会得到一个"莫名其妙全哑、日志里什么都没有"的现场。
+
+static NSMutableDictionary<NSString *, NSNumber *> *NBCoolLastAllowed(void) {
+    static NSMutableDictionary *d = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+
+// noteKey -> @[@(drop), @(ts), reason 字符串]：同一条通知的结论复用
+static NSMutableDictionary<NSString *, NSArray *> *NBCoolNoteDecision(void) {
+    static NSMutableDictionary *d = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+
++ (BOOL)shouldDropForCooldownForBundle:(NSString *)bundle title:(NSString *)title message:(NSString *)message now:(NSDate *)now reason:(NSString **)reason problem:(NSString **)problem {
+    if (reason) *reason = nil;
+    if (problem) *problem = nil;
+    @try {
+        NSDictionary *p = [self prefs];
+        id raw = p[NB_KEY_COOLDOWN_SECONDS];
+        if (!raw) return NO;                        // 没配 = 关闭（正常状态，不报 problem）
+
+        NSTimeInterval win = 0;
+        if (!NBStrictNumberValue(raw, &win)) {
+            if (problem) {
+                *problem = [NSString stringWithFormat:@"%@ 读不出（是 %@）⇒ 冷却不生效",
+                            NB_KEY_COOLDOWN_SECONDS, NSStringFromClass([raw class])];
+            }
+            return NO;
+        }
+        if (win <= 0) return NO;                    // 0 / 负数 = 关闭（正常状态）
+        if (win > NB_COOLDOWN_MAX_SECONDS) {
+            // 硬封顶，不是阻尼：单位搞错（毫秒当秒写成 60000）会让某个 App 一小时只弹一次，
+            // 症状是"它是不是坏了"。夹在这里（唯一出口、存值之前），并且**报出来**。
+            if (problem) {
+                *problem = [NSString stringWithFormat:@"窗口 %.0f 秒 > 上限 %.0f 秒 ⇒ 按上限算",
+                            win, (double)NB_COOLDOWN_MAX_SECONDS];
+            }
+            win = NB_COOLDOWN_MAX_SECONDS;
+        }
+
+        NSString *bi = [bundle isKindOfClass:[NSString class]] ? bundle : @"";
+        if (!bi.length) return NO;                  // 认不出 App ⇒ 不参与冷却（与流水线口径一致）
+
+        NSTimeInterval nowTs = [(now ?: [NSDate date]) timeIntervalSince1970];
+        NSString *noteKey = [NSString stringWithFormat:@"%@|%@|%@",
+                             bi, title ?: @"", message ?: @""];
+
+        NSMutableDictionary<NSString *, NSNumber *> *last = NBCoolLastAllowed();
+        NSMutableDictionary<NSString *, NSArray *> *notes = NBCoolNoteDecision();
+        // 🔴 结论变量声明在锁**外面**：@synchronized 块内部只做"判定 + 记账"，
+        //    真正的返回值放到锁外统一给。理由见下面锁结束处那条注释。
+        BOOL drop = NO;
+        NSString *why = nil;
+        // 🔴 两张表用**同一把锁**（都以 last 为锁对象）：两个 @synchronized 嵌套在别的顺序下
+        //    就能互锁，而这里只要保证"只有一个锁对象"就不会有这个问题。
+        @synchronized (last) {
+            // ① 同一条通知的结论复用（这是三个入口一致性的全部来源）
+            NSArray *cached = notes[noteKey];
+            if (cached.count == 3) {
+                NSTimeInterval ts = [cached[1] doubleValue];
+                if (nowTs >= ts && (nowTs - ts) < NB_COOLDOWN_NOTE_TTL) {
+                    if ([cached[0] boolValue]) {
+                        if (reason) *reason = cached[2];
+                        return YES;
+                    }
+                    return NO;
+                }
+                [notes removeObjectForKey:noteKey];   // 过了复用窗口：按新通知重新算
+            }
+
+            // ② 冷却判定：窗口起点是**上一条被放行的**通知，被拦下的不推进起点。
+            //    🔴 被拦的不推进 = 窗口是"从第一条算起"，不是"每次再等 N 秒"。
+            //       后者（滑动窗口）在刷屏 App 上会变成永久静音 —— 那是另一种灾难。
+            NSNumber *prev = last[bi];
+            if (prev) {
+                NSTimeInterval since = nowTs - prev.doubleValue;
+                if (since >= 0 && since < win) {
+                    drop = YES;
+                    // 单位写进字面量（"12 秒前"而不是"12"）：这串会进日志，裸数字只能让人猜。
+                    why = [NSString stringWithFormat:@"冷却 %.0f 秒内（首条 %.0f 秒前）",
+                           win, since];
+                }
+            }
+            if (!drop) last[bi] = @(nowTs);
+
+            // ③ 存结论（连 reason 一起，供第二、三个入口复用）
+            notes[noteKey] = @[ @(drop), @(nowTs), why ?: @"" ];
+
+            // ④ 表有界。满了**整体清空**（= 冷却暂时失效 = 照常弹）：
+            //    方向必须是"多弹"，不是"少弹" —— 无界增长最后悔的是"莫名其妙全都不弹"。
+            if (last.count > NB_COOLDOWN_MAX_BUNDLES) [last removeAllObjects];
+            if (notes.count > NB_COOLDOWN_MAX_BUNDLES) [notes removeAllObjects];
+
+            // ⑤ 淘汰已经不可能再拦住任何通知的旧条目（超出窗口的）。
+            //    这一步只是让它别无限长 —— 判定永远先看 ② 的结果，不依赖清理是否及时。
+            for (NSString *k in [last allKeys]) {
+                if (nowTs - [last[k] doubleValue] >= win) [last removeObjectForKey:k];
+            }
+        }
+        // 🔴 结论在锁**外**落地：这样函数的每条路径都有明确的 return。
+        //    若把 `return drop;` 写在 @synchronized 里面当最后一句，clang 不一定能证明
+        //    "这个块必返回"，-Wreturn-type 在本项目的 -Werror 下就是一次构建失败 ——
+        //    而本地没有编译器，只能等 CI 才知道（这条坑值得写下来）。
+        if (drop && reason) *reason = why;
+        return drop;
+    } @catch (__unused NSException *e) {
+        return NO;      // 判错就不拦：宁可吵一下，绝不能莫名其妙全都不弹
+    }
 }
 
 // ---------- 按 App 换提示音（实验） ----------

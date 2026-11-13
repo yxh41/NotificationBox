@@ -66,6 +66,28 @@ typedef NS_OPTIONS(NSUInteger, NBKeywordAction) {
                     date:(nullable NSDate *)date
                   sysId:(nullable NSString *)sysId;
 
+// ---------- v0.0.189：搜索语法 ----------
+// 把搜索框里那句话解析成"词"。**这是唯一口径**：SQL 拼装（`NBPrepareScope`）和
+// App 名匹配（界面的 `bundlesMatchingSearch:`）都必须读它，谁也不许自己 split 一遍。
+//
+// 语法（三条，都不认识别的）：
+//   · 空格分隔 = AND：每个正向词都必须命中（标题/正文/副标题 三个字段任一，或命中同一个 App 名）
+//   · "双引号包起来" = 一个词，可以含空格（`"招商银行 到账"` 是一个词，不是一个 AND 组）
+//   · 词首的 `-` = 排除（`红包 -恭喜` = 含"红包"且不含"恭喜"）
+//
+// 返回数组，每项 @{ @"text": NSString, @"neg": NSNumber(BOOL) }，顺序 = 用户输入顺序。
+// 空词（单独一个 `-` / 单独一对引号 / 纯空白）会被丢掉；**全都丢光 = 不过滤**（返回 @[]）。
+//
+// 🔴🔴 为什么这个函数必须由库里导出、而不是让界面自己 split：
+//    SQL 里 `bundle IN (...)`（命中 App 名）是挂在**第一个正向词**上的 —— 因为 App 名不在库里，
+//    只有界面层能拿 `InstalledApps` 算出"这个词命中了哪几个 App"。界面若自己算"哪个是第一个
+//    正向词"，两边一旦分叉（比如界面按空格 split、库里按引号 split），就会出现
+//    "搜某个 App 明明有记录却搜不出来"，而那种错**完全静默**：只是结果少了几条。
+// 🔴 词数有上限（16）。每个词占 3 个 SQL 参数，无限加会让 `sqlite3_prepare_v2` 失败 ——
+//    而这里的 prepare 失败返回 NULL，在调用处看起来和「库里没有记录」完全一样
+//    （v0.0.141「记录全没了」就是这么发生的）。超限时后面的词被忽略并写日志。
++ (NSArray<NSDictionary *> *)searchTermsFromString:(nullable NSString *)raw;
+
 // 查询（盒子 App 调用）
 // v0.0.36：加 `unreadOnly`（只看未读）。四种筛选是**独立叠加**的
 // （App / 时间 / 搜索 / 未读），和之前三个参数的组合方式一致。

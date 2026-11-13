@@ -1459,6 +1459,66 @@ static NSInteger NBCleanOlderThan(NSTimeInterval cutoff) {
     return changed;
 }
 
+// ---------- v0.0.189：搜索语法解析（唯一口径）----------
+// 为什么要做成"词列表"而不是继续拿一整串去 LIKE：一整串只能表达"含这整段字"，
+// 而用户真正想说的是"同时含这几个字、但不要那个"。旧的单串 LIKE 对 `红包 恭喜`
+// 会去匹配标题里**连续出现**"红包 恭喜"的记录 —— 几乎永远搜不到，用户看到的是空列表。
+//
+// 🔴 词数上限：每个词在 SQL 里占 3 个参数（三个字段各一条 LIKE），
+//    而且拼出来的是 N 层嵌套括号。无限加会让 prepare 失败，而 prepare 失败在这里
+//    返回 NULL，调用处看起来和「库里没有记录」一模一样（见 v0.0.141 那次"记录全没了"）。
+//    16 个词 = 48 个参数 + 若干个 bundle，离任何 SQLite 参数上限都还远。
+static const NSUInteger kNBMaxSearchTerms = 16;
+
++ (NSArray<NSDictionary *> *)searchTermsFromString:(NSString *)raw {
+    if (![raw isKindOfClass:[NSString class]] || !raw.length) return @[];
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    NSUInteger i = 0, n = raw.length;
+    while (i < n) {
+        unichar c = [raw characterAtIndex:i];
+        if ([ws characterIsMember:c]) { i++; continue; }
+
+        BOOL neg = NO;
+        if (c == '-') {                 // 🔴 只认**词首**的 `-`：`2024-11-13` 是一个普通词
+            neg = YES;
+            i++;
+            if (i >= n) break;          // 孤零零一个 `-`：丢掉
+        }
+
+        NSMutableString *tok = [NSMutableString string];
+        if ([raw characterAtIndex:i] == '"') {
+            // 引号词：吃到下一个引号为止。🔴 没闭合就到结尾（宽容）——
+            // 用户输入到一半就点了搜索的情况下，报错/"什么都不匹配"都不如按他打的字搜。
+            // 🔴 引号**只在词首**有意义：词中间出现的引号按普通字符处理
+            //    （否则 `红包"恭喜` 会被拆成两个词，而用户根本没想表达 AND）。
+            i++;
+            while (i < n && [raw characterAtIndex:i] != '"') {
+                [tok appendFormat:@"%C", [raw characterAtIndex:i]];
+                i++;
+            }
+            if (i < n) i++;
+        } else {
+            while (i < n) {
+                unichar d = [raw characterAtIndex:i];
+                if ([ws characterIsMember:d]) break;
+                [tok appendFormat:@"%C", d];
+                i++;
+            }
+        }
+
+        if (!tok.length) continue;      // `-""` / `""` 这类：词是空的，不占位置
+        if (out.count >= kNBMaxSearchTerms) {
+            NBStoreLog(@"搜索词超过 %lu 个，后面的被忽略（每词占 3 个 SQL 参数，"
+                       @"无限加会让 prepare 失败 ⇒ 列表变空，那种失败看起来像「库里没记录」）",
+                       (unsigned long)kNBMaxSearchTerms);
+            break;
+        }
+        [out addObject:@{ @"text": [tok copy], @"neg": @(neg) }];
+    }
+    return out;
+}
+
 // 🔴🔴 v0.0.40：**筛选条件的唯一出口**。
 //    列表（`queryWithBundle:`）、图标栏红点（`bundlesWithUnreadSince:`）、
 //    未读计数（`unreadCountWithBundle:`）、批量标记（`markAllRead…`）四条路全走这里。
@@ -1477,9 +1537,11 @@ static NSInteger NBCleanOlderThan(NSTimeInterval cutoff) {
 //    🔴🔴 **它必须进这个函数** —— 如果留在 `queryWithBundle:` 里单独拼，计数那条路就少一个
 //    `OR bundle IN (...)`，两个口径立刻不一致 ⇒ v0.0.40 花整版修掉的
 //    「列表里明明都读完了、顶部还在喊还有 3 条」当场复发。
-//    🔴 `searchBundles` 只在 `search.length` 时生效：它和三个 LIKE 是**同一个括号组**里的 OR。
+//    🔴 `searchBundles` 只在**有正向词**时生效：它和那三个 LIKE 是**同一个括号组**里的 OR。
 //    只传 bundles、search 却是 nil 的调用没有意义 ⇒ 直接忽略（不报错，因为调用方可能
 //    复用同一个"筛选快照"，那里 search 可能恰好是空的）。
+//    v0.0.189 起它挂在**第一个正向词**上（`-排除` 这种词不占这个位置），
+//    理由见下面 `posIdx == 0` 那一段的注释。
 // `head` 里可以预置 `read=0`（未读专用）；`tail` 放 ORDER BY / LIMIT。
 static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nullable tail,
                                     NSString * _Nullable bundle, NSTimeInterval since,
@@ -1488,21 +1550,60 @@ static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nul
     NSMutableString *sql = [NSMutableString stringWithString:head];
     if (bundle.length) [sql appendString:@" AND bundle=?"];
     if (since > 0)     [sql appendString:@" AND ts>=?"];
-    if (search.length) {
-        // v0.0.42 两处扩展：
-        // ① 加 `subtitle` —— 以前 subtitle 只在 message 为空时才当正文显示（见 NotifyCell），
-        //    正文不空时它**一个字都看不到**、也搜不到。用户明明有这条记录，搜关键词却是空列表。
-        // ② 加 `bundle IN (...)` —— 搜「微信」「招商银行」这种 App 名，而库里只有
-        //    `com.tencent.xin` / `cmb.pb`，标题正文里也没有那几个汉字 ⇒ 以前永远搜不到。
-        [sql appendString:@" AND (title LIKE ? OR message LIKE ? OR subtitle LIKE ?"];
-        if (searchBundles.count) {
-            NSMutableString *ph = [NSMutableString string];
-            for (NSUInteger k = 0; k < searchBundles.count; k++) {
-                [ph appendString:(k ? @",?" : @"?")];
+
+    // ---------- v0.0.189：搜索支持语法（引号 / AND / 排除）----------
+    // v0.0.42 的两处扩展（`subtitle`、`bundle IN`）都保留，只是从此**逐词**成立：
+    // ① `subtitle` —— 以前 subtitle 只在 message 为空时才当正文显示（见 NotifyCell），
+    //    正文不空时它**一个字都看不到**、也搜不到。用户明明有这条记录，搜关键词却是空列表。
+    // ② `bundle IN (...)` —— 搜「微信」「招商银行」这种 App 名，而库里只有
+    //    `com.tencent.xin` / `cmb.pb`，标题正文里也没有那几个汉字 ⇒ 以前永远搜不到。
+    //
+    // 🔴🔴 SQL 文本和绑定值在**同一个循环**里生成（`binds` 数组），顺序只在这一处决定。
+    //    分成"先拼 SQL、再回头绑参"两个循环是这类代码最经典的错误来源：
+    //    少绑一条**不会报错**（SQLite 把没绑的参数当 NULL，而 `x LIKE NULL` 恒不成立），
+    //    症状是"搜出来的东西莫名其妙少一半"，而且紧跟其后的 `bundle IN` 参数会整体前移一格。
+    //    ⇒ 以后加任何条件，都在这个循环里同时 append SQL 和 addObject 绑定值。
+    NSArray<NSDictionary *> *terms = search.length ? [NotifyStore searchTermsFromString:search]
+                                                   : @[];
+    NSMutableArray *binds = [NSMutableArray array];   // NSString（LIKE 值）或 NSArray（bundle 列表）
+    NSUInteger posIdx = 0;                            // 第几个**正向**词（从 0 开始）
+    for (NSDictionary *t in terms) {
+        NSString *txt = t[@"text"];
+        if (![txt isKindOfClass:[NSString class]] || !txt.length) continue;   // 空词不占位置
+        NSString *like = [NSString stringWithFormat:@"%%%@%%", txt];
+
+        if ([t[@"neg"] boolValue]) {
+            // 排除词 ⇒ `AND NOT (...)`。
+            // 🔴 这里必须 IFNULL：`NULL LIKE ?` 得到 NULL，`NOT NULL` 还是 NULL，
+            //    而 WHERE 里 NULL 等于不成立 ⇒ 那些**副标题为空**的正常记录会被一起排除掉，
+            //    症状是"排除一个词，结果少了一大半"。正向词不需要 IFNULL（NULL 本来就该"不匹配"），
+            //    但两边写成同一个形状，以后改动时更容易看出差别。
+            [sql appendString:@" AND NOT (IFNULL(title,'') LIKE ? OR IFNULL(message,'') LIKE ?"
+                               @" OR IFNULL(subtitle,'') LIKE ?)"];
+            [binds addObject:like];
+            [binds addObject:like];
+            [binds addObject:like];
+        } else {
+            [sql appendString:@" AND (IFNULL(title,'') LIKE ? OR IFNULL(message,'') LIKE ?"
+                               @" OR IFNULL(subtitle,'') LIKE ?"];
+            [binds addObject:like];
+            [binds addObject:like];
+            [binds addObject:like];
+            // 🔴 App 名命中只挂在**第一个正向词**上。界面侧的 `bundlesMatchingSearch:`
+            //    用同一个 `searchTermsFromString:` 取"第一个正向词"，两边因此不可能分叉。
+            //    只挂第一个的理由：`searchBundles` 是"这**一个**词命中了哪些 App"，
+            //    把它 AND 到别的词上等于要求每条记录同时命中两个 App 名（永远为空）。
+            if (posIdx == 0 && searchBundles.count) {
+                NSMutableString *ph = [NSMutableString string];
+                for (NSUInteger k = 0; k < searchBundles.count; k++) {
+                    [ph appendString:(k ? @",?" : @"?")];
+                }
+                [sql appendFormat:@" OR bundle IN (%@)", ph];
+                [binds addObject:[searchBundles copy]];
             }
-            [sql appendFormat:@" OR bundle IN (%@)", ph];
+            [sql appendString:@")"];
+            posIdx++;
         }
-        [sql appendString:@")"];
     }
     if (tail.length)   [sql appendString:tail];
 
@@ -1566,20 +1667,17 @@ static sqlite3_stmt *NBPrepareScope(sqlite3 *db, NSString *head, NSString * _Nul
         NBStoreLog(@"SELECT 彻底失败 err=%s sql=%@", m2 ? m2 : "(null)", finalSQL);
         return NULL;
     }
-    // 绑参顺序**必须**和上面 append 的顺序逐条对应。
+    // 绑参顺序**必须**和上面 `binds` 里的顺序逐条对应（它们是在同一个循环里生成的，
+    // 🔴 这里只负责"照着念"，不许再自己判断任何条件 —— 一旦这里也写 if，
+    //    就出现了第二份口径，而两份口径会静默走岔）。
     int i = 1;
     if (bundle.length) sqlite3_bind_text(st, i++, [bundle UTF8String], -1, SQLITE_TRANSIENT);
     if (since > 0)     sqlite3_bind_double(st, i++, (double)since);
-    if (search.length) {
-        NSString *like = [NSString stringWithFormat:@"%%%@%%", search];
-        // 🔴 三条 LIKE **各绑一次**。少绑一条不会报错（SQLite 把没绑的参数当 NULL，
-        //    而 `x LIKE NULL` 恒不成立）—— 症状是"搜出来的东西莫名其妙少一半"，
-        //    而且紧接着的 `bundle IN` 参数会**整体前移一格**，绑错值。
-        sqlite3_bind_text(st, i++, [like UTF8String], -1, SQLITE_TRANSIENT);   // title
-        sqlite3_bind_text(st, i++, [like UTF8String], -1, SQLITE_TRANSIENT);   // message
-        sqlite3_bind_text(st, i++, [like UTF8String], -1, SQLITE_TRANSIENT);   // subtitle
-        if (searchBundles.count) {
-            for (NSString *bid in searchBundles) {
+    for (id v in binds) {
+        if ([v isKindOfClass:[NSString class]]) {
+            sqlite3_bind_text(st, i++, [(NSString *)v UTF8String], -1, SQLITE_TRANSIENT);
+        } else if ([v isKindOfClass:[NSArray class]]) {
+            for (NSString *bid in (NSArray *)v) {
                 sqlite3_bind_text(st, i++, [bid UTF8String], -1, SQLITE_TRANSIENT);
             }
         }

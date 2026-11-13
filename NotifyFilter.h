@@ -146,6 +146,38 @@ typedef NS_ENUM(NSInteger, NBMuteKind) {
 // 排序 = 先按到期时间升序、再按 bundle。"*" 单列在最前（它影响所有 App，最该先看到）。
 + (NSArray<NSDictionary *> *)activeMutesAt:(nullable NSDate *)now;
 
+// ---------- v0.0.189：冷却期 ----------
+// 语义：**同一个 App 在 N 秒内只弹第一条**（N = 设置里的 `cooldownSeconds`，0/缺失 = 关闭），
+// 其余的同 App 通知**不弹**，但照常记进盒子（与免打扰/静音同一条"不弹但仍记录"的口径）。
+//
+// 🔴🔴 这个函数**有副作用**：它会写入"这个 App 上一次被放行的时刻"。
+//    ⇒ ⛔ 绝不许在试运行 / 诊断 / 设置预览这类"只是想看看会怎样"的地方调它。
+//      在那些地方调一次，就会把用户真实的冷却窗口开起来 —— 症状是
+//      "我什么都没做，某个 App 突然不弹了"。要只读地看，用 `activeMutesAt:` 那种只读接口的思路：
+//      本函数只给 NB 流水线（Tweak.x）用，判据会盯着"App 侧一次都不许出现"。
+//
+// 🔴 为什么必须带 title/message：三个入口（PB / PBR / PBRS）会先后对**同一条通知**走这条流水线。
+//    冷却是有状态的判定，若每个入口都独立算，第一个入口放行并记下时刻之后，
+//    第二、第三个入口就会"落在窗口内"⇒ 被拦。而真正负责呈现的到底是哪个入口，
+//    在 iOS 16 上并没有稳定结论（系统版本/App 都可能不同）。
+//    ⇒ 同一条通知的结论必须**复用**：本函数内部按 (bundle|title|message) 缓存结论
+//      （`NB_COOLDOWN_NOTE_TTL` 秒内有效），三个入口拿到的一定是同一个答案。
+//    ⛔ 不许把这件事交给调用方做"我只在首次调" —— 首次标记（firstTime）是**记录**那条链的
+//      概念，它的键（bundle|title|message）与呈现链要的东西是同一个，但两处各算一次就是
+//      两份口径。宁可在这个唯一的判定点里算。
+//
+// reason（可为 NULL）= 人话，形如 "60 秒内第 2 条（首条 12 秒前）"。
+// problem（可为 NULL）= **配了但没能生效**的原因（值读不出/被上限截断），reason 为 nil 时才可能有值：
+//   与静音的 problem 同一条纪律 —— "生效了"和"没生效"绝不能写成同一句话。
+// 任何异常一律返回 NO（照常弹）：宁可多吵一声，也不能把通知吞了。
++ (BOOL)shouldDropForCooldownForBundle:(nullable NSString *)bundle
+                                 title:(nullable NSString *)title
+                               message:(nullable NSString *)message
+                                   now:(nullable NSDate *)now
+                                reason:(NSString * _Nullable * _Nullable)reason
+                               problem:(NSString * _Nullable * _Nullable)problem;
+
+
 // ---------- v0.0.25：按 App 换提示音（实验）—— **换挂点重写** ----------
 //
 // 🔴🔴 为什么整段换掉 v0.0.21~v0.0.24 的做法：

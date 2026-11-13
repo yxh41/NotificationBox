@@ -256,7 +256,9 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
     // （两次撞死）；这里只是**我们自己不弹**，不碰 BB 内部 ⇒ 零系统风险。
     [self addSection:@"免打扰"
               footer:@"可跨零点，例如 23:00 → 07:00。"
-                     @"只影响「弹不弹」，记录照旧落库。"];
+                     @"只影响「弹不弹」，记录照旧落库。"
+                     @"冷却期填 N 秒 = 同一个 App 在 N 秒内只弹第一条，"
+                     @"其余的不弹、但仍记进盒子（0 或清空 = 关闭）。"];
     [self addSwitchRow:@"免打扰时段"
                    sub:@"这段时间不弹，但仍然记录"
                   icon:@"moon.fill"
@@ -271,6 +273,15 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
              keyboard:UIKeyboardTypeNumbersAndPunctuation key:NB_KEY_DND_END];
     [self addActionRow:@"免打扰生效的 App" sub:nil icon:@"bell.slash.fill" tint:indigo
                    key:@"dndapps" destructive:NO action:@selector(onDndApps:)];
+    // v0.0.189：冷却期。**排在「免打扰生效的 App」之后、「临时静音的 App」之前** ——
+    // 上面三行是"哪段时间别吵我"，这一行是"刷屏的 App 别连珠炮"，都属于"不弹但仍记录"；
+    // 而临时静音是个**有状态**的东西（要看得到有哪些在生效），所以紧跟在它前面。
+    // 🔴 为什么是数字框而不是开关：开关只能表达"开/关"，而这一项真正被问到的问题是
+    //    "多久算同一条" —— 写成开关就必然还要再配一个数字，两个控件一个语义。
+    // 🔴 单位（秒）写进标题，不写在说明里：说明会滚出屏幕，标题不会。
+    [self addFieldRow:@"冷却期秒数" icon:@"timer" tint:indigo
+                   ph:@"0（关）" value:[self strOf:cur[NB_KEY_COOLDOWN_SECONDS]]
+             keyboard:UIKeyboardTypeNumberPad key:NB_KEY_COOLDOWN_SECONDS];
 
     // v0.0.168：临时静音的总览入口。
     // 🔴 为什么必须有：静音是从「长按某条记录」设的，而那条记录可能被删、App 可能被卸载，
@@ -1170,6 +1181,28 @@ static const CGFloat kHeadGap = 8.0;   // 组标题与卡片之间
                     [self fail:@"自动清理天数要填 0~3650 之间（0 = 关闭，原值未改）"];
                     return;
                 }
+            }
+        } else if ([key isEqualToString:NB_KEY_COOLDOWN_SECONDS]) {
+            // v0.0.189：冷却期窗口（单位**秒**）。0 / 清空 = 关。
+            // 🔴 上限必须和引擎侧**同一个常量**（`NB_COOLDOWN_MAX_SECONDS`）：
+            //    两边各写一个数就会出现"界面让填 7200、引擎悄悄按 3600 算"——
+            //    正是 v0.0.108 在自动清通知中心上踩过的坑，「设置说 A、行为是 B」比不支持更糟。
+            // 🔴 不许 `[v integerValue]` 直接吃：它对 "abc" 返回 0，而 0 的语义正是"关"
+            //    ⇒ 一个手滑就把功能关了，界面还显示"保存成功"。
+            if (v.length == 0) {
+                [d removeObjectForKey:key];       // 清空 = 关闭
+            } else {
+                NSScanner *sc = [NSScanner scannerWithString:v];
+                NSInteger n = 0;
+                if (![sc scanInteger:&n] || !sc.isAtEnd
+                    || n < 0 || (double)n > NB_COOLDOWN_MAX_SECONDS) {
+                    [self fail:[NSString stringWithFormat:
+                                @"冷却期要填 0~%.0f 秒（0 = 关闭，清空也等于关闭）（原值未改）",
+                                (double)NB_COOLDOWN_MAX_SECONDS]];
+                    return;
+                }
+                if (n > 0) d[key] = @(n);
+                else [d removeObjectForKey:key];
             }
         } else if ([key isEqualToString:NB_KEY_AUTO_CLEAR_HOURS]) {
             // v0.0.108：自动清通知中心（单位**小时**）。0 / 清空 = 关。
