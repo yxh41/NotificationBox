@@ -1531,7 +1531,7 @@ def _(c):
 
 # ── I9. 统计页行内行动（v0.0.187）────────────────────────────
 
-@chk("I9", "统计页行内行动：写入只有一份、提示贴在容器上、长按与无障碍两条入口都在", baseline="red")
+@chk("I9", "统计页行内行动：写入只有一份、提示贴容器、长按与无障碍两条入口、长按预览无白底", baseline="red")
 def _(c):
     """🔴 v0.0.187 新增。守的是「一行数据旁边那个动作，到底有没有真的发生」。
 
@@ -1552,6 +1552,14 @@ def _(c):
           横滑被系统拿去做逐项浏览）；只有 customActions = 手势用户发现不了。
           ⇒ 两条都判，且"最重的那个"必须标 destructive、排在最后
           （转子按数组顺序念，随手滑一下就双击是常有的事）。
+
+       ④ **长按预览不许有那块白底（v0.0.188）。**
+          用户报的现象：长按排行某一行 → 不选、点空白处取消 → 看得见一块白底消失。
+          那块白底**不是任何 cell 画的**（`NBStatCell` 的 background / contentView 全透明，
+          整页只有灰底），是系统给 context menu 预览垫的默认底色。
+          ⇒ 两个预览回调（highlighting + dismissing）**都必须实现**，且共用一份
+          把垫底换成 `clearColor` 的实现。只写 highlighting ⇒ 收起退回系统兜底预览，
+          症状正好就是"松手时白底闪一下"——记录页 v0.0.119 已经付过这次学费。
 
        ⚠️ 判据域一律 `strip_comments()`：下面每条要判的都是**代码里那一句**，
           而我在实现里写了大量"为什么"的注释，里面反复出现这些标识符
@@ -1699,7 +1707,28 @@ def _(c):
             problems.append("cellForRow 没在「非 App 维度」显式清空动作"
                             "（复用的 cell 会带着上一个 App 的 bundle 去静音）")
 
-    # ───────────── ④ 容器：提示贴哪儿、触觉分不分档 ─────────────
+    # ───────────── ④ 长按预览：那块白底（v0.0.188）─────────────
+    pv_h = func_body(stats, "- (UITargetedPreview *)tableView:(UITableView *)tv previewForHighlightingContextMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {")
+    pv_d = func_body(stats, "- (UITargetedPreview *)tableView:(UITableView *)tv previewForDismissingContextMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {")
+    if pv_h is None:
+        problems.append("统计页没实现 previewForHighlighting…ContextMenu ⇒ 长按浮起用的是系统默认预览（那块白底）")
+    if pv_d is None:
+        problems.append("统计页没实现 previewForDismissing…ContextMenu ⇒ 松手时退回系统兜底预览，白底闪一下")
+    pv = func_body(stats, "- (UITargetedPreview *)nbPreviewForStatMenu:(UIContextMenuConfiguration *)configuration {")
+    if pv is None:
+        problems.append("找不到 nbPreviewForStatMenu（两个预览回调必须共用同一份，否则浮起和落回不一致）")
+    else:
+        if "p.backgroundColor = [UIColor clearColor];" not in pv:
+            problems.append("预览垫底不是透明 ⇒ 取消时那块白底会消失（用户报的就是这个）")
+        for bad in ("NBCardBG()", "NBPageBG()"):
+            if bad in pv:
+                problems.append("预览垫底用了 %s（统计页的行本来没有卡片底，垫一张白卡等于凭空长出一张）" % bad)
+        if "cellForRowAtIndexPath:" not in pv:
+            problems.append("预览没按 identifier 取到那一行的 cell（取不到要交回系统，⛔ 别硬编一个视图）")
+    if "configurationWithIdentifier:ip" not in stats:
+        problems.append("菜单的 identifier 不是 indexPath ⇒ 预览回调不知道长按的是哪一行（静默退回系统默认预览）")
+
+    # ───────────── ⑤ 容器：提示贴哪儿、触觉分不分档 ─────────────
     if "stats.appActionHandler" not in tab:
         problems.append("容器没接 stats.appActionHandler ⇒ 统计页那两个动作没有出口")
     h = func_body(tab, "- (void)handleStatsAppAction:(NBStatAppAction)action forBundle:(NSString *)bundle {")
@@ -1731,7 +1760,7 @@ def _(c):
         problems.append("Makefile 的 App FILES 里没有 app/NBToast.m（链接期 undefined symbol _NBShowToast）")
 
     return (not problems, "；".join(problems) if problems else
-            "写入核心唯一且回读精确、提示贴容器、长按与无障碍两条入口齐全")
+            "写入核心唯一且回读精确、提示贴容器、长按与无障碍两条入口齐全、预览无白底")
 
 
 # ───────────────────────────── 跑判据 ─────────────────────────────
@@ -2161,6 +2190,18 @@ MUTATIONS = [
      "    NBStatAppActionMuteOneHour = 0,\n"
      "    NBStatAppActionSkipRecord  = 1,\n"
      "};", "I9"),
+    ("M102 长按预览垫一张白卡（取消时那块白底消失 = 用户报的现象）",
+     "app/NotifyStatsViewController.m",
+     "    p.backgroundColor = [UIColor clearColor];",
+     "    p.backgroundColor = NBCardBG();", "I9"),
+    ("M103 只实现 highlighting、不实现 dismissing（松手时白底闪一下）",
+     "app/NotifyStatsViewController.m",
+     "- (UITargetedPreview *)tableView:(UITableView *)tv previewForDismissingContextMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {",
+     "- (UITargetedPreview *)nbUnusedDismissPreview:(UIContextMenuConfiguration *)configuration {", "I9"),
+    ("M104 菜单 identifier 传 nil（预览回调不知道长按的是哪一行 ⇒ 退回系统默认预览）",
+     "app/NotifyStatsViewController.m",
+     "return [UIContextMenuConfiguration configurationWithIdentifier:ip",
+     "return [UIContextMenuConfiguration configurationWithIdentifier:nil", "I9"),
 ]
 
 

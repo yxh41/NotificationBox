@@ -872,6 +872,8 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
 - (void)nbEmitAppAction:(NBStatAppAction)action forBundle:(NSString *)bid;
 // 菜单里的「只看这个 App」落到这里（和点行走同一个出口，只有一处算时间窗）。
 - (void)nbEmitDrillForBundle:(NSString *)bid;
+// v0.0.188：长按预览共用一份（highlighting / dismissing 都调它，返回同一份才有"不换东西"）。
+- (UITargetedPreview *)nbPreviewForStatMenu:(UIContextMenuConfiguration *)configuration;
 @end
 
 @implementation NotifyStatsViewController
@@ -1619,11 +1621,61 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
     UIMenu *menu = [UIMenu menuWithTitle:(name.length ? name : bid)
                                  children:@[drillAct, muteAct, skipAct]];
 
-    return [UIContextMenuConfiguration configurationWithIdentifier:nil
+    // 🔴 v0.0.188：`identifier` 必须传 `ip`，不能是 nil。
+    //    下面那两个预览回调要**靠它**才知道"这次长按的是哪一行"，
+    //    传 nil 的话 `nbPreviewForStatMenu:` 第一步就 return nil ⇒ 系统退回它自己的
+    //    默认预览（就是那块白底），而这条链路**不会报错、不会进日志**。
+    return [UIContextMenuConfiguration configurationWithIdentifier:ip
                                                    previewProvider:nil
                                                     actionProvider:^UIMenu *(NSArray<UIMenuElement *> *suggested) {
         return menu;
     }];
+}
+
+// ================= v0.0.188：长按预览不许有那块白底 =================
+//
+// 🔴 用户看到的现象：长按排行某一行 → 不选、直接点空白处取消 → **能看见一块白底消失的过程**。
+//    那块白底不是 cell 画的（`NBStatCell` 的 background 是 clear、contentView 也是 clear，
+//    整页只有灰底），而是系统给 context menu 预览垫的**默认底色**
+//    （`UIPreviewParameters` 的默认 `backgroundColor` = 系统背景色）。
+//
+// 🔴 为什么记录页没有这个问题、统计页有：记录页用的是 `UIContextMenuInteraction`
+//    那一套（cell 自己实现 `contextMenuInteraction:configurationForMenuAtLocation:`），
+//    并且**同时实现了 highlighting / dismissing 两个预览回调**，把垫底换成透明
+//    （`NotifyCell.m` 的 `nbPreviewForMenu`，v0.0.119 那次修的）。
+//    而统计页 v0.0.187 用的是 `UITableViewDelegate` 的菜单回调 ——
+//    它有一对**自己的**预览接口（下面这两个），不实现就等于把形状和垫底全交回系统。
+//
+// 🔴🔴 **两个都必须实现**，只写 highlighting 是不够的：
+//    浮起用我们的预览、收起退回系统兜底 ⇒ 症状正好就是用户报的
+//    "松手时忽然出现一块白底再消失"。（记录页 v0.0.119 的注释里已经记过这一条坑。）
+- (UITargetedPreview *)tableView:(UITableView *)tv previewForHighlightingContextMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {
+    return [self nbPreviewForStatMenu:configuration];
+}
+
+- (UITargetedPreview *)tableView:(UITableView *)tv previewForDismissingContextMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {
+    return [self nbPreviewForStatMenu:configuration];
+}
+
+// 两个回调返回**同一份**：用户看到的永远是"同一行浮起 / 同一行落回"，中间不换东西。
+- (UITargetedPreview *)nbPreviewForStatMenu:(UIContextMenuConfiguration *)configuration {
+    id ident = configuration.identifier;
+    if (![ident isKindOfClass:[NSIndexPath class]]) return nil;   // 拿不到行 ⇒ 交回系统（⛔ 别硬编一个）
+    UITableViewCell *cell = [self.table cellForRowAtIndexPath:(NSIndexPath *)ident];
+    if (!cell) return nil;      // 行已经滚出去了：同样交回系统，不崩
+
+    UIPreviewParameters *p = [[UIPreviewParameters alloc] init];
+    // 🔴 透明垫底 = 那块矩形根本不会出现（系统那层提亮对透明无效）。
+    //    ⛔ 不要改成 `NBCardBG()`：统计页的行**本来就没有卡片底**，垫一张白卡等于
+    //       "凭空长出一张卡片"，取消时白卡消失 —— 就是用户这次报的那个现象。
+    //    ⛔ 也不要改成 `NBPageBG()`：深色下它会被提亮成灰块（v0.0.119 的教训）。
+    p.backgroundColor = [UIColor clearColor];
+    // 🔴 故意**不设** `visiblePath`：让它按快照的 alpha 反推轮廓（系统默认就在做这件事），
+    //    我们只换垫底色，形状逻辑一概不碰。
+    //    ⚠️ 统计页 cell 是透明底、只有文字和条形不透明 ⇒ 轮廓会是"文字+条形"那一块，
+    //       不是规整的圆角矩形。这与记录页（有白卡片底）不同，但比"冒出一块白底"正确得多。
+    //       若真机上这种轮廓仍然难看，下一步才是给 visiblePath（代价 = 形状变成我们画的）。
+    return [[UITargetedPreview alloc] initWithView:cell parameters:p];
 }
 
 // 菜单里那条「只看这个 App」的落点：和点行共用出口，只有一处算时间窗。
