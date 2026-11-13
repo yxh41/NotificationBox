@@ -1417,6 +1417,77 @@ static const CGFloat kNBOvershootDrag = 0.35;
     self.accessibilityLabel = parts.count ? [parts componentsJoinedByString:@"，"] : nil;
 }
 
+#pragma mark - v0.0.186 VoiceOver 的动作入口（accessibilityCustomActions）
+
+// 🔴 为什么要有这一段：到 v0.0.185，`accessibilityCustomActions` 在整个工程里
+//    **零命中**。删记录只有左滑、翻已读只有右滑，而 VoiceOver 下横向滑动被系统
+//    拿去当"逐项浏览"了 ⇒ 这两件事对 VoiceOver 用户**根本不存在**。
+//    长按菜单还在，但需要双指长按、且不容易发现。
+// ⇒ 把已有动作挂到无障碍的标准入口上。这是补"能不能做"，不是补"念得好不好"。
+//
+// 🔴 只挂 block 非 nil 的项：摆一个按了没反应的 custom action 比没有更糟
+//    （和长按菜单里"抽不到链接就不加那一项"同一条规矩）。
+//
+// 🔴 顺序 = 最想先做的事排前面：先看内容（打开 / 复制）→ 再改状态 → **删除放最后**。
+//    删除排最后不是随便排的：VoiceOver 逐项浏览是按顺序走的，
+//    把它放第一个等于让"扫过去顺手一划"直接删掉一条记录。
+//
+// ⚠️ 这四个动作的**实现**全在列表那边（`nbOnDelete` 等 block），cell 只提供入口 ——
+//    所以不存在"滑动删得掉、无障碍删不掉"这种两条路分叉。
+- (BOOL)nbA11yDoOpen:(UIAccessibilityCustomAction *)action {
+    if (self.nbOnOpen) self.nbOnOpen();
+    return YES;
+}
+
+- (BOOL)nbA11yDoCopy:(UIAccessibilityCustomAction *)action {
+    if (self.nbOnCopy) self.nbOnCopy();
+    return YES;
+}
+
+- (BOOL)nbA11yDoToggleRead:(UIAccessibilityCustomAction *)action {
+    if (self.nbOnToggleRead) self.nbOnToggleRead();
+    return YES;
+}
+
+- (BOOL)nbA11yDoDelete:(UIAccessibilityCustomAction *)action {
+    if (self.nbOnDelete) self.nbOnDelete();
+    return YES;
+}
+
+- (NSArray<UIAccessibilityCustomAction *> *)accessibilityCustomActions {
+    NSMutableArray<UIAccessibilityCustomAction *> *out =
+        [NSMutableArray arrayWithCapacity:4];
+
+    if (self.nbOnOpen) {
+        // 名字里带 App 名：同一个 App 在列表里可能有好几张卡，
+        // 只念「打开」用户不知道会跳到哪儿去（和长按菜单同一条理由）。
+        NSString *name = self.rawAppName.length
+                       ? [NSString stringWithFormat:@"打开「%@」", self.rawAppName]
+                       : @"打开";
+        [out addObject:[[UIAccessibilityCustomAction alloc]
+            initWithName:name target:self selector:@selector(nbA11yDoOpen:)]];
+    }
+    if (self.nbOnCopy) {
+        [out addObject:[[UIAccessibilityCustomAction alloc]
+            initWithName:@"复制内容" target:self selector:@selector(nbA11yDoCopy:)]];
+    }
+    if (self.nbOnToggleRead) {
+        // 🔴 方向按**这一刻**的 `isUnread` 说，和右滑蓝块的文案同一个来源
+        //    （`nbUpdateLeadLabel` 也是按它刷的）。念错方向等于骗人。
+        NSString *name = self.isUnread ? @"标为已读" : @"标为未读";
+        [out addObject:[[UIAccessibilityCustomAction alloc]
+            initWithName:name target:self selector:@selector(nbA11yDoToggleRead:)]];
+    }
+    if (self.nbOnDelete) {
+        [out addObject:[[UIAccessibilityCustomAction alloc]
+            initWithName:@"删除" target:self selector:@selector(nbA11yDoDelete:)]];
+    }
+
+    // ⛔ 一个都没有时返回 nil 而不是空数组：空数组会被读成"这一行有动作菜单、
+    //    但里面是空的"，VoiceOver 会给出一个什么也没有的入口。
+    return out.count ? out : nil;
+}
+
 - (void)setTimeText:(NSString *)text {
     self.timeLabel.text = text;
     // 🔴 v0.0.180：时间也要进 a11y 文案，所以存一份原始量（见属性注释）。
@@ -1672,6 +1743,10 @@ static const CGFloat kNBOvershootDrag = 0.35;
     // 🔴 这个 block 尤其危险：它改的是 `read`，删错行还能看出来少了一条，
     //    标错行则是"某条莫名其妙的记录变成已读/未读"，很难联想到是复用残留。
     self.nbOnToggleRead = nil;
+    // v0.0.186：无障碍动作的两个回调同样要清 —— 复用残留会让"扫到这一行按删除"
+    // 落到**上一行**的 rowId 上。`nbOnOpen` 更隐蔽：它会打开别的 App。
+    self.nbOnCopy = nil;
+    self.nbOnOpen = nil;
 
     // ================= v0.0.180：整行无障碍文案复位 =================
     // 🔴🔴 必须**显式**清 `accessibilityLabel`，⛔ 不能指望"下一个 setter 会覆盖它"。

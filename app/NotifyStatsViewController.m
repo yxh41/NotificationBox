@@ -1388,6 +1388,21 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
     if (un > 0) [parts addObject:[NSString stringWithFormat:@"未读 %ld 条", (long)un]];
     c.accessibilityLabel = [parts componentsJoinedByString:@"，"];
 
+    // ---------- v0.0.186：只有「按 App」的行能点进记录页 ----------
+    // 🔴 按小时 / 按天的行**钻不了**：记录页只有 24小时 / 7天 / 不限 三档，
+    //    表达不了"14:00–15:00"或者"11-09 这一天"这种范围。
+    //    ⇒ 那些行显式关掉选中态，⛔ 不留一个"点了没反应"的默认高亮 ——
+    //    有高亮等于暗示能点，这比不能点更让人迷惑。
+    c.selectionStyle = (dim == 0) ? UITableViewCellSelectionStyleDefault
+                                  : UITableViewCellSelectionStyleNone;
+
+    // 🔴 能点的行必须**说出来**：VoiceOver 下双击是唯一入口，而这一行原本只是
+    //    一句静态文案（App 名 / 条数 / 占比）。hint 只解释"双击会发生什么"，
+    //    ⛔ 不碰 `accessibilityTraits` —— 列表那边 v0.0.180 就是因为覆盖 traits
+    //    把双击进详情弄坏过，而那种坏法极难归因。
+    c.accessibilityHint = (dim == 0 && self.drilldownHandler)
+                        ? @"双击查看这个 App 的记录" : nil;
+
     // 🔴 必须显式要求重排：`rankLabel.text` 从有值变成 nil 时，
     //    "名字起点要不要左移 20pt"只有 layoutSubviews 知道，
     //    而改 text 本身**不会**触发重排 —— 复用的行会带着上一行的缩进。
@@ -1397,6 +1412,36 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
+
+    // ================= v0.0.186：按 App 的行 ⇒ 钻进记录页 =================
+    // 🔴 为什么现在才做：v0.0.183 把统计提成第二个页签之后，这一页成了**孤岛** ——
+    //    排行榜把每个 App 的条数摆得清清楚楚，点上去却什么也不发生。
+    //    用户看到"微信 18 条"最自然的下一步就是"让我看看那 18 条"。
+    if (self.dimSeg.selectedSegmentIndex != 0) return;      // 另两个维度钻不了（见 cellForRow）
+    if (ip.row < 0 || ip.row >= (NSInteger)self.rows.count) return;
+    NSDictionary *d = self.rows[ip.row];
+    if (![d isKindOfClass:[NSDictionary class]]) return;
+    id bv = d[@"bundle"];
+    NSString *bid = [bv isKindOfClass:[NSString class]] ? (NSString *)bv : nil;
+    if (!bid.length) return;
+    // 没有接手的容器（这一页被单独 push 出来）⇒ 保持原来的"点一下只收起"
+    if (!self.drilldownHandler) return;
+
+    // 🔴 时间窗映射表（两端枚举：本页 `rangeSeg` 0~3 / 记录页 `timeSeg` 0~2）：
+    //      统计「全部」  → 记录「不限时间」   days = 0
+    //      统计「7 天」  → 记录「近7天」      days = 7
+    //      统计「30 天」 → **记录页没有这一档** ⇒ days = -1（别动时间窗）
+    //      统计「自定义」→ 记录页表达不了      ⇒ days = -1
+    //    ⛔ 绝不用"最接近的 7 天"去凑 30 天：那会变成"统计说 42 条、点进去只有 8 条"，
+    //      两个指标打架比"不能点"更糟（本项目最贵的一类事故）。
+    NSInteger days = -1;
+    switch (self.rangeSeg.selectedSegmentIndex) {
+        case 0:  days = 0;  break;
+        case 1:  days = 7;  break;
+        default: days = -1; break;
+    }
+    // 触觉不在这里给：真正"生效"的是页签切过去了，那一下由容器统一震（见 NBHomeTabBarController）。
+    self.drilldownHandler(bid, days);
 }
 
 @end

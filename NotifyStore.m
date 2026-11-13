@@ -478,6 +478,14 @@ void NBSharedLog(NSString *fmt, ...) {
     }
 }
 
+// v0.0.186：本文件里的 C 辅助函数要用 `openDB`，而它只在这里实现、没有进 .h。
+// 🔴 为什么不把它加进 NotifyStore.h：它返回 `sqlite3 *` 裸指针，
+//    暴露给 App 侧等于邀请别人在错误的时机开库/关库（本项目已经为"谁都能开库"
+//    付过一次 BUSY 锁的代价）。这里只需要让**本文件内**的 C 函数看得见。
+@interface NotifyStore ()
++ (sqlite3 *)openDB;
+@end
+
 @implementation NotifyStore
 
 + (void)ensureDir {
@@ -980,6 +988,182 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
     return out;
 }
 
+#pragma mark - v0.0.186 标星记录豁免淘汰（上限裁剪 / 自动清理天数）
+
+// 🔴 为什么要有这一段：原上限裁剪是一条 SQL
+//      DELETE FROM notifications WHERE id NOT IN
+//        (SELECT id FROM notifications ORDER BY ts DESC LIMIT N)
+//    ⇒ 标星记录和普通记录一样被裁。而列表里的「★ 只看标星」筛选、
+//      卡片上的 ★、设置页「关键词规则 → 标星」都在向用户承诺"标星 = 留着"
+//      ⇒ 这是界面在说假话，而且丢的是用户以为已经收藏好的数据。
+//
+// 🔴 为什么标星只能在 C 层判：`nbStar` 是**派生量** —— 由 `keywordRules` 现算，
+//    SQL 里根本没有这一列（见 ViewController.m `starOnly` 那一段注释）。
+//    这里用的匹配口径与 `+keywordActionForTitle:…` **逐条一致**
+//    （4 个字段、大小写不敏感子串），⛔ 不另发明一套 ——
+//    否则会出现"列表里带 ★、裁剪时却当成普通记录删掉"这种两套口径打架。
+//
+// 🔴 为什么没有标星规则时走原来那条 SQL：绝大多数用户没设标星规则，
+//    他们这一版的行为必须**零变化** —— 连一次额外的全表读、多一次 plist 读都不要。
+//
+// 🔴 配额（kNBStarKeepMax）不能省：一条 `keyword=的` 这种规则会让**所有**记录都算标星，
+//    没有配额就等于把「记录上限」整个废掉（库无限长、列表越来越卡）。
+//    超配额时按 ts 从旧删起 —— 和普通记录同一条规则。
+static const NSInteger kNBStarKeepMax = 200;
+
+// 前置声明：`NBContainsText` 定义在文件后面的 v0.0.48 关键词段。
+// 🔴 判定必须用**同一个实现**，⛔ 不许为了"这里能用"再写一份子串匹配。
+static BOOL NBContainsText(NSString *hay, NSString *needle);
+
+static NSString *NBColText(sqlite3_stmt *st, int idx) {
+    const unsigned char *p = sqlite3_column_text(st, idx);
+    return p ? [NSString stringWithUTF8String:(const char *)p] : nil;
+}
+
+// 只挑出「标星」那几条规则：折叠规则与淘汰无关，先剔掉能少一半匹配次数。
+static NSArray<NSDictionary *> *NBStarRules(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *r in [NotifyStore keywordRules]) {
+        if (![r isKindOfClass:[NSDictionary class]]) continue;
+        if (![r[@"star"] boolValue]) continue;
+        if (![r[@"keyword"] length]) continue;
+        [out addObject:r];
+        if (out.count >= 20) break;      // 和 `keywordRules` 的上限同一个数字
+    }
+    return out;
+}
+
+static BOOL NBRowHitsStar(NSString *title, NSString *message, NSString *subtitle,
+                          NSString *appName, NSArray<NSDictionary *> *starRules) {
+    if (!starRules.count) return NO;
+    for (NSDictionary *r in starRules) {
+        NSString *kw = r[@"keyword"];
+        if (NBContainsText(title, kw) || NBContainsText(message, kw)
+            || NBContainsText(subtitle, kw) || NBContainsText(appName, kw)) return YES;
+    }
+    return NO;
+}
+
+// 按 id 批量删。返回真正删掉的行数。
+// 🔴 参数绑定而不是拼 SQL：id 是整型、拼起来不会注入，但**批量拼长语句**会撞上
+//    SQLite 的语句长度上限；更重要的是"拼 SQL"这个习惯一旦用开，下次碰到字符串就出事。
+// 🔴 必须查 `sqlite3_changes()`：DELETE 命中 0 行照样返回 SQLITE_DONE。
+static NSInteger NBDeleteIds(sqlite3 *db, NSArray<NSNumber *> *ids) {
+    if (!db || !ids.count) return 0;
+    sqlite3_stmt *del = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM notifications WHERE id=?", -1, &del, NULL) != SQLITE_OK) {
+        NBStoreLog(@"按 id 删除 prepare 失败 err=%s", sqlite3_errmsg(db));
+        return -1;
+    }
+    NSInteger removed = 0;
+    for (NSNumber *n in ids) {
+        sqlite3_bind_int64(del, 1, (sqlite3_int64)[n longLongValue]);
+        if (sqlite3_step(del) == SQLITE_DONE && sqlite3_changes(db) > 0) removed++;
+        sqlite3_reset(del);
+    }
+    sqlite3_finalize(del);
+    return removed;
+}
+
+// 上限裁剪：普通记录留最新 limit 条，标星记录单独留 kNBStarKeepMax 条。
+// 返回删掉的行数（0 = 没超限；-1 = 算不出来）。
+static NSInteger NBTrimNotifications(sqlite3 *db, NSInteger limit) {
+    if (!db || limit <= 0) return -1;
+
+    // ---- 快速路径：没有任何标星规则 ⇒ 还是 v0.0.185 那条 SQL，一字不改 ----
+    NSArray<NSDictionary *> *starRules = NBStarRules();
+    if (!starRules.count) {
+        NSString *del = [NSString stringWithFormat:
+            @"DELETE FROM notifications WHERE id NOT IN "
+            @"(SELECT id FROM notifications ORDER BY ts DESC LIMIT %ld);", (long)limit];
+        if (sqlite3_exec(db, [del UTF8String], NULL, NULL, NULL) != SQLITE_OK) {
+            NBStoreLog(@"上限裁剪失败 err=%s", sqlite3_errmsg(db));
+            return -1;
+        }
+        return (NSInteger)sqlite3_changes(db);
+    }
+
+    // ---- 慢路径：全表按 ts 从新到旧走一遍，普通/标星各自计数 ----
+    // 🔴 规则**只读一次**：`keywordRules` 每调一次都要读一遍 settings.plist，
+    //    放进循环就是"每行读一次盘"（500 行 = 500 次文件 IO，真机会卡）。
+    NSDictionary<NSString *, NSString *> *names = [NotifyStore appNames];
+    NSMutableArray<NSNumber *> *delIds = [NSMutableArray array];
+    NSInteger plainKept = 0, starKept = 0;
+
+    sqlite3_stmt *st = NULL;
+    const char *sel = "SELECT id, title, message, subtitle, bundle FROM notifications "
+                      "ORDER BY ts DESC;";
+    if (sqlite3_prepare_v2(db, sel, -1, &st, NULL) != SQLITE_OK) {
+        NBStoreLog(@"上限裁剪 prepare 失败 err=%s", sqlite3_errmsg(db));
+        return -1;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        sqlite3_int64 rid = sqlite3_column_int64(st, 0);
+        NSString *ti = NBColText(st, 1);
+        NSString *me = NBColText(st, 2);
+        NSString *su = NBColText(st, 3);
+        NSString *bd = NBColText(st, 4);
+        NSString *an = bd.length ? names[bd] : nil;
+        if (NBRowHitsStar(ti, me, su, an, starRules)) {
+            if (++starKept > kNBStarKeepMax) [delIds addObject:@(rid)];
+        } else if (++plainKept > limit) {
+            [delIds addObject:@(rid)];
+        }
+    }
+    sqlite3_finalize(st);
+    if (!delIds.count) return 0;
+    return NBDeleteIds(db, delIds);
+}
+
+// v0.0.186：按天数清理，但**放过命中标星规则的记录**。
+// 🔴 「自动」≠「用户主动」：这里是自动路径（用户没要求删某一条）⇒ 豁免标星；
+//    「批量清理记录」是用户主动操作 ⇒ **不豁免**，仍走原 `deleteWithBundle:`。
+//    两者语义不同不是笔误，是刻意的。
+// 🔴 这里不另设标星配额：被放过的那些最终由上限裁剪的 `kNBStarKeepMax` 兜住
+//    （两条路径共用同一个常量 ⇒ 库仍然有界），所以不需要第二个数字。
+static NSInteger NBCleanOlderThan(NSTimeInterval cutoff) {
+    NSArray<NSDictionary *> *starRules = NBStarRules();
+    if (!starRules.count) {
+        // 没有标星规则 ⇒ 走原来那条路，行为和 v0.0.185 完全一样
+        return [NotifyStore deleteWithBundle:nil beforeTs:cutoff readOnly:NO];
+    }
+    sqlite3 *db = [NotifyStore openDB];
+    if (!db) return -1;
+
+    NSDictionary<NSString *, NSString *> *names = [NotifyStore appNames];
+    NSMutableArray<NSNumber *> *delIds = [NSMutableArray array];
+    NSInteger keptStar = 0;
+
+    sqlite3_stmt *st = NULL;
+    const char *sel = "SELECT id, title, message, subtitle, bundle FROM notifications "
+                      "WHERE ts<? ORDER BY ts ASC;";
+    if (sqlite3_prepare_v2(db, sel, -1, &st, NULL) != SQLITE_OK) {
+        NBStoreLog(@"按天数清理 prepare 失败 err=%s", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_double(st, 1, (double)cutoff);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        sqlite3_int64 rid = sqlite3_column_int64(st, 0);
+        NSString *ti = NBColText(st, 1);
+        NSString *me = NBColText(st, 2);
+        NSString *su = NBColText(st, 3);
+        NSString *bd = NBColText(st, 4);
+        NSString *an = bd.length ? names[bd] : nil;
+        if (NBRowHitsStar(ti, me, su, an, starRules)) { keptStar++; continue; }
+        [delIds addObject:@(rid)];
+    }
+    sqlite3_finalize(st);
+
+    NSInteger removed = NBDeleteIds(db, delIds);
+    sqlite3_close(db);
+    if (removed > 0) {
+        NBStoreLog(@"按天数清理：删 %ld 条，放过标星 %ld 条（cutoff=%.0f）",
+                   (long)removed, (long)keptStar, cutoff);
+    }
+    return removed;
+}
+
 // v0.0.133：旧签名退化成**薄封装**（见 NotifyStore.h 的理由：唯一实现只写一遍）。
 + (void)recordWithBundle:(NSString *)bundle
                    title:(NSString *)title
@@ -1205,13 +1389,18 @@ static NSArray<NSDictionary *> *NBRows(sqlite3 *db, NSString *sql, NSTimeInterva
         sqlite3_finalize(stmt);
     }
 
-    // 上限裁剪：保留最新的 maxRecords 条
+    // 上限裁剪：普通记录留最新 maxRecords 条；命中「标星」关键词的记录单独配额
+    // （v0.0.186：以前这一段是一条 SQL，标星记录会被当普通记录一起裁掉）
     NSInteger limit = [self maxRecords];
     if (limit > 0) {
-        NSString *del = [NSString stringWithFormat:
-            @"DELETE FROM notifications WHERE id NOT IN "
-            @"(SELECT id FROM notifications ORDER BY ts DESC LIMIT %ld);", (long)limit];
-        sqlite3_exec(db, [del UTF8String], NULL, NULL, NULL);
+        NSInteger trimmed = NBTrimNotifications(db, limit);
+        // 🔴 只在**一次删掉多条**时留痕（用户把上限调小、或者第一次有标星规则）。
+        //    库满之后每来一条通知都会裁 1 条 —— 那种日常行一打，
+        //    日志窗口（≈50 条）就被挤满了，一次性诊断再也看不到。
+        if (trimmed > 1) {
+            NBStoreLog(@"上限裁剪：一次删掉 %ld 条（limit=%ld；普通与标星分开计配额）",
+                       (long)trimmed, (long)limit);
+        }
     }
     sqlite3_close(db);
 }
@@ -2001,9 +2190,9 @@ static sqlite3_stmt *NBPrepareDelete(sqlite3 *db, NSString *bundle, NSTimeInterv
     NSInteger days = [self autoCleanDays];
     if (days <= 0) return 0;   // 关闭 ⇒ 什么都不做，也不打日志（避免每次启动刷屏）
     NSTimeInterval cutoff = [[NSDate date] timeIntervalSince1970] - (NSTimeInterval)days * 86400.0;
-    // 🔴 复用 v0.0.45 的批量删除：bundle=nil（所有 App）、readOnly=NO（连未读一起删，
-    //    因为"保留最近 N 天"的语义就是"更老的都不要了"）。
-    NSInteger n = [self deleteWithBundle:nil beforeTs:cutoff readOnly:NO];
+    // 🔴 v0.0.186：改走 `NBCleanOlderThan` —— 「自动」路径**放过命中标星规则的记录**。
+    //    和 v0.0.45 的 `deleteWithBundle:` 不是同一条路：那个是用户主动清理（不豁免）。
+    NSInteger n = NBCleanOlderThan(cutoff);
     if (n > 0) {
         NBStoreLog(@"自动清理：删掉 %ld 天前的 %ld 条（cutoff=%.0f）", (long)days, (long)n, cutoff);
     }

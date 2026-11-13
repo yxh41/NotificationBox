@@ -598,6 +598,14 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 // v0.0.133：带深链版本。`deeplink` 为 nil/不可用时**同一个方法内部**退回只打开 App
 // （契约见 AppLauncher.h：永不比 openBundle: 更差）。
 - (void)nbOpenAppWithBundle:(NSString *)bundleId deeplink:(NSString *)deeplink;
+// ================= v0.0.186：长按菜单与无障碍动作共用的两个动作 =================
+// 🔴 为什么要把这两件事抽成方法：v0.0.186 之前它们是写在菜单 handler 里的**内联 block**，
+//    只有长按一个入口。现在无障碍的 `accessibilityCustomActions` 也要用同一件事
+//    ⇒ 抽成方法，两个入口共用一份实现。
+//    ⛔ 不许在 cell 那边再写一份"复制到剪贴板"：正文口径（`nbBodyTextForRow:`）
+//       和"没有内容时提示什么"必须只有一处，否则拖一段时间两边说法就会不一样。
+- (void)nbCopyRowText:(NSDictionary *)row;
+- (void)nbOpenRowInApp:(NSDictionary *)row;
 // v0.0.118：浮层提示（1.4 秒淡出）。不走 `alertTitle:`：
 //    那个是 alert（要 present），而这里最常发生的时刻正是"菜单刚收起"，
 //    两条 present 撞在一起就是"点了没反应"。浮层只往视图上贴一个 label，不涉及 present。
@@ -1865,16 +1873,20 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
 // 🔴 只清**摘要行里列出来的**那几项。App 筛选（头像栏）不在此列 ——
 //    它在屏幕上是**看得见的高亮**，用户想清会自己点「全部」；
 //    在"清除"里顺手把它也清掉，等于替用户改了一个他没在问的选择。
-- (void)onClearFilters {
-    // 先作废挂起的搜索防抖，避免清完 250ms 后又被跑一次全量查询
-    [self cancelPendingLoadData];
-
+// v0.0.186：把「清筛选」拆成**只改状态**和「改完再查」两步。
+// 🔴 为什么拆：统计页钻取要一次做完"清掉其它筛选 + 设 App + 设时间窗"，然后**只查一次库**。
+//    v0.0.185 之前 `onClearFilters` 自带 `loadData`，直接复用就会连查两次 ——
+//    列表要闪一下（第一帧"全部 App"、第二帧才跳到目标），而且那两次查询之间
+//    用户的手指可能已经点到别的地方去了。
+// 🔴 拆的是**执行时机**，不是筛选语义：清哪些量仍然只有这一处定义
+//    （`onClearFilters` 和 `applyDrilldownBundle:` 都只调它）。
+- (void)nbResetFilterState {
     if (self.timeSeg.selectedSegmentIndex != 0) {
         self.timeSeg.selectedSegmentIndex = 0;      // 回默认档（近24小时）
     }
     // 🔴 下面三个状态是**直接赋值**、而不是挨个调 `onUnread:` / `onStar:`：
     //    那两个方法各自内部都会 `loadData`（一次 6~8 条 SQL + 重建 2000 行），
-    //    连调三次就是三次全量重查。这里统一在最后收一次口。
+    //    连调三次就是三次全量重查。这里统一交给调用方收一次口。
     //    ⚠️ 代价：`unreadOnly` 的语义等于"`unreadSeg` 的第 1 段"，两边必须一起改 ——
     //    所以这两行紧贴着写，将来改 `onUnread:` 的人一眼能看到它。
     self.unreadSeg.selectedSegmentIndex = 0;
@@ -1890,8 +1902,57 @@ static NSArray<NSString *> *NBKeyLineKeywords(void) {
         self.searchBar.text = nil;
     }
     [self updateSummaryRow];
+}
+
+- (void)onClearFilters {
+    // 先作废挂起的搜索防抖，避免清完 250ms 后又被跑一次全量查询
+    [self cancelPendingLoadData];
+    [self nbResetFilterState];
     [self loadData];
 }
+
+// ================= v0.0.186：统计页钻取 =================
+//
+// 🔴 为什么需要它：v0.0.183 把统计提成第二个页签之后，统计页成了**孤岛** ——
+//    排行榜把 67 个 App 的条数摆得清清楚楚，点上去却只有 `deselectRowAtIndexPath`。
+//    用户看到"微信 18 条"最自然的下一步就是"让我看看那 18 条"。
+//
+// 🔴 时间窗只能**部分映射**，这是这一版最需要说清的一件事：
+//      统计页：全部 / 7 天 / 30 天 / 自定义（`rangeSeg` 0~3）
+//      记录页：近24小时 / 近7天 / 不限（`timeSeg` 0~2）
+//    ⇒ 「全部」→ 不限、「7 天」→ 近7天，这两档是**逐字对得上**的；
+//      「30 天」和「自定义」在记录页**没有对应档** —— 传 -1 表示"别动时间窗"，
+//      保持用户自己选的那个，⛔ 绝不用"最接近的 7 天"去凑 ——
+//      那会出现"统计说 42 条、点进去只有 8 条"，比不能点更糟（两个口径打架）。
+//
+// 🔴 其余筛选（未读 / ★ / 残留 / 搜索）必须一起清掉：它们**都会挡记录**，
+//    不清就会出现"点进去数目对不上"，而用户完全看不出是哪个开关在挡。
+- (void)applyDrilldownBundle:(NSString *)bundle dayRange:(NSInteger)days {
+    [self cancelPendingLoadData];
+    [self nbResetFilterState];
+
+    // App 维度：`filterBundle` 的写入点仍然只有"用户动作的入口"这一族
+    // （图标栏点击 / 本方法）。⛔ 不在 `loadData` 里改它。
+    self.filterBundle = bundle.length ? bundle : nil;
+
+    // 时间窗：只动能一一对应的档（映射表见方法头注释）
+    NSInteger seg = -1;
+    if (days == 0)       seg = 2;   // 全部      → 不限时间
+    else if (days == 7)  seg = 1;   // 7 天      → 近7天
+    else if (days == 1)  seg = 0;   // 24 小时   → 近24小时
+    if (seg >= 0) {
+        self.timeSeg.selectedSegmentIndex = seg;
+        // 🔴 同步"上一档"：下次用户自己切时间胶囊时，滑动方向靠它算
+        //    （`onTime:` 里用 `nbPrevTimeIdx` 和当前档比大小）。不同步的话，
+        //    钻取后第一次切档的动画会朝反方向走 —— 一个看得见但归不到原因的小 bug。
+        self.nbPrevTimeIdx = seg;
+    }
+
+    // 换了 App 筛选 = 整屏内容被换掉 ⇒ 走入场错落（和点图标栏同一条路）
+    [self nbArmEntrance];
+    [self loadData];
+}
+
 
 // 统一在 safeArea 里排版，避免和导航栏/搜索框互相压字
 - (void)viewDidLayoutSubviews {
@@ -3921,6 +3982,12 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     c.nbMenuBuilder = ^UIMenu *{
         return [weakSelf nbMenuForRow:d];
     };
+    // ---------- v0.0.186：VoiceOver 的四个动作入口 ----------
+    // 🔴 删除 / 翻已读用的是上面那两个就绪的 block（`nbOnDelete` / `nbOnToggleRead`），
+    //    这里只补"复制 / 打开"两个 —— 它们需要完整正文、bundle 和深链，cell 拿不到。
+    // 🔴 同样每次 cellForRow 重设：cell 会复用，留着上一行的就是"按复制拿到别人的正文"。
+    c.nbOnCopy = ^{ [weakSelf nbCopyRowText:d]; };
+    c.nbOnOpen = ^{ [weakSelf nbOpenRowInApp:d]; };
     return c;
 }
 
@@ -4129,7 +4196,7 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
                                             image:[UIImage systemImageNamed:(link.length ? @"link" : @"arrow.up.forward.app")]
                                        identifier:nil
                                           handler:^(__kindof UIAction *a) {
-        [weakSelf nbOpenAppWithBundle:bid deeplink:link];
+        [weakSelf nbOpenRowInApp:row];
     }];
     [acts addObject:openAct];
 
@@ -4137,12 +4204,50 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
                                             image:[UIImage systemImageNamed:@"doc.on.doc"]
                                        identifier:nil
                                           handler:^(__kindof UIAction *a) {
-        NSString *body = [weakSelf nbBodyTextForRow:row];
-        UIPasteboard *pb = [UIPasteboard generalPasteboard];
-        pb.string = body.length ? body : @"（这条通知没有内容）";
-        [weakSelf nbToast:@"已复制"];
+        [weakSelf nbCopyRowText:row];
     }];
     [acts addObject:copyAct];
+
+    // ================= v0.0.186：已读切换 + 删除 =================
+    // 🔴 为什么这两项以前不在菜单里（v0.0.118 起一直没有）⇒ 它们只有滑动入口：
+    //    右滑翻已读、左滑删除。对 VoiceOver 用户等于**不存在**（横滑被系统拿去浏览了），
+    //    对其他用户也是"长按一条想删掉它"这个最自然的动作落空。
+    // 🔴 动作实现**不新写**：直接调滑动那条路用的同一批方法
+    //    （`nbSetRead:forRowIds:` / `nbDeleteRowIds:`）——
+    //    两个入口一个实现，才不会出现"左滑删得掉、长按删不掉"这种分叉。
+    // 🔴 作用范围 = `nbGroupIds`（×N 那一行代表一组），和左滑删除同口径：
+    //    只删一条会出现"删了一条、×5 变 ×4、卡片还在原地"。
+    NSArray<NSNumber *> *menuIds = [row[@"nbGroupIds"] isKindOfClass:[NSArray class]]
+                                 ? row[@"nbGroupIds"] : nil;
+    if (!menuIds.count) {
+        NSInteger one = [row[@"id"] integerValue];
+        menuIds = (one > 0) ? @[@(one)] : @[];
+    }
+    BOOL menuRowUnread = ([row[@"read"] integerValue] == 0);
+    if (menuIds.count) {
+        UIAction *readAct = [UIAction actionWithTitle:(menuRowUnread ? @"标为已读" : @"标为未读")
+                                                image:[UIImage systemImageNamed:
+                                                       (menuRowUnread ? @"envelope.open" : @"envelope.badge")]
+                                           identifier:nil
+                                              handler:^(__kindof UIAction *a) {
+            // 方向按**拼菜单那一刻**的 `read` 算，⛔ 不在执行时现读 ——
+            // 否则"菜单还开着的时候列表被刷新了"会让标题说标已读、实际标成未读
+            // （和 `nbOnToggleRead` 那条注释同一个理由）。
+            [weakSelf nbSetRead:menuRowUnread forRowIds:menuIds];
+        }];
+        [acts addObject:readAct];
+
+        UIAction *delAct = [UIAction actionWithTitle:@"删除"
+                                               image:[UIImage systemImageNamed:@"trash"]
+                                          identifier:nil
+                                             handler:^(__kindof UIAction *a) {
+            [weakSelf nbDeleteRowIds:menuIds];
+        }];
+        // 红色。⚠️ 长按菜单不另加确认框：左滑删除也没有确认，
+        //    同一个动作在两处口径必须一样（要加就两处一起加，那是另一版的事）。
+        delAct.attributes = UIMenuElementAttributesDestructive;
+        [acts addObject:delAct];
+    }
 
     // ================= v0.0.166：正文提取 =================
     // 🔴 只有**真的抽到东西**才加这两项。抽不到还摆一个点了没反应的动作，
@@ -4230,6 +4335,37 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
                                  children:muteActs]];
 
     return [UIMenu menuWithTitle:@"" children:acts];
+}
+
+// ================= v0.0.186：菜单与无障碍动作共用的实现 =================
+// 🔴 这两个方法原来分别是菜单里的一段内联 block（v0.0.118 起）。v0.0.186 给
+//    VoiceOver 加了 `accessibilityCustomActions`，同一件事有了第二个入口
+//    ⇒ 抽成方法：**两个入口、一份实现**。
+//    ⛔ 否则迟早出现"长按复制出来的是全文、无障碍复制出来的是截断版"这种分叉。
+- (void)nbCopyRowText:(NSDictionary *)row {
+    if (![row isKindOfClass:[NSDictionary class]]) return;
+    NSString *body = [self nbBodyTextForRow:row];
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    pb.string = body.length ? body : @"（这条通知没有内容）";
+    [self nbToast:@"已复制"];
+}
+
+- (void)nbOpenRowInApp:(NSDictionary *)row {
+    if (![row isKindOfClass:[NSDictionary class]]) return;
+    id bv = row[@"bundle"];
+    NSString *bid = [bv isKindOfClass:[NSString class]] ? (NSString *)bv : nil;
+    if (!bid.length) {
+        // 🔴 没有 bundle 就明说，⛔ 不许静默返回：按了没反应会被当成"功能坏了"。
+        //    和长按菜单里"抽不到链接就不加那一项"不同 —— 那一项是**入口**不该出现，
+        //    而这里是入口已经存在、必须解释为什么不动作。
+        NBHapticFire(NBHapticKindWarning);
+        [self nbToast:@"这条没有 bundle id，没法打开 App"];
+        return;
+    }
+    NSString *link = [AppLauncher deeplinkFromPayload:row[@"payload"]];
+    // 🔴 不走 present：这个动作在菜单收起 / VoiceOver 动作回调的瞬间执行，
+    //    present 会被系统静默丢掉（v0.0.118 那条注释，这里同样成立）。
+    [self nbOpenAppWithBundle:bid deeplink:link];
 }
 
 // ================= v0.0.168：临时静音的写入 =================

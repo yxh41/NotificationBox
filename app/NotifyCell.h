@@ -113,6 +113,21 @@ NS_ASSUME_NONNULL_BEGIN
 // 🔴 捕获的仍然是 rowId 那一组的数组快照，⛔ 不是 indexPath（理由同 `nbOnDelete`）。
 @property (nonatomic, copy, nullable) void (^nbOnToggleRead)(void);
 
+// ================= v0.0.186：VoiceOver 的动作入口 =================
+// 🔴 为什么需要它们：到 v0.0.185 为止，`accessibilityCustomActions` 在整个工程里
+//    **零命中** —— 删记录、翻已读这两件事只有"左滑/右滑"一个入口，而 VoiceOver 下
+//    横向滑动被系统拿去当"逐项浏览"了 ⇒ 这两件事对 VoiceOver 用户**根本不存在**。
+//    长按菜单虽然还在，但 VoiceOver 下需要双指长按、而且不容易发现。
+// ⇒ 由 cell 把已有的四个动作挂到 `accessibilityCustomActions` 上（见 .m）。
+// 🔴 为什么"复制内容 / 打开 App"要由列表交进来、而"删除 / 翻已读"不用：
+//    后两件 cell 手上已经有回调（`nbOnDelete` / `nbOnToggleRead`），前两件需要
+//    完整正文（cell 只有截断后的显示串）和 bundle/深链（cell 根本不知道）——
+//    那些都在列表那边。cell 拿到的只是"按了就叫我"，实现只有一处。
+// 🔴 和 `nbOnToggleRead` 同一条纪律：语义（「标为已读」还是「标为未读」）由 cell
+//    按当前状态决定，列表只负责执行 —— 否则会出现"念的是已读、按下去变未读"。
+@property (nonatomic, copy, nullable) void (^nbOnCopy)(void);
+@property (nonatomic, copy, nullable) void (^nbOnOpen)(void);
+
 // ================= v0.0.118：长按卡片弹菜单 =================
 // 列表把「这一行的菜单怎么拼」交进来；cell **不**知道 App 名、也不知道怎么打开 App
 // （那些是列表 / Store 的事）。返回 nil ⇒ 这一行不弹菜单。

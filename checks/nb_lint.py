@@ -1349,6 +1349,169 @@ def _(c):
             "两个页签各带 nav，根没套 nav，tab 外观不透明，临时页收起页签，新文件已进 FILES")
 
 
+@chk("I8", "标星不被淘汰 / 菜单与 VoiceOver 同源 / 统计页钻取的时间窗只做逐字映射", baseline="red")
+def _(c):
+    """🔴 v0.0.186 新增。三件事，守的都是「界面对用户的承诺」和「代码实际行为」的一致性。
+
+       ① **标星记录不许被自动淘汰。**
+          列表里「★ 只看标星」筛选、卡片上的 ★、关键词规则的「标星」三处都在承诺
+          "标星 = 留着"，而 v0.0.185 的上限裁剪是一条
+          `ORDER BY ts DESC LIMIT N` —— 标星和普通记录一样被裁掉。
+          同时钉住三件事：标星只能在 **C 层**判（`nbStar` 是派生量、SQL 里没这一列）、
+          **配额不能省**（一条 `keyword=的` 会让所有记录都算标星 ⇒ 上限整个失效）、
+          **规则只许读一次**（`keywordRules` 每调一次读一遍 plist，放进逐行循环就是
+          每行一次文件 IO）。
+
+       ② **菜单与无障碍动作同源。**
+          v0.0.185 之前删除只有左滑、翻已读只有右滑；VoiceOver 下横滑被系统拿去
+          "逐项浏览"了 ⇒ 这两件事对 VoiceOver 用户**根本不存在**。判据要求：
+          长按菜单里有「标为已读/未读」「删除」，cell 有 `accessibilityCustomActions`，
+          而且四个动作**都真的调 block**（不是摆着好看的空壳）。
+
+       ③ **钻取的时间窗只许逐字对应。**
+          统计页 4 档（全部/7天/30天/自定义）vs 记录页 3 档（24小时/7天/不限），
+          只有「全部」「7天」对得上；30 天与自定义必须传 -1（别动时间窗），
+          ⛔ 不许拿"最接近的 7 天"去凑 —— 那会变成"统计说 42 条、点进去 8 条"，
+          两个指标打架比不能点更糟（本项目最贵的一类事故）。
+    """
+    store = strip_comments(c["files"].get("NotifyStore.m", ""))
+    vc    = strip_comments(c["files"].get("app/ViewController.m", ""))
+    vch   = strip_comments(c["files"].get("app/ViewController.h", ""))
+    cell  = strip_comments(c["files"].get("app/NotifyCell.m", ""))
+    stats = strip_comments(c["files"].get("app/NotifyStatsViewController.m", ""))
+    statsh = strip_comments(c["files"].get("app/NotifyStatsViewController.h", ""))
+    tab   = strip_comments(c["files"].get("app/NBHomeTabBarController.m", ""))
+    problems = []
+
+    # ───────────── ① 标星豁免淘汰 ─────────────
+    trim = func_body(store, "static NSInteger NBTrimNotifications(sqlite3 *db, NSInteger limit)")
+    if trim is None:
+        problems.append("找不到 NBTrimNotifications（上限裁剪还是一条到底的 SQL ⇒ 标星记录会被裁掉）")
+    else:
+        if "NBRowHitsStar" not in trim:
+            problems.append("上限裁剪没判标星（函数体里没有 NBRowHitsStar）⇒ 标星记录照样被淘汰")
+        if "kNBStarKeepMax" not in trim:
+            problems.append("上限裁剪没有标星配额 ⇒ 一条常见关键词规则就能让「记录上限」整个失效")
+        # 🔴 只判常量存在会被"把 > 改成 >="这类改法骗过去 ⇒ 必须判"配额真的参与比较"
+        if not re.search(r"starKept\s*>\s*kNBStarKeepMax", trim):
+            problems.append("标星配额没参与判定（缺 starKept > kNBStarKeepMax）")
+        if "starRules.count" not in trim:
+            problems.append("没有「无标星规则就走原 SQL」的快速路径（所有用户都要多付一次全表读）")
+        loop = re.search(r"while\s*\(\s*sqlite3_step\(st\)\s*==\s*SQLITE_ROW\s*\)(.*)",
+                         trim, re.S)
+        if loop and "NBStarRules" in loop.group(1):
+            problems.append("NBStarRules() 出现在逐行循环里（每行读一次 settings.plist）")
+
+    hit = func_body(store, "static BOOL NBRowHitsStar(")
+    if hit is None:
+        problems.append("找不到 NBRowHitsStar（标星判定没有唯一实现）")
+    elif "NBContainsText" not in hit:
+        problems.append("标星判定没复用 NBContainsText（自己写子串匹配 ⇒ 和列表两套口径，"
+                        "迟早出现「列表带★、裁剪当普通记录删掉」）")
+
+    clean = func_body(store, "static NSInteger NBCleanOlderThan(NSTimeInterval cutoff)")
+    if clean is None or "NBRowHitsStar" not in clean:
+        problems.append("按天数清理没豁免标星（NBCleanOlderThan 里没有 NBRowHitsStar）")
+    auto = func_body(store, "+ (NSInteger)runAutoClean {")
+    if auto is None or "NBCleanOlderThan" not in auto:
+        problems.append("runAutoClean 没走 NBCleanOlderThan ⇒ 自动清理照样删掉标星记录")
+
+    # ───────────── ② 长按菜单 + VoiceOver 动作 ─────────────
+    # 🔴 签名必须带 ` {`：`nbMenuForRow:` 在本文件里**另有私有声明**（`… row;`），
+    #    只写签名会先命中声明那一处，然后 `func_body` 因为"签名到下一个 { 之间有分号"
+    #    返回 None —— 这正是 REF §P 记过的「同名声明」坑，直接表现为判据说"找不到"。
+    menu = func_body(vc, "- (UIMenu *)nbMenuForRow:(NSDictionary *)row {")
+    if menu is None:
+        problems.append("找不到 nbMenuForRow:")
+    else:
+        for lit, why in ((u'@"标为已读"', "菜单缺「标为已读」"),
+                         (u'@"标为未读"', "菜单缺「标为未读」"),
+                         (u'@"删除"',   "菜单缺「删除」")):
+            if lit not in menu:
+                problems.append(why + "（这两件事仍然只有滑动入口）")
+        if "UIMenuElementAttributesDestructive" not in menu:
+            problems.append("菜单里的「删除」没标成破坏性（不是红色，和左滑删除的视觉权重不一致）")
+        if "nbSetRead:" not in menu or "nbDeleteRowIds:" not in menu:
+            problems.append("菜单没复用 nbSetRead:forRowIds: / nbDeleteRowIds:（另写了一套实现）")
+        if "nbCopyRowText:" not in menu:
+            problems.append("菜单的「复制内容」没走 nbCopyRowText:（和 VoiceOver 那份会走岔）")
+
+    ca = func_body(cell, "- (NSArray<UIAccessibilityCustomAction *> *)accessibilityCustomActions {")
+    if ca is None:
+        problems.append("cell 没实现 accessibilityCustomActions ⇒ VoiceOver 用户删不掉、标不了已读")
+    else:
+        for sel in ("nbA11yDoDelete:", "nbA11yDoToggleRead:", "nbA11yDoCopy:", "nbA11yDoOpen:"):
+            if sel not in ca:
+                problems.append("无障碍动作缺 %s" % sel)
+        if "return out.count ? out : nil;" not in ca:
+            problems.append("无障碍动作没有「一个都没有就返回 nil」的兜底"
+                            "（空数组会让 VoiceOver 给一个什么也没有的入口）")
+    for fn, blk in (("nbA11yDoDelete", "nbOnDelete"),
+                    ("nbA11yDoToggleRead", "nbOnToggleRead"),
+                    ("nbA11yDoCopy", "nbOnCopy"),
+                    ("nbA11yDoOpen", "nbOnOpen")):
+        body = func_body(cell, "- (BOOL)%s:" % fn)
+        if body is None or ("self.%s()" % blk) not in body:
+            problems.append("%s 没真的调 self.%s()（动作摆着好看，按了什么也不做）" % (fn, blk))
+    reuse = after(cell, "self.nbOnToggleRead = nil;", 400) or ""
+    for blk in ("self.nbOnCopy = nil;", "self.nbOnOpen = nil;"):
+        if blk not in reuse:
+            problems.append("复用清理里缺 %s（复用的行会带着上一行的复制/打开目标）" % blk)
+    if "accessibilityTraits" in cell:
+        problems.append("cell 里出现 accessibilityTraits —— 覆盖 traits 会把双击进详情弄坏（v0.0.180）")
+
+    # ───────────── ③ 统计页钻取 ─────────────
+    if "applyDrilldownBundle" not in vch:
+        problems.append("ViewController.h 没暴露 applyDrilldownBundle:dayRange:")
+    drill = func_body(vc, "- (void)applyDrilldownBundle:(NSString *)bundle dayRange:(NSInteger)days {")
+    if drill is None:
+        problems.append("找不到 applyDrilldownBundle 的实现")
+    else:
+        if "nbResetFilterState" not in drill:
+            problems.append("钻取没清其它筛选（未读/★/残留/搜索都会挡记录 ⇒ 点进去数目对不上）")
+        if "filterBundle" not in drill:
+            problems.append("钻取没设 filterBundle（App 维度没生效）")
+        if "nbArmEntrance" not in drill:
+            problems.append("钻取后没走入场动画（和点图标栏不一致）")
+        if not re.search(r"days\s*==\s*7", drill):
+            problems.append("钻取的时间窗缺「7 天」这一档")
+
+    ds = func_body(stats, "- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {")
+    if ds is None:
+        problems.append("统计页找不到 didSelectRowAtIndexPath")
+    else:
+        if "drilldownHandler" not in ds:
+            problems.append("统计页点了排行没反应（didSelectRow 里没调 drilldownHandler）")
+        if "selectedSegmentIndex != 0" not in ds:
+            problems.append("统计页没判维度（按小时/按天的行表达不了时间范围，不该能点）")
+        # 🔴 必须判**这一句**（`default: days = -1`），不能只判 `days = -1` ——
+        #    函数里还有一句 `NSInteger days = -1;` 的初始化，那样判的话
+        #    把 default 改成 `days = 7` 依然绿（同一条铁律：同一表达式出现 N 处，
+        #    探针就失去分辨力。本轮 M81 第一版就是这么恒绿的）。
+        if not re.search(r"default:\s*days\s*=\s*-1", ds):
+            problems.append("统计页把 30 天/自定义映射成了别的档（会变成「统计 42 条、点进去 8 条」）")
+    if "ViewController.h" in statsh or '#import "ViewController.h"' in stats:
+        problems.append("统计页 import 了 ViewController.h（两页互相认识 ⇒ 改一个牵一个）")
+
+    sr = func_body(tab, "- (void)showRecordsForBundle:(NSString *)bundle dayRange:(NSInteger)days {")
+    if sr is None:
+        problems.append("容器没有 showRecordsForBundle:dayRange:")
+    else:
+        i_apply = sr.find("applyDrilldownBundle")
+        i_sel = sr.find("self.selectedIndex")
+        if i_apply < 0:
+            problems.append("容器没把钻取转给记录页")
+        elif i_sel >= 0 and i_apply > i_sel:
+            problems.append("容器先把页签切了再设筛选（记录页会先按旧筛选闪一帧）")
+        if "popToRootViewControllerAnimated" not in sr:
+            problems.append("容器没把记录页弹回根（用户可能落在某个详情页上）")
+    if "stats.drilldownHandler" not in tab:
+        problems.append("容器没接 stats.drilldownHandler ⇒ 统计页没有出口")
+
+    return (not problems, "；".join(problems) if problems else
+            "标星豁免淘汰（含配额与快速路径）、菜单与无障碍动作同源且真调 block、钻取只做逐字时间窗映射")
+
+
 # ───────────────────────────── 跑判据 ─────────────────────────────
 def run_all(ctx, verbose=True):
     bad = {}
@@ -1647,6 +1810,63 @@ MUTATIONS = [
      "        [p stroke];", "        ;", "I6"),
     ("M71 色相差不按环处理（0.95 与 0.05 会被当成差很远）", "app/NotifyStatsViewController.m",
      "    if (dh > 0.5) dh = 1.0 - dh;", "    ;", "I6"),
+
+    # ===== v0.0.186：标星豁免淘汰（I8 ①②）=====
+    # 🔴 M72 锚点要带上后一行：`if (NBRowHitsStar(…)) {` 在裁剪和天数清理里**各有一处**，
+    #    只写这一行会因为"锚点出现 2 次"直接判失败（不是判据失效，是锚点不够具体）。
+    ("M72 上限裁剪不判标星（标星记录照样被淘汰）", "NotifyStore.m",
+     "        if (NBRowHitsStar(ti, me, su, an, starRules)) {\n"
+     "            if (++starKept",
+     "        if (NO) {\n"
+     "            if (++starKept", "I8"),
+    ("M73 标星没有配额（一条常见关键词就让上限失效）", "NotifyStore.m",
+     "            if (++starKept > kNBStarKeepMax) [delIds addObject:@(rid)];",
+     "            starKept++;", "I8"),
+    ("M74 自动清理回退到旧路（天数清理照样删标星）", "NotifyStore.m",
+     "    NSInteger n = NBCleanOlderThan(cutoff);",
+     "    NSInteger n = [self deleteWithBundle:nil beforeTs:cutoff readOnly:NO];", "I8"),
+    ("M75 标星判定自己写子串匹配（和列表两套口径）", "NotifyStore.m",
+     "        if (NBContainsText(title, kw) || NBContainsText(message, kw)\n"
+     "            || NBContainsText(subtitle, kw) || NBContainsText(appName, kw)) return YES;",
+     "        if ([title rangeOfString:kw].location != NSNotFound\n"
+     "            || [message rangeOfString:kw].location != NSNotFound\n"
+     "            || [subtitle rangeOfString:kw].location != NSNotFound\n"
+     "            || [appName rangeOfString:kw].location != NSNotFound) return YES;", "I8"),
+
+    # ===== v0.0.186：菜单 + VoiceOver 动作（I8 ②）=====
+    ("M76 长按菜单去掉「删除」", "app/ViewController.m",
+     '        UIAction *delAct = [UIAction actionWithTitle:@"删除"',
+     '        UIAction *delAct = [UIAction actionWithTitle:@"移除"', "I8"),
+    ("M77 cell 不实现 accessibilityCustomActions", "app/NotifyCell.m",
+     "- (NSArray<UIAccessibilityCustomAction *> *)accessibilityCustomActions {",
+     "- (NSArray<UIAccessibilityCustomAction *> *)nbUnusedCustomActions {", "I8"),
+    # 🔴 M78 锚点必须带上方法签名：`if (self.nbOnDelete) self.nbOnDelete();`
+    #    在本文件里出现 3 次（左滑删除按钮那条路也有），只写这一行会"锚点不唯一"。
+    ("M78 无障碍动作不调 block（按了什么也不做）", "app/NotifyCell.m",
+     "- (BOOL)nbA11yDoDelete:(UIAccessibilityCustomAction *)action {\n"
+     "    if (self.nbOnDelete) self.nbOnDelete();",
+     "- (BOOL)nbA11yDoDelete:(UIAccessibilityCustomAction *)action {\n"
+     "    ;", "I8"),
+    ("M79 复用清理不清 nbOnCopy（按复制拿到上一行的正文）", "app/NotifyCell.m",
+     "    self.nbOnCopy = nil;", "    ;", "I8"),
+    ("M80 菜单复制自己写一份（和 VoiceOver 那份走岔）", "app/ViewController.m",
+     "        [weakSelf nbCopyRowText:row];",
+     '        UIPasteboard.generalPasteboard.string = row[@"message"];', "I8"),
+
+    # ===== v0.0.186：统计页钻取（I8 ③）=====
+    ("M81 30 天/自定义拿 7 天去凑（统计 42 条、点进去 8 条）", "app/NotifyStatsViewController.m",
+     "        default: days = -1; break;", "        default: days = 7; break;", "I8"),
+    ("M82 容器先切页签再设筛选（记录页先闪一帧旧筛选）", "app/NBHomeTabBarController.m",
+     "    [(ViewController *)root applyDrilldownBundle:bundle dayRange:days];",
+     "    self.selectedIndex = NBHomeTabRecords;\n"
+     "    [(ViewController *)root applyDrilldownBundle:bundle dayRange:days];", "I8"),
+    ("M83 统计页不判维度（按小时的行也能点进去）", "app/NotifyStatsViewController.m",
+     "    if (self.dimSeg.selectedSegmentIndex != 0) return;", "    ;", "I8"),
+    ("M84 统计页 import 了 ViewController（两页互相认识）", "app/NotifyStatsViewController.h",
+     "@interface NotifyStatsViewController : UIViewController",
+     '#import "ViewController.h"\n@interface NotifyStatsViewController : UIViewController', "I8"),
+    ("M85 无障碍动作没有 nil 兜底（VoiceOver 给个空入口）", "app/NotifyCell.m",
+     "    return out.count ? out : nil;", "    return out;", "I8"),
 ]
 
 

@@ -27,4 +27,13 @@ typedef NS_ENUM(NSInteger, NBHomeTab) {
 
 @interface NBHomeTabBarController : UITabBarController
 
+// ================= v0.0.186：统计页 → 记录页的钻取 =================
+// 统计页点排行榜某一行时调它：切到「记录」页签，并只看这个 App。
+// 🔴 为什么由**容器**来转这一手，而不是让统计页自己去拿列表对象：
+//    统计页不该认识 `ViewController`（那会让两个页面互相 import 头文件、
+//    以后任何一页改名都会牵连另一页）。统计页只声明一个 block 回调，
+//    由本类在 `viewDidLoad` 里把它们接起来 —— 谁持有谁一目了然。
+// 🔴 `dayRange` 是**天**：0 = 不限时间，-1 = 映射不了、别动时间窗（见 ViewController.h）。
+- (void)showRecordsForBundle:(nullable NSString *)bundle dayRange:(NSInteger)days;
+
 @end
