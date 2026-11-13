@@ -1484,12 +1484,29 @@ def _(c):
             problems.append("统计页点了排行没反应（didSelectRow 里没调 drilldownHandler）")
         if "selectedSegmentIndex != 0" not in ds:
             problems.append("统计页没判维度（按小时/按天的行表达不了时间范围，不该能点）")
-        # 🔴 必须判**这一句**（`default: days = -1`），不能只判 `days = -1` ——
-        #    函数里还有一句 `NSInteger days = -1;` 的初始化，那样判的话
-        #    把 default 改成 `days = 7` 依然绿（同一条铁律：同一表达式出现 N 处，
-        #    探针就失去分辨力。本轮 M81 第一版就是这么恒绿的）。
-        if not re.search(r"default:\s*days\s*=\s*-1", ds):
+        # v0.0.187：映射表抽成了 `nbDaysForCurrentRange` —— 长按菜单里的
+        # 「只看这个 App」也要用它。⇒ 这里只判"必须走那个方法"，
+        # 映射本身对不对由下面单独判（⛔ 别在这里再内联一份 switch）。
+        if "nbDaysForCurrentRange" not in ds:
+            problems.append("didSelectRow 自己算了时间窗（映射表必须只有一份）")
+
+    # 🔴 必须判**这一句**（`default: days = -1`），不能只判 `days = -1` ——
+    #    函数里还有一句 `NSInteger days = -1;` 的初始化，那样判的话
+    #    把 default 改成 `days = 7` 依然绿（同一条铁律：同一表达式出现 N 处，
+    #    探针就失去分辨力。本轮 M81 第一版就是这么恒绿的）。
+    daysfn = func_body(stats, "- (NSInteger)nbDaysForCurrentRange {")
+    if daysfn is None:
+        problems.append("统计页找不到 nbDaysForCurrentRange（时间窗映射表）")
+    else:
+        if not re.search(r"default:\s*days\s*=\s*-1", daysfn):
             problems.append("统计页把 30 天/自定义映射成了别的档（会变成「统计 42 条、点进去 8 条」）")
+        if not re.search(r"days\s*=\s*7", daysfn):
+            problems.append("时间窗映射表缺「7 天」这一档")
+    # 🔴 映射表被抄成第二份 ⇒ 两个入口各走一路，而症状是"点进去 7 天、长按进去全部"。
+    #    （先剥注释再数，免得数到我自己写的说明 —— 这条铁律已付过三次学费。）
+    n_map = len(re.findall(r"default:\s*days\s*=\s*-1", stats))
+    if n_map > 1:
+        problems.append("时间窗映射表出现了 %d 份（两个入口各写一遍必走岔）" % n_map)
     if "ViewController.h" in statsh or '#import "ViewController.h"' in stats:
         problems.append("统计页 import 了 ViewController.h（两页互相认识 ⇒ 改一个牵一个）")
 
@@ -1510,6 +1527,211 @@ def _(c):
 
     return (not problems, "；".join(problems) if problems else
             "标星豁免淘汰（含配额与快速路径）、菜单与无障碍动作同源且真调 block、钻取只做逐字时间窗映射")
+
+
+# ── I9. 统计页行内行动（v0.0.187）────────────────────────────
+
+@chk("I9", "统计页行内行动：写入只有一份、提示贴在容器上、长按与无障碍两条入口都在", baseline="red")
+def _(c):
+    """🔴 v0.0.187 新增。守的是「一行数据旁边那个动作，到底有没有真的发生」。
+
+       ① **写入只有一份实现。** 静音的三条纪律（重建表 → 落盘 → 回读**精确条目**）
+          原来只活在 `nbMuteRow:kind:` 里。统计页也要静音时，抄一份必然在抄的时候
+          丢掉回读那条 —— 而丢掉的正好是"到底生效了没"。
+          ⇒ `nbMuteRow:` **自己不许再算到期时刻**（那是第二份实现），它和统计页
+          都必须走 `nbWriteMuteForBundle:kind:message:`，而后者必须有那四件套
+          加一句「精确条目在不在」的循环。
+
+       ② **提示必须贴在容器上。** 动作从统计页发起、写入落在记录页，而记录页那一刻
+          在另一个页签、不可见。贴在 `records.view` 上的提示用户**一个像素都看不到**，
+          症状与"点了没反应"完全同形，而日志里一切正常。
+          ⇒ 容器里必须出现 `NBShowToast(self.view`，且不许出现 `records.view`。
+          同理：共享提示必须能跨 host 去重，否则容器和页面各弹一个，文字会重影。
+
+       ③ **两条入口都要有。** 只有长按 = VoiceOver 用户用不了（v0.0.186 已付过学费：
+          横滑被系统拿去做逐项浏览）；只有 customActions = 手势用户发现不了。
+          ⇒ 两条都判，且"最重的那个"必须标 destructive、排在最后
+          （转子按数组顺序念，随手滑一下就双击是常有的事）。
+
+       ⚠️ 判据域一律 `strip_comments()`：下面每条要判的都是**代码里那一句**，
+          而我在实现里写了大量"为什么"的注释，里面反复出现这些标识符
+          （`records.view` / `endDateForMuteKind:` / `shouldSkipRecordForBundle:`）——
+          不剥注释就是假绿，剥了才只认代码。
+    """
+    vc     = strip_comments(c["files"].get("app/ViewController.m", ""))
+    vch    = strip_comments(c["files"].get("app/ViewController.h", ""))
+    stats  = strip_comments(c["files"].get("app/NotifyStatsViewController.m", ""))
+    statsh = strip_comments(c["files"].get("app/NotifyStatsViewController.h", ""))
+    tab    = strip_comments(c["files"].get("app/NBHomeTabBarController.m", ""))
+    toast  = strip_comments(c["files"].get("app/NBToast.m", ""))
+    problems = []
+
+    # ───────────── ① 静音的写入核心只有一份 ─────────────
+    core = func_body(vc, "- (BOOL)nbWriteMuteForBundle:(NSString *)bid kind:(NBMuteKind)kind message:(NSString **)outMessage {")
+    if core is None:
+        problems.append("找不到 nbWriteMuteForBundle（静音的写入核心）")
+    else:
+        for frag, why in (
+                ("activeMutesAt:", "写入核心没重建静音表（旧字典里的坏值会被原样带进新表）"),
+                ("endDateForMuteKind:", "写入核心没按档位算到期时刻"),
+                ("[NotifyStore saveSettings:", "写入核心没落盘"),
+                ("shouldDropForMute:", "写入核心没问判定侧认不认"),
+                ('if ([e[@"bundle"] isEqualToString:bid]) { exact = YES; break; }',
+                 "回读没查**精确条目**（只问 shouldDropForMute: 会被通配 \"*\" 蒙对 ⇒ "
+                 "一次失败的写入也会被判成成功）"),
+        ):
+            if frag not in core:
+                problems.append(why)
+
+    mute_row = func_body(vc, "- (void)nbMuteRow:(NSDictionary *)row kind:(NBMuteKind)kind {")
+    if mute_row is None:
+        problems.append("找不到 nbMuteRow:kind:")
+    else:
+        if "nbWriteMuteForBundle" not in mute_row:
+            problems.append("nbMuteRow: 没走共享的写入核心")
+        if "endDateForMuteKind:" in mute_row:
+            problems.append("nbMuteRow: 自己又算了一遍到期时刻（第二份实现，回读那条必然先被抄丢）")
+
+    wrap = func_body(vc, "- (BOOL)nbApplyMuteOneHourForBundle:(NSString *)bundle message:(NSString **)outMessage {")
+    if wrap is None:
+        problems.append("找不到 nbApplyMuteOneHourForBundle（统计页静音的落点）")
+    else:
+        if "nbWriteMuteForBundle" not in wrap:
+            problems.append("nbApplyMuteOneHourForBundle 没走共享的写入核心")
+        if "reloadData" not in wrap:
+            problems.append("静音后没让列表重算静音长相（切回记录页看到的还是「没静音」）")
+    for sig in ("nbApplyMuteOneHourForBundle", "nbApplySkipRecordForBundle"):
+        if sig not in vch:
+            problems.append("ViewController.h 没暴露 %s" % sig)
+
+    # ───────────── ② 「不记录」名单的写入 ─────────────
+    skipc = func_body(vc, "- (BOOL)nbWriteSkipRecordForBundle:(NSString *)bid message:(NSString **)outMessage {")
+    if skipc is None:
+        problems.append("找不到 nbWriteSkipRecordForBundle")
+    else:
+        for frag, why in (
+                ("NBStringArray(", "名单没用 NBStringArray 读（只认数组，认不出 \"a,b\" 那种历史写法）"),
+                ("NB_KEY_NO_RECORD_APPS", "读写的不是「不记录」名单那个键"),
+                ("sortedArrayUsingSelector:", "写盘前没排序（同一组选择每次写出来都不一样，没法对拍）"),
+                # 🔴 v0.0.187 第一版这里只判了 `shouldSkipRecordForBundle:` 存在 ——
+                #    而函数里的**早退分支**也调了一次同一个函数 ⇒ M89 恒绿。
+                #    （同一表达式出现 N 处 ⇒ 探针失去分辨力。本轮第 5 次。）
+                #    正解 = 判回读**那一句**：带 `BOOL judge = ` 前缀，只有回读处这么写。
+                ("BOOL judge = [NotifyFilter shouldSkipRecordForBundle:bid];",
+                 "回读没问判定侧认不认（该用 tweak 真正决定落不落库的那个函数）"),
+        ):
+            if frag not in skipc:
+                problems.append(why)
+        # 回读必须两层：再读一次名单 + 问判定。只做一层分别是"自证"和"可能被别的来源蒙对"。
+        # 🔴 判**那一行**而不是数 `NBStringArray(` 出现几次：函数开头的早退分支也调了一次，
+        #    计数会被它撑到 2 ⇒ 回读那一层没了照样绿（同一条铁律的另一种长相）。
+        if "[NBStringArray(after[NB_KEY_NO_RECORD_APPS]) containsObject:bid]" not in skipc:
+            problems.append("回读没再读一次名单（少「写进去的确实是名单」这一层）")
+
+    # ───────────── ③ 统计页：动作入口 ─────────────
+    # 🔴 v0.0.187 我第一版就把这个 `typedef NS_ENUM` 写进了 `@interface` 体内
+    #    （属性声明中间），clang 会当场报错 —— 而本地没有编译器，只有 CI 才能发现。
+    #    本项目在 `NotifyFilter.h` 上栽过一模一样的跟头（那次是塞进方法声明中间）。
+    #    ⇒ 机械守：枚举的 `typedef` 必须出现在 `@interface` **之前**。
+    #    ⚠️ 用完整签名当锚点（`typedef NS_ENUM(NSInteger, NBStatAppAction)`），
+    #       不能只找 `typedef` / `NBStatAppAction` —— 我自己的注释里就有这两个词。
+    i_enum = statsh.find("typedef NS_ENUM(NSInteger, NBStatAppAction)")
+    i_iface = statsh.find("@interface NotifyStatsViewController")
+    if i_enum < 0:
+        problems.append("统计页头文件没有 NBStatAppAction 枚举（行内行动的动作类型丢了）")
+    elif i_iface >= 0 and i_enum > i_iface:
+        problems.append("枚举写进了 @interface 体内（clang 直接报错：体内只接受属性/方法声明）")
+    if "appActionHandler" not in statsh:
+        problems.append("统计页头文件没有 appActionHandler（行内行动没有出口）")
+
+    ctx = func_body(stats, "- (UIContextMenuConfiguration *)tableView:(UITableView *)tv contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)ip point:(CGPoint)point {")
+    if ctx is None:
+        problems.append("统计页没有长按菜单（手势用户发现不了这三个动作）")
+    else:
+        if "selectedSegmentIndex != 0" not in ctx:
+            problems.append("长按菜单没判维度（对「14:00–15:00」静音/不记录没有任何含义）")
+        if "children:@[drillAct, muteAct, skipAct]" not in ctx:
+            problems.append("长按菜单缺动作或顺序不对（应按 只看/静音/不记录，最重的排最后）")
+        if "UIMenuElementAttributesDestructive" not in ctx:
+            problems.append("「以后不记录」没标 destructive（它比静音 1 小时重得多）")
+        if "nbEmitDrillForBundle" not in ctx:
+            problems.append("菜单里的「只看这个 App」没走和点行同一个出口（时间窗映射表会变成两份）")
+
+    ca = func_body(stats, "- (NSArray<UIAccessibilityCustomAction *> *)accessibilityCustomActions {")
+    if ca is None:
+        problems.append("统计页 cell 没实现 accessibilityCustomActions ⇒ VoiceOver 用户做不了这三个动作")
+    else:
+        i_drill = ca.find('@"只看这个 App"')
+        i_mute = ca.find('@"静音 1 小时"')
+        i_skip = ca.find('@"以后不记录这个 App"')
+        if i_drill < 0 or i_mute < 0 or i_skip < 0:
+            problems.append("无障碍动作缺项（应为 只看这个 App / 静音 1 小时 / 以后不记录这个 App）")
+        elif not (i_drill < i_mute < i_skip):
+            problems.append("无障碍动作顺序不对（转子按顺序念，最有后果的必须排最后）")
+        if "return out.count ? out : nil;" not in ca:
+            problems.append("无障碍动作没有「一个都没有就返回 nil」的兜底"
+                            "（空数组会让 VoiceOver 转到一个什么也没有的动作组）")
+    for fn, blk in (("nbA11yDoDrill", "nbOnDrill"),
+                    ("nbA11yDoMute", "nbOnMute"),
+                    ("nbA11yDoSkipRecord", "nbOnSkipRecord")):
+        body = func_body(stats, "- (BOOL)%s:(UIAccessibilityCustomAction *)a {" % fn)
+        if body is None or ("self.%s()" % blk) not in body:
+            problems.append("%s 没真的调 self.%s()（动作摆着好看，按了什么也不做）" % (fn, blk))
+
+    reuse = func_body(stats, "- (void)prepareForReuse {")
+    if reuse is None:
+        problems.append("统计页 cell 找不到 prepareForReuse")
+    else:
+        for blk in ("self.nbOnDrill = nil;", "self.nbOnMute = nil;", "self.nbOnSkipRecord = nil;"):
+            if blk not in reuse:
+                problems.append("复用清理里缺 %s（复用的行会带着上一个 App 的 bundle 去静音）" % blk)
+
+    cf = func_body(stats, "- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {")
+    if cf is None:
+        problems.append("统计页找不到 cellForRowAtIndexPath")
+    else:
+        for blk in ("c.nbOnDrill = ^", "c.nbOnMute = ^", "c.nbOnSkipRecord = ^"):
+            if blk not in cf:
+                problems.append("cellForRow 没挂 %s（这一行的动作不会发生）" % blk)
+        # 🔴 非 App 维度必须**显式**清空：只写 if 分支的话，复用池里那个刚才是某个
+        #    App 的 cell 会把上一个 App 的 bundle 带到「14:00 那行」上（静音错 App）。
+        if "} else {\n        c.nbOnDrill = nil;" not in cf:
+            problems.append("cellForRow 没在「非 App 维度」显式清空动作"
+                            "（复用的 cell 会带着上一个 App 的 bundle 去静音）")
+
+    # ───────────── ④ 容器：提示贴哪儿、触觉分不分档 ─────────────
+    if "stats.appActionHandler" not in tab:
+        problems.append("容器没接 stats.appActionHandler ⇒ 统计页那两个动作没有出口")
+    h = func_body(tab, "- (void)handleStatsAppAction:(NBStatAppAction)action forBundle:(NSString *)bundle {")
+    if h is None:
+        problems.append("容器找不到 handleStatsAppAction:forBundle:")
+    else:
+        if "NBShowToast(self.view" not in h:
+            problems.append("结果提示没贴在容器上（记录页那一刻在另一个页签、不可见 ⇒ 用户看不到任何反馈）")
+        if "records.view" in h:
+            problems.append("结果提示贴到了记录页的 view 上 ⇒ 用户一个像素都看不到")
+        if not re.search(r"ok\s*\?\s*NBHapticKindSuccess\s*:\s*NBHapticKindWarning", h):
+            problems.append("容器不区分成功/失败触觉（失败也震「成功」，手指收到假结论）")
+
+    # ───────────── ⑤ 共享提示本身 ─────────────
+    if "NBShowToast(self.view" not in vc:
+        problems.append("ViewController 的提示没走共享实现")
+    if not toast:
+        problems.append("app/NBToast.m 不存在（共享提示没了）")
+    else:
+        if "sNBToastBox" not in toast or "[old removeFromSuperview]" not in toast:
+            problems.append("共享提示没有跨 host 去重（容器和页面各弹一个，文字会重影）")
+    # 🔴 Makefile 这一条**不能复用 `mask()`**：它只认 C 的 // 和 /* */，不认 Makefile 的 #。
+    #    只认「FILES 那一行赋值」——注释里提到文件名叫说明，那一行里有才叫编进去了。
+    files_line = next((ln for ln in c["files"].get("Makefile", "").splitlines()
+                       if ln.lstrip().startswith("NotifyBoxApp_FILES")), "")
+    if not files_line:
+        problems.append("Makefile 里找不到 NotifyBoxApp_FILES 赋值行 —— 锚点失效，判据作废")
+    elif "app/NBToast.m" not in files_line:
+        problems.append("Makefile 的 App FILES 里没有 app/NBToast.m（链接期 undefined symbol _NBShowToast）")
+
+    return (not problems, "；".join(problems) if problems else
+            "写入核心唯一且回读精确、提示贴容器、长按与无障碍两条入口齐全")
 
 
 # ───────────────────────────── 跑判据 ─────────────────────────────
@@ -1617,8 +1839,8 @@ MUTATIONS = [
      "    self.table.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;",
      "    ;", "I3"),
     ("M23 把 NBHaptic.m 从 Makefile 的 App FILES 里删掉", "Makefile",
-     "app/NBHaptic.m app/NBHomeTabBarController.m NotifyStore.m",
-     "app/NBHomeTabBarController.m NotifyStore.m", "I3"),
+     "app/NBHaptic.m app/NBHomeTabBarController.m app/NBToast.m NotifyStore.m",
+     "app/NBHomeTabBarController.m app/NBToast.m NotifyStore.m", "I3"),
     ("M24 删掉点图标栏的触觉", "app/ViewController.m",
      "    NBHapticFire(NBHapticKindSoft);\n"
      '    self.filterBundle = [bid isEqualToString:@"全部"] ? nil : bid;',
@@ -1769,8 +1991,8 @@ MUTATIONS = [
      "    self.viewControllers = @[recordsNav, statsNav];",
      "    self.viewControllers = @[recordsNav];", "I7"),
     ("M59 Makefile 漏掉 NBHomeTabBarController.m（链接期才炸）", "Makefile",
-     "app/NBHaptic.m app/NBHomeTabBarController.m NotifyStore.m",
-     "app/NBHaptic.m NotifyStore.m", "I7"),
+     "app/NBHaptic.m app/NBHomeTabBarController.m app/NBToast.m NotifyStore.m",
+     "app/NBHaptic.m app/NBToast.m NotifyStore.m", "I7"),
     ("M60 统计页签标题写成英文（用户看不懂）", "app/NBHomeTabBarController.m",
      '        [[UITabBarItem alloc] initWithTitle:@"统计"',
      '        [[UITabBarItem alloc] initWithTitle:@"Stats"', "I7"),
@@ -1867,6 +2089,78 @@ MUTATIONS = [
      '#import "ViewController.h"\n@interface NotifyStatsViewController : UIViewController', "I8"),
     ("M85 无障碍动作没有 nil 兜底（VoiceOver 给个空入口）", "app/NotifyCell.m",
      "    return out.count ? out : nil;", "    return out;", "I8"),
+
+    # ===== v0.0.187：统计页行内行动（I9）=====
+    ("M86 长按菜单不判维度（对「14:00–15:00」也能静音/不记录）", "app/NotifyStatsViewController.m",
+     "    if (self.dimSeg.selectedSegmentIndex != 0) return nil;", "    ;", "I9"),
+    ("M87 无障碍动作把最有后果的排第一个（随手滑一下就执行了）", "app/NotifyStatsViewController.m",
+     "    NSMutableArray<UIAccessibilityCustomAction *> *out = [NSMutableArray array];\n"
+     "    if (self.nbOnDrill) {",
+     "    NSMutableArray<UIAccessibilityCustomAction *> *out = [NSMutableArray array];\n"
+     "    if (self.nbOnSkipRecord) {\n"
+     "        [out addObject:[[UIAccessibilityCustomAction alloc]\n"
+     "                        initWithName:@\"以后不记录这个 App\"\n"
+     "                              target:self\n"
+     "                            selector:@selector(nbA11yDoSkipRecord:)]];\n"
+     "    }\n"
+     "    if (self.nbOnDrill) {", "I9"),
+    ("M88 静音回读不查精确条目（通配 \"*\" 会把失败判成成功）", "app/ViewController.m",
+     '        if ([e[@"bundle"] isEqualToString:bid]) { exact = YES; break; }',
+     "        if (e) { exact = YES; break; }", "I9"),
+    ("M89 不记录名单只写不问判定侧", "app/ViewController.m",
+     "    BOOL judge = [NotifyFilter shouldSkipRecordForBundle:bid];",
+     "    BOOL judge = YES;", "I9"),
+    ("M90 统计页静音后不刷新列表（切回记录页看到的还是「没静音」）", "app/ViewController.m",
+     "    [self nbAnimateMuteLookForBundle:bundle muted:YES];\n    [self.table reloadData];",
+     "    [self nbAnimateMuteLookForBundle:bundle muted:YES];", "I9"),
+    ("M91 结果提示贴到记录页的 view 上（用户在统计页，一个像素都看不到）", "app/NBHomeTabBarController.m",
+     "    NBShowToast(self.view, msg);", "    NBShowToast(records.view, msg);", "I9"),
+    ("M92 容器不分成功/失败触觉（失败也震「成功」）", "app/NBHomeTabBarController.m",
+     "    NBShowToast(self.view, msg);\n"
+     "    NBHapticFire(ok ? NBHapticKindSuccess : NBHapticKindWarning);",
+     "    NBShowToast(self.view, msg);\n"
+     "    NBHapticFire(NBHapticKindSuccess);", "I9"),
+    ("M93 长按菜单缺「只看这个 App」", "app/NotifyStatsViewController.m",
+     "children:@[drillAct, muteAct, skipAct]];", "children:@[muteAct, skipAct]];", "I9"),
+    ("M94 nbMuteRow: 自己再算一遍到期时刻（第二份实现，回读先被抄丢）", "app/ViewController.m",
+     "    BOOL ok = [self nbWriteMuteForBundle:bid kind:kind message:&msg];",
+     "    NSTimeInterval u = [[NotifyFilter endDateForMuteKind:kind now:nil] timeIntervalSince1970];\n"
+     "    BOOL ok = (u > 0); (void)msg;", "I9"),
+    ("M95 统计页复用不清 nbOnSkipRecord（复用的行带着上一个 App 的 bundle）", "app/NotifyStatsViewController.m",
+     "    self.nbOnSkipRecord = nil;", "    ;", "I9"),
+    ("M96 无障碍动作不调 block（摆着好看，按了什么也不做）", "app/NotifyStatsViewController.m",
+     "    if (self.nbOnMute) self.nbOnMute();", "    ;", "I9"),
+    ("M97 cellForRow 只在 App 维度赋值、不显式清空（复用的 cell 静音错 App）", "app/NotifyStatsViewController.m",
+     "    } else {\n"
+     "        c.nbOnDrill = nil;\n"
+     "        c.nbOnMute = nil;\n"
+     "        c.nbOnSkipRecord = nil;\n"
+     "    }",
+     "    }", "I9"),
+    ("M98 共享提示不跨 host 去重（容器和页面各弹一个，文字重影）", "app/NBToast.m",
+     "    UIView *old = sNBToastBox;\n    if (old) [old removeFromSuperview];",
+     "    UIView *old = nil; (void)old;", "I9"),
+    ("M99 Makefile 漏掉 app/NBToast.m（链接期 undefined symbol）", "Makefile",
+     "app/NBHomeTabBarController.m app/NBToast.m NotifyStore.m",
+     "app/NBHomeTabBarController.m NotifyStore.m", "I9"),
+    ("M100 统计页无障碍动作没有 nil 兜底（VoiceOver 给个空动作组）", "app/NotifyStatsViewController.m",
+     "    return out.count ? out : nil;", "    return out;", "I9"),
+    ("M101 把枚举挪进 @interface 体内（clang 直接报错，本地无编译器发现不了）",
+     "app/NotifyStatsViewController.h",
+     "typedef NS_ENUM(NSInteger, NBStatAppAction) {\n"
+     "    /// 临时静音 1 小时（复用记录页那套写入 + 回读；固定 1 小时，见 ViewController.h 的说明）\n"
+     "    NBStatAppActionMuteOneHour = 0,\n"
+     "    /// 加进「不记录」名单：以后不再落库，**已有记录保留**\n"
+     "    NBStatAppActionSkipRecord  = 1,\n"
+     "};\n"
+     "\n"
+     "@interface NotifyStatsViewController : UIViewController",
+     "@interface NotifyStatsViewController : UIViewController\n"
+     "\n"
+     "typedef NS_ENUM(NSInteger, NBStatAppAction) {\n"
+     "    NBStatAppActionMuteOneHour = 0,\n"
+     "    NBStatAppActionSkipRecord  = 1,\n"
+     "};", "I9"),
 ]
 
 

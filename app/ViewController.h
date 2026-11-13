@@ -11,4 +11,20 @@
 //    （实现里有一张映射表；宁可不改时间窗，也不要悄悄给一个口径不对的范围）。
 - (void)applyDrilldownBundle:(nullable NSString *)bundle dayRange:(NSInteger)days;
 
+// ================= v0.0.187：统计页行内行动的两个落点 =================
+// 由 `NBHomeTabBarController` 调（统计页长按 / 无障碍动作 → 对某个 App 采取行动）。
+//
+// 🔴 为什么入口在这里、而界面在统计页：写入的纪律（重建表 → 落盘 → 回读精确条目）
+//    和提示文案只有**一处**实现（`nbWriteMuteForBundle:kind:message:`）。在统计页再写
+//    一份的话，回读那三条必然会在抄的时候丢一条 —— 而丢掉的正好是"到底生效了没"。
+//
+// 🔴 这两个方法**不负责提示与触觉**：它们只返回"回读结果 + 一句拼好的话"，
+//    由容器贴在**自己**的 view 上 —— 动作是从统计页发起的，记录页此刻不可见。
+//
+// 返回 YES = 已回读确认生效（不是"我写盘成功了"）。
+- (BOOL)nbApplyMuteOneHourForBundle:(nullable NSString *)bundle
+                            message:(NSString * _Nullable * _Nullable)outMessage;
+- (BOOL)nbApplySkipRecordForBundle:(nullable NSString *)bundle
+                           message:(NSString * _Nullable * _Nullable)outMessage;
+
 @end

@@ -490,6 +490,18 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
 //    ⇒ 首次上屏的几行条形宽度算成 0，**滚动一下再回来才正常**。
 //    比例存下来、由 layoutSubviews 乘上真实的槽宽，时序问题就从结构上消失了。
 @property (nonatomic, assign) CGFloat ratio;
+
+// ================= v0.0.187：这一行的三个动作 =================
+// 🔴 为什么挂在 cell 上而不是只写长按菜单：长按在 VoiceOver 下**不是一个可靠的入口**
+//    （系统把长按拿去做别的），无障碍用户唯一稳定的动作入口是
+//    `accessibilityCustomActions`（转子上下滑选、双击执行）。
+//    v0.0.186 在记录页已经吃过这个亏：左滑删除 / 右滑翻已读在 VoiceOver 下**根本不存在**，
+//    全工程 0 处 customActions。这里一开始就两条路都留。
+// 🔴 三个都是 block 而不是直接把 bundle 传进来：动作要不要发生、发生时要读什么
+//    （时间窗档位）只有列表知道，cell 只负责"我这一行被要求做这件事了"。
+@property (nonatomic, copy, nullable) void (^nbOnDrill)(void);
+@property (nonatomic, copy, nullable) void (^nbOnMute)(void);
+@property (nonatomic, copy, nullable) void (^nbOnSkipRecord)(void);
 @end
 
 @implementation NBStatCell
@@ -568,6 +580,9 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
 
 // 🔴 复用池必须清：条形的宽度是"上一次的值"，不清的话滚一下就会看到
 //    "新行的名字 + 上一行的条长"（本项目已栽过三次同类）。
+// 🔴 v0.0.187 同理更要清那三个动作 block：不清的话滚一下，
+//    某个 App 的行会带着**上一个 App 的 bundle** 去静音 —— 症状是"静音了别的 App"，
+//    而且用户完全看不出发生过什么（这比条形宽度串了贵得多）。
 - (void)prepareForReuse {
     [super prepareForReuse];
     self.rankLabel.text = nil;
@@ -578,6 +593,56 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
     self.barFill.frame = CGRectMake(0, 0, 0, self.barBox.bounds.size.height);
     self.barFill.backgroundColor = [UIColor systemBlueColor];
     self.accessibilityLabel = nil;
+    self.nbOnDrill = nil;
+    self.nbOnMute = nil;
+    self.nbOnSkipRecord = nil;
+}
+
+#pragma mark - v0.0.187 VoiceOver 的动作入口
+
+// 🔴 顺序就是语速下的操作顺序：转子按数组顺序念，用户随手滑一下就可能双击。
+//    ⇒ 最有后果的那个排**最后**（"加入不记录"会真的让这个 App 从此不留痕）。
+//    这和记录页把「删除」排最后是同一条纪律。
+// 🔴 返回 nil 而不是空数组：空数组会让 VoiceOver 转到一个"什么也没有"的动作组，
+//    表现为"转了但什么都没发生"，比没有入口更迷惑。
+- (NSArray<UIAccessibilityCustomAction *> *)accessibilityCustomActions {
+    NSMutableArray<UIAccessibilityCustomAction *> *out = [NSMutableArray array];
+    if (self.nbOnDrill) {
+        [out addObject:[[UIAccessibilityCustomAction alloc]
+                        initWithName:@"只看这个 App"
+                              target:self
+                            selector:@selector(nbA11yDoDrill:)]];
+    }
+    if (self.nbOnMute) {
+        [out addObject:[[UIAccessibilityCustomAction alloc]
+                        initWithName:@"静音 1 小时"
+                              target:self
+                            selector:@selector(nbA11yDoMute:)]];
+    }
+    if (self.nbOnSkipRecord) {
+        [out addObject:[[UIAccessibilityCustomAction alloc]
+                        initWithName:@"以后不记录这个 App"
+                              target:self
+                            selector:@selector(nbA11yDoSkipRecord:)]];
+    }
+    return out.count ? out : nil;
+}
+
+// 三个 target 方法都必须**真的调那个 block**：动作摆着好看、按了什么也不做，
+// 是这一版最容易交付出去的空壳（判据 I9 机械守着）。
+- (BOOL)nbA11yDoDrill:(UIAccessibilityCustomAction *)a {
+    if (self.nbOnDrill) self.nbOnDrill();
+    return YES;
+}
+
+- (BOOL)nbA11yDoMute:(UIAccessibilityCustomAction *)a {
+    if (self.nbOnMute) self.nbOnMute();
+    return YES;
+}
+
+- (BOOL)nbA11yDoSkipRecord:(UIAccessibilityCustomAction *)a {
+    if (self.nbOnSkipRecord) self.nbOnSkipRecord();
+    return YES;
 }
 
 @end
@@ -796,6 +861,17 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
 - (NSTimeInterval)sinceFromSeg;
 - (NSTimeInterval)beforeTsFromSeg;
 - (NSString *)nameForRow:(NSDictionary *)d;
+// ================= v0.0.187：行内行动 =================
+// 🔴 时间窗映射表**只有一份**，就在这里。三个入口都要用它：
+//    点行（钻取）、长按菜单里的「只看这个 App」、以及将来任何新入口。
+//    ⛔ 不许在任一入口里再写一遍 switch —— 那种"两份映射"必然走岔，
+//    而走岔的表现是"统计说 42 条、点进去只有 8 条"（两个指标打架，比不能点更糟）。
+//    返回 0 = 全部、7 = 7 天、**负数 = 这一档记录页没有对应档，别动时间窗**。
+- (NSInteger)nbDaysForCurrentRange;
+// 把"对这一行做这个动作"喊出去。⛔ 不在这里判写入能不能成 —— 那是记录页的事。
+- (void)nbEmitAppAction:(NBStatAppAction)action forBundle:(NSString *)bid;
+// 菜单里的「只看这个 App」落到这里（和点行走同一个出口，只有一处算时间窗）。
+- (void)nbEmitDrillForBundle:(NSString *)bid;
 @end
 
 @implementation NotifyStatsViewController
@@ -1328,6 +1404,35 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
     return day;
 }
 
+#pragma mark - v0.0.187 行内行动
+
+// 时间窗映射表（两端枚举：本页 `rangeSeg` 0~3 / 记录页 `timeSeg` 0~2）：
+//      统计「全部」  → 记录「不限时间」   days = 0
+//      统计「7 天」  → 记录「近7天」      days = 7
+//      统计「30 天」 → **记录页没有这一档** ⇒ days = -1（别动时间窗）
+//      统计「自定义」→ 记录页表达不了      ⇒ days = -1
+// ⛔ 绝不用"最接近的 7 天"去凑 30 天：那会变成"统计说 42 条、点进去只有 8 条"，
+//    两个指标打架比"不能点"更糟（本项目最贵的一类事故）。
+- (NSInteger)nbDaysForCurrentRange {
+    NSInteger days = -1;
+    switch (self.rangeSeg.selectedSegmentIndex) {
+        case 0:  days = 0;  break;
+        case 1:  days = 7;  break;
+        default: days = -1; break;
+    }
+    return days;
+}
+
+// 「对某个 App 采取行动」的唯一出口。
+// 🔴 这里**只喊话**，不判断能不能做：写入与回读在记录页，提示在容器。
+//    这一页的职责边界是"我知道用户对哪个 App 想干什么"，仅此而已 ——
+//    它连记录页是个什么类都不知道（⛔ 不 import ViewController.h）。
+- (void)nbEmitAppAction:(NBStatAppAction)action forBundle:(NSString *)bid {
+    if (!bid.length) return;
+    if (!self.appActionHandler) return;
+    self.appActionHandler(bid, action);
+}
+
 #pragma mark - UITableView
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)sec {
@@ -1403,6 +1508,27 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
     c.accessibilityHint = (dim == 0 && self.drilldownHandler)
                         ? @"双击查看这个 App 的记录" : nil;
 
+    // ---------- v0.0.187：这一行的三个动作 ----------
+    // 🔴 只有「按 App」维度才有动作，其它维度**必须显式清 nil**：
+    //    复用池里的 cell 可能刚才是某个 App 的行，不清的话
+    //    "按小时的 14:00 那行"会带着上一个 App 的 bundle 去静音（静音错）。
+    //    ⛔ 不能只在 dim==0 的分支里赋值、else 什么都不做。
+    id bvForAct = d[@"bundle"];
+    NSString *bidForAct = (dim == 0 && [bvForAct isKindOfClass:[NSString class]])
+                        ? (NSString *)bvForAct : nil;
+    if (bidForAct.length && self.appActionHandler) {
+        __weak typeof(self) weakSelf = self;
+        c.nbOnDrill = ^{ [weakSelf nbEmitDrillForBundle:bidForAct]; };
+        c.nbOnMute = ^{ [weakSelf nbEmitAppAction:NBStatAppActionMuteOneHour
+                                       forBundle:bidForAct]; };
+        c.nbOnSkipRecord = ^{ [weakSelf nbEmitAppAction:NBStatAppActionSkipRecord
+                                             forBundle:bidForAct]; };
+    } else {
+        c.nbOnDrill = nil;
+        c.nbOnMute = nil;
+        c.nbOnSkipRecord = nil;
+    }
+
     // 🔴 必须显式要求重排：`rankLabel.text` 从有值变成 nil 时，
     //    "名字起点要不要左移 20pt"只有 layoutSubviews 知道，
     //    而改 text 本身**不会**触发重排 —— 复用的行会带着上一行的缩进。
@@ -1427,21 +1553,84 @@ typedef NS_ENUM(NSInteger, NBChartKind) {
     // 没有接手的容器（这一页被单独 push 出来）⇒ 保持原来的"点一下只收起"
     if (!self.drilldownHandler) return;
 
-    // 🔴 时间窗映射表（两端枚举：本页 `rangeSeg` 0~3 / 记录页 `timeSeg` 0~2）：
-    //      统计「全部」  → 记录「不限时间」   days = 0
-    //      统计「7 天」  → 记录「近7天」      days = 7
-    //      统计「30 天」 → **记录页没有这一档** ⇒ days = -1（别动时间窗）
-    //      统计「自定义」→ 记录页表达不了      ⇒ days = -1
-    //    ⛔ 绝不用"最接近的 7 天"去凑 30 天：那会变成"统计说 42 条、点进去只有 8 条"，
-    //      两个指标打架比"不能点"更糟（本项目最贵的一类事故）。
-    NSInteger days = -1;
-    switch (self.rangeSeg.selectedSegmentIndex) {
-        case 0:  days = 0;  break;
-        case 1:  days = 7;  break;
-        default: days = -1; break;
-    }
+    // 🔴 时间窗映射表**不在这里写**（v0.0.187 抽成了 `nbDaysForCurrentRange`）：
+    //    现在长按菜单里也有「只看这个 App」，两个入口若各写一遍 switch，
+    //    迟早变成"点进去 7 天、长按进去全部"。映射表只许有一份。
+    NSInteger days = [self nbDaysForCurrentRange];
     // 触觉不在这里给：真正"生效"的是页签切过去了，那一下由容器统一震（见 NBHomeTabBarController）。
     self.drilldownHandler(bid, days);
+}
+
+#pragma mark - v0.0.187 长按菜单（行内行动）
+
+// 长按排行某一行 ⇒ 三个动作。
+//
+// 🔴 为什么用 `UIContextMenuConfiguration` 而不是自己挂长按手势：
+//    这是表格行的标准入口，系统会顺手给出预览浮起 / 触觉 / 无障碍朗读，
+//    而且**不需要我在 gesture 的每个状态里判断 Began**（本项目在手势上吃过亏：
+//    `UILongPressGestureRecognizer` 每个状态变化都回调，一次性动作会被重复执行）。
+//
+// 🔴 只对「按 App」维度给菜单：按小时 / 按天的行是时间格子，对一个"14:00–15:00"
+//    静音或者"不记录"没有任何含义 —— 那些行必须**什么都不弹**。
+//    ⛔ 别为了让长按"看起来有反应"给它们一个空菜单（空菜单浮起一块空白预览，
+//       比没反应更像坏了）。
+- (UIContextMenuConfiguration *)tableView:(UITableView *)tv contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)ip point:(CGPoint)point {
+    if (!self.appActionHandler) return nil;
+    if (self.dimSeg.selectedSegmentIndex != 0) return nil;
+    if (ip.row < 0 || ip.row >= (NSInteger)self.rows.count) return nil;
+    NSDictionary *d = self.rows[ip.row];
+    if (![d isKindOfClass:[NSDictionary class]]) return nil;
+    id bv = d[@"bundle"];
+    NSString *bid = [bv isKindOfClass:[NSString class]] ? (NSString *)bv : nil;
+    if (!bid.length) return nil;
+
+    // 🔴 名字在**弹菜单这一刻**取（`nameForRow:` 读的是当前维度和当前品牌色表），
+    //    ⛔ 不在 cell 里缓存一份 UIMenu：复用池里最爱串的正是这种"存下来的行为"。
+    NSString *name = [self nameForRow:d];
+
+    __weak typeof(self) weakSelf = self;
+
+    UIAction *drillAct = [UIAction actionWithTitle:@"只看这个 App"
+                                            image:[UIImage systemImageNamed:@"line.3.horizontal.decrease.circle"]
+                                       identifier:nil
+                                          handler:^(__unused UIAction *a) {
+        // 🔴 走和"点行"完全同一条路（含同一张时间窗映射表）。
+        //    这里再算一次 days 就是第二份映射表 —— 见 `nbDaysForCurrentRange` 的注释。
+        [weakSelf nbEmitDrillForBundle:bid];
+    }];
+
+    UIAction *muteAct = [UIAction actionWithTitle:@"静音 1 小时"
+                                           image:[UIImage systemImageNamed:@"bell.slash"]
+                                      identifier:nil
+                                         handler:^(__unused UIAction *a) {
+        [weakSelf nbEmitAppAction:NBStatAppActionMuteOneHour forBundle:bid];
+    }];
+
+    // 🔴 「以后不记录」必须是 destructive 长相：它会让这个 App 的后续通知**一条都不留**，
+    //    比静音 1 小时重得多（静音只是不弹）。排最后也一样的原因。
+    UIAction *skipAct = [UIAction actionWithTitle:@"以后不记录这个 App"
+                                           image:[UIImage systemImageNamed:@"eye.slash"]
+                                      identifier:nil
+                                         handler:^(__unused UIAction *a) {
+        [weakSelf nbEmitAppAction:NBStatAppActionSkipRecord forBundle:bid];
+    }];
+    skipAct.attributes = UIMenuElementAttributesDestructive;
+
+    UIMenu *menu = [UIMenu menuWithTitle:(name.length ? name : bid)
+                                 children:@[drillAct, muteAct, skipAct]];
+
+    return [UIContextMenuConfiguration configurationWithIdentifier:nil
+                                                   previewProvider:nil
+                                                    actionProvider:^UIMenu *(NSArray<UIMenuElement *> *suggested) {
+        return menu;
+    }];
+}
+
+// 菜单里那条「只看这个 App」的落点：和点行共用出口，只有一处算时间窗。
+- (void)nbEmitDrillForBundle:(NSString *)bid {
+    if (!bid.length) return;
+    if (!self.drilldownHandler) return;
+    self.drilldownHandler(bid, [self nbDaysForCurrentRange]);
 }
 
 @end

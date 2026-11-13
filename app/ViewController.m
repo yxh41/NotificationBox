@@ -25,6 +25,9 @@
 // v0.0.168：临时静音。判定逻辑在 NotifyFilter 里 —— **tweak 与 App 编的是同一份**，
 // 不能在 App 里再写一份"这个 App 现在静音了没"，否则两边口径会各走一路。
 #import "NotifyFilter.h"
+// v0.0.187：浮层提示的唯一实现。搬到共享文件是因为统计页的行内行动要贴在**容器**上
+// （写入发生在记录页，而记录页那一刻在另一个页签、不可见）。
+#import "NBToast.h"
 
 // v0.0.38 的 `kNBMarkAllWidth`（「全标已读」按钮固定宽度）在 v0.0.131 删掉了：
 // 那个按钮已经搬进筛选菜单，布局里不再需要算它的宽度 —— 连声明一起去掉，
@@ -610,6 +613,16 @@ static const NSTimeInterval kNBAutoSearchDelay = 0.25;
 //    那个是 alert（要 present），而这里最常发生的时刻正是"菜单刚收起"，
 //    两条 present 撞在一起就是"点了没反应"。浮层只往视图上贴一个 label，不涉及 present。
 - (void)nbToast:(NSString *)text;
+// ================= v0.0.187：写入核心（静音 / 不记录）=================
+// 🔴 为什么要把"写盘 + 回读"从 `nbMuteRow:kind:` 里抽出来：
+//    v0.0.187 的统计页行内行动也要静音某个 App，而它的入口在**另一个页签**。
+//    不抽的话只有两条路 —— ①在统计页再抄一份写入逻辑（两份必走岔，
+//    而且回读那三条纪律必然会在抄的时候丢一条）②只能从长按菜单里点（等于没做）。
+// 🔴 这两个方法**只负责写与回读，不负责提示/触觉**：
+//    提示贴哪个 view 是调用方才知道的事（见 NBToast.h 文件头）。
+//    返回值 = 回读结果（YES 才算真的生效），`outMessage` = 已经拼好的整句人话。
+- (BOOL)nbWriteMuteForBundle:(NSString *)bid kind:(NBMuteKind)kind message:(NSString **)outMessage;
+- (BOOL)nbWriteSkipRecordForBundle:(NSString *)bid message:(NSString **)outMessage;
 @end
 
 // 🔴 v0.0.161：诊断长文本页用的独立 VC（**文件级**，不能嵌进 @implementation ViewController 里，
@@ -4370,9 +4383,14 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
 
 // ================= v0.0.168：临时静音的写入 =================
 //
-// 🔴 这个函数做三件事，顺序不能换：
+// 🔴 v0.0.187：这一段从"菜单专用的实现"变成了**全工程唯一的静音写入核心**。
+//    两个入口共用它：记录页长按菜单（`nbMuteRow:kind:`）和统计页行内行动
+//    （`nbApplyMuteOneHourForBundle:message:`，由容器调）。
+//    ⛔ 不许任何一侧再写一份 —— 下面这几条纪律抄一遍必然丢一条。
+//
+// 它做三件事，顺序不能换：
 //   ① 用 `activeMutesAt:` **重建**整张表（它顺手把过期项、坏值清掉）；
-//   ② 加/删本 App 那一条并落盘；
+//   ② 加本 App 那一条并落盘；
 //   ③ **回读校验**：再问一次"这个 App 现在真的静音了吗"。
 //   ③ 不能省。`writeToFile:` 返回 YES 只证明"文件写进去了"，
 //   不证明"判定侧认这一条"（超上限那条路就是写成功但判定不生效）。
@@ -4381,21 +4399,18 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
 // 🔴 重建表而不是在旧字典上改：旧字典里可能有 `"abc"` 这种读不出的到期值。
 //   在旧值上改会把它原样带进新表，而 `activeMutesAt:` 会把它剔掉 —— 顺手修好。
 //   代价是：坏条目会被**静默丢弃**。可以接受，因为坏条目本来就是"没生效"的状态。
-- (void)nbMuteRow:(NSDictionary *)row kind:(NBMuteKind)kind {
-    if (![row isKindOfClass:[NSDictionary class]]) return;
-
-    id bv = row[@"bundle"];
-    NSString *bid = [bv isKindOfClass:[NSString class]] ? (NSString *)bv : nil;
+//
+// 🔴 `outMessage` 给出的是**已经拼好的整句人话**（成功/失败都有），调用方直接弹。
+//    这样"菜单里那句"和"统计页那句"不可能各说各的（同一件事只有一个说法）。
+//    成功文案要带 App 名，而名字只有本类拿得到（`appNameForBundle:`）⇒
+//    ⛔ 这个核心不能挪进 NotifyFilter 那种"App 与 dylib 都编"的文件里。
+- (BOOL)nbWriteMuteForBundle:(NSString *)bid kind:(NBMuteKind)kind message:(NSString **)outMessage {
     if (!bid.length) {
-        // v0.0.178：三条失败出口都震 Warning 一档。
-        // 🔴 为什么失败要震、而且要和成功**不同档**：静音是"看起来生效了但可能没生效"
-        //    的典型 —— 卡片暗了、可通知照弹。只靠一句 toast 的话，手指按下去没有任何
-        //    差别，用户会以为成功了（本项目最贵的那类假读数：界面在说假话）。
-        //    ⚠️ Warning ≠ 通用错误音：只给"你以为成了、其实没成"这种场合。
-        NBHapticFire(NBHapticKindWarning);
-        [self nbToast:@"这条没有 bundle id，没法按 App 静音"];
-        return;
+        if (outMessage) *outMessage = @"这条没有 bundle id，没法按 App 静音";
+        return NO;
     }
+    NSString *name = [self appNameForBundle:bid];
+    NSString *who = name.length ? name : bid;
 
     NSMutableDictionary *tbl = [NSMutableDictionary dictionary];
     for (NSDictionary *e in [NotifyFilter activeMutesAt:nil]) {
@@ -4405,10 +4420,11 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     // 🔴 到顶就拒绝新的（不淘汰旧的）：静音是个位数级的手动操作，到顶说明写坏了；
     //    此时"少静音一个、并说出来"比"悄悄挤掉一个你不知道的"安全。
     if (!tbl[bid] && tbl.count >= NB_MUTE_MAX_ENTRIES) {
-        NBHapticFire(NBHapticKindWarning);
-        [self nbToast:[NSString stringWithFormat:
-                       @"静音条目已经 %d 条，先取消几个再试", NB_MUTE_MAX_ENTRIES]];
-        return;
+        if (outMessage) {
+            *outMessage = [NSString stringWithFormat:
+                           @"静音条目已经 %d 条，先取消几个再试", NB_MUTE_MAX_ENTRIES];
+        }
+        return NO;
     }
 
     NSTimeInterval until = [[NotifyFilter endDateForMuteKind:kind now:nil] timeIntervalSince1970];
@@ -4430,23 +4446,104 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     BOOL ok = saved && exact
            && [NotifyFilter shouldDropForMute:bid now:nil reason:&why problem:NULL];
     if (!ok) {
-        NBHapticFire(NBHapticKindWarning);
-        [self nbToast:[NSString stringWithFormat:@"静音没有生效（%@）",
-                       saved ? @"写进去了但判定侧不认，看日志 MUTE-BAD#" : @"写盘失败"]];
-        return;
+        if (outMessage) {
+            *outMessage = [NSString stringWithFormat:@"静音没有生效（%@）",
+                           saved ? @"写进去了但判定侧不认，看日志 MUTE-BAD#" : @"写盘失败"];
+        }
+        return NO;
+    }
+    if (outMessage) {
+        *outMessage = [NSString stringWithFormat:@"%@ 已静音 · %@", who, why ?: @""];
+    }
+    return YES;
+}
+
+// 记录页长按菜单的入口。现在只负责"取 bundle + 反馈"，写入与回读全在上面那个核心里。
+// 🔴 成功触觉与熄灯动画都必须排在**回读结果**之后 —— 写盘失败也震"成功"、
+//    也画一遍熄灯的话，用户读到的就是"已经静音了"，而实际通知照弹
+//    （本项目最贵的那类假读数：界面在说假话）。判据 I3 机械守着这个先后。
+- (void)nbMuteRow:(NSDictionary *)row kind:(NBMuteKind)kind {
+    if (![row isKindOfClass:[NSDictionary class]]) return;
+
+    id bv = row[@"bundle"];
+    NSString *bid = [bv isKindOfClass:[NSString class]] ? (NSString *)bv : nil;
+
+    NSString *msg = nil;
+    BOOL ok = [self nbWriteMuteForBundle:bid kind:kind message:&msg];
+    // v0.0.178：失败震 Warning 一档，和成功**不同档**。
+    // 🔴 为什么失败要震：静音是"看起来生效了但可能没生效"的典型 ——
+    //    卡片暗了、可通知照弹。只靠一句 toast 的话，手指按下去没有任何差别，
+    //    用户会以为成功了。⚠️ Warning ≠ 通用错误音：只给"你以为成了、其实没成"这种场合。
+    NBHapticFire(ok ? NBHapticKindSuccess : NBHapticKindWarning);
+    [self nbToast:msg];
+    if (!ok) return;
+
+    // v0.0.176：熄铃。写在**回读校验通过之后** —— 动画表示"生效了"。
+    [self nbAnimateMuteLookForBundle:bid muted:YES];
+}
+
+// ================= v0.0.187：「加入不记录」名单的写入 =================
+//
+// 🔴 和静音同一个形状（重建 → 落盘 → 回读），但回读问的是**另一个判定函数**
+//    `shouldSkipRecordForBundle:` —— 那才是 tweak 侧真正决定"落不落库"的同一份代码。
+//    拿 `shouldDropBundle:` 去验就成了"问 AB 证明 CD"。
+//
+// 🔴 名单的读法必须走 `NBStringArray()`：这个键历史上被写成过数组，也可能被手工写成
+//    "a,b" 逗号串。`NBStringArray` 两种都认；自己写 `[d[key] isKindOfClass:]` 只认一种，
+//    另一种会让"名单里明明有、判定却说没有"。
+//
+// 🔴 已存在的记录**不受影响**：这个键只拦"以后要不要落库"，不删历史。
+//    文案必须把这一点说出来，否则用户以为点了就等于清空。
+- (BOOL)nbWriteSkipRecordForBundle:(NSString *)bid message:(NSString **)outMessage {
+    if (!bid.length) {
+        if (outMessage) *outMessage = @"这条没有 bundle id，没法加进「不记录」";
+        return NO;
+    }
+    NSString *name = [self appNameForBundle:bid];
+    NSString *who = name.length ? name : bid;
+
+    NSDictionary *before = [NotifyStore settings];
+    NSArray<NSString *> *oldList = NBStringArray(before[NB_KEY_NO_RECORD_APPS]);
+    if ([oldList containsObject:bid]) {
+        // 已经在了。这不是失败 —— 判定侧现在就是"不记录"，说清楚就行
+        //（⛔ 别假装又加了一次：那会让人以为名单里有两份）。
+        if (outMessage) {
+            *outMessage = [NSString stringWithFormat:@"%@ 本来就在「不记录」名单里", who];
+        }
+        return [NotifyFilter shouldSkipRecordForBundle:bid];
     }
 
-    // v0.0.178：回读校验通过 = 真的生效了 ⇒ 给"成功"那一档。
-    // 🔴 位置和下面那句熄灯动画**同一条纪律**：必须排在 `ok` 判断之后。
-    //    写盘失败也震 Success 的话，用户摸到的就是"成了"，而通知照弹。
-    NBHapticFire(NBHapticKindSuccess);
-    NSString *name = [self appNameForBundle:bid];
-    [self nbToast:[NSString stringWithFormat:@"%@ 已静音 · %@", name.length ? name : bid, why ?: @""]];
+    NSMutableArray<NSString *> *arr = [NSMutableArray arrayWithArray:oldList];
+    [arr addObject:bid];
+    // 排序后再存：同一组选择每次写出来的文件都一样，方便对拍
+    // （和 AppPickerViewController 的 persist 用同一套口径）。
+    NSArray *sorted = [arr sortedArrayUsingSelector:@selector(compare:)];
 
-    // v0.0.176：熄铃。写在**回读校验通过之后** —— 动画表示"生效了"，
-    // 所以绝不能排在 `ok` 判断之前：那样写盘失败也会画一遍熄灯，
-    // 用户看到的就是"已经静音了"，而实际通知照弹（本项目最贵的那类假读数）。
-    [self nbAnimateMuteLookForBundle:bid muted:YES];
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:before];
+    d[NB_KEY_NO_RECORD_APPS] = sorted;
+    BOOL saved = [NotifyStore saveSettings:d];
+
+    // 回读两层，缺一不可：
+    //   ① 键里真的有这个 bundle —— 证明写进去了、而且写的是**名单**而不是别的东西；
+    //   ② 判定侧认 —— 证明 tweak 读这份设置时也会跳过它。
+    // 🔴 只做①是"我写的我读回来"（自证）；只做②会被别的来源蒙对
+    //    （比如黑白名单恰好也命中同一个 App）。两层一起才算证完。
+    NSDictionary *after = [NotifyStore settings];
+    BOOL exact = [NBStringArray(after[NB_KEY_NO_RECORD_APPS]) containsObject:bid];
+    BOOL judge = [NotifyFilter shouldSkipRecordForBundle:bid];
+    if (!saved || !exact || !judge) {
+        if (outMessage) {
+            *outMessage = [NSString stringWithFormat:@"没加成（%@）",
+                           !saved ? @"写盘失败"
+                                  : (!exact ? @"写进去了但名单里读不到"
+                                            : @"名单里有、判定侧不认，看日志")];
+        }
+        return NO;
+    }
+    if (outMessage) {
+        *outMessage = [NSString stringWithFormat:@"%@ 以后不再记录 · 已有记录保留", who];
+    }
+    return YES;
 }
 
 // v0.0.176：把某个 App 的静音态动画铺到**所有可见行**上。
@@ -4522,6 +4619,38 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     [self nbAnimateMuteLookForBundle:bid muted:NO];
 }
 
+// ================= v0.0.187：统计页行内行动的公开入口 =================
+//
+// 🔴 这两个方法**不弹提示、不震触觉**：调用方是容器（`NBHomeTabBarController`），
+//    因为它才知道该把提示贴在哪个 view 上（记录页那一刻在另一个页签、不可见）。
+//    ⛔ 别在这里补一句 toast —— 贴在记录页上的提示用户根本看不到，
+//    而"看不到提示"和"点了没反应"在用户眼里是同一件事。
+//
+// 🔴 固定「1 小时」这一档，不给三档菜单：统计页是"顺手治一下"的地方，
+//    先让用户做三选一等于把决策成本加回来。真要 8 小时 / 到明早，
+//    记录页长按菜单里那三档一直都在（同一套核心，口径不会分岔）。
+
+- (BOOL)nbApplyMuteOneHourForBundle:(NSString *)bundle message:(NSString **)outMessage {
+    BOOL ok = [self nbWriteMuteForBundle:bundle kind:NBMuteKind1Hour message:outMessage];
+    if (!ok) return NO;
+
+    // 🔴 成功了必须让列表**重算一遍静音长相**。
+    //    `reloadData` 会重跑 cellForRow，而那里 `nbSetMutedLook:` 的入参
+    //    正是 `shouldDropForMute:` 的结果（同一个判定函数）。
+    //    ⛔ 别只调 `nbAnimateMuteLookForBundle:`：它只动**当前可见**的 cell，
+    //       而记录页此刻在另一个页签 ⇒ 可见集合可能是空的，
+    //       用户切回去看到的还是"没静音"的样子（界面在说假话）。
+    [self nbAnimateMuteLookForBundle:bundle muted:YES];
+    [self.table reloadData];
+    return YES;
+}
+
+- (BOOL)nbApplySkipRecordForBundle:(NSString *)bundle message:(NSString **)outMessage {
+    // 不刷新列表：这个动作只影响"以后落不落库"，屏幕上已有的记录一条都不变
+    //（文案里那句"已有记录保留"说的就是这件事，界面和行为必须一致）。
+    return [self nbWriteSkipRecordForBundle:bundle message:outMessage];
+}
+
 // 标题 / 正文 / 副标题按顺序拼，空的跳过。
 - (NSString *)nbBodyTextForRow:(NSDictionary *)row {
     if (![row isKindOfClass:[NSDictionary class]]) return nil;
@@ -4564,71 +4693,13 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     [self nbToast:text];
 }
 
-// 浮层提示：贴在视图正中，1.4 秒后淡出。
-// 🔴 为什么不用 `alertTitle:text:`（现成的 alert 入口）：这个提示出现的最常见时刻
-//    正是"长按菜单刚收起"，而菜单本身是一次 present ⇒ 同时再 present 一个 alert
-//    会被系统丢掉（真机表现：点了没反应，日志里什么都没有）。
-//    往视图上贴 label 不涉及 present，任何时刻都安全。
+// 浮层提示。**实现已搬到 app/NBToast.m**（v0.0.187）——
+// 🔴 为什么搬：v0.0.187 的「统计页行内行动」是在统计页点下去、写入却落在记录页，
+//    而记录页那一刻在另一个页签、根本不可见 ⇒ 提示必须能贴到**容器**的 view 上。
+//    留在这里的话别的文件调不到（私有方法），只能复制一份 —— 两份必走岔。
+// 这里保留一个同名私有入口，纯粹是为了让本文件里那二十几处调用点一个字都不用改。
 - (void)nbToast:(NSString *)text {
-    if (!text.length) return;
-    UIView *host = self.view;
-    if (!host) return;
-
-    // 同一时刻只留一个：连点两下不该叠出两层黑底（叠起来颜色更深、看着像卡了）。
-    static NSInteger kToastTag = 0x4E42;   // 'NB'
-    // 🔴 必须遍历 `subviews` 的**副本**：循环里 `removeFromSuperview` 会改动 `subviews` 本身，
-    //    边遍历边改是未定义行为（快枚举会直接抛 "collection was mutated while being enumerated"）。
-    for (UIView *old in [host.subviews copy]) {
-        if (old.tag == kToastTag) [old removeFromSuperview];
-    }
-
-    UIView *box = [[UIView alloc] init];
-    box.tag = kToastTag;
-    box.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.82];
-    box.layer.cornerRadius = 12.0;
-    box.layer.masksToBounds = YES;
-    box.alpha = 0.0;
-    box.translatesAutoresizingMaskIntoConstraints = NO;
-    box.userInteractionEnabled = NO;      // 提示不该挡住底下的列表
-    [host addSubview:box];
-
-    UILabel *lb = [[UILabel alloc] init];
-    lb.text = text;
-    lb.textColor = [UIColor whiteColor];
-    lb.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
-    lb.textAlignment = NSTextAlignmentCenter;
-    lb.numberOfLines = 0;
-    lb.translatesAutoresizingMaskIntoConstraints = NO;
-    [box addSubview:lb];
-
-    // 内边距 14/12：外面套一层 box 而不是直接给 label 加背景 ——
-    // UILabel 没有 contentInsets，硬给背景会让文字顶到圆角上。
-    [NSLayoutConstraint activateConstraints:@[
-        [lb.leadingAnchor  constraintEqualToAnchor:box.leadingAnchor  constant:14.0],
-        [lb.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-14.0],
-        [lb.topAnchor      constraintEqualToAnchor:box.topAnchor      constant:10.0],
-        [lb.bottomAnchor   constraintEqualToAnchor:box.bottomAnchor   constant:-10.0],
-        [box.centerXAnchor constraintEqualToAnchor:host.centerXAnchor],
-        [box.centerYAnchor constraintEqualToAnchor:host.centerYAnchor],
-        // 🔴 必须限宽：长句子不限宽会顶到屏幕边上（本项目吃过"提示语被截断/挤出屏幕"的亏）。
-        [box.widthAnchor   constraintLessThanOrEqualToAnchor:host.widthAnchor constant:-72.0],
-    ]];
-
-    [UIView animateWithDuration:0.18
-                          delay:0.0
-                        options:UIViewAnimationOptionCurveEaseOut
-                     animations:^{
-        box.alpha = 1.0;
-    } completion:^(BOOL finished) {
-        [UIView animateWithDuration:0.35
-                              delay:1.1
-                            options:UIViewAnimationOptionCurveEaseIn
-                         animations:^{
-            box.alpha = 0.0;
-        } completion:^(BOOL finished2) {
-            [box removeFromSuperview];
-        }];
-    }];
+    NBShowToast(self.view, text);
 }
 
 - (void)nbDeleteRowIds:(NSArray<NSNumber *> *)rowIds {
